@@ -1,0 +1,168 @@
+import {
+  AreaChart,
+  Area,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  Legend,
+} from "recharts";
+import type { Signal } from "../api/client";
+
+interface Props {
+  signals: Signal[];
+}
+
+interface DataPoint {
+  time: number;
+  timeLabel: string;
+  [speaker: string]: number | string;
+}
+
+const SPEAKER_COLORS = [
+  "#4F8BFF", // blue
+  "#8B5CF6", // purple
+  "#F59E0B", // amber
+  "#10B981", // emerald
+  "#EC4899", // pink
+];
+
+function formatTime(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  return `${min}:${String(sec).padStart(2, "0")}`;
+}
+
+export default function StressTimeline({ signals }: Props) {
+  // Filter to stress signals only
+  const stressSignals = signals.filter(
+    (s) => s.agent === "voice" && s.signal_type === "vocal_stress_score" && s.value != null
+  );
+
+  if (stressSignals.length === 0) {
+    return (
+      <div className="flex h-48 items-center justify-center rounded-lg border border-nexus-border bg-nexus-surface text-sm text-nexus-text-muted">
+        No stress data available
+      </div>
+    );
+  }
+
+  // Get unique speakers
+  const speakers = Array.from(
+    new Set(stressSignals.map((s) => s.speaker_label || s.speaker_id || "Unknown"))
+  );
+
+  // Build time-series data points
+  const timeMap = new Map<number, DataPoint>();
+
+  for (const signal of stressSignals) {
+    const timeKey = signal.window_start_ms;
+    const speaker = signal.speaker_label || signal.speaker_id || "Unknown";
+
+    if (!timeMap.has(timeKey)) {
+      timeMap.set(timeKey, {
+        time: timeKey,
+        timeLabel: formatTime(timeKey),
+      });
+    }
+
+    const point = timeMap.get(timeKey)!;
+    point[speaker] = Number((signal.value ?? 0).toFixed(3));
+  }
+
+  const data = Array.from(timeMap.values()).sort((a, b) => a.time - b.time);
+
+  return (
+    <div className="rounded-lg border border-nexus-border bg-nexus-surface p-4">
+      <h3 className="mb-3 text-sm font-medium text-nexus-text-primary">
+        Stress Timeline
+      </h3>
+      <ResponsiveContainer width="100%" height={220}>
+        <AreaChart data={data} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
+          <defs>
+            {speakers.map((speaker, i) => (
+              <linearGradient
+                key={speaker}
+                id={`stress-gradient-${i}`}
+                x1="0"
+                y1="0"
+                x2="0"
+                y2="1"
+              >
+                <stop
+                  offset="5%"
+                  stopColor={SPEAKER_COLORS[i % SPEAKER_COLORS.length]}
+                  stopOpacity={0.3}
+                />
+                <stop
+                  offset="95%"
+                  stopColor={SPEAKER_COLORS[i % SPEAKER_COLORS.length]}
+                  stopOpacity={0.05}
+                />
+              </linearGradient>
+            ))}
+          </defs>
+          <CartesianGrid strokeDasharray="3 3" stroke="#2D3348" />
+          <XAxis
+            dataKey="timeLabel"
+            tick={{ fill: "#8B93A7", fontSize: 10 }}
+            tickLine={{ stroke: "#2D3348" }}
+            axisLine={{ stroke: "#2D3348" }}
+          />
+          <YAxis
+            domain={[0, 1]}
+            tick={{ fill: "#8B93A7", fontSize: 10 }}
+            tickLine={{ stroke: "#2D3348" }}
+            axisLine={{ stroke: "#2D3348" }}
+            tickFormatter={(v: number) => v.toFixed(1)}
+          />
+          <Tooltip
+            contentStyle={{
+              backgroundColor: "#1A1D27",
+              border: "1px solid #2D3348",
+              borderRadius: "8px",
+              fontSize: 12,
+              color: "#E8ECF4",
+            }}
+            formatter={(value: number) => [value.toFixed(3), ""]}
+            labelStyle={{ color: "#8B93A7" }}
+          />
+          <Legend
+            wrapperStyle={{ fontSize: 11, color: "#8B93A7" }}
+          />
+          {speakers.map((speaker, i) => (
+            <Area
+              key={speaker}
+              type="monotone"
+              dataKey={speaker}
+              stroke={SPEAKER_COLORS[i % SPEAKER_COLORS.length]}
+              fillOpacity={1}
+              fill={`url(#stress-gradient-${i})`}
+              strokeWidth={1.5}
+              dot={false}
+              name={speaker}
+            />
+          ))}
+        </AreaChart>
+      </ResponsiveContainer>
+
+      {/* Stress level legend */}
+      <div className="mt-2 flex items-center gap-4 text-[10px] text-nexus-text-muted">
+        <span className="flex items-center gap-1">
+          <span className="inline-block h-2 w-2 rounded-full bg-nexus-stress-low" />
+          Low (&lt;0.30)
+        </span>
+        <span className="flex items-center gap-1">
+          <span className="inline-block h-2 w-2 rounded-full bg-nexus-stress-med" />
+          Moderate (0.30–0.60)
+        </span>
+        <span className="flex items-center gap-1">
+          <span className="inline-block h-2 w-2 rounded-full bg-nexus-stress-high" />
+          High (&gt;0.60)
+        </span>
+      </div>
+    </div>
+  );
+}

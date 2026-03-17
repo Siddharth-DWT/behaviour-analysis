@@ -1,0 +1,32 @@
+# NEXUS Voice Agent - Dependencies
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# Audio processing
+librosa==0.10.2
+soundfile==0.13.1
+numpy==1.26.4
+
+# Whisper transcription (local via faster-whisper for speed)
+faster-whisper==1.1.0
+
+# Speaker diarization
+pyannote.audio==3.3.2
+torch==2.5.1
+torchaudio==2.5.1
+
+# Database
+psycopg2-binary==2.9.10
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+
+# Redis
+redis[hiredis]==5.2.1
+
+# HTTP client (for external GPU Whisper API)
+httpx>=0.25.0
+
+# Utilities
+pydantic==2.10.4
+python-dotenv==1.0.1

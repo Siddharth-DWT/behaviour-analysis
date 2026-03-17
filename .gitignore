@@ -1,0 +1,48 @@
+# Environment
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+venv/
+.venv/
+
+# Data (don't commit recordings or reports)
+data/recordings/*
+data/reports/*
+!data/recordings/.gitkeep
+!data/reports/.gitkeep
+
+# Node
+node_modules/
+.next/
+
+# Docker volumes
+postgres_data/
+redis_data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Models (downloaded at runtime)
+models/
+*.pt
+*.bin
+*.onnx
+
+# Logs and PIDs
+.logs/
+.pids/
+
+# Claude Code
+.claude/

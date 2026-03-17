@@ -1,0 +1,189 @@
+# ============================================================================
+# NEXUS - Multi-Agent Behavioural Analysis System
+# Docker Compose - Local Development Environment
+# ============================================================================
+# 
+# USAGE:
+#   docker compose up -d          → Start all services
+#   docker compose logs -f        → Watch logs
+#   docker compose down           → Stop all
+#   docker compose down -v        → Stop + delete data
+#
+# SERVICES:
+#   postgres   → PostgreSQL 16 + pgvector (config, transcripts, signals, vectors)
+#   redis      → Valkey 8 (inter-agent message bus)
+#   voice      → Voice Agent (Python FastAPI)
+#   language   → Language Agent (Python FastAPI)
+#   fusion     → Fusion Agent (Python FastAPI)
+#   api        → API Gateway (Python FastAPI) - dashboard backend
+#   dashboard  → React Admin Dashboard (dev server)
+#
+# PORTS:
+#   5432  → PostgreSQL
+#   6379  → Redis/Valkey
+#   8001  → Voice Agent API
+#   8002  → Language Agent API
+#   8003  → Fusion Agent API
+#   8000  → API Gateway
+#   5173  → Dashboard (React dev server)
+#
+# ============================================================================
+
+services:
+
+  # --------------------------------------------------------------------------
+  # INFRASTRUCTURE
+  # --------------------------------------------------------------------------
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: nexus-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: nexus
+      POSTGRES_USER: nexus
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nexus_dev_2026}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus -d nexus"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - nexus-network
+
+  redis:
+    image: valkey/valkey:8-alpine
+    container_name: nexus-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./infrastructure/redis/valkey.conf:/etc/valkey/valkey.conf
+    command: valkey-server /etc/valkey/valkey.conf
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - nexus-network
+
+  # --------------------------------------------------------------------------
+  # AGENTS (uncomment when ready to develop each service)
+  # --------------------------------------------------------------------------
+
+  # voice:
+  #   build:
+  #     context: ./services/voice-agent
+  #     dockerfile: Dockerfile
+  #   container_name: nexus-voice-agent
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8001:8001"
+  #   environment:
+  #     - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
+  #     - REDIS_URL=redis://redis:6379/0
+  #     - OPENAI_API_KEY=${OPENAI_API_KEY}
+  #   volumes:
+  #     - ./services/voice-agent:/app
+  #     - ./shared:/app/shared
+  #     - ./data:/app/data
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - nexus-network
+
+  # language:
+  #   build:
+  #     context: ./services/language-agent
+  #     dockerfile: Dockerfile
+  #   container_name: nexus-language-agent
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8002:8002"
+  #   environment:
+  #     - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
+  #     - REDIS_URL=redis://redis:6379/0
+  #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+  #   volumes:
+  #     - ./services/language-agent:/app
+  #     - ./shared:/app/shared
+  #     - ./data:/app/data
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - nexus-network
+
+  # fusion:
+  #   build:
+  #     context: ./services/fusion-agent
+  #     dockerfile: Dockerfile
+  #   container_name: nexus-fusion-agent
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8003:8003"
+  #   environment:
+  #     - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
+  #     - REDIS_URL=redis://redis:6379/0
+  #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+  #   volumes:
+  #     - ./services/fusion-agent:/app
+  #     - ./shared:/app/shared
+  #     - ./data:/app/data
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - nexus-network
+
+  # api:
+  #   build:
+  #     context: ./services/api-gateway
+  #     dockerfile: Dockerfile
+  #   container_name: nexus-api-gateway
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
+  #     - REDIS_URL=redis://redis:6379/0
+  #   volumes:
+  #     - ./services/api-gateway:/app
+  #     - ./shared:/app/shared
+  #     - ./data:/app/data
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - nexus-network
+
+# --------------------------------------------------------------------------
+# VOLUMES & NETWORKS
+# --------------------------------------------------------------------------
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  nexus-network:
+    driver: bridge
+    name: nexus-network

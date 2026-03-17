@@ -1,0 +1,19 @@
+# NEXUS Fusion Agent - Dependencies
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# Claude API for narrative generation
+anthropic==0.40.0
+
+# Database
+psycopg2-binary==2.9.10
+asyncpg==0.30.0
+
+# Redis
+redis[hiredis]==5.2.1
+
+# Utilities
+pydantic==2.10.4
+python-dotenv==1.0.1
+numpy==1.26.4
