@@ -12,6 +12,7 @@ import type { Signal } from "../api/client";
 
 interface Props {
   signals: Signal[];
+  speakerRoles?: Record<string, string>;
 }
 
 interface DataPoint {
@@ -35,7 +36,7 @@ function formatTime(ms: number): string {
   return `${min}:${String(sec).padStart(2, "0")}`;
 }
 
-export default function StressTimeline({ signals }: Props) {
+export default function StressTimeline({ signals, speakerRoles }: Props) {
   // Filter to stress signals only
   const stressSignals = signals.filter(
     (s) => s.agent === "voice" && s.signal_type === "vocal_stress_score" && s.value != null
@@ -50,9 +51,16 @@ export default function StressTimeline({ signals }: Props) {
   }
 
   // Get unique speakers
-  const speakers = Array.from(
+  const speakerLabels = Array.from(
     new Set(stressSignals.map((s) => s.speaker_label || s.speaker_id || "Unknown"))
   );
+
+  // Build display names with roles
+  const speakerDisplayNames: Record<string, string> = {};
+  for (const label of speakerLabels) {
+    const role = speakerRoles?.[label];
+    speakerDisplayNames[label] = role ? `${label} (${role})` : label;
+  }
 
   // Build time-series data points
   const timeMap = new Map<number, DataPoint>();
@@ -60,6 +68,7 @@ export default function StressTimeline({ signals }: Props) {
   for (const signal of stressSignals) {
     const timeKey = signal.window_start_ms;
     const speaker = signal.speaker_label || signal.speaker_id || "Unknown";
+    const displayName = speakerDisplayNames[speaker] || speaker;
 
     if (!timeMap.has(timeKey)) {
       timeMap.set(timeKey, {
@@ -69,10 +78,11 @@ export default function StressTimeline({ signals }: Props) {
     }
 
     const point = timeMap.get(timeKey)!;
-    point[speaker] = Number((signal.value ?? 0).toFixed(3));
+    point[displayName] = Number((signal.value ?? 0).toFixed(3));
   }
 
   const data = Array.from(timeMap.values()).sort((a, b) => a.time - b.time);
+  const displaySpeakers = speakerLabels.map((l) => speakerDisplayNames[l] || l);
 
   return (
     <div className="rounded-lg border border-nexus-border bg-nexus-surface p-4">
@@ -82,7 +92,7 @@ export default function StressTimeline({ signals }: Props) {
       <ResponsiveContainer width="100%" height={220}>
         <AreaChart data={data} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
           <defs>
-            {speakers.map((speaker, i) => (
+            {displaySpeakers.map((speaker, i) => (
               <linearGradient
                 key={speaker}
                 id={`stress-gradient-${i}`}
@@ -132,7 +142,7 @@ export default function StressTimeline({ signals }: Props) {
           <Legend
             wrapperStyle={{ fontSize: 11, color: "#8B93A7" }}
           />
-          {speakers.map((speaker, i) => (
+          {displaySpeakers.map((speaker, i) => (
             <Area
               key={speaker}
               type="monotone"
@@ -156,7 +166,7 @@ export default function StressTimeline({ signals }: Props) {
         </span>
         <span className="flex items-center gap-1">
           <span className="inline-block h-2 w-2 rounded-full bg-nexus-stress-med" />
-          Moderate (0.30–0.60)
+          Moderate (0.30-0.60)
         </span>
         <span className="flex items-center gap-1">
           <span className="inline-block h-2 w-2 rounded-full bg-nexus-stress-high" />

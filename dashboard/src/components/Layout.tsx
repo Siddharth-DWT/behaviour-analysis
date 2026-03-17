@@ -54,6 +54,7 @@ export default function Layout({ children }: { children: ReactNode }) {
                     : "text-nexus-text-secondary hover:bg-nexus-surface-hover hover:text-nexus-text-primary"
                 }`}
                 onClick={(e) => item.disabled && e.preventDefault()}
+                title={item.label}
               >
                 <Icon className="h-4 w-4 shrink-0" />
                 {!collapsed && <span>{item.label}</span>}
@@ -66,6 +67,7 @@ export default function Layout({ children }: { children: ReactNode }) {
         <button
           onClick={() => setCollapsed(!collapsed)}
           className="flex h-10 items-center justify-center border-t border-nexus-border text-nexus-text-muted hover:text-nexus-text-secondary"
+          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
         >
           {collapsed ? (
             <ChevronRight className="h-4 w-4" />

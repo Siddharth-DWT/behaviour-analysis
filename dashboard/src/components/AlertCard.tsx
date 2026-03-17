@@ -10,30 +10,34 @@ function formatTime(ms: number): string {
 
 const SEVERITY_CONFIG: Record<
   string,
-  { icon: typeof AlertTriangle; color: string; bg: string; label: string }
+  { icon: typeof AlertTriangle; color: string; bg: string; borderColor: string; label: string }
 > = {
   red: {
     icon: AlertCircle,
     color: "text-nexus-stress-high",
     bg: "bg-nexus-stress-high/10",
+    borderColor: "border-l-nexus-stress-high",
     label: "CRITICAL",
   },
   orange: {
     icon: AlertTriangle,
     color: "text-nexus-alert",
     bg: "bg-nexus-alert/10",
+    borderColor: "border-l-nexus-alert",
     label: "ALERT",
   },
   yellow: {
     icon: Info,
     color: "text-nexus-stress-med",
     bg: "bg-nexus-stress-med/10",
+    borderColor: "border-l-nexus-stress-med",
     label: "NOTICE",
   },
   green: {
     icon: Star,
     color: "text-nexus-stress-low",
     bg: "bg-nexus-stress-low/10",
+    borderColor: "border-l-nexus-stress-low",
     label: "INSIGHT",
   },
 };
@@ -44,7 +48,7 @@ export default function AlertCard({ alert }: { alert: Alert }) {
 
   return (
     <div
-      className={`rounded-lg border border-nexus-border p-3 ${config.bg}`}
+      className={`rounded-lg border border-nexus-border border-l-[3px] ${config.borderColor} ${config.bg} p-3`}
     >
       <div className="flex items-start gap-2">
         <Icon className={`mt-0.5 h-4 w-4 shrink-0 ${config.color}`} />

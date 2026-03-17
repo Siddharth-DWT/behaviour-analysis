@@ -52,6 +52,21 @@ export default function ReportView() {
   const content = report?.content;
   const signals = signalData?.signals ?? [];
 
+  // Build speaker role map from signal metadata
+  const speakerRoles: Record<string, string> = {};
+  if (content && (content as Record<string, unknown>)["speaker_roles"]) {
+    const roles = (content as Record<string, unknown>)["speaker_roles"] as Record<string, string>;
+    Object.assign(speakerRoles, roles);
+  }
+  for (const sig of signals) {
+    if (sig.metadata && typeof sig.metadata === "object") {
+      const meta = sig.metadata as Record<string, unknown>;
+      if (meta["speaker_role"] && sig.speaker_label) {
+        speakerRoles[sig.speaker_label] = String(meta["speaker_role"]);
+      }
+    }
+  }
+
   if (loadingReport) {
     return (
       <div className="flex items-center justify-center py-20 text-sm text-nexus-text-muted">
@@ -99,6 +114,7 @@ export default function ReportView() {
           <button
             onClick={() => refetch()}
             className="flex items-center gap-1 rounded bg-nexus-surface px-2 py-1 text-xs text-nexus-text-secondary hover:bg-nexus-surface-hover"
+            title="Regenerate report"
           >
             <RefreshCw className="h-3 w-3" />
             Regenerate
@@ -154,16 +170,16 @@ export default function ReportView() {
                     className="border-l-2 border-nexus-accent-blue/40 pl-3"
                   >
                     <div className="flex items-center gap-2 text-xs">
-                      <span className="font-mono font-bold text-nexus-accent-blue">
+                      <span className="flex h-5 w-5 items-center justify-center rounded-full bg-nexus-accent-blue/15 font-mono text-[10px] font-bold text-nexus-accent-blue">
                         {i + 1}
                       </span>
                       {moment.time_description && (
-                        <span className="text-nexus-text-muted">
+                        <span className="font-mono text-nexus-text-muted">
                           {moment.time_description}
                         </span>
                       )}
                     </div>
-                    <p className="mt-0.5 text-sm text-nexus-text-primary">
+                    <p className="mt-1 text-sm text-nexus-text-primary">
                       {moment.description}
                     </p>
                     {moment.significance && (
@@ -178,13 +194,13 @@ export default function ReportView() {
           )}
 
           {/* Stress Timeline */}
-          <StressTimeline signals={signals} />
+          <StressTimeline signals={signals} speakerRoles={speakerRoles} />
 
           {/* Cross-modal Insights */}
           {content.cross_modal_insights &&
             content.cross_modal_insights.length > 0 && (
-              <section className="rounded-lg border border-nexus-agent-fusion/30 bg-nexus-agent-fusion/5 p-5">
-                <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-nexus-agent-fusion">
+              <section className="rounded-lg border border-nexus-accent-purple/30 bg-nexus-accent-purple/5 p-5">
+                <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-nexus-accent-purple">
                   <Lightbulb className="h-4 w-4" />
                   Cross-Modal Insights
                 </h2>
@@ -194,7 +210,7 @@ export default function ReportView() {
                       key={i}
                       className="flex items-start gap-2 text-sm text-nexus-text-primary"
                     >
-                      <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-nexus-agent-fusion" />
+                      <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-nexus-accent-purple" />
                       {insight}
                     </li>
                   ))}
@@ -206,7 +222,7 @@ export default function ReportView() {
           {content.recommendations && content.recommendations.length > 0 && (
             <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
               <h2 className="mb-3 text-sm font-semibold text-nexus-text-primary">
-                Recommendations
+                Coaching Recommendations
               </h2>
               <ul className="space-y-2">
                 {content.recommendations.map((rec, i) => (
@@ -214,7 +230,7 @@ export default function ReportView() {
                     key={i}
                     className="flex items-start gap-2 text-sm text-nexus-text-primary"
                   >
-                    <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-nexus-stress-low" />
+                    <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-nexus-stress-low" />
                     {rec}
                   </li>
                 ))}
