@@ -67,7 +67,7 @@ export default function SessionList() {
           <button
             onClick={() => fileInputRef.current?.click()}
             disabled={uploading}
-            className="flex items-center gap-1.5 rounded bg-nexus-accent-blue px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-nexus-accent-blue/80 disabled:opacity-50"
+            className="flex items-center gap-1.5 rounded bg-nexus-accent-blue px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-blue-80 disabled:opacity-50"
           >
             {uploading ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -88,14 +88,14 @@ export default function SessionList() {
 
       {/* Upload status */}
       {uploading && (
-        <div className="mb-4 flex items-center gap-2 rounded-lg border border-nexus-accent-blue/30 bg-nexus-accent-blue/10 p-3 text-xs text-nexus-accent-blue">
+        <div className="mb-4 flex items-center gap-2 rounded-lg border border-accent-blue-30 bg-accent-blue-10 p-3 text-xs text-nexus-accent-blue">
           <Loader2 className="h-4 w-4 animate-spin" />
           Running full pipeline: Voice → Language → Fusion. This may take a few minutes...
         </div>
       )}
 
       {uploadError && (
-        <div className="mb-4 rounded-lg border border-nexus-stress-high/30 bg-nexus-stress-high/10 p-3 text-xs text-nexus-stress-high">
+        <div className="mb-4 rounded-lg border border-stress-high-30 bg-stress-high-10 p-3 text-xs text-nexus-stress-high">
           Upload failed: {uploadError}
         </div>
       )}
@@ -110,7 +110,7 @@ export default function SessionList() {
 
       {/* Error state */}
       {error && (
-        <div className="rounded-lg border border-nexus-stress-high/30 bg-nexus-stress-high/10 p-4 text-sm text-nexus-stress-high">
+        <div className="rounded-lg border border-stress-high-30 bg-stress-high-10 p-4 text-sm text-nexus-stress-high">
           Failed to load sessions: {(error as Error).message}
         </div>
       )}

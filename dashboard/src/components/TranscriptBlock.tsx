@@ -66,7 +66,7 @@ export default function TranscriptBlock({ segment, signals, speakerRole }: Props
 
   return (
     <div
-      className={`group rounded-lg border border-nexus-border border-l-[3px] ${borderColor} bg-nexus-surface p-3 transition-colors hover:border-nexus-border/80`}
+      className={`group rounded-lg border border-nexus-border border-l-[3px] ${borderColor} bg-nexus-surface p-3 transition-colors`}
     >
       {/* Header: time + speaker + role */}
       <div className="mb-1.5 flex items-center gap-2 text-xs">
@@ -75,7 +75,7 @@ export default function TranscriptBlock({ segment, signals, speakerRole }: Props
         </span>
         <span className="font-medium text-nexus-accent-blue">{speaker}</span>
         {speakerRole && (
-          <span className="rounded bg-nexus-accent-purple/15 px-1.5 py-0.5 text-[10px] font-medium text-nexus-accent-purple">
+          <span className="rounded bg-accent-purple-15 px-1.5 py-0.5 text-[10px] font-medium text-nexus-accent-purple">
             {speakerRole}
           </span>
         )}

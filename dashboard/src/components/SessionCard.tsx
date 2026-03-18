@@ -13,11 +13,11 @@ function formatDuration(ms: number | null): string {
 }
 
 const STATUS_STYLES: Record<string, string> = {
-  completed: "bg-nexus-stress-low/20 text-nexus-stress-low",
-  processing: "bg-nexus-stress-med/20 text-nexus-stress-med",
-  analysing: "bg-nexus-accent-blue/20 text-nexus-accent-blue",
-  failed: "bg-nexus-stress-high/20 text-nexus-stress-high",
-  created: "bg-nexus-neutral/20 text-nexus-neutral",
+  completed: "bg-stress-low-20 text-nexus-stress-low",
+  processing: "bg-stress-med-20 text-nexus-stress-med",
+  analysing: "bg-accent-blue-20 text-nexus-accent-blue",
+  failed: "bg-stress-high-20 text-nexus-stress-high",
+  created: "bg-neutral-20 text-nexus-neutral",
 };
 
 const MEETING_TYPE_LABELS: Record<string, string> = {
@@ -34,7 +34,7 @@ export default function SessionCard({ session }: { session: Session }) {
   return (
     <Link
       to={`/sessions/${session.id}`}
-      className="block rounded-lg border border-nexus-border bg-nexus-surface p-4 transition-colors hover:border-nexus-accent-blue/40 hover:bg-nexus-surface-hover"
+      className="block rounded-lg border border-nexus-border bg-nexus-surface p-4 transition-colors hover:border-accent-blue-40 hover:bg-nexus-surface-hover"
     >
       <div className="flex items-start justify-between">
         <div className="flex-1 min-w-0">

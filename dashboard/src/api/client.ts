@@ -147,7 +147,22 @@ export async function getReport(
   id: string,
   regenerate = false
 ): Promise<{ session_id: string; report: Report }> {
-  return request(`/sessions/${id}/report${regenerate ? "?regenerate=true" : ""}`);
+  const result = await request<{ session_id: string; report: Report }>(
+    `/sessions/${id}/report${regenerate ? "?regenerate=true" : ""}`
+  );
+  // API may return content as JSON string — parse it
+  if (result.report && typeof result.report.content === "string") {
+    try {
+      const parsed = JSON.parse(result.report.content as unknown as string);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (result.report as any).content = parsed;
+    } catch {
+      // If parse fails, wrap raw string as executive_summary
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (result.report as any).content = { executive_summary: result.report.content };
+    }
+  }
+  return result;
 }
 
 export async function uploadSession(

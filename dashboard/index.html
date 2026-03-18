@@ -1,11 +1,21 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="theme-dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>NEXUS Dashboard</title>
+    <script>
+      // Apply saved theme immediately to prevent flash of wrong theme
+      (function() {
+        var t = localStorage.getItem('nexus-theme');
+        if (t === 'light') {
+          document.documentElement.classList.remove('theme-dark');
+          document.documentElement.classList.add('theme-light');
+        }
+      })();
+    </script>
   </head>
-  <body class="bg-nexus-bg text-nexus-text-primary">
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

@@ -124,7 +124,7 @@ export default function ReportView() {
 
       {/* Error state */}
       {reportError && (
-        <div className="mb-6 rounded-lg border border-nexus-stress-high/30 bg-nexus-stress-high/10 p-4 text-sm text-nexus-stress-high">
+        <div className="mb-6 rounded-lg border border-stress-high-30 bg-stress-high-10 p-4 text-sm text-nexus-stress-high">
           Failed to load report: {(reportError as Error).message}
         </div>
       )}
@@ -145,7 +145,7 @@ export default function ReportView() {
         <div className="space-y-6">
           {/* Executive Summary */}
           {content.executive_summary && (
-            <section className="rounded-lg border border-nexus-accent-purple/30 bg-nexus-accent-purple/5 p-5">
+            <section className="rounded-lg border border-accent-purple-30 bg-accent-purple-5 p-5">
               <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-nexus-accent-purple">
                 <Sparkles className="h-4 w-4" />
                 Executive Summary
@@ -167,10 +167,10 @@ export default function ReportView() {
                 {content.key_moments.map((moment, i) => (
                   <div
                     key={i}
-                    className="border-l-2 border-nexus-accent-blue/40 pl-3"
+                    className="border-l-2 border-accent-blue-40 pl-3"
                   >
                     <div className="flex items-center gap-2 text-xs">
-                      <span className="flex h-5 w-5 items-center justify-center rounded-full bg-nexus-accent-blue/15 font-mono text-[10px] font-bold text-nexus-accent-blue">
+                      <span className="flex h-5 w-5 items-center justify-center rounded-full bg-accent-blue-15 font-mono text-[10px] font-bold text-nexus-accent-blue">
                         {i + 1}
                       </span>
                       {moment.time_description && (
@@ -199,7 +199,7 @@ export default function ReportView() {
           {/* Cross-modal Insights */}
           {content.cross_modal_insights &&
             content.cross_modal_insights.length > 0 && (
-              <section className="rounded-lg border border-nexus-accent-purple/30 bg-nexus-accent-purple/5 p-5">
+              <section className="rounded-lg border border-accent-purple-30 bg-accent-purple-5 p-5">
                 <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-nexus-accent-purple">
                   <Lightbulb className="h-4 w-4" />
                   Cross-Modal Insights

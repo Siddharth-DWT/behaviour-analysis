@@ -44,7 +44,7 @@ export function toSmartBadge(signal: Signal): SmartBadge | null {
     return {
       label: `Stress ${(value * 100).toFixed(0)}%`,
       color: isHigh ? "text-nexus-stress-high" : "text-nexus-alert",
-      bg: isHigh ? "bg-nexus-stress-high/15" : "bg-nexus-alert/15",
+      bg: isHigh ? "bg-stress-high-15" : "bg-alert-15",
       priority: value > 0.6 ? 95 : 70,
     };
   }
@@ -55,7 +55,7 @@ export function toSmartBadge(signal: Signal): SmartBadge | null {
       return {
         label: "Positive",
         color: "text-nexus-stress-low",
-        bg: "bg-nexus-stress-low/15",
+        bg: "bg-stress-low-15",
         priority: 40,
       };
     }
@@ -63,7 +63,7 @@ export function toSmartBadge(signal: Signal): SmartBadge | null {
       return {
         label: "Negative",
         color: "text-nexus-stress-high",
-        bg: "bg-nexus-stress-high/15",
+        bg: "bg-stress-high-15",
         priority: 60,
       };
     }
@@ -78,7 +78,7 @@ export function toSmartBadge(signal: Signal): SmartBadge | null {
     return {
       label,
       color: "text-nexus-accent-blue",
-      bg: "bg-nexus-accent-blue/15",
+      bg: "bg-accent-blue-15",
       priority: 50,
     };
   }
@@ -88,7 +88,7 @@ export function toSmartBadge(signal: Signal): SmartBadge | null {
     return {
       label: "Buying Signal",
       color: "text-nexus-stress-low",
-      bg: "bg-nexus-stress-low/15",
+      bg: "bg-stress-low-15",
       priority: 90,
     };
   }
@@ -96,7 +96,7 @@ export function toSmartBadge(signal: Signal): SmartBadge | null {
     return {
       label: "Buying Signal",
       color: "text-nexus-stress-low",
-      bg: "bg-nexus-stress-low/15",
+      bg: "bg-stress-low-15",
       priority: 90,
     };
   }
@@ -106,7 +106,7 @@ export function toSmartBadge(signal: Signal): SmartBadge | null {
     return {
       label: "Objection",
       color: "text-nexus-stress-high",
-      bg: "bg-nexus-stress-high/15",
+      bg: "bg-stress-high-15",
       priority: 85,
     };
   }
@@ -114,7 +114,7 @@ export function toSmartBadge(signal: Signal): SmartBadge | null {
     return {
       label: "Objection",
       color: "text-nexus-stress-high",
-      bg: "bg-nexus-stress-high/15",
+      bg: "bg-stress-high-15",
       priority: 85,
     };
   }
@@ -126,7 +126,7 @@ export function toSmartBadge(signal: Signal): SmartBadge | null {
       return {
         label: "Fillers",
         color: "text-nexus-stress-med",
-        bg: "bg-nexus-stress-med/15",
+        bg: "bg-stress-med-15",
         priority: 55,
       };
     }
@@ -140,7 +140,7 @@ export function toSmartBadge(signal: Signal): SmartBadge | null {
       return {
         label: "Pitch Elevated",
         color: "text-nexus-alert",
-        bg: "bg-nexus-alert/15",
+        bg: "bg-alert-15",
         priority: 50,
       };
     }
@@ -154,7 +154,7 @@ export function toSmartBadge(signal: Signal): SmartBadge | null {
       return {
         label: lower.includes("fast") || lower.includes("rapid") ? "Fast Speech" : "Slow Speech",
         color: "text-nexus-stress-med",
-        bg: "bg-nexus-stress-med/15",
+        bg: "bg-stress-med-15",
         priority: 45,
       };
     }
@@ -166,7 +166,7 @@ export function toSmartBadge(signal: Signal): SmartBadge | null {
     return {
       label: "Low Power",
       color: "text-nexus-accent-purple",
-      bg: "bg-nexus-accent-purple/15",
+      bg: "bg-accent-purple-15",
       priority: 45,
     };
   }
@@ -178,7 +178,7 @@ export function toSmartBadge(signal: Signal): SmartBadge | null {
     return {
       label: `Tone: ${value_text}`,
       color: "text-nexus-accent-blue",
-      bg: "bg-nexus-accent-blue/15",
+      bg: "bg-accent-blue-15",
       priority: 35,
     };
   }
@@ -189,7 +189,7 @@ export function toSmartBadge(signal: Signal): SmartBadge | null {
     return {
       label: fusionLabel,
       color: "text-nexus-agent-fusion",
-      bg: "bg-nexus-agent-fusion/15",
+      bg: "bg-agent-fusion-15",
       priority: 80,
     };
   }

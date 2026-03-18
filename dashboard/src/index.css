@@ -2,12 +2,75 @@
 @tailwind components;
 @tailwind utilities;
 
+.theme-dark {
+  --bg-primary: #0F1117;
+  --bg-surface: #1A1D27;
+  --bg-surface-hover: #242836;
+  --border: #2D3348;
+  --text-primary: #E8ECF4;
+  --text-secondary: #8B93A7;
+  --text-muted: #565E73;
+  --accent-blue: #4F8BFF;
+  --accent-purple: #8B5CF6;
+  --stress-high: #EF4444;
+  --stress-med: #F59E0B;
+  --stress-low: #22C55E;
+  --neutral: #6B7280;
+  --confidence: #3B82F6;
+  --engagement: #10B981;
+  --alert: #F97316;
+  --agent-voice: #4F8BFF;
+  --agent-language: #8B5CF6;
+  --agent-facial: #F59E0B;
+  --agent-body: #10B981;
+  --agent-gaze: #EC4899;
+  --agent-conversation: #06B6D4;
+  --agent-fusion: #F97316;
+  --card-shadow: rgba(0,0,0,0.3);
+}
+
+.theme-light {
+  --bg-primary: #F8F9FC;
+  --bg-surface: #FFFFFF;
+  --bg-surface-hover: #F0F2F5;
+  --border: #E2E5ED;
+  --text-primary: #1A1D27;
+  --text-secondary: #565E73;
+  --text-muted: #8B93A7;
+  --accent-blue: #2563EB;
+  --accent-purple: #7C3AED;
+  --stress-high: #DC2626;
+  --stress-med: #D97706;
+  --stress-low: #16A34A;
+  --neutral: #6B7280;
+  --confidence: #2563EB;
+  --engagement: #059669;
+  --alert: #EA580C;
+  --agent-voice: #2563EB;
+  --agent-language: #7C3AED;
+  --agent-facial: #D97706;
+  --agent-body: #059669;
+  --agent-gaze: #DB2777;
+  --agent-conversation: #0891B2;
+  --agent-fusion: #EA580C;
+  --card-shadow: rgba(0,0,0,0.08);
+}
+
 body {
   margin: 0;
-  background-color: #0f1117;
-  color: #e8ecf4;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* Smooth theme transitions — applied to key containers only, not *.
+   The * selector breaks Recharts SVG animations and causes layout issues. */
+.theme-dark, .theme-light,
+aside, header, main, section, nav,
+div[class*="bg-nexus-"], div[class*="rounded-lg"] {
+  transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
 }
 
 /* Custom scrollbar */
@@ -16,12 +79,44 @@ body {
   height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: #1a1d27;
+  background: var(--bg-surface);
 }
 ::-webkit-scrollbar-thumb {
-  background: #2d3348;
+  background: var(--border);
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #565e73;
+  background: var(--text-muted);
 }
+
+/* Opacity variants for theme colors — needed because Tailwind opacity modifiers
+   (e.g. bg-color/15) don't work with raw CSS variable values. */
+.bg-accent-blue-10 { background: color-mix(in srgb, var(--accent-blue) 10%, transparent); }
+.bg-accent-blue-15 { background: color-mix(in srgb, var(--accent-blue) 15%, transparent); }
+.bg-accent-blue-20 { background: color-mix(in srgb, var(--accent-blue) 20%, transparent); }
+.bg-accent-blue-80 { background: color-mix(in srgb, var(--accent-blue) 80%, transparent); }
+.bg-accent-purple-5 { background: color-mix(in srgb, var(--accent-purple) 5%, transparent); }
+.bg-accent-purple-10 { background: color-mix(in srgb, var(--accent-purple) 10%, transparent); }
+.bg-accent-purple-15 { background: color-mix(in srgb, var(--accent-purple) 15%, transparent); }
+.bg-accent-purple-20 { background: color-mix(in srgb, var(--accent-purple) 20%, transparent); }
+.bg-accent-purple-30 { background: color-mix(in srgb, var(--accent-purple) 30%, transparent); }
+.bg-stress-high-10 { background: color-mix(in srgb, var(--stress-high) 10%, transparent); }
+.bg-stress-high-15 { background: color-mix(in srgb, var(--stress-high) 15%, transparent); }
+.bg-stress-high-20 { background: color-mix(in srgb, var(--stress-high) 20%, transparent); }
+.bg-stress-med-10 { background: color-mix(in srgb, var(--stress-med) 10%, transparent); }
+.bg-stress-med-15 { background: color-mix(in srgb, var(--stress-med) 15%, transparent); }
+.bg-stress-med-20 { background: color-mix(in srgb, var(--stress-med) 20%, transparent); }
+.bg-stress-low-10 { background: color-mix(in srgb, var(--stress-low) 10%, transparent); }
+.bg-stress-low-15 { background: color-mix(in srgb, var(--stress-low) 15%, transparent); }
+.bg-stress-low-20 { background: color-mix(in srgb, var(--stress-low) 20%, transparent); }
+.bg-alert-10 { background: color-mix(in srgb, var(--alert) 10%, transparent); }
+.bg-alert-15 { background: color-mix(in srgb, var(--alert) 15%, transparent); }
+.bg-neutral-20 { background: color-mix(in srgb, var(--neutral) 20%, transparent); }
+.bg-agent-fusion-15 { background: color-mix(in srgb, var(--agent-fusion) 15%, transparent); }
+.border-accent-purple-30 { border-color: color-mix(in srgb, var(--accent-purple) 30%, transparent); }
+.border-accent-blue-30 { border-color: color-mix(in srgb, var(--accent-blue) 30%, transparent); }
+.border-accent-blue-40 { border-color: color-mix(in srgb, var(--accent-blue) 40%, transparent); }
+.border-stress-high-30 { border-color: color-mix(in srgb, var(--stress-high) 30%, transparent); }
+.hover\:bg-accent-blue-80:hover { background: color-mix(in srgb, var(--accent-blue) 80%, transparent); }
+.hover\:bg-accent-purple-30:hover { background: color-mix(in srgb, var(--accent-purple) 30%, transparent); }
+.hover\:border-accent-blue-40:hover { border-color: color-mix(in srgb, var(--accent-blue) 40%, transparent); }

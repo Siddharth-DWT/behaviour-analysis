@@ -7,7 +7,10 @@ import {
   Activity,
   ChevronLeft,
   ChevronRight,
+  Sun,
+  Moon,
 } from "lucide-react";
+import { useTheme } from "../contexts/ThemeContext";
 
 const NAV_ITEMS = [
   { path: "/sessions", label: "Sessions", icon: FolderOpen },
@@ -18,6 +21,7 @@ const NAV_ITEMS = [
 export default function Layout({ children }: { children: ReactNode }) {
   const [collapsed, setCollapsed] = useState(true);
   const location = useLocation();
+  const { theme, toggleTheme } = useTheme();
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -50,7 +54,7 @@ export default function Layout({ children }: { children: ReactNode }) {
                   item.disabled
                     ? "cursor-not-allowed opacity-30"
                     : active
-                    ? "bg-nexus-accent-blue/10 text-nexus-accent-blue"
+                    ? "bg-accent-blue-10 text-nexus-accent-blue"
                     : "text-nexus-text-secondary hover:bg-nexus-surface-hover hover:text-nexus-text-primary"
                 }`}
                 onClick={(e) => item.disabled && e.preventDefault()}
@@ -91,6 +95,13 @@ export default function Layout({ children }: { children: ReactNode }) {
             </span>
           </div>
           <div className="flex items-center gap-3 text-xs text-nexus-text-muted">
+            <button
+              onClick={toggleTheme}
+              className="rounded-lg p-1.5 text-nexus-text-muted hover:bg-nexus-surface-hover hover:text-nexus-text-primary transition-colors"
+              title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+            >
+              {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+            </button>
             <span className="rounded bg-nexus-surface-hover px-2 py-1 font-mono">
               v0.1.0
             </span>
