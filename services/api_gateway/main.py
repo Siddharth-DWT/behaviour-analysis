@@ -63,7 +63,7 @@ FUSION_AGENT_URL = os.getenv("FUSION_AGENT_URL", "http://localhost:8007")
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/recordings"))
 
 # ── HTTP client timeout (Voice Agent with Whisper can be slow) ──
-AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "300"))  # 5 minutes
+AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "900"))  # 15 minutes
 
 app = FastAPI(
     title="NEXUS API Gateway",

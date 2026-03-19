@@ -46,3 +46,4 @@ models/
 
 # Claude Code
 .claude/
+recordings/

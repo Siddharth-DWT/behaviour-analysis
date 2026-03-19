@@ -344,8 +344,37 @@ class Transcriber:
             f"{len(segments)} segments"
         )
 
-        # Load full audio once
-        y, sr = librosa.load(audio_path, sr=16000, mono=True)
+        # Load full audio once (pyav fallback for MP3/M4A/MP4/WebM)
+        try:
+            y, sr = librosa.load(audio_path, sr=16000, mono=True)
+        except Exception:
+            import av
+            container = av.open(audio_path)
+            stream = container.streams.audio[0]
+            native_sr = stream.sample_rate
+            samples = []
+            for packet in container.demux(stream):
+                if packet.dts is None:
+                    continue
+                try:
+                    for frame in packet.decode():
+                        arr = frame.to_ndarray()
+                        if arr.ndim > 1:
+                            arr = arr.mean(axis=0)
+                        arr = arr.astype(np.float32)
+                        if frame.format.name in ("s16", "s16p", "s32", "s32p"):
+                            arr = arr / 32768.0
+                        samples.append(arr)
+                except Exception:
+                    continue
+            container.close()
+            if not samples:
+                logger.warning("pyav decoded no frames — skipping KMeans diarization")
+                return None
+            y = np.concatenate(samples).astype(np.float32)
+            sr = 16000
+            if native_sr != sr:
+                y = librosa.resample(y, orig_sr=native_sr, target_sr=sr)
         total_samples = len(y)
 
         features = []  # (mean_pitch, mean_energy) per segment

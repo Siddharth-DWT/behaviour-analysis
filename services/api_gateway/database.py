@@ -20,7 +20,7 @@ DEV_ORG_ID = "00000000-0000-0000-0000-000000000001"
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://nexus:nexus_dev_2026@localhost:5432/nexus",
+    "postgresql://nexus:nexus_dev_2026@localhost:5436/nexus",
 )
 
 _pool: Optional[asyncpg.Pool] = None

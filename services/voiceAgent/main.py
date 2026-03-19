@@ -39,10 +39,10 @@ try:
     from transcriber import Transcriber
 except ImportError:
     # Fallback for running from project root
-    from services.voice_agent.feature_extractor import VoiceFeatureExtractor
-    from services.voice_agent.calibration import CalibrationModule
-    from services.voice_agent.rules import VoiceRuleEngine
-    from services.voice_agent.transcriber import Transcriber
+    from services.voiceAgent.feature_extractor import VoiceFeatureExtractor
+    from services.voiceAgent.calibration import CalibrationModule
+    from services.voiceAgent.rules import VoiceRuleEngine
+    from services.voiceAgent.transcriber import Transcriber
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nexus.voice")
@@ -141,10 +141,16 @@ async def analyse_audio(request: AnalysisRequest):
     
     # ── Step 2: Extract acoustic features ──
     logger.info(f"[{session_id}] Step 2: Extracting features...")
-    features_by_speaker = feature_extractor.extract_all(
-        str(file_path), 
-        transcript["segments"]
-    )
+    try:
+        features_by_speaker = feature_extractor.extract_all(
+            str(file_path),
+            transcript["segments"]
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Audio file could not be decoded — it may be empty or corrupted. ({e})",
+        )
     
     # ── Step 3: Build baselines ──
     logger.info(f"[{session_id}] Step 3: Calibrating baselines...")

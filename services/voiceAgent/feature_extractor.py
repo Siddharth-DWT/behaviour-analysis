@@ -15,6 +15,7 @@ import soundfile as sf
 from typing import Optional
 from pathlib import Path
 import logging
+import av
 
 logger = logging.getLogger("nexus.voice.features")
 
@@ -46,8 +47,8 @@ class VoiceFeatureExtractor:
             Dict of {speaker_id: [feature_vector, feature_vector, ...]}
             Each feature_vector covers a WINDOW_SIZE_SEC window.
         """
-        # Load full audio
-        y, sr = librosa.load(audio_path, sr=self.sr, mono=True)
+        # Load full audio (soundfile for WAV/FLAC, pyav fallback for MP3/M4A/WebM etc.)
+        y, sr = self._load_audio(audio_path)
         duration_sec = len(y) / sr
         
         # Group segments by speaker
@@ -101,6 +102,54 @@ class VoiceFeatureExtractor:
         
         return features_by_speaker
     
+    def _load_audio(self, audio_path: str) -> tuple[np.ndarray, int]:
+        """
+        Load audio file to float32 numpy array at self.sr.
+        Tries soundfile first (WAV/FLAC/OGG — no deps).
+        Falls back to pyav (MP3/M4A/WebM/MP4 — uses bundled ffmpeg libs).
+        """
+        try:
+            y, sr = librosa.load(audio_path, sr=self.sr, mono=True)
+            return y, sr
+        except Exception:
+            pass
+
+        # pyav fallback — decodes via ffmpeg libraries bundled with av package
+        logger.info(f"soundfile/audioread failed, using pyav for {Path(audio_path).suffix}")
+        container = av.open(audio_path)
+        stream = container.streams.audio[0]
+        native_sr = stream.sample_rate
+
+        samples = []
+        for packet in container.demux(stream):
+            if packet.dts is None:
+                continue
+            try:
+                for frame in packet.decode():
+                    arr = frame.to_ndarray()          # (channels, samples) planar
+                    if arr.ndim > 1:
+                        arr = arr.mean(axis=0)        # mix to mono
+                    arr = arr.astype(np.float32)
+                    # Normalise int16/int32 range to -1..1
+                    if frame.format.name in ("s16", "s16p", "s32", "s32p"):
+                        arr = arr / 32768.0
+                    samples.append(arr)
+            except av.error.InvalidDataError:
+                continue                               # skip corrupt packets
+
+        container.close()
+
+        if not samples:
+            raise ValueError(f"pyav decoded no audio frames from {audio_path}")
+
+        y = np.concatenate(samples).astype(np.float32)
+
+        # Resample to target SR if needed
+        if native_sr != self.sr:
+            y = librosa.resample(y, orig_sr=native_sr, target_sr=self.sr)
+
+        return y, self.sr
+
     def _extract_speaker_audio(
         self, y: np.ndarray, sr: int, 
         segments: list[dict], 
@@ -191,17 +240,17 @@ class VoiceFeatureExtractor:
         
         # ── Speech Rate (proxy) ──
         try:
-            # Use transcript word count as primary speech rate measure
-            window_words = sum(
-                len(s.get("text", "").split()) for s in segments
-            )
-            window_duration_sec = (win_end_ms - win_start_ms) / 1000.0
-            
-            # Only count time where this speaker was actually talking
-            speaker_time_sec = sum(
-                (min(s["end_ms"], win_end_ms) - max(s["start_ms"], win_start_ms)) / 1000.0
-                for s in segments
-            )
+            # Proportion words by overlap fraction to avoid inflating WPM
+            # when a segment crosses the window boundary
+            window_words = 0.0
+            speaker_time_sec = 0.0
+            for s in segments:
+                seg_dur_ms = s["end_ms"] - s["start_ms"]
+                overlap_ms = min(s["end_ms"], win_end_ms) - max(s["start_ms"], win_start_ms)
+                if seg_dur_ms > 0 and overlap_ms > 0:
+                    frac = overlap_ms / seg_dur_ms
+                    window_words += len(s.get("text", "").split()) * frac
+                    speaker_time_sec += overlap_ms / 1000.0
             
             if speaker_time_sec > 0.5:
                 features["speech_rate_wpm"] = float(window_words / (speaker_time_sec / 60.0))
@@ -313,8 +362,8 @@ class VoiceFeatureExtractor:
         
         hnr_values = []
         for start in range(0, len(audio) - frame_length, hop_length):
-            frame = audio[start:start + frame_length]
-            
+            frame = audio[start:start + frame_length] * np.hanning(frame_length)
+
             # Autocorrelation
             autocorr = np.correlate(frame, frame, mode='full')
             autocorr = autocorr[len(autocorr)//2:]
