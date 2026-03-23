@@ -1065,21 +1065,75 @@ def assign_speaker_roles(segments: list[dict], content_type: str) -> dict:
     roles = ROLE_MAP.get(content_type, ["Speaker A", "Speaker B"])
     speakers = sorted(set(s["speaker"] for s in segments))
 
-    # Try LLM
+    if content_type != "sales_call" or len(speakers) < 2:
+        return {spk: roles[i % len(roles)] for i, spk in enumerate(speakers)}
+
+    # ── 1. Keyword detection (deterministic — most reliable) ──
+    # The person who says "calling from" / "my name is" / "this is X from Y" is the SELLER.
+    # The person who says "not looking" / "not interested" / "thank you for the call" is the PROSPECT.
+    import re
+    seller_patterns = [
+        r"\bcalling\s+(you\s+)?from\b",
+        r"\bmy\s+name\s+is\b",
+        r"\bthis\s+is\s+\w+\s+(calling|from)\b",
+        r"\bI('m|\s+am)\s+\w+\s+from\b",
+        r"\bwe\s+(offer|provide|specialize|help)\b",
+        r"\bour\s+(company|service|product|team|platform)\b",
+        r"\bI\s+(wanted|was\s+wondering|was\s+calling)\b",
+    ]
+    prospect_patterns = [
+        r"\bnot\s+(looking|interested|ready)\b",
+        r"\bthank\s+you\s+for\s+(the\s+)?call",
+        r"\bwe('re|\s+are)\s+(not|already)\b",
+        r"\bwho\s+(is\s+this|are\s+you)\b",
+        r"\bwhat\s+(company|is\s+this\s+about)\b",
+    ]
+
+    seller_score = {}
+    prospect_score = {}
+    for spk in speakers:
+        seller_score[spk] = 0
+        prospect_score[spk] = 0
+
+    for seg in segments:
+        spk = seg["speaker"]
+        text = seg["text"].lower()
+        for pat in seller_patterns:
+            if re.search(pat, text):
+                seller_score[spk] += 1
+        for pat in prospect_patterns:
+            if re.search(pat, text):
+                prospect_score[spk] += 1
+
+    # If keyword evidence is clear, use it directly
+    total_seller = sum(seller_score.values())
+    total_prospect = sum(prospect_score.values())
+    if total_seller > 0 or total_prospect > 0:
+        # Each speaker: net score = seller_hits - prospect_hits (positive = more seller-like)
+        net = {spk: seller_score[spk] - prospect_score[spk] for spk in speakers}
+        ranked = sorted(speakers, key=lambda s: net[s], reverse=True)
+        result = {ranked[0]: "Seller", ranked[1]: "Prospect"}
+        print(f"  Speaker roles (keyword): {result}  (seller_score={seller_score}, prospect_score={prospect_score})")
+        return result
+
+    # ── 2. LLM fallback (when no keyword evidence) ──
     try:
         sys.path.insert(0, str(PROJECT_ROOT))
         from shared.utils.llm_client import complete, is_configured
-        if is_configured() and len(segments) >= 2:
+        if is_configured():
             excerpt = "\n".join(
                 f'{s["speaker"]}: {s["text"]}'
-                for s in segments[:8]
+                for s in segments[:16]
             )
             system_prompt = (
                 f"You are a conversation analyst. Given transcript excerpts from a "
-                f"{content_type.replace('_', ' ')}, identify each speaker's role. "
-                f"Likely roles: {', '.join(roles)}. "
-                f"Return ONLY a JSON object mapping speaker IDs to roles, e.g. "
-                f'{{"Speaker_0": "{roles[0]}", "Speaker_1": "{roles[1]}"}}'
+                f"{content_type.replace('_', ' ')}, identify each speaker's role.\n\n"
+                f"Rules for a sales_call:\n"
+                f"- The SELLER introduces themselves, names their company, pitches.\n"
+                f"- The PROSPECT answers, asks questions, raises concerns.\n\n"
+                f"Likely roles: {', '.join(roles)}.\n"
+                f"IMPORTANT: Do NOT assume Speaker_0 is the Seller. Analyze the actual words.\n"
+                f"Return ONLY a JSON object mapping speaker IDs to roles."
             )
             raw = complete(system_prompt=system_prompt, user_prompt=excerpt, max_tokens=200, temperature=0.0)
             text = raw.strip()
@@ -1087,21 +1141,23 @@ def assign_speaker_roles(segments: list[dict], content_type: str) -> dict:
                 text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
             parsed = json.loads(text)
             if isinstance(parsed, dict) and all(isinstance(v, str) for v in parsed.values()):
+                print(f"  Speaker roles (LLM): {parsed}")
                 return parsed
     except Exception as e:
         print(f"  {C_DIM}Role assignment LLM failed ({e}), using heuristic{C_RESET}")
 
-    # Heuristic fallback
-    if content_type == "sales_call" and len(speakers) >= 2:
-        objection_counts = {}
-        for seg in segments:
-            low = seg["text"].lower()
-            if any(kw in low for kw in ["not looking", "not interested", "concern", "expensive",
-                                         "not sure", "issue", "worried", "no thank you", "thank you for the call"]):
-                objection_counts[seg["speaker"]] = objection_counts.get(seg["speaker"], 0) + 1
-        if objection_counts:
-            prospect = max(objection_counts, key=objection_counts.get)
-            return {spk: ("Prospect" if spk == prospect else "Seller") for spk in speakers}
+    # ── 3. Heuristic fallback ──
+    objection_counts = {}
+    for seg in segments:
+        low = seg["text"].lower()
+        if any(kw in low for kw in ["not looking", "not interested", "concern", "expensive",
+                                     "not sure", "issue", "worried", "no thank you", "thank you for the call"]):
+            objection_counts[seg["speaker"]] = objection_counts.get(seg["speaker"], 0) + 1
+    if objection_counts:
+        prospect = max(objection_counts, key=objection_counts.get)
+        result = {spk: ("Prospect" if spk == prospect else "Seller") for spk in speakers}
+        print(f"  Speaker roles (heuristic): {result}")
+        return result
 
     # Generic fallback
     return {spk: roles[i % len(roles)] for i, spk in enumerate(speakers)}

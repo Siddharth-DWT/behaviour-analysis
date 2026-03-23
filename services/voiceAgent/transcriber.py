@@ -21,10 +21,14 @@ import os
 import sys
 import logging
 import numpy as np
+import torchaudio as _ta
+import torch
 from typing import Optional
 from pathlib import Path
+from dotenv import load_dotenv
 
 logger = logging.getLogger("nexus.voice.transcriber")
+load_dotenv(Path(__file__).parent.parent.parent / ".env")
 
 # ── Configuration ──
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
@@ -52,8 +56,8 @@ class Transcriber:
         self._use_external = False
         self._num_speakers = None  # Speaker count hint (2-10), None = auto
 
-        # Try to initialise external Whisper client
-        if EXTERNAL_WHISPER_URL and EXTERNAL_API_KEY:
+        # Try to initialise external Whisper client (API key is optional)
+        if EXTERNAL_WHISPER_URL:
             self._init_external()
 
     def _init_external(self):
@@ -316,9 +320,9 @@ class Transcriber:
             except Exception as e:
                 logger.warning(f"Acoustic KMeans diarization failed: {e}")
 
-        # Fallback: gap-based heuristic
+        # Fallback: gap-based heuristic (needs audio for real pitch)
         if max_speakers == 2:
-            return self._diarize_gap_two_speaker(segments)
+            return self._diarize_gap_two_speaker(segments, audio_path)
         return self._diarize_simple_multi_speaker(segments, max_speakers)
 
     def _diarize_acoustic_kmeans(
@@ -344,37 +348,15 @@ class Transcriber:
             f"{len(segments)} segments"
         )
 
-        # Load full audio once (pyav fallback for MP3/M4A/MP4/WebM)
+        # Load full audio once
         try:
+            from shared.utils.audio_loader import load_audio
+            y, sr = load_audio(audio_path, sr=16000)
+        except ImportError:
             y, sr = librosa.load(audio_path, sr=16000, mono=True)
-        except Exception:
-            import av
-            container = av.open(audio_path)
-            stream = container.streams.audio[0]
-            native_sr = stream.sample_rate
-            samples = []
-            for packet in container.demux(stream):
-                if packet.dts is None:
-                    continue
-                try:
-                    for frame in packet.decode():
-                        arr = frame.to_ndarray()
-                        if arr.ndim > 1:
-                            arr = arr.mean(axis=0)
-                        arr = arr.astype(np.float32)
-                        if frame.format.name in ("s16", "s16p", "s32", "s32p"):
-                            arr = arr / 32768.0
-                        samples.append(arr)
-                except Exception:
-                    continue
-            container.close()
-            if not samples:
-                logger.warning("pyav decoded no frames — skipping KMeans diarization")
-                return None
-            y = np.concatenate(samples).astype(np.float32)
-            sr = 16000
-            if native_sr != sr:
-                y = librosa.resample(y, orig_sr=native_sr, target_sr=sr)
+        except ValueError:
+            logger.warning("Could not decode audio — skipping KMeans diarization")
+            return None
         total_samples = len(y)
 
         features = []  # (mean_pitch, mean_energy) per segment
@@ -452,6 +434,19 @@ class Transcriber:
         )
         labels = kmeans.fit_predict(features_arr)
 
+        # ── Cluster balance check: if one speaker gets >70% of segments,
+        # the clustering failed to separate speakers. Fall back to gap+pitch. ──
+        from collections import Counter
+        counts = Counter(labels.tolist())
+        total = len(labels)
+        max_pct = max(counts.values()) / total if total > 0 else 1.0
+        if max_pct > 0.70:
+            logger.warning(
+                f"KMeans produced imbalanced split: {dict(counts)} "
+                f"({max_pct:.0%} in one cluster). Falling to gap+pitch."
+            )
+            return None  # Will trigger gap+pitch fallback in _diarize_simple
+
         # Assign speaker labels; order clusters by mean pitch (lower pitch = Speaker_0)
         cluster_pitches = {}
         for cluster_id in range(num_speakers):
@@ -482,20 +477,85 @@ class Transcriber:
 
         return segments
 
-    def _diarize_gap_two_speaker(self, segments: list[dict]) -> list[dict]:
-        """Fallback: 2-speaker alternation based on gaps."""
-        current_speaker = "Speaker_0"
-        TURN_GAP_MS = 1000
+    def _diarize_gap_two_speaker(
+        self,
+        segments: list[dict],
+        audio_path: Optional[str] = None,
+    ) -> list[dict]:
+        """
+        Fallback: 2-speaker alternation based on gaps + real pitch shifts.
 
+        Speaker changes are detected when EITHER:
+          - Silence gap > 800ms between segments, OR
+          - Mean F0 pitch jump > 25 Hz between adjacent segments
+        """
+        import librosa
+
+        current_speaker = "Speaker_0"
+        TURN_GAP_MS = 800
+        PITCH_JUMP_HZ = 25.0
+
+        # Compute real mean pitch (F0) per segment from audio
+        seg_pitches: list[Optional[float]] = [None] * len(segments)
+
+        if audio_path:
+            y, sr = None, 16000
+            try:
+                from shared.utils.audio_loader import load_audio
+                y, sr = load_audio(audio_path, sr=16000)
+            except ImportError:
+                try:
+                    y, sr = librosa.load(audio_path, sr=16000, mono=True)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            if y is not None:
+                total_samples = len(y)
+                for idx, seg in enumerate(segments):
+                    start_sample = int(seg["start_ms"] / 1000 * sr)
+                    end_sample = int(seg["end_ms"] / 1000 * sr)
+                    start_sample = max(0, min(start_sample, total_samples - 1))
+                    end_sample = max(start_sample + 1, min(end_sample, total_samples))
+                    chunk = y[start_sample:end_sample]
+
+                    if len(chunk) < sr * 0.2:
+                        continue
+                    try:
+                        f0, voiced, _ = librosa.pyin(
+                            chunk, fmin=60, fmax=500, sr=sr,
+                            frame_length=2048, hop_length=512,
+                        )
+                        voiced_f0 = f0[voiced] if voiced is not None else f0[~np.isnan(f0)]
+                        if len(voiced_f0) > 0:
+                            seg_pitches[idx] = float(np.nanmean(voiced_f0))
+                    except Exception:
+                        pass
+
+        # Detect speaker changes
         for i, seg in enumerate(segments):
             if i > 0:
                 gap_ms = seg["start_ms"] - segments[i-1]["end_ms"]
-                if gap_ms > TURN_GAP_MS:
+                pitch_shift = False
+                if seg_pitches[i] is not None and seg_pitches[i-1] is not None:
+                    pitch_shift = abs(seg_pitches[i] - seg_pitches[i-1]) > PITCH_JUMP_HZ
+
+                if gap_ms > TURN_GAP_MS or pitch_shift:
                     current_speaker = (
                         "Speaker_1" if current_speaker == "Speaker_0"
                         else "Speaker_0"
                     )
             seg["speaker"] = current_speaker
+
+        # Log balance
+        from collections import Counter
+        counts = Counter(seg["speaker"] for seg in segments)
+        pitched = sum(1 for p in seg_pitches if p is not None)
+        logger.info(
+            f"Gap+pitch diarization: {dict(counts)} "
+            f"({len(segments)} segments, {pitched} with pitch data)"
+        )
 
         return segments
 
@@ -609,6 +669,14 @@ class Transcriber:
         """
         try:
             if self._diarization_pipeline is None:
+                if not hasattr(_ta, "list_audio_backends"):
+                    _ta.list_audio_backends = lambda: ["soundfile"]
+
+                if not hasattr(_ta, "get_audio_backend"):
+                    _ta.get_audio_backend = lambda: "soundfile"
+
+                if not hasattr(_ta, "set_audio_backend"):
+                    _ta.set_audio_backend = lambda backend: None
                 from pyannote.audio import Pipeline
 
                 hf_token = os.getenv("HF_TOKEN", "")
@@ -619,9 +687,12 @@ class Transcriber:
                 logger.info("Loading pyannote diarization pipeline...")
                 self._diarization_pipeline = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
-                    use_auth_token=hf_token,
+                    token=hf_token,
                 )
                 logger.info("Pyannote pipeline loaded.")
+
+            if torch.cuda.is_available():
+                self._diarization_pipeline.to(torch.device("cuda"))
 
             # Run diarization
             diarization = self._diarization_pipeline(audio_path)
@@ -637,7 +708,7 @@ class Transcriber:
 
             # Assign speakers to transcript segments by overlap
             for seg in segments:
-                seg_mid = (seg["start_ms"] + seg["end_ms"]) / 2
+                # seg_mid = (seg["start_ms"] + seg["end_ms"]) / 2
                 best_speaker = "Speaker_0"
                 best_overlap = 0
 
@@ -659,4 +730,4 @@ class Transcriber:
 
         except Exception as e:
             logger.error(f"Pyannote diarization failed: {e}. Falling back to simple.")
-            return self._diarize_simple(segments)
+            return self._diarize_simple(segments, self._num_speakers, audio_path)

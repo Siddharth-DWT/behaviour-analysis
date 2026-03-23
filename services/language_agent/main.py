@@ -23,10 +23,13 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
-# Add shared module to path
+# isort: split
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+# isort: split
+from shared.models.transcript import TranscriptSegment
+from shared.models.requests import LanguageAnalysisRequest as AnalysisRequest, LanguageAnalysisResponse as AnalysisResponse
 
 # Import from same directory (works in Docker /app context)
 try:
@@ -117,33 +120,6 @@ async def health():
         "redis_connected": HAS_MESSAGE_BUS,
     }
 
-
-# ── Request / Response Models ──
-
-class TranscriptSegment(BaseModel):
-    """A single transcript segment from the Voice Agent."""
-    speaker: str = "Speaker_0"
-    start_ms: int = 0
-    end_ms: int = 0
-    text: str = ""
-    words: Optional[list[dict]] = None
-
-
-class AnalysisRequest(BaseModel):
-    """Request to analyse transcript segments."""
-    segments: list[TranscriptSegment]
-    session_id: Optional[str] = None
-    meeting_type: Optional[str] = "sales_call"
-    content_type: Optional[str] = None  # Auto-detected or override: sales_call, podcast, interview, etc.
-    run_intent_classification: Optional[bool] = True
-
-
-class AnalysisResponse(BaseModel):
-    session_id: str
-    segment_count: int
-    speakers: list[str]
-    signals: list[dict]
-    summary: dict
 
 
 @app.post("/analyse", response_model=AnalysisResponse)

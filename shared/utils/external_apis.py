@@ -36,12 +36,12 @@ DEFAULT_TIMEOUT = 120  # seconds
 
 def is_whisper_available() -> bool:
     """Check if external Whisper STT API is configured."""
-    return bool(WHISPER_URL and API_KEY)
+    return bool(WHISPER_URL)
 
 
 def is_tts_available() -> bool:
     """Check if external Coqui TTS API is configured."""
-    return bool(TTS_URL and API_KEY)
+    return bool(TTS_URL)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -76,14 +76,11 @@ class WhisperClient:
             raise ValueError(
                 "Whisper URL not configured. Set EXTERNAL_WHISPER_URL env var."
             )
-        if not self.api_key:
-            raise ValueError(
-                "API key not configured. Set EXTERNAL_API_KEY env var."
-            )
-
     @property
     def _headers(self) -> dict:
-        return {"X-API-Key": self.api_key}
+        if self.api_key:
+            return {"X-API-Key": self.api_key}
+        return {}
 
     def is_healthy(self) -> bool:
         """Check if the Whisper service is running and GPU is available."""
@@ -322,14 +319,11 @@ class TTSClient:
             raise ValueError(
                 "TTS URL not configured. Set EXTERNAL_TTS_URL env var."
             )
-        if not self.api_key:
-            raise ValueError(
-                "API key not configured. Set EXTERNAL_API_KEY env var."
-            )
-
     @property
     def _headers(self) -> dict:
-        return {"X-API-Key": self.api_key}
+        if self.api_key:
+            return {"X-API-Key": self.api_key}
+        return {}
 
     def is_healthy(self) -> bool:
         """Check if the TTS service is running."""

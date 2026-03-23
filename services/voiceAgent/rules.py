@@ -26,7 +26,7 @@ try:
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     from shared.models.signals import Signal, SpeakerBaseline
-    from services.voice_agent.calibration import CalibrationModule
+    from services.voiceAgent.calibration import CalibrationModule
 
 logger = logging.getLogger("nexus.voice.rules")
 
@@ -271,7 +271,11 @@ class VoiceRuleEngine:
             credibility_impact = "noticeable"
         else:
             credibility_impact = "none"
-        
+
+        # Only emit a signal when something noteworthy is happening
+        if status == "normal" and credibility_impact == "none":
+            return None
+
         return {
             "filler_count": filler_count,
             "filler_rate_pct": round(filler_rate, 3),

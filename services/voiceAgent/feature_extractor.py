@@ -13,9 +13,7 @@ import numpy as np
 import librosa
 import soundfile as sf
 from typing import Optional
-from pathlib import Path
 import logging
-import av
 
 logger = logging.getLogger("nexus.voice.features")
 
@@ -105,50 +103,17 @@ class VoiceFeatureExtractor:
     def _load_audio(self, audio_path: str) -> tuple[np.ndarray, int]:
         """
         Load audio file to float32 numpy array at self.sr.
-        Tries soundfile first (WAV/FLAC/OGG — no deps).
-        Falls back to pyav (MP3/M4A/WebM/MP4 — uses bundled ffmpeg libs).
+        Delegates to shared loader (librosa first, pyav fallback).
         """
         try:
-            y, sr = librosa.load(audio_path, sr=self.sr, mono=True)
-            return y, sr
-        except Exception:
+            from shared.utils.audio_loader import load_audio
+            return load_audio(audio_path, sr=self.sr)
+        except ImportError:
             pass
 
-        # pyav fallback — decodes via ffmpeg libraries bundled with av package
-        logger.info(f"soundfile/audioread failed, using pyav for {Path(audio_path).suffix}")
-        container = av.open(audio_path)
-        stream = container.streams.audio[0]
-        native_sr = stream.sample_rate
-
-        samples = []
-        for packet in container.demux(stream):
-            if packet.dts is None:
-                continue
-            try:
-                for frame in packet.decode():
-                    arr = frame.to_ndarray()          # (channels, samples) planar
-                    if arr.ndim > 1:
-                        arr = arr.mean(axis=0)        # mix to mono
-                    arr = arr.astype(np.float32)
-                    # Normalise int16/int32 range to -1..1
-                    if frame.format.name in ("s16", "s16p", "s32", "s32p"):
-                        arr = arr / 32768.0
-                    samples.append(arr)
-            except av.error.InvalidDataError:
-                continue                               # skip corrupt packets
-
-        container.close()
-
-        if not samples:
-            raise ValueError(f"pyav decoded no audio frames from {audio_path}")
-
-        y = np.concatenate(samples).astype(np.float32)
-
-        # Resample to target SR if needed
-        if native_sr != self.sr:
-            y = librosa.resample(y, orig_sr=native_sr, target_sr=self.sr)
-
-        return y, self.sr
+        # Inline fallback if shared module unavailable
+        y, sr = librosa.load(audio_path, sr=self.sr, mono=True)
+        return y, sr
 
     def _extract_speaker_audio(
         self, y: np.ndarray, sr: int, 
@@ -186,20 +151,21 @@ class VoiceFeatureExtractor:
         
         features = {}
         
-        # ── Pitch (F0) ──
+        # ── Pitch (F0) — computed once, reused by jitter/shimmer ──
+        f0_voiced = np.array([], dtype=np.float64)
         try:
             f0, voiced_flag, voiced_probs = librosa.pyin(
-                audio, 
+                audio,
                 fmin=librosa.note_to_hz('C2'),   # ~65 Hz
                 fmax=librosa.note_to_hz('C7'),   # ~2093 Hz
                 sr=sr,
                 frame_length=2048,
                 hop_length=512
             )
-            
+
             # Filter to voiced frames only
             f0_voiced = f0[~np.isnan(f0)]
-            
+
             if len(f0_voiced) > 0:
                 features["f0_mean"] = float(np.mean(f0_voiced))
                 features["f0_std"] = float(np.std(f0_voiced))
@@ -257,7 +223,7 @@ class VoiceFeatureExtractor:
             else:
                 features["speech_rate_wpm"] = 0.0
             
-            features["word_count"] = window_words
+            features["word_count"] = int(round(window_words))
             features["speaking_time_sec"] = float(speaker_time_sec)
             
             # Spectral flux as syllable rate proxy
@@ -275,7 +241,7 @@ class VoiceFeatureExtractor:
         
         # ── Voice Quality: Jitter & Shimmer ──
         try:
-            jitter, shimmer = self._compute_jitter_shimmer(audio, sr)
+            jitter, shimmer = self._compute_jitter_shimmer(audio, sr, f0_voiced)
             features["jitter_local_pct"] = jitter
             features["shimmer_local_pct"] = shimmer
         except Exception as e:
@@ -320,17 +286,18 @@ class VoiceFeatureExtractor:
         
         return features
     
-    def _compute_jitter_shimmer(self, audio: np.ndarray, sr: int) -> tuple[float, float]:
+    def _compute_jitter_shimmer(self, audio: np.ndarray, sr: int, f0_voiced: np.ndarray = None) -> tuple[float, float]:
         """
         Compute local jitter (F0 perturbation) and shimmer (amplitude perturbation).
-        Simplified implementation using librosa pitch tracking.
+        Reuses f0_voiced from _extract_features to avoid a redundant pyin call.
         """
-        f0, voiced_flag, _ = librosa.pyin(
-            audio, fmin=65, fmax=600, sr=sr,
-            frame_length=2048, hop_length=512
-        )
-        f0_voiced = f0[~np.isnan(f0)]
-        
+        if f0_voiced is None or len(f0_voiced) == 0:
+            f0, _, _ = librosa.pyin(
+                audio, fmin=65, fmax=600, sr=sr,
+                frame_length=2048, hop_length=512
+            )
+            f0_voiced = f0[~np.isnan(f0)]
+
         if len(f0_voiced) < 3:
             return 0.0, 0.0
         
@@ -352,48 +319,24 @@ class VoiceFeatureExtractor:
     
     def _compute_hnr(self, audio: np.ndarray, sr: int) -> float:
         """
-        Compute Harmonics-to-Noise Ratio (voice quality indicator).
-        Higher HNR = cleaner voice. Lower = breathier/tenser.
-        Normal speech: 15-25 dB. Stressed: < 12 dB.
-        """
-        # Autocorrelation-based HNR estimation
-        frame_length = int(0.04 * sr)  # 40ms frames
-        hop_length = int(0.01 * sr)    # 10ms hop
-        
-        hnr_values = []
-        for start in range(0, len(audio) - frame_length, hop_length):
-            frame = audio[start:start + frame_length] * np.hanning(frame_length)
+        Compute Harmonics-to-Noise Ratio proxy via spectral flatness.
 
-            # Autocorrelation
-            autocorr = np.correlate(frame, frame, mode='full')
-            autocorr = autocorr[len(autocorr)//2:]
-            
-            if autocorr[0] == 0:
-                continue
-            
-            # Normalize
-            autocorr = autocorr / autocorr[0]
-            
-            # Find peak in pitch range (50-500 Hz)
-            min_lag = int(sr / 500)
-            max_lag = int(sr / 50)
-            
-            if max_lag >= len(autocorr):
-                continue
-            
-            peak_region = autocorr[min_lag:max_lag]
-            if len(peak_region) == 0:
-                continue
-            
-            peak_val = np.max(peak_region)
-            
-            if peak_val > 0 and peak_val < 1:
-                hnr = 10 * np.log10(peak_val / (1 - peak_val + 1e-10))
-                hnr_values.append(float(hnr))
-        
-        if hnr_values:
-            return float(np.median(hnr_values))
-        return 0.0
+        Spectral flatness (Wiener entropy) measures how tonal vs noise-like a
+        signal is: 0 = perfectly tonal (harmonic), 1 = white noise.
+        Converting to dB gives a value that correlates well with true HNR:
+          - Clean speech   → ~15-25 dB
+          - Breathy/tense  → ~8-14 dB
+          - Background noise → ~2-6 dB
+
+        This is more robust than autocorrelation on codec-compressed audio
+        (MP4/MP3/M4A) where quantisation artefacts destroy periodicity cues.
+        """
+        hop_length = int(0.01 * sr)  # 10ms hop
+        flatness = librosa.feature.spectral_flatness(y=audio, hop_length=hop_length)
+        # flatness shape: (1, T) — values in [0, 1]
+        mean_flatness = float(np.mean(flatness))
+        hnr_db = -10.0 * np.log10(mean_flatness + 1e-10)
+        return float(np.clip(hnr_db, 0.0, 40.0))
     
     def _detect_pauses(
         self, audio: np.ndarray, sr: int,
@@ -471,9 +414,9 @@ class VoiceFeatureExtractor:
                         })
                         if "like" in bigram:
                             like_count += 1
-                
-                elif clean == "like" and i > 0 and i < len(words) - 1:
-                    # Standalone "like" as filler (not comparative)
+
+                # Standalone "like" as filler (not comparative)
+                if clean == "like" and i > 0 and i < len(words) - 1:
                     prev_word = words[i-1].strip(".,!?;:'\"")
                     if prev_word not in {"would", "looks", "sounds", "feels", "seems", "is", "was"}:
                         like_count += 1

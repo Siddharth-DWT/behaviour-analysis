@@ -24,11 +24,14 @@ from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import httpx
 
-# Add shared module to path
+# isort: split
+# Project root must be on sys.path before shared.* imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+# isort: split
+from shared.models.requests import SessionCreateResponse, SessionListResponse
 
 try:
     from database import (
@@ -135,18 +138,6 @@ async def health():
 # POST /sessions — Upload + full pipeline
 # ─────────────────────────────────────────────────────────
 
-class SessionCreateResponse(BaseModel):
-    session_id: str
-    status: str
-    title: str
-    meeting_type: str
-    duration_seconds: Optional[float] = None
-    speaker_count: Optional[int] = None
-    voice_signal_count: int = 0
-    language_signal_count: int = 0
-    fusion_signal_count: int = 0
-    alert_count: int = 0
-    report_generated: bool = False
 
 
 @app.post("/sessions", response_model=SessionCreateResponse)
@@ -154,6 +145,7 @@ async def create_session_endpoint(
     file: UploadFile = File(...),
     title: str = Form(default=""),
     meeting_type: str = Form(default="sales_call"),
+    num_speakers: Optional[int] = Form(default=None),
 ):
     """
     Upload an audio file and run the full analysis pipeline:
@@ -207,7 +199,7 @@ async def create_session_endpoint(
     # ── Step 3: Voice Agent ──
     voice_result = None
     try:
-        voice_result = await _call_voice_agent(session_id, str(file_path.resolve()))
+        voice_result = await _call_voice_agent(session_id, str(file_path.resolve()), num_speakers=num_speakers)
         logger.info(
             f"[{session_id}] Voice Agent: "
             f"{voice_result.get('duration_seconds', 0):.0f}s, "
@@ -355,11 +347,6 @@ async def create_session_endpoint(
 # GET /sessions — List
 # ─────────────────────────────────────────────────────────
 
-class SessionListResponse(BaseModel):
-    sessions: list[dict]
-    total: int
-    limit: int
-    offset: int
 
 
 @app.get("/sessions", response_model=SessionListResponse)
@@ -562,15 +549,18 @@ async def get_session_transcript(session_id: str):
 # Agent call helpers
 # ─────────────────────────────────────────────────────────
 
-async def _call_voice_agent(session_id: str, file_path: str) -> dict:
+async def _call_voice_agent(session_id: str, file_path: str, num_speakers: Optional[int] = None) -> dict:
     """Call Voice Agent POST /analyse with file path."""
+    payload = {
+        "file_path": file_path,
+        "session_id": session_id,
+    }
+    if num_speakers is not None:
+        payload["num_speakers"] = num_speakers
     async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
         resp = await client.post(
             f"{VOICE_AGENT_URL}/analyse",
-            json={
-                "file_path": file_path,
-                "session_id": session_id,
-            },
+            json=payload,
         )
         resp.raise_for_status()
         return resp.json()

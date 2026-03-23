@@ -91,7 +91,7 @@ class FusionRuleEngine:
             })
 
         # ── FUSION-07: Hedge × Positive Sentiment → Incongruence ──
-        incong = self._rule_fusion_07(language_signals)
+        incong = self._rule_fusion_07(language_signals, voice_signals)
         if incong is not None:
             signals.append({
                 "agent": "fusion",
@@ -244,26 +244,22 @@ class FusionRuleEngine:
     def _rule_fusion_07(
         self,
         language_signals: list[dict],
+        voice_signals: list[dict] = None,
     ) -> Optional[dict]:
         """
         Audio-only adaptation of FUSION-07 (Head Shake × Affirmative Language).
 
-        In video mode, FUSION-07 detects unconscious head shakes during
-        affirmative statements. In audio-only mode, we substitute the
-        body signal with LINGUISTIC incongruence:
+        True incongruence requires ALL of:
+          a) Sentiment > +0.4 (clearly positive)
+          b) At least ONE of: objection (conf > 0.5), power < 0.25, filler_rate > 3%
+          c) Voice stress > 0.35 for same speaker/window
+          d) Combined confidence > 0.45
 
-        When sentiment is positive but power language is weak (many hedges),
-        the speaker's words say "yes" but their language patterns say "uncertain".
-
-        Logic:
-          IF sentiment is positive (value > 0.30)
-             AND power_language is weak (value < 0.40)
-          THEN verbal_incongruence (the words agree but the language hedges)
-
-        Also checks:
-          - Objection signals concurrent with positive sentiment
-          - Intent = AGREE but power = weak
+        If only (a)+(b) met but NOT (c): downgrade to "hedged_agreement"
+        with confidence capped at 0.35 — logged but not alerted.
         """
+        voice_signals = voice_signals or []
+
         sentiment_signals = [
             s for s in language_signals
             if s.get("signal_type") == "sentiment_score"
@@ -273,73 +269,100 @@ class FusionRuleEngine:
             if s.get("signal_type") == "power_language_score"
         ]
 
-        if not sentiment_signals or not power_signals:
+        if not sentiment_signals:
             return None
 
         latest_sentiment = max(
             sentiment_signals, key=lambda s: _to_int(s.get("window_start_ms", 0))
         )
-        latest_power = max(
-            power_signals, key=lambda s: _to_int(s.get("window_start_ms", 0))
-        )
-
         sentiment_value = _to_float(latest_sentiment.get("value", 0))
-        power_value = _to_float(latest_power.get("value", 0.5))
 
-        # Only fire when content is positive but language is powerless
-        if sentiment_value <= 0.30 or power_value >= 0.40:
+        # (a) Sentiment must be clearly positive (> 0.4, not just > 0.3)
+        if sentiment_value <= 0.40:
             return None
 
-        # Incongruence strength: positive content + weak power = hedging agreement
-        incongruence = (sentiment_value - 0.30) * (0.40 - power_value)
-        # Normalise (max when sentiment=1.0, power=0.0 → 0.7*0.4 = 0.28)
-        score = min(incongruence / 0.28, 1.0)
+        # Get power value
+        power_value = 0.5
+        if power_signals:
+            latest_power = max(
+                power_signals, key=lambda s: _to_int(s.get("window_start_ms", 0))
+            )
+            power_value = _to_float(latest_power.get("value", 0.5))
 
-        # Classify
-        if score > 0.70:
+        # (b) At least ONE linguistic marker:
+        #   - objection with confidence > 0.5
+        #   - power < 0.25 (very weak)
+        #   - filler elevated
+        objection_signals = [
+            s for s in language_signals
+            if s.get("signal_type") == "objection_signal"
+            and _to_float(s.get("confidence", 0)) > 0.50
+        ]
+        filler_signals = [
+            s for s in voice_signals
+            if s.get("signal_type") == "filler_detection"
+            and s.get("value_text") in ("filler_spike", "filler_elevated", "elevated", "high")
+        ]
+
+        has_objection = len(objection_signals) > 0
+        has_weak_power = power_value < 0.25
+        has_filler_spike = len(filler_signals) > 0
+
+        if not (has_objection or has_weak_power or has_filler_spike):
+            return None
+
+        # (c) Check voice stress > 0.35
+        stress_signals = [
+            s for s in voice_signals
+            if s.get("signal_type") == "vocal_stress_score"
+        ]
+        stress_value = 0.0
+        if stress_signals:
+            latest_stress = max(
+                stress_signals, key=lambda s: _to_int(s.get("window_start_ms", 0))
+            )
+            stress_value = _to_float(latest_stress.get("value", 0))
+
+        has_voice_stress = stress_value > 0.35
+
+        # Build evidence
+        evidence = {
+            "sentiment_value": round(sentiment_value, 3),
+            "power_value": round(power_value, 3),
+            "stress_value": round(stress_value, 3),
+            "objection_present": has_objection,
+            "weak_power": has_weak_power,
+            "filler_spike": has_filler_spike,
+            "voice_stress_aligned": has_voice_stress,
+        }
+
+        # Score based on how many markers fire
+        marker_count = sum([has_objection, has_weak_power, has_filler_spike])
+        incongruence = (sentiment_value - 0.40) * (marker_count * 0.20)
+        score = min(incongruence / 0.36, 1.0)
+
+        if not has_voice_stress:
+            # Downgrade: polite hedging, not true incongruence
+            return {
+                "score": min(score, 0.30),
+                "level": "hedged_agreement",
+                "confidence": min(0.35, score * 0.50),
+                "evidence": evidence,
+            }
+
+        # True incongruence: sentiment + markers + voice stress
+        if score > 0.60:
             level = "strong_verbal_incongruence"
-        elif score > 0.40:
+        elif score > 0.35:
             level = "moderate_verbal_incongruence"
         else:
             level = "mild_verbal_incongruence"
 
-        # Only emit if meaningful
-        if score < 0.25:
-            return None
-
-        # Check for reinforcing objection signals
-        objection_signals = [
-            s for s in language_signals
-            if s.get("signal_type") == "objection_signal"
-        ]
-
         raw_confidence = min(0.40 + score * 0.30, 0.70)
 
-        if objection_signals:
-            raw_confidence = min(raw_confidence + 0.10, 0.70)
-            level = "incongruence_with_objection"
-
-        # Check intent signals — AGREE intent + weak power is suspicious
-        intent_signals = [
-            s for s in language_signals
-            if s.get("signal_type") == "intent_classification"
-            and s.get("value_text") == "AGREE"
-        ]
-        if intent_signals and power_value < 0.30:
-            raw_confidence = min(raw_confidence + 0.05, 0.70)
-
-        evidence = {
-            "sentiment_value": round(sentiment_value, 3),
-            "power_value": round(power_value, 3),
-            "powerless_features": (
-                latest_power.get("metadata", {}).get("powerless_feature_count", 0)
-                if isinstance(latest_power.get("metadata"), dict) else 0
-            ),
-            "objection_present": len(objection_signals) > 0,
-            "agree_intent_with_weak_power": (
-                len(intent_signals) > 0 and power_value < 0.30
-            ),
-        }
+        # (d) Minimum confidence threshold
+        if raw_confidence < 0.45:
+            return None
 
         return {
             "score": score,

@@ -7,8 +7,12 @@ python-multipart==0.0.20
 transformers==4.47.1
 torch==2.5.1
 
-# Claude API for intent classification + complex NLP
+# LLM APIs for intent classification + sentiment + complex NLP
 anthropic==0.40.0
+openai>=1.0.0
+
+# Sentiment fallback
+vaderSentiment>=3.3.2
 
 # Database
 psycopg2-binary==2.9.10
@@ -21,4 +25,4 @@ redis[hiredis]==5.2.1
 # Utilities
 pydantic==2.10.4
 python-dotenv==1.0.1
-numpy==1.26.4
+numpy>=1.22.0

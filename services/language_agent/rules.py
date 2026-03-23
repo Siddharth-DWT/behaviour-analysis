@@ -20,7 +20,6 @@ Research references:
   - Lakoff 1975 (language & gender / powerless speech)
   - O'Barr & Atkins 1982 (powerless speech in courtrooms)
 """
-import os
 import json
 import logging
 import sys
@@ -36,6 +35,13 @@ except ImportError:
     from shared.models.signals import Signal
 
 # ── LLM client (supports Anthropic + OpenAI via LLM_PROVIDER env var) ──
+try:
+    from shared.utils.llm_client import is_configured, get_provider_info, complete as llm_complete
+    _LLM_IMPORT_OK = True
+except ImportError:
+    _LLM_IMPORT_OK = False
+    llm_complete = None  # type: ignore[assignment]
+
 _llm_ready = None  # None = not checked yet, True/False = checked
 
 
@@ -44,19 +50,16 @@ def _check_llm_ready() -> bool:
     global _llm_ready
     if _llm_ready is not None:
         return _llm_ready
-    try:
-        from shared.utils.llm_client import is_configured, get_provider_info
-        _llm_ready = is_configured()
-        if _llm_ready:
-            info = get_provider_info()
-            logger.info(
-                f"LLM client ready: provider={info['provider']}, model={info['model']}"
-            )
-        else:
-            logger.warning("LLM not configured — LANG-INTENT-01 will be skipped")
-    except ImportError:
+    if not _LLM_IMPORT_OK:
         logger.warning("shared.utils.llm_client not available — LANG-INTENT-01 will be skipped")
         _llm_ready = False
+        return _llm_ready
+    _llm_ready = is_configured()
+    if _llm_ready:
+        info = get_provider_info()
+        logger.info(f"LLM client ready: provider={info['provider']}, model={info['model']}")
+    else:
+        logger.warning("LLM not configured — LANG-INTENT-01 will be skipped")
     return _llm_ready
 
 
@@ -64,6 +67,8 @@ INTENT_BATCH_SIZE = 15  # 10-20 utterances per LLM call
 
 
 class LanguageRuleEngine:
+    # Per RULES.md: no single-domain signal may exceed 0.85
+    _MAX_CONFIDENCE = 0.85
     """
     Evaluates linguistic features against detection rules.
     Produces Signal dicts for each fired rule.
@@ -90,6 +95,7 @@ class LanguageRuleEngine:
         features: dict,
         speaker_id: str,
         content_type: Optional[str] = None,
+        speaker_role: Optional[str] = None,
     ) -> list[dict]:
         """
         Run all rules against a single segment's features.
@@ -98,6 +104,8 @@ class LanguageRuleEngine:
             features: Feature dict from LanguageFeatureExtractor
             speaker_id: Speaker identifier
             content_type: Optional override for content type
+            speaker_role: Optional speaker role (e.g. "Seller", "Prospect")
+                          Buying signals are only valid from Prospect/Buyer.
 
         Returns:
             List of Signal dicts (one per fired rule)
@@ -109,27 +117,38 @@ class LanguageRuleEngine:
 
         # ── LANG-SENT-01: Per-Sentence Sentiment (all content types) ──
         sent = self._rule_sentiment_01(features)
-        if sent is not None:
-            signals.append({
-                "agent": "language",
-                "speaker_id": speaker_id,
-                "signal_type": "sentiment_score",
-                "value": round(sent["value"], 4),
-                "value_text": sent["label"],
-                "confidence": round(sent["confidence"], 4),
-                "window_start_ms": start_ms,
-                "window_end_ms": end_ms,
-                "metadata": {
-                    "raw_label": sent["raw_label"],
-                    "raw_score": sent["raw_score"],
-                    "text_preview": features.get("text", "")[:80],
-                },
-            })
+        signals.append({
+            "agent": "language",
+            "speaker_id": speaker_id,
+            "signal_type": "sentiment_score",
+            "value": round(sent["value"], 4),
+            "value_text": sent["label"],
+            "confidence": round(sent["confidence"], 4),
+            "window_start_ms": start_ms,
+            "window_end_ms": end_ms,
+            "metadata": {
+                "raw_label": sent["raw_label"],
+                "raw_score": sent["raw_score"],
+                "text_preview": features.get("text", "")[:80],
+            },
+        })
 
         # ── LANG-BUY-01: Buying Signal Detection (sales_call only) ──
-        if active_type in self.SALES_TYPES:
+        # Buying signals are only meaningful from the Prospect/Buyer, never the Seller.
+        role_lower = (speaker_role or "").lower()
+        is_seller = role_lower in ("seller", "agent", "rep", "salesperson")
+
+        if active_type in self.SALES_TYPES and not is_seller:
             buy = self._rule_buying_01(features)
             if buy is not None:
+                meta = {
+                    "categories": buy["categories"],
+                    "match_count": buy["match_count"],
+                    "matches": buy["matches"][:5],
+                    "text_preview": features.get("text", "")[:80],
+                }
+                if not speaker_role:
+                    meta["needs_role_validation"] = True
                 signals.append({
                     "agent": "language",
                     "speaker_id": speaker_id,
@@ -139,12 +158,7 @@ class LanguageRuleEngine:
                     "confidence": round(buy["confidence"], 4),
                     "window_start_ms": start_ms,
                     "window_end_ms": end_ms,
-                    "metadata": {
-                        "categories": buy["categories"],
-                        "match_count": buy["match_count"],
-                        "matches": buy["matches"][:5],
-                        "text_preview": features.get("text", "")[:80],
-                    },
+                    "metadata": meta,
                 })
 
         # ── LANG-OBJ-01: Objection Signal Detection (sales_call only) ──
@@ -219,24 +233,24 @@ class LanguageRuleEngine:
     # Research: Liu 2012, Pennebaker 2015
     # ════════════════════════════════════════════════════════
 
-    def _rule_sentiment_01(self, f: dict) -> Optional[dict]:
+    def _rule_sentiment_01(self, f: dict) -> dict:
         """
         Convert DistilBERT sentiment into a -1.0 to +1.0 signal.
-        Only emits signals for non-neutral sentiment (strong positive/negative).
+        Always fires: neutral at confidence 0.40 (dashboard subtle indicator per spec).
         """
         raw_label = f.get("sentiment_label", "NEUTRAL")
         raw_score = f.get("sentiment_score", 0.5)
         value = f.get("sentiment_value", 0.0)
 
-        # Classify intensity
+        # Classify intensity (thresholds aligned with LLM ±0.35 neutral zone)
         abs_value = abs(value)
-        if abs_value > 0.90:
+        if abs_value > 0.80:
             label = "strong_positive" if value > 0 else "strong_negative"
             confidence = 0.80
-        elif abs_value > 0.75:
+        elif abs_value > 0.55:
             label = "positive" if value > 0 else "negative"
             confidence = 0.70
-        elif abs_value > 0.60:
+        elif abs_value > 0.35:
             label = "mild_positive" if value > 0 else "mild_negative"
             confidence = 0.55
         else:
@@ -246,7 +260,7 @@ class LanguageRuleEngine:
         return {
             "value": value,
             "label": label,
-            "confidence": min(confidence, 0.85),  # Hard cap per NEXUS rules
+            "confidence": min(confidence, self._MAX_CONFIDENCE),
             "raw_label": raw_label,
             "raw_score": raw_score,
         }
@@ -398,7 +412,7 @@ class LanguageRuleEngine:
         return {
             "score": score,
             "level": level,
-            "confidence": min(confidence, 0.85),
+            "confidence": min(confidence, self._MAX_CONFIDENCE),
             "powerless_count": powerless_count,
             "features_found": features_found,
             "word_count": word_count,
@@ -417,8 +431,6 @@ class LanguageRuleEngine:
         Uses the shared llm_client (supports Anthropic Claude or OpenAI).
         Returns Signal dicts for each classified utterance.
         """
-        from shared.utils.llm_client import complete
-
         # Build numbered utterance list for the prompt
         utterance_lines = []
         for i, f in enumerate(batch):
@@ -459,7 +471,7 @@ Utterances:
 {utterance_block}"""
 
         try:
-            response_text = complete(
+            response_text = llm_complete(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=1024,
@@ -496,7 +508,7 @@ Utterances:
                 "agent": "language",
                 "speaker_id": f.get("speaker_id", "unknown"),
                 "signal_type": "intent_classification",
-                "value": raw_confidence,
+                "value": 1.0,  # Intent is categorical: 1.0 = detected
                 "value_text": cls.get("intent", "UNKNOWN"),
                 "confidence": round(raw_confidence, 4),
                 "window_start_ms": f.get("start_ms", 0),

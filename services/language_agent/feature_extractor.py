@@ -308,15 +308,11 @@ class LanguageFeatureExtractor:
                 "text": text,
             }
 
-            # Sentiment
-            sent = sentiments[i] if i < len(sentiments) else {"label": "NEUTRAL", "score": 0.5}
+            # Sentiment (score is already -1.0 to +1.0 from _batch_sentiment)
+            sent = sentiments[i] if i < len(sentiments) else {"label": "NEUTRAL", "score": 0.0}
             features["sentiment_label"] = sent["label"]
             features["sentiment_score"] = sent["score"]
-            # Convert to -1..+1 scale: POSITIVE → +score, NEGATIVE → -score
-            if sent["label"] == "NEGATIVE":
-                features["sentiment_value"] = -sent["score"]
-            else:
-                features["sentiment_value"] = sent["score"]
+            features["sentiment_value"] = sent["score"]
 
             # Buying signals
             buying = self._detect_buying_signals(text)
@@ -346,58 +342,162 @@ class LanguageFeatureExtractor:
 
         return features_list
 
-    # ── Sentiment (DistilBERT with VADER fallback) ──
+    # ── Sentiment (LLM primary → VADER fallback → DistilBERT fallback) ──
 
     def _batch_sentiment(self, texts: list[str]) -> list[dict]:
         """
         Run sentiment analysis on a batch of texts.
-        Uses DistilBERT if available, falls back to VADER (rule-based).
-        Returns list of {label: POSITIVE|NEGATIVE, score: 0.0-1.0}.
+
+        Priority:
+          1. LLM (gpt-4o-mini / Claude) — best for conversational speech
+          2. VADER (rule-based) — decent fallback, with ±0.2 dead zone
+          3. DistilBERT — last resort, wide neutral zone
+
+        Returns list of {label: POSITIVE|NEGATIVE|NEUTRAL, score: -1.0 to +1.0}.
         """
         if not texts:
             return []
 
-        # Filter out empty strings
         valid_indices = [i for i, t in enumerate(texts) if t.strip()]
         valid_texts = [texts[i] for i in valid_indices]
+        neutral = {"label": "NEUTRAL", "score": 0.0}
 
         if not valid_texts:
-            return [{"label": "NEUTRAL", "score": 0.5}] * len(texts)
+            return [neutral] * len(texts)
 
-        # Try DistilBERT first
+        # ── 1. LLM-based sentiment (primary) ──
+        llm_result = self._llm_batch_sentiment(valid_texts, valid_indices, len(texts))
+        if llm_result is not None:
+            return llm_result
+
+        # ── 2. VADER fallback (rule-based, dead zone ±0.2) ──
+        vader = _get_vader_analyzer()
+        if vader is not None:
+            output = [neutral.copy() for _ in texts]
+            for idx in valid_indices:
+                compound = vader.polarity_scores(texts[idx])["compound"]
+                if compound > 0.2:
+                    output[idx] = {"label": "POSITIVE", "score": round(compound, 4)}
+                elif compound < -0.2:
+                    output[idx] = {"label": "NEGATIVE", "score": round(compound, 4)}
+                else:
+                    output[idx] = {"label": "NEUTRAL", "score": 0.0}
+            return output
+
+        # ── 3. DistilBERT fallback (wide neutral zone) ──
         pipe = _get_sentiment_pipeline()
         if pipe is not None and _sentiment_backend == "distilbert":
             try:
                 results = pipe(valid_texts, batch_size=32)
-                output = [{"label": "NEUTRAL", "score": 0.5}] * len(texts)
+                output = [neutral.copy() for _ in texts]
                 for idx, result in zip(valid_indices, results):
-                    output[idx] = {
-                        "label": result["label"],
-                        "score": round(result["score"], 4),
-                    }
+                    label = result["label"]
+                    raw = result["score"]
+                    # Convert to signed: NEGATIVE → negative, POSITIVE → positive
+                    signed = raw if label == "POSITIVE" else -raw
+                    # Wide neutral zone: only flag if |score| > 0.4
+                    if abs(signed) < 0.4:
+                        output[idx] = {"label": "NEUTRAL", "score": 0.0}
+                    else:
+                        output[idx] = {
+                            "label": "POSITIVE" if signed > 0 else "NEGATIVE",
+                            "score": round(signed, 4),
+                        }
                 return output
             except Exception as e:
-                logger.warning(f"DistilBERT batch failed: {e}, falling back to VADER")
+                logger.warning(f"DistilBERT batch failed: {e}")
 
-        # VADER fallback (rule-based, no GPU needed)
-        vader = _get_vader_analyzer()
-        if vader is not None:
-            output = [{"label": "NEUTRAL", "score": 0.5}] * len(texts)
-            for idx in valid_indices:
-                text = texts[idx]
-                scores = vader.polarity_scores(text)
-                compound = scores["compound"]
-                if compound > 0.05:
-                    output[idx] = {"label": "POSITIVE", "score": round(min(1.0, 0.5 + compound / 2), 4)}
-                elif compound < -0.05:
-                    output[idx] = {"label": "NEGATIVE", "score": round(min(1.0, 0.5 + abs(compound) / 2), 4)}
-                else:
-                    output[idx] = {"label": "NEUTRAL", "score": 0.5}
+        logger.warning("No sentiment backend available — returning neutral")
+        return [neutral.copy() for _ in texts]
+
+    def _llm_batch_sentiment(
+        self,
+        valid_texts: list[str],
+        valid_indices: list[int],
+        total_count: int,
+    ) -> Optional[list[dict]]:
+        """
+        Score sentiment via LLM in batches of 12.
+        Returns None if LLM is not available or fails entirely.
+        """
+        import sys, json
+        from pathlib import Path
+        project_root = str(Path(__file__).parent.parent.parent)
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+
+        try:
+            from shared.utils.llm_client import complete as llm_complete, is_configured
+            if not is_configured():
+                return None
+        except ImportError:
+            return None
+
+        BATCH_SIZE = 12
+        neutral = {"label": "NEUTRAL", "score": 0.0}
+        output = [neutral.copy() for _ in range(total_count)]
+
+        system_prompt = (
+            "You are a sentiment scoring engine for conversational speech. "
+            "Rate the EMOTIONAL sentiment of each sentence from the SPEAKER'S perspective.\n"
+            "Scale: -1.0 (speaker expressing strong displeasure/frustration) to "
+            "+1.0 (speaker expressing strong approval/enthusiasm). 0.0 = neutral.\n\n"
+            "CRITICAL RULES:\n"
+            "- Factual descriptions of problems or situations are NEUTRAL (0.0), not negative. "
+            "'We don't have time for social media' is factual (0.0), not a complaint.\n"
+            "- Greetings, introductions, and self-identification are NEUTRAL (0.0). "
+            "'This is Sadam calling from HOS' = 0.0.\n"
+            "- Explaining a situation without emotion is NEUTRAL: "
+            "'executives are so busy right now' = 0.0.\n"
+            "- Only score negative when the speaker expresses personal displeasure: "
+            "'This is terrible and I hate it' = -0.8.\n"
+            "- Only score positive when the speaker expresses genuine enthusiasm: "
+            "'sounds great awesome' = +0.7.\n\n"
+            "Return ONLY a JSON array of numbers, one per sentence. No explanations."
+        )
+
+        try:
+            for batch_start in range(0, len(valid_texts), BATCH_SIZE):
+                batch = valid_texts[batch_start:batch_start + BATCH_SIZE]
+                batch_indices = valid_indices[batch_start:batch_start + BATCH_SIZE]
+
+                numbered = "\n".join(f"{i+1}. \"{t}\"" for i, t in enumerate(batch))
+                user_prompt = f"Score these {len(batch)} sentences:\n{numbered}"
+
+                raw = llm_complete(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    max_tokens=200,
+                    temperature=0.0,
+                )
+
+                # Parse JSON array from response
+                text = raw.strip()
+                if text.startswith("```"):
+                    text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                scores = json.loads(text)
+
+                if not isinstance(scores, list):
+                    logger.warning(f"LLM returned non-array: {text[:100]}")
+                    continue
+
+                for j, idx in enumerate(batch_indices):
+                    if j < len(scores):
+                        val = float(scores[j])
+                        val = max(-1.0, min(1.0, val))
+                        if val > 0.35:
+                            output[idx] = {"label": "POSITIVE", "score": round(val, 4)}
+                        elif val < -0.35:
+                            output[idx] = {"label": "NEGATIVE", "score": round(val, 4)}
+                        else:
+                            output[idx] = {"label": "NEUTRAL", "score": round(val, 4)}
+
+            logger.info(f"LLM sentiment scored {len(valid_texts)} segments")
             return output
 
-        # Ultimate fallback — everything neutral
-        logger.warning("No sentiment backend available — returning neutral")
-        return [{"label": "NEUTRAL", "score": 0.5}] * len(texts)
+        except Exception as e:
+            logger.warning(f"LLM sentiment failed: {e}, falling back to VADER/DistilBERT")
+            return None
 
     # ── Buying Signals (Rackham 1988 SPIN patterns) ──
 

@@ -26,10 +26,12 @@ from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
-# Add shared module to path
+# isort: split
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+# isort: split
+from shared.models.requests import VoiceAnalysisRequest as AnalysisRequest, VoiceAnalysisResponse as AnalysisResponse
 
 # Import from same directory (works in Docker /app context)
 try:
@@ -92,22 +94,6 @@ async def health():
         }
     }
 
-
-class AnalysisRequest(BaseModel):
-    """Request to analyse an audio file already on disk."""
-    file_path: str
-    session_id: Optional[str] = None
-    meeting_type: Optional[str] = "sales_call"
-    num_speakers: Optional[int] = None  # Speaker count hint (2-10) for diarization
-
-
-class AnalysisResponse(BaseModel):
-    session_id: str
-    duration_seconds: float
-    speakers: list[dict]
-    signals: list[dict]
-    summary: dict
-    transcript_segments: Optional[list[dict]] = None  # Diarised transcript for downstream agents
 
 
 @app.post("/analyse", response_model=AnalysisResponse)

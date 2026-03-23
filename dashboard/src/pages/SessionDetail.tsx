@@ -253,18 +253,60 @@ function computeCallOutcome(speakerStats: SpeakerStats[]) {
 
 function inferSpeakerRoles(
   speakerStats: SpeakerStats[],
-  meetingType: string
+  meetingType: string,
+  segments: TranscriptSegment[] = []
 ): Record<string, string> {
   const roles: Record<string, string> = {};
   if (meetingType !== "sales_call" || speakerStats.length < 2) return roles;
 
-  // In a sales call: the speaker with more buying signals / questions is the Prospect
-  // The speaker with more assertive language is the Seller
+  // Strategy 1: Check who introduces themselves in the first 6 segments.
+  // The speaker who says "calling from", "my name is X from", "this is X from"
+  // is the Seller. The other is the Prospect.
+  const SELLER_PATTERNS = [
+    /calling (?:you )?from/i,
+    /this is .{1,30} from/i,
+    /my name is .{1,30} from/i,
+    /i['']m .{1,20} (?:calling|reaching out)/i,
+    /we(?:['']re| are) a .{1,40} company/i,
+    /quick call to see if/i,
+    /wanted to (?:talk|reach|connect|check)/i,
+  ];
+
+  const early = segments.slice(0, 8);
+  let sellerLabel: string | null = null;
+  for (const seg of early) {
+    const text = seg.text || "";
+    const speaker = seg.speaker_label;
+    if (!speaker) continue;
+    for (const pat of SELLER_PATTERNS) {
+      if (pat.test(text)) {
+        sellerLabel = speaker;
+        break;
+      }
+    }
+    if (sellerLabel) break;
+  }
+
+  if (sellerLabel) {
+    const labels = speakerStats.map((s) => s.label);
+    roles[sellerLabel] = "Seller";
+    const prospect = labels.find((l) => l !== sellerLabel);
+    if (prospect) roles[prospect] = "Prospect";
+    return roles;
+  }
+
+  // Strategy 2 (fallback): Score by signals.
+  // Objections strongly indicate Prospect. Talks-more indicates Seller.
   const sorted = [...speakerStats].sort((a, b) => {
-    // Higher buying signals + lower power = more likely Prospect
-    const aScore = a.buyingSignalCount * 2 - a.avgPower * 10;
-    const bScore = b.buyingSignalCount * 2 - b.avgPower * 10;
-    return bScore - aScore; // Higher score = more likely Prospect
+    const aScore =
+      (a.objectionCount ?? 0) * 5 -
+      a.avgPower * 3 +
+      a.avgStress * 2;
+    const bScore =
+      (b.objectionCount ?? 0) * 5 -
+      b.avgPower * 3 +
+      b.avgStress * 2;
+    return bScore - aScore;
   });
 
   roles[sorted[0].label] = "Prospect";
@@ -348,8 +390,8 @@ export default function SessionDetail() {
   const speakerStats = computeSpeakerStats(signals);
   const callOutcome = computeCallOutcome(speakerStats);
 
-  // Infer speaker roles
-  const speakerRoles = inferSpeakerRoles(speakerStats, session.meeting_type);
+  // Infer speaker roles (uses transcript to detect who introduces themselves)
+  const speakerRoles = inferSpeakerRoles(speakerStats, session.meeting_type, segments);
 
   // Extract fusion signals
   const fusionSignals = signals.filter((s) => s.agent === "fusion");

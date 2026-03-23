@@ -6,3 +6,8 @@ httpx>=0.25.0
 redis>=5.0.0
 pydantic>=2.5.0
 python-multipart>=0.0.6
+python-dotenv>=1.0.0
+
+# LLM APIs (used by shared/utils/llm_client.py)
+openai>=1.0.0
+anthropic>=0.40.0

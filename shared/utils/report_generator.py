@@ -499,13 +499,18 @@ def _transcript_section(segments: list, voice_signals: list, lang_signals: list,
 
 
 def _segment_badges(seg: dict, voice_signals: list, lang_signals: list) -> str:
-    """Build inline signal badges for a transcript segment, sorted by priority."""
+    """Build inline signal badges for a transcript segment, sorted by priority.
+    Deduplicates by signal type — keeps only the highest-value badge per type."""
     start = seg.get("start_ms", 0)
     end = seg.get("end_ms", 0)
     speaker = seg.get("speaker", "")
 
-    # Collect badges as (priority, html) tuples — lower priority number = more important
-    badge_tuples = []
+    # Collect badges as {base_type: (priority, value, html)} — dedup by base_type
+    best: dict[str, tuple] = {}
+
+    def _add(base_type: str, priority: int, val: float, html: str):
+        if base_type not in best or val > best[base_type][1]:
+            best[base_type] = (priority, val, html)
 
     # Voice signals in this segment's time range
     for vs in voice_signals:
@@ -520,14 +525,27 @@ def _segment_badges(seg: dict, voice_signals: list, lang_signals: list) -> str:
         val = vs.get("value", 0)
 
         if st == "vocal_stress_score" and val > 0.3:
-            if val > 0.5:
-                badge_tuples.append((1, f'<span class="badge badge-stress">stress {val:.2f}</span>'))
-            else:
-                badge_tuples.append((3, f'<span class="badge badge-stress-lo">stress {val:.2f}</span>'))
+            cls = "badge-stress" if val > 0.5 else "badge-stress-lo"
+            _add("stress", 1 if val > 0.5 else 3, val,
+                 f'<span class="badge {cls}">stress {val:.0%}</span>')
         elif st == "filler_detection" and vs.get("value_text") == "elevated":
             cnt = vs.get("metadata", {}).get("filler_count", 0)
             if cnt > 0:
-                badge_tuples.append((6, f'<span class="badge badge-filler">fillers x{cnt}</span>'))
+                _add("filler", 6, cnt,
+                     f'<span class="badge badge-filler">fillers x{cnt}</span>')
+        elif st == "pitch_analysis":
+            vt = (vs.get("value_text") or "").lower()
+            if "elevated" in vt or "high" in vt:
+                _add("pitch", 5, val,
+                     '<span class="badge badge-filler">pitch ↑</span>')
+        elif st == "speech_rate_analysis":
+            vt = (vs.get("value_text") or "").lower()
+            if "fast" in vt or "rapid" in vt:
+                _add("rate", 6, val,
+                     '<span class="badge badge-intent">fast</span>')
+            elif "slow" in vt:
+                _add("rate", 6, val,
+                     '<span class="badge badge-intent">slow</span>')
 
     # Language signals
     for ls in lang_signals:
@@ -540,29 +558,38 @@ def _segment_badges(seg: dict, voice_signals: list, lang_signals: list) -> str:
         st = ls.get("signal_type", "")
         if st == "sentiment_score":
             val = ls.get("value", 0)
-            if val > 0.6:
-                badge_tuples.append((5, f'<span class="badge badge-sentiment-pos">sent +{val:.2f}</span>'))
+            if val > 0.3:
+                _add("sentiment", 5, val,
+                     f'<span class="badge badge-sentiment-pos">positive</span>')
             elif val < -0.3:
-                badge_tuples.append((4, f'<span class="badge badge-sentiment-neg">sent {val:.2f}</span>'))
-        elif st == "objection_signal":
+                _add("sentiment", 4, abs(val),
+                     f'<span class="badge badge-sentiment-neg">negative</span>')
+        elif st == "objection_signal" and ls.get("value", 0) > 0.3:
             cats = ls.get("metadata", {}).get("categories", [])
             label = cats[0] if cats else "objection"
-            badge_tuples.append((2, f'<span class="badge badge-objection">{_esc(label)}</span>'))
-        elif st == "buying_signal":
-            badge_tuples.append((2, '<span class="badge badge-buying">buying signal</span>'))
+            _add("objection", 2, ls.get("value", 0),
+                 f'<span class="badge badge-objection">{_esc(label)}</span>')
+        elif st == "buying_signal" and ls.get("value", 0) > 0.3:
+            _add("buying", 2, ls.get("value", 0),
+                 '<span class="badge badge-buying">buying signal</span>')
         elif st == "intent_classification":
             intent = ls.get("value_text", "")
-            if intent:
-                badge_tuples.append((7, f'<span class="badge badge-intent">{_esc(intent)}</span>'))
+            if intent and intent.upper() not in ("INFORM", "QUESTION"):
+                _add("intent", 7, ls.get("value", 0),
+                     f'<span class="badge badge-intent">{_esc(intent)}</span>')
         elif st == "power_language_score":
             val = ls.get("value", 0.5)
-            if val < 0.4:
-                badge_tuples.append((7, '<span class="badge badge-power">low power</span>'))
+            if val < 0.3:
+                _add("power", 7, 1 - val,
+                     '<span class="badge badge-power">weak language</span>')
+            elif val > 0.8:
+                _add("power", 7, val,
+                     '<span class="badge badge-buying">strong language</span>')
 
-    # Sort by priority (most important first), then mark top 2 as high
-    badge_tuples.sort(key=lambda x: x[0])
+    # Sort by priority (most important first), limit to 4
+    sorted_badges = sorted(best.values(), key=lambda x: x[0])
     final_badges = []
-    for idx, (_, badge_html) in enumerate(badge_tuples):
+    for idx, (_, _, badge_html) in enumerate(sorted_badges[:4]):
         priority = "high" if idx < 2 else "low"
         tagged = badge_html.replace('class="badge ', f'data-priority="{priority}" class="badge ')
         final_badges.append(tagged)

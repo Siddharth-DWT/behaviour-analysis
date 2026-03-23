@@ -29,10 +29,18 @@ from dataclasses import asdict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
-# Add shared module to path
+# isort: split
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+# isort: split
+from shared.models.signals import FusionSignalInput
+from shared.models.requests import (
+    FusionAnalyseRequest as AnalyseRequest,
+    FusionSessionAnalyseRequest as SessionAnalyseRequest,
+    ReportRequest,
+    FusionAnalyseResponse as AnalyseResponse,
+)
 
 try:
     from fusion_engine import SignalBuffer, compute_unified_state, WINDOW_SHORT_MS
@@ -113,64 +121,6 @@ async def health():
         "redis_connected": HAS_MESSAGE_BUS,
     }
 
-
-# ── Request / Response Models ──
-
-class FusionSignalInput(BaseModel):
-    """A signal from voice or language agent."""
-    agent: str
-    speaker_id: str = "unknown"
-    signal_type: str = ""
-    value: Optional[float] = None
-    value_text: str = ""
-    confidence: float = 0.5
-    window_start_ms: int = 0
-    window_end_ms: int = 0
-    metadata: Optional[dict] = None
-
-
-class AnalyseRequest(BaseModel):
-    """Direct fusion analysis from pre-collected signals."""
-    voice_signals: list[FusionSignalInput] = []
-    language_signals: list[FusionSignalInput] = []
-    session_id: Optional[str] = None
-    meeting_type: Optional[str] = "sales_call"
-    content_type: Optional[str] = None  # Auto-detected or override
-    generate_report: Optional[bool] = True
-    voice_summary: Optional[dict] = None
-    language_summary: Optional[dict] = None
-
-
-class SessionAnalyseRequest(BaseModel):
-    """Fusion analysis by reading from Redis Streams."""
-    session_id: str
-    meeting_type: Optional[str] = "sales_call"
-    content_type: Optional[str] = None  # Auto-detected or override
-    generate_report: Optional[bool] = True
-    voice_summary: Optional[dict] = None
-    language_summary: Optional[dict] = None
-
-
-class ReportRequest(BaseModel):
-    """Generate a narrative report for a completed session."""
-    session_id: str
-    duration_seconds: float
-    speakers: list[str]
-    voice_summary: dict
-    language_summary: dict
-    fusion_signals: list[dict] = []
-    unified_states: list[dict] = []
-    meeting_type: Optional[str] = "sales_call"
-
-
-class AnalyseResponse(BaseModel):
-    session_id: str
-    speakers: list[str]
-    fusion_signals: list[dict]
-    unified_states: list[dict]
-    alerts: list[dict]
-    report: Optional[dict] = None
-    summary: dict
 
 
 @app.post("/analyse", response_model=AnalyseResponse)
