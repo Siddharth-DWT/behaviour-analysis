@@ -1,6 +1,8 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import * as d3 from "d3";
 import type { Signal, TranscriptSegment } from "../api/client";
+import { SignalNetworkView } from "./signal-network";
+import type { SignalGraphData } from "./signal-network";
 
 // ═══════════════════════════════════════════
 // TYPES
@@ -45,33 +47,6 @@ interface GraphLink extends d3.SimulationLinkDatum<GraphNode> {
   width: number;
   dashed: boolean;
   label?: string;
-}
-
-// Backend signal graph types
-interface BackendGraphNode {
-  id: string;
-  type: string;
-  label: string;
-  agent?: string;
-  value?: number;
-  value_text?: string;
-  confidence?: number;
-  timestamp_ms?: number;
-  speaker_id?: string;
-  signal_type?: string;
-  metadata?: Record<string, unknown>;
-}
-
-interface BackendGraphEdge {
-  source: string;
-  target: string;
-  relationship: string;
-}
-
-interface SignalGraphData {
-  nodes: BackendGraphNode[];
-  edges: BackendGraphEdge[];
-  stats?: Record<string, unknown>;
 }
 
 interface ConversationGraphProps {
@@ -367,99 +342,6 @@ function buildGraphData(
 }
 
 // ═══════════════════════════════════════════
-// SIGNAL NETWORK BUILDER (from backend graph)
-// ═══════════════════════════════════════════
-
-const EDGE_STYLES: Record<string, { color: string; dashed: boolean; width: number }> = {
-  speaker_produced: { color: "#4F8BFF44", dashed: false, width: 1 },
-  co_occurred:      { color: "#888866", dashed: true, width: 1 },
-  preceded:         { color: "#6366F188", dashed: false, width: 1.5 },
-  contradicts:      { color: "#EF4444", dashed: true, width: 2 },
-  about_topic:      { color: "#10B98188", dashed: false, width: 1 },
-  triggered:        { color: "#F97316", dashed: false, width: 2 },
-  resolves:         { color: "#22C55E", dashed: false, width: 1.5 },
-};
-
-function buildSignalNetworkData(
-  sg: SignalGraphData,
-  speakerRoles: Record<string, string>,
-): { nodes: GraphNode[]; links: GraphLink[] } {
-  const nodes: GraphNode[] = [];
-  const links: GraphLink[] = [];
-  const includedIds = new Set<string>();
-
-  // Include all speakers and topics, top signals by confidence
-  const ranked = [...sg.nodes].sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
-  for (const n of ranked) {
-    if (n.type === "speaker" || n.type === "topic" || n.type === "fusion_signal") {
-      includedIds.add(n.id);
-    }
-  }
-  // Top 15 voice + top 15 lang signals
-  let v = 0, l = 0;
-  for (const n of ranked) {
-    if (n.type === "voice_signal" && v < 15) { includedIds.add(n.id); v++; }
-    if (n.type === "lang_signal" && l < 15) { includedIds.add(n.id); l++; }
-  }
-
-  const typeColors: Record<string, string> = {
-    speaker:       "#4F8BFF",
-    topic:         "#8B5CF6",
-    voice_signal:  "#6366F1",
-    lang_signal:   "#06B6D4",
-    fusion_signal: "#F97316",
-  };
-
-  for (const n of sg.nodes) {
-    if (!includedIds.has(n.id)) continue;
-    const spkIdx = Object.keys(speakerRoles).indexOf(n.speaker_id ?? "");
-    const color = typeColors[n.type] ?? "#888";
-    const isFusion = n.type === "fusion_signal";
-    const isSpeaker = n.type === "speaker";
-    const isTopic = n.type === "topic";
-
-    nodes.push({
-      id: n.id,
-      type: isFusion ? "insight" : isSpeaker ? "speaker" : isTopic ? "topic" : "signal",
-      label: n.label || n.signal_type?.replace(/_/g, " ") || n.id,
-      detail: [
-        n.type,
-        n.signal_type,
-        n.value != null ? `val=${n.value.toFixed(2)}` : null,
-        n.confidence != null ? `conf=${Math.round(n.confidence * 100)}%` : null,
-      ].filter(Boolean).join(" · "),
-      speaker: n.speaker_id || undefined,
-      color: isSpeaker ? SPEAKER_COLORS[spkIdx >= 0 ? spkIdx : 0] : color,
-      borderColor: isSpeaker ? SPEAKER_COLORS[spkIdx >= 0 ? spkIdx : 0] : color,
-      width: isSpeaker ? 80 : isFusion ? 90 : isTopic ? 70 : 60,
-      height: isSpeaker ? 80 : isFusion ? 34 : isTopic ? 26 : 24,
-      time_ms: n.timestamp_ms ?? 0,
-      badges: [],
-      confidence: n.confidence,
-      pinned: isSpeaker,
-    });
-  }
-
-  // Only include edges where both endpoints are included
-  sg.edges.forEach((e, i) => {
-    if (!includedIds.has(e.source) || !includedIds.has(e.target)) return;
-    const style = EDGE_STYLES[e.relationship] ?? { color: "#88888866", dashed: true, width: 1 };
-    links.push({
-      id: `sne_${i}`,
-      source: e.source,
-      target: e.target,
-      edgeType: e.relationship,
-      color: style.color,
-      width: style.width,
-      dashed: style.dashed,
-      label: e.relationship,
-    });
-  });
-
-  return { nodes, links };
-}
-
-// ═══════════════════════════════════════════
 // BADGE RENDERING
 // ═══════════════════════════════════════════
 
@@ -494,17 +376,10 @@ export default function ConversationGraph({
   const [showSignals, setShowSignals] = useState(true);
   const [viewMode, setViewMode] = useState<"conversation" | "signal_network">("conversation");
 
-  const convData = useMemo(
+  const { nodes, links } = useMemo(
     () => buildGraphData(segments, signals, entities, speakerRoles, durationMs, simplified),
     [segments, signals, entities, speakerRoles, durationMs, simplified]
   );
-
-  const netData = useMemo(
-    () => signalGraph ? buildSignalNetworkData(signalGraph, speakerRoles) : { nodes: [], links: [] },
-    [signalGraph, speakerRoles]
-  );
-
-  const { nodes, links } = viewMode === "signal_network" && signalGraph ? netData : convData;
 
   // Filter by time range and search
   const visibleNodeIds = useMemo(() => {
@@ -769,12 +644,37 @@ export default function ConversationGraph({
     return () => { simulation.stop(); };
   }, [nodes, links, visibleNodeIds, durationMs, segments]);
 
+  // ── Delegate to Signal Network view ──
+  if (viewMode === "signal_network" && signalGraph) {
+    return (
+      <div>
+        {/* Thin mode switcher bar above the network view */}
+        <div className="flex items-center gap-2 px-3 py-1.5 border border-nexus-border rounded-t-lg bg-nexus-surface">
+          <div className="flex rounded border border-nexus-border overflow-hidden text-[10px]">
+            <button onClick={() => setViewMode("conversation")}
+              className="px-2 py-0.5 bg-nexus-surface text-nexus-text-secondary hover:bg-nexus-surface-hover">
+              Conversation
+            </button>
+            <button className="px-2 py-0.5 bg-nexus-blue text-white">
+              Signal Network
+            </button>
+          </div>
+        </div>
+        <SignalNetworkView
+          signalGraph={signalGraph}
+          speakerRoles={speakerRoles}
+          onClose={onClose}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="rounded-lg border border-nexus-border bg-nexus-bg overflow-hidden">
       {/* Toolbar */}
       <div className="flex items-center gap-2 px-4 py-2 border-b border-nexus-border bg-nexus-surface flex-wrap">
         <span className="text-sm font-medium text-nexus-text-primary mr-auto">
-          {viewMode === "signal_network" ? "Signal Relationship Network" : "Conversation Graph"}
+          Conversation Graph
           <span className="ml-2 text-[10px] text-nexus-text-muted font-normal">
             {nodes.length} nodes · {links.length} edges
           </span>
@@ -783,22 +683,14 @@ export default function ConversationGraph({
         {/* View mode toggle */}
         {signalGraph && (
           <div className="flex rounded border border-nexus-border overflow-hidden text-[10px]">
-            <button
-              onClick={() => setViewMode("conversation")}
-              className={`px-2 py-0.5 transition-colors ${viewMode === "conversation" ? "bg-nexus-blue text-white" : "bg-nexus-surface text-nexus-text-secondary hover:bg-nexus-surface-hover"}`}
-            >
-              Conversation
-            </button>
-            <button
-              onClick={() => setViewMode("signal_network")}
-              className={`px-2 py-0.5 transition-colors ${viewMode === "signal_network" ? "bg-nexus-blue text-white" : "bg-nexus-surface text-nexus-text-secondary hover:bg-nexus-surface-hover"}`}
-            >
+            <button className="px-2 py-0.5 bg-nexus-blue text-white">Conversation</button>
+            <button onClick={() => setViewMode("signal_network")}
+              className="px-2 py-0.5 bg-nexus-surface text-nexus-text-secondary hover:bg-nexus-surface-hover">
               Signal Network
             </button>
           </div>
         )}
 
-        {viewMode === "conversation" && (<>
         <label className="flex items-center gap-1 text-[10px] text-nexus-text-secondary cursor-pointer">
           <input type="checkbox" checked={showTopics} onChange={(e) => setShowTopics(e.target.checked)} className="h-3 w-3" />
           Topics
@@ -811,7 +703,6 @@ export default function ConversationGraph({
           <input type="checkbox" checked={simplified} onChange={(e) => setSimplified(e.target.checked)} className="h-3 w-3" />
           Simplified
         </label>
-        </>)}
 
         <input
           type="text"
@@ -834,29 +725,8 @@ export default function ConversationGraph({
         <svg ref={svgRef} className="w-full h-full" />
       </div>
 
-      {/* Signal Network legend */}
-      {viewMode === "signal_network" && (
-        <div className="flex flex-wrap gap-x-4 gap-y-1 px-4 py-2 border-t border-nexus-border bg-nexus-surface">
-          {[
-            { color: "#4F8BFF", label: "Speaker" },
-            { color: "#8B5CF6", label: "Topic" },
-            { color: "#6366F1", label: "Voice Signal" },
-            { color: "#06B6D4", label: "Language Signal" },
-            { color: "#F97316", label: "Fusion Insight" },
-          ].map(({ color, label }) => (
-            <span key={label} className="flex items-center gap-1 text-[9px] text-nexus-text-secondary">
-              <span className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: color }} />
-              {label}
-            </span>
-          ))}
-          <span className="text-[9px] text-nexus-text-muted ml-auto">
-            Red dashed = contradicts · Orange = triggered · Green = resolves
-          </span>
-        </div>
-      )}
-
       {/* Timeline scrubber */}
-      {viewMode === "conversation" && (
+      {(
       <div className="px-4 py-2 border-t border-nexus-border bg-nexus-surface">
         <div className="flex items-center gap-2">
           <span className="text-[10px] text-nexus-text-muted w-10">
