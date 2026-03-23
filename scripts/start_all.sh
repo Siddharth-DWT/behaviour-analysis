@@ -69,7 +69,7 @@ else
     # Wait for Redis/Valkey
     echo -ne "  Waiting for Valkey (Redis)..."
     for i in $(seq 1 15); do
-        if docker compose exec -T valkey redis-cli ping 2>/dev/null | grep -q PONG; then
+        if docker compose exec -T redis valkey-cli ping 2>/dev/null | grep -q PONG; then
             echo -e " ${C_GREEN}ready${C_RESET}"
             break
         fi
@@ -115,10 +115,10 @@ start_service() {
     echo -e "  ${C_DIM}PID: ${pid}, Log: .logs/${name}.log${C_RESET}"
 }
 
-start_service "voice-agent"    8001 "services/voice-agent"    2
-start_service "language-agent"  8002 "services/language-agent"  3
-start_service "fusion-agent"    8007 "services/fusion-agent"    4
-start_service "api-gateway"     8000 "services/api-gateway"     5
+start_service "voice-agent"    8001 "services/voiceAgent"     2
+start_service "language-agent" 8002 "services/language_agent"  3
+start_service "fusion-agent"   8007 "services/fusion_agent"    4
+start_service "api-gateway"    8000 "services/api_gateway"     5
 
 # ══════════════════════════════════════════════════════════════
 # Health Check Loop

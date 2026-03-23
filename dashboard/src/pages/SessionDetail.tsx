@@ -823,6 +823,7 @@ export default function SessionDetail() {
                   speakerRoles={speakerRoles}
                   durationMs={session.duration_ms || 0}
                   onClose={() => setShowConvoGraph(false)}
+                  signalGraph={content?.signal_graph as any}
                 />
               )}
             </>

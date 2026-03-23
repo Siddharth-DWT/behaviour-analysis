@@ -153,8 +153,8 @@ async def analyse_transcript(request: AnalysisRequest):
         f"(content_type={content_type})"
     )
 
-    # Convert Pydantic models to dicts
-    segments = [seg.model_dump() for seg in request.segments]
+    # Convert to dicts (segments may already be dicts or Pydantic models)
+    segments = [seg.model_dump() if hasattr(seg, 'model_dump') else dict(seg) for seg in request.segments]
 
     # ── Step 1: Extract features ──
     logger.info(f"[{session_id}] Step 1: Extracting linguistic features...")

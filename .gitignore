@@ -47,3 +47,9 @@ models/
 # Claude Code
 .claude/
 recordings/
+
+# Stale hyphenated service dirs (actual code is in voiceAgent/, api_gateway/, etc.)
+services/voice-agent/
+services/language-agent/
+services/fusion-agent/
+services/api-gateway/
