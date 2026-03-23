@@ -186,21 +186,39 @@ BUYING_PATTERNS_COMPILED = {
 # Objection / Resistance Patterns — Rackham 1988
 # ═══════════════════════════════════════════════════════════════
 
+# Allow optional adverb modifiers (actually, really, currently, etc.) between keywords
+_MOD = r"(\s+\w+)?"  # optional single-word modifier
+
 OBJECTION_PATTERNS = {
     "direct_objection": [
         r"\bthat('s|\s+is)\s+(too\s+)?(expensive|costly|pricey)\b",
         r"\bwe\s+(can't|cannot|don't)\s+(afford|justify|approve)\b",
-        r"\bthat('s|\s+is)\s+not\s+(going\s+to|gonna)\s+work\b",
+        r"\bthat('s|\s+is)\s+not" + _MOD + r"\s+(going\s+to|gonna)\s+work\b",
         r"\bwe\s+(already|currently)\s+(have|use)\b",
-        r"\bwe('re|\s+are)\s+(not\s+)?(interested|looking|ready)\b",
-        r"\bI\s+don't\s+(think|see|believe)\s+(this|it|that)\b",
+        # "we are not (actually/really/currently) looking/interested/ready"
+        r"\bwe('re|\s+are)\s+not" + _MOD + r"\s+(interested|looking|ready)\b",
+        # "we are not looking" without negation word (catch "we aren't looking")
+        r"\bwe\s+(aren't|ain't)" + _MOD + r"\s+(interested|looking|ready)\b",
+        r"\bI\s+don't" + _MOD + r"\s+(think|see|believe)\s+(this|it|that)\b",
+        # "not looking for (outsourced/external/any) X"
+        r"\bnot" + _MOD + r"\s+looking\s+for\b",
+        # "don't need / don't want"
+        r"\b(we|I)\s+(don't|do\s+not)" + _MOD + r"\s+(need|want|require)\b",
     ],
     "timing_objection": [
-        r"\bnot\s+(right\s+)?now\b",
+        # "not (sure/available/free) right now" — allow modifier before "now"
+        r"\bnot" + _MOD + r"\s+(right\s+)?now\b",
         r"\bmaybe\s+(later|next\s+(quarter|year|month))\b",
         r"\bthe\s+timing\s+(isn't|is\s+not)\s+(right|good|ideal)\b",
         r"\bwe('re|\s+are)\s+(not\s+)?ready\b",
         r"\bneed\s+more\s+time\b",
+        # "I'm a little busy" / "I'm busy right now"
+        r"\bI('m|\s+am)\s+(\w+\s+)?busy\b",
+        # "can you call (me) (back) (some) other time"
+        r"\bcall\s+(me\s+)?(back\s+)?(some\s+)?other\s+time\b",
+        # "maybe in (the) future" / "in future maybe"
+        r"\b(maybe\s+)?in\s+(the\s+)?future\b",
+        r"\bI'm\s+not\s+sure\s+(right\s+)?now\b",
     ],
     "authority_objection": [
         r"\bI('d|\s+would)\s+(need|have)\s+to\s+(check|ask|run\s+it\s+by|get\s+approval)\b",
