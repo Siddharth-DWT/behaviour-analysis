@@ -35,9 +35,11 @@ from shared.models.requests import LanguageAnalysisRequest as AnalysisRequest, L
 try:
     from feature_extractor import LanguageFeatureExtractor
     from rules import LanguageRuleEngine
+    from entity_extractor import EntityExtractor
 except ImportError:
     from services.language_agent.feature_extractor import LanguageFeatureExtractor
     from services.language_agent.rules import LanguageRuleEngine
+    from services.language_agent.entity_extractor import EntityExtractor
 
 # Shared utilities
 try:
@@ -66,15 +68,17 @@ app.add_middleware(
 # ── Globals (initialised on startup) ──
 feature_extractor: Optional[LanguageFeatureExtractor] = None
 rule_engine: Optional[LanguageRuleEngine] = None
+entity_extractor: Optional[EntityExtractor] = None
 
 
 @app.on_event("startup")
 async def startup():
-    global feature_extractor, rule_engine
+    global feature_extractor, rule_engine, entity_extractor
     logger.info("Starting NEXUS Language Agent...")
 
     feature_extractor = LanguageFeatureExtractor()
     rule_engine = LanguageRuleEngine()
+    entity_extractor = EntityExtractor()
 
     # Pre-load DistilBERT model so first request isn't slow
     logger.info("Warming up sentiment model...")
@@ -177,6 +181,19 @@ async def analyse_transcript(request: AnalysisRequest):
     else:
         logger.info(f"[{session_id}] Step 3: Intent classification skipped (disabled)")
 
+    # ── Step 3b: Entity & topic extraction ──
+    entities = {}
+    try:
+        logger.info(f"[{session_id}] Step 3b: Extracting entities & topics...")
+        entities = await entity_extractor.extract(segments, content_type)
+        logger.info(
+            f"[{session_id}] Entities: {len(entities.get('people', []))} people, "
+            f"{len(entities.get('topics', []))} topics, "
+            f"{len(entities.get('commitments', []))} commitments"
+        )
+    except Exception as e:
+        logger.warning(f"[{session_id}] Entity extraction failed (non-fatal): {e}")
+
     # ── Step 4: Publish to Redis Streams ──
     if HAS_MESSAGE_BUS:
         published = 0
@@ -205,6 +222,7 @@ async def analyse_transcript(request: AnalysisRequest):
     logger.info(f"[{session_id}] Complete: {len(all_signals)} signals in {elapsed:.1f}s")
 
     summary = _build_summary(all_signals, features_list, speakers)
+    summary["entities"] = entities
 
     return AnalysisResponse(
         session_id=session_id,

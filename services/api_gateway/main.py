@@ -306,14 +306,28 @@ async def create_session_endpoint(
         except Exception as e:
             logger.warning(f"[{session_id}] Alert persist failed: {e}")
 
+    # Enrich report with entities and signal graph from fusion summary
+    entities = language_summary.get("entities", {})
+    fusion_summary = fusion_result.get("summary", {}) if fusion_result else {}
+    signal_graph = fusion_summary.get("signal_graph", {})
+    key_paths = fusion_summary.get("key_paths", [])
+
     # Persist report
     report_generated = False
-    if report:
+    report_content = report or {}
+    graph_analytics = fusion_summary.get("graph_analytics", {})
+
+    if entities or signal_graph:
+        report_content["entities"] = entities
+        report_content["signal_graph"] = signal_graph
+        report_content["key_paths"] = key_paths
+        report_content["graph_analytics"] = graph_analytics
+    if report_content:
         try:
             await save_report(
                 session_id=session_id,
-                content=report,
-                narrative=report.get("executive_summary", ""),
+                content=report_content,
+                narrative=report_content.get("executive_summary", ""),
             )
             report_generated = True
         except Exception as e:

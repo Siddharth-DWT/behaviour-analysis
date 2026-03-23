@@ -46,10 +46,14 @@ try:
     from fusion_engine import SignalBuffer, compute_unified_state, WINDOW_SHORT_MS
     from rules import FusionRuleEngine
     from narrative import generate_session_narrative
+    from signal_graph import SignalGraph
+    from graph_analytics import GraphAnalytics
 except ImportError:
     from services.fusion_agent.fusion_engine import SignalBuffer, compute_unified_state, WINDOW_SHORT_MS
     from services.fusion_agent.rules import FusionRuleEngine
     from services.fusion_agent.narrative import generate_session_narrative
+    from services.fusion_agent.signal_graph import SignalGraph
+    from services.fusion_agent.graph_analytics import GraphAnalytics
 
 try:
     from shared.utils.message_bus import message_bus
@@ -262,7 +266,48 @@ async def analyse_signals(request: AnalyseRequest):
 
         logger.info(f"[{session_id}] Published {published} fusion signals + {len(all_alerts)} alerts")
 
-    # ── Step 4: Generate narrative report ──
+    # Extract entities from language summary (used by narrative + graph)
+    entities = {}
+    if request.language_summary:
+        entities = request.language_summary.get("entities", {})
+
+    # ── Step 4: Build signal graph + analytics ──
+    graph_json = {}
+    key_paths = []
+    graph_insights = {}
+    try:
+        graph = SignalGraph()
+        graph.build_from_session(
+            voice_signals=voice_dicts,
+            language_signals=language_dicts,
+            fusion_signals=all_fusion_signals,
+            transcript_segments=[],
+            entities=entities,
+        )
+        graph_json = graph.to_json()
+        key_paths = graph.get_key_paths(max_paths=5)
+
+        # Run graph analytics
+        analytics = GraphAnalytics(graph)
+        graph_insights = analytics.compute_all()
+
+        # Generate graph-based fusion signals
+        graph_signals = rule_engine.evaluate_graph_insights(
+            graph_insights, speakers, all_fusion_signals
+        )
+        all_fusion_signals.extend(graph_signals)
+
+        logger.info(
+            f"[{session_id}] Signal graph: "
+            f"{graph_json['stats']['node_count']} nodes, "
+            f"{graph_json['stats']['edge_count']} edges, "
+            f"{len(key_paths)} key paths, "
+            f"{len(graph_signals)} graph-based signals"
+        )
+    except Exception as e:
+        logger.warning(f"[{session_id}] Signal graph/analytics failed (non-fatal): {e}")
+
+    # ── Step 5: Generate narrative report ──
     report = None
     if request.generate_report:
         logger.info(f"[{session_id}] Generating narrative report...")
@@ -286,6 +331,8 @@ async def analyse_signals(request: AnalyseRequest):
             fusion_signals=all_fusion_signals,
             unified_states=all_unified_states,
             meeting_type=report_type,
+            entities=entities,
+            graph_analytics=graph_insights,
         )
 
     # ── Build summary ──
@@ -298,6 +345,9 @@ async def analyse_signals(request: AnalyseRequest):
     )
 
     summary = _build_summary(all_fusion_signals, all_unified_states, all_alerts)
+    summary["signal_graph"] = graph_json
+    summary["key_paths"] = key_paths
+    summary["graph_analytics"] = graph_insights
 
     return AnalyseResponse(
         session_id=session_id,
@@ -385,21 +435,24 @@ async def generate_report(request: ReportRequest):
 
 # ── Helpers ──
 
-def _to_int(v) -> int:
-    if v is None or v == "":
-        return 0
-    try:
-        return int(float(v))
-    except (ValueError, TypeError):
-        return 0
+try:
+    from shared.utils.conversions import to_int as _to_int
+except ImportError:
+    def _to_int(v) -> int:
+        if v is None or v == "":
+            return 0
+        try:
+            return int(float(v))
+        except (ValueError, TypeError):
+            return 0
 
 
 def _max_time(signals: list[dict]) -> int:
-    """Get the latest timestamp from a list of signals."""
+    """Get the latest timestamp from a list of signals (0 if empty)."""
     if not signals:
-        return int(time.time() * 1000)
+        return 0
     times = [_to_int(s.get("window_end_ms", 0)) for s in signals]
-    return max(times) if times else int(time.time() * 1000)
+    return max(times) if times else 0
 
 
 def _normalise_redis_signal(s: dict) -> dict:

@@ -88,6 +88,26 @@ export interface Report {
     cross_modal_insights?: string[];
     recommendations?: string[];
     raw_response?: string;
+    entities?: {
+      people?: Array<{ name: string; role: string; first_mention_ms: number }>;
+      companies?: Array<{ name: string; context: string; first_mention_ms: number }>;
+      products_services?: Array<{ name: string; context: string }>;
+      topics?: Array<{ name: string; start_ms: number; end_ms: number }>;
+      objections?: Array<{ text: string; timestamp_ms: number; resolved: boolean }>;
+      commitments?: Array<{ text: string; speaker: string; timestamp_ms: number }>;
+      key_terms?: string[];
+    };
+    signal_graph?: {
+      nodes: Array<Record<string, unknown>>;
+      edges: Array<Record<string, unknown>>;
+      stats?: Record<string, unknown>;
+    };
+    key_paths?: Array<{
+      nodes: Array<{ id: string; type: string; label: string; agent: string | null; confidence: number | null; timestamp_ms: number }>;
+      description: string;
+      score: number;
+    }>;
+    graph_analytics?: Record<string, unknown>;
   };
   narrative: string | null;
   generated_at: string;

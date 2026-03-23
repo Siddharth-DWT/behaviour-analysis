@@ -55,6 +55,7 @@ class Transcriber:
         self._external_client = None
         self._use_external = False
         self._num_speakers = None  # Speaker count hint (2-10), None = auto
+        self._last_diarization_backend = "uninitialized"
 
         # Try to initialise external Whisper client (API key is optional)
         if EXTERNAL_WHISPER_URL:
@@ -199,6 +200,9 @@ class Transcriber:
         model_used = result.get("model", EXTERNAL_WHISPER_MODEL)
         proc_time = result.get("processing_time", 0)
 
+        # Strip Whisper hallucination loops
+        segments = self._strip_hallucinations(segments)
+
         logger.info(
             f"External transcription complete: {duration:.1f}s audio, "
             f"{len(segments)} segments, model={model_used}, "
@@ -267,6 +271,10 @@ class Transcriber:
             })
 
         duration = info.duration
+
+        # Strip Whisper hallucination loops
+        segments = self._strip_hallucinations(segments)
+
         logger.info(f"Local transcription complete: {duration:.1f}s, {len(segments)} segments")
 
         # Apply speaker diarization
@@ -283,8 +291,91 @@ class Transcriber:
         }
 
     # ═══════════════════════════════════════════════════════════
+    # HALLUCINATION FILTER
+    # ═══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _strip_hallucinations(segments: list[dict], max_repeat: int = 5) -> list[dict]:
+        """
+        Remove Whisper hallucination loops.
+
+        Whisper hallucinates repetitive short tokens (\"yeah\", \"you\",
+        \"thank you\", punctuation) when audio is silent, noisy, or has
+        music. Detected by: N+ consecutive segments with identical
+        short text (after lowering + stripping punctuation).
+
+        Args:
+            segments: transcript segments
+            max_repeat: how many identical consecutive segments before
+                        we consider it a hallucination loop (default 5)
+        Returns:
+            Cleaned segment list with hallucination tail removed.
+        """
+        if len(segments) < max_repeat + 1:
+            return segments
+
+        def _norm(text: str) -> str:
+            return text.lower().strip(" .,!?;:'\"-")
+
+        # Walk backwards to find where the repetition starts
+        last_real = len(segments) - 1
+        i = len(segments) - 1
+        while i >= max_repeat:
+            # Check if segments [i-max_repeat+1 .. i] are all identical short text
+            window = segments[i - max_repeat + 1: i + 1]
+            texts = [_norm(s.get("text", "")) for s in window]
+            # All same, short (< 4 words), and non-empty
+            if (
+                len(set(texts)) == 1
+                and texts[0]
+                and len(texts[0].split()) <= 3
+            ):
+                last_real = i - max_repeat
+                i = last_real
+            else:
+                break
+
+        if last_real < len(segments) - 1:
+            removed = len(segments) - last_real - 1
+            kept = last_real + 1
+            logger.warning(
+                f"Whisper hallucination detected: removed {removed} "
+                f"repetitive segments (kept {kept} of {len(segments)})"
+            )
+            return segments[: last_real + 1]
+
+        return segments
+
+    # ═══════════════════════════════════════════════════════════
     # SPEAKER DIARIZATION
     # ═══════════════════════════════════════════════════════════
+
+    def _estimate_speaker_count(self, segments: list[dict]) -> int:
+        """Estimate number of speakers from turn patterns."""
+        if len(segments) <= 1:
+            return 1
+        turn_gap_ms = 1200
+        turns = 1
+        short_turns = 0
+        long_turns = 0
+        for i, seg in enumerate(segments):
+            duration_ms = max(0, seg["end_ms"] - seg["start_ms"])
+            if duration_ms < 2500:
+                short_turns += 1
+            elif duration_ms > 7000:
+                long_turns += 1
+            if i == 0:
+                continue
+            gap_ms = seg["start_ms"] - segments[i - 1]["end_ms"]
+            if gap_ms > turn_gap_ms:
+                turns += 1
+        if turns <= 2 and len(segments) <= 3:
+            return 1  # Truly minimal audio — maybe a single utterance
+        if turns <= 8:
+            return 2  # Default for most calls
+        if short_turns > long_turns and turns >= 12:
+            return 3
+        return 2
 
     def _diarize_simple(
         self,
@@ -307,7 +398,16 @@ class Transcriber:
         if not segments:
             return segments
 
-        max_speakers = min(num_speakers or 2, 10)
+        if num_speakers is None:
+            estimated = self._estimate_speaker_count(segments)
+            logger.info("No speaker-count hint provided; estimated %s speaker(s)", estimated)
+            max_speakers = estimated
+        else:
+            max_speakers = min(max(1, num_speakers), 10)
+
+        # Never run KMeans or gap heuristic with 1 cluster
+        if max_speakers < 2:
+            max_speakers = 2
 
         # Try acoustic KMeans clustering first (when we have the audio)
         if audio_path and max_speakers >= 2:
@@ -359,7 +459,7 @@ class Transcriber:
             return None
         total_samples = len(y)
 
-        features = []  # (mean_pitch, mean_energy) per segment
+        features = []  # 5 features per segment
         valid_mask = []  # Track which segments have valid features
 
         for seg in segments:
@@ -372,27 +472,42 @@ class Transcriber:
             chunk = y[start_sample:end_sample]
 
             if len(chunk) < sr * 0.1:  # Skip very short chunks (< 100ms)
-                features.append([0.0, 0.0])
+                features.append([0.0, 0.0, 0.0, 0.0, 0.0])
                 valid_mask.append(False)
                 continue
 
-            # Mean pitch via pyin
+            # Mean pitch + pitch std via pyin
             try:
                 f0, voiced_flag, _ = librosa.pyin(
                     chunk, fmin=60, fmax=500, sr=sr,
                     frame_length=2048, hop_length=512,
                 )
-                # Take mean of voiced frames only
                 voiced_f0 = f0[voiced_flag] if voiced_flag is not None else f0[~np.isnan(f0)]
                 mean_pitch = float(np.nanmean(voiced_f0)) if len(voiced_f0) > 0 else 0.0
+                pitch_std = float(np.nanstd(voiced_f0)) if len(voiced_f0) > 1 else 0.0
             except Exception:
                 mean_pitch = 0.0
+                pitch_std = 0.0
 
             # Mean RMS energy
             rms = librosa.feature.rms(y=chunk, frame_length=2048, hop_length=512)[0]
             mean_energy = float(np.mean(rms)) if len(rms) > 0 else 0.0
 
-            features.append([mean_pitch, mean_energy])
+            # Spectral centroid
+            try:
+                sc = librosa.feature.spectral_centroid(y=chunk, sr=sr)[0]
+                spectral_centroid = float(np.mean(sc)) if len(sc) > 0 else 0.0
+            except Exception:
+                spectral_centroid = 0.0
+
+            # Zero crossing rate
+            try:
+                zcr = librosa.feature.zero_crossing_rate(chunk)[0]
+                zero_crossing = float(np.mean(zcr)) if len(zcr) > 0 else 0.0
+            except Exception:
+                zero_crossing = 0.0
+
+            features.append([mean_pitch, mean_energy, spectral_centroid, zero_crossing, pitch_std])
             valid_mask.append(mean_pitch > 0)
 
         features_arr = np.array(features, dtype=np.float64)
@@ -434,18 +549,37 @@ class Transcriber:
         )
         labels = kmeans.fit_predict(features_arr)
 
-        # ── Cluster balance check: if one speaker gets >70% of segments,
-        # the clustering failed to separate speakers. Fall back to gap+pitch. ──
+        # ── Temporal smoothing: reassign truly isolated micro-fragments.
+        # Only smooth if the segment is very short (<1.5s) AND gaps to both
+        # neighbours are very small (<200ms). This catches Whisper artefacts
+        # without destroying real A-B-A-B speaker alternation. ──
+        labels = labels.tolist()
+        for i in range(1, len(labels) - 1):
+            prev_label = labels[i - 1]
+            next_label = labels[i + 1]
+            if prev_label == next_label and labels[i] != prev_label:
+                seg_duration_ms = segments[i]["end_ms"] - segments[i]["start_ms"]
+                gap_before = segments[i]["start_ms"] - segments[i - 1]["end_ms"]
+                gap_after = segments[i + 1]["start_ms"] - segments[i]["end_ms"]
+                if seg_duration_ms < 1500 and gap_before < 200 and gap_after < 200:
+                    labels[i] = prev_label
+        labels = np.array(labels)
+
+        # ── Cluster balance check: adaptive threshold based on speaker count.
+        # For N speakers, dominant speaker should not exceed (1/N + 0.40).
+        # e.g. 2 speakers: max 90%, 3 speakers: max 73%, 4 speakers: max 65%
         from collections import Counter
         counts = Counter(labels.tolist())
         total = len(labels)
         max_pct = max(counts.values()) / total if total > 0 else 1.0
-        if max_pct > 0.70:
+        max_allowed_pct = (1.0 / num_speakers) + 0.40
+        if max_pct > max_allowed_pct:
             logger.warning(
                 f"KMeans produced imbalanced split: {dict(counts)} "
-                f"({max_pct:.0%} in one cluster). Falling to gap+pitch."
+                f"({max_pct:.0%} in one cluster, limit={max_allowed_pct:.0%}). "
+                f"Falling to gap+pitch."
             )
-            return None  # Will trigger gap+pitch fallback in _diarize_simple
+            return None
 
         # Assign speaker labels; order clusters by mean pitch (lower pitch = Speaker_0)
         cluster_pitches = {}
@@ -469,6 +603,7 @@ class Transcriber:
             spk = seg["speaker"]
             speaker_counts[spk] = speaker_counts.get(spk, 0) + 1
 
+        self._last_diarization_backend = "kmeans"
         logger.info(
             f"Acoustic KMeans diarization complete: "
             f"{len(speaker_counts)} speakers — "
@@ -552,6 +687,7 @@ class Transcriber:
         from collections import Counter
         counts = Counter(seg["speaker"] for seg in segments)
         pitched = sum(1 for p in seg_pitches if p is not None)
+        self._last_diarization_backend = "gap_pitch"
         logger.info(
             f"Gap+pitch diarization: {dict(counts)} "
             f"({len(segments)} segments, {pitched} with pitch data)"
@@ -565,21 +701,18 @@ class Transcriber:
         max_speakers: int,
     ) -> list[dict]:
         """
-        Multi-speaker heuristic diarization (3-10 speakers).
+        Last-resort multi-speaker heuristic diarization (3-10 speakers).
 
-        Uses segment duration, gap patterns, and word characteristics
-        to cluster segments into speaker groups. This is a rough
-        heuristic — for accurate multi-speaker, use pyannote.
+        Only called when acoustic KMeans has already failed (insufficient
+        features or imbalanced clusters). Uses gap + duration heuristics.
 
         Strategy:
         1. Detect turn changes via gaps (> 1s gap = new turn)
         2. Group consecutive same-speaker segments into turns
         3. Cluster turns by duration pattern and assign speakers
            round-robin up to max_speakers
-        4. Merge adjacent turns from the same speaker
         """
         TURN_GAP_MS = 1000
-        SHORT_GAP_MS = 300  # Short gaps within same speaker
 
         # Step 1: Detect turn boundaries
         turn_boundaries = [0]  # First segment always starts a turn
@@ -653,6 +786,7 @@ class Transcriber:
                 prev_duration = turn["total_duration_ms"]
 
         detected = len(set(seg.get("speaker", "") for seg in segments))
+        self._last_diarization_backend = "heuristic_multi"
         logger.info(
             f"Multi-speaker simple diarization: {detected} speakers detected "
             f"(max={max_speakers}, {len(turns)} turns)"
@@ -678,17 +812,32 @@ class Transcriber:
                 if not hasattr(_ta, "set_audio_backend"):
                     _ta.set_audio_backend = lambda backend: None
                 from pyannote.audio import Pipeline
+                from huggingface_hub import login
+                import huggingface_hub as _hf_hub
 
                 hf_token = os.getenv("HF_TOKEN", "")
                 if not hf_token:
                     logger.warning("HF_TOKEN not set, falling back to simple diarization")
-                    return self._diarize_simple(segments)
+                    return self._diarize_simple(segments, self._num_speakers, audio_path)
+
+                # Store token in HF cache so hf_hub finds it automatically
+                login(token=hf_token, add_to_git_credential=False)
+
+                # Monkey-patch hf_hub_download to strip the deprecated
+                # use_auth_token kwarg that pyannote 3.x passes unconditionally
+                _orig = _hf_hub.hf_hub_download
+                def _patched(*args, **kwargs):
+                    kwargs.pop("use_auth_token", None)
+                    return _orig(*args, **kwargs)
+                _hf_hub.hf_hub_download = _patched
 
                 logger.info("Loading pyannote diarization pipeline...")
-                self._diarization_pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1",
-                    token=hf_token,
-                )
+                try:
+                    self._diarization_pipeline = Pipeline.from_pretrained(
+                        "pyannote/speaker-diarization-3.1",
+                    )
+                finally:
+                    _hf_hub.hf_hub_download = _orig  # Always restore original
                 logger.info("Pyannote pipeline loaded.")
 
             if torch.cuda.is_available():
@@ -724,6 +873,7 @@ class Transcriber:
                 seg["speaker"] = best_speaker
 
             speakers = set(seg["speaker"] for seg in segments)
+            self._last_diarization_backend = "pyannote"
             logger.info(f"Pyannote diarization: {len(speakers)} speakers detected")
 
             return segments

@@ -204,7 +204,7 @@ class TestPower01:
         assert result is not None
 
     def test_too_short_skipped(self):
-        """Utterances under 5 words return None."""
+        """Utterances under 8 words return None."""
         f = make_features("Sure.", word_count=1, power_score=0.9, powerless_count=0)
         result = self.engine._rule_power_01(f)
         assert result is None

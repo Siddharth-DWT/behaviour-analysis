@@ -383,10 +383,30 @@ class LanguageRuleEngine:
         """
         Score powerfulness of speech based on Lakoff/O'Barr features.
         Only fires on utterances with enough words to be meaningful.
+        Skips greetings, questions, introductions, and single-word responses.
         """
         word_count = f.get("power_word_count", 0)
-        if word_count < 5:
-            return None  # Too short to assess
+        if word_count < 8:
+            return None  # Too short to assess meaningfully
+
+        text = f.get("text", "").strip()
+        text_lower = text.lower()
+
+        # Skip short questions — power scoring doesn't apply to "Have you worked in education?"
+        if text.rstrip().endswith("?") and word_count < 12:
+            return None
+
+        # Skip greetings and single-word acknowledgements
+        first_word = text_lower.split()[0] if text_lower else ""
+        if first_word in {"hello", "hi", "hey", "yes", "sure", "thank", "thanks", "okay", "bye"}:
+            if word_count < 12:
+                return None
+
+        # Skip introductions ("this is X from Y", "calling you from")
+        if ("calling" in text_lower and "from" in text_lower) or \
+           ("this is" in text_lower and "from" in text_lower) or \
+           "my name is" in text_lower:
+            return None
 
         score = f.get("power_score", 0.5)
         powerless_count = f.get("powerless_feature_count", 0)

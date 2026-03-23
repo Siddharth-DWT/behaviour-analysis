@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -26,6 +27,12 @@ import TranscriptBlock from "../components/TranscriptBlock";
 import StressTimeline from "../components/StressTimeline";
 import AlertCard from "../components/AlertCard";
 import SignalExplorer from "../components/SignalExplorer";
+import TopicTimeline from "../components/TopicTimeline";
+import SignalChainCards from "../components/SignalChainCards";
+import SpeakerGraph from "../components/SpeakerGraph";
+import InsightPanel from "../components/InsightPanel";
+import ConversationGraph from "../components/ConversationGraph";
+import GraphInsightsCard from "../components/GraphInsightsCard";
 
 // ── Helpers ──
 
@@ -118,7 +125,8 @@ function computeSpeakerStats(signals: Signal[]): SpeakerStats[] {
   const speakerMap = new Map<string, Signal[]>();
 
   for (const s of signals) {
-    const label = s.speaker_label || "Unknown";
+    if (!s.speaker_label) continue;  // Skip signals without speaker attribution
+    const label = s.speaker_label;
     if (!speakerMap.has(label)) speakerMap.set(label, []);
     speakerMap.get(label)!.push(s);
   }
@@ -336,8 +344,12 @@ const FUSION_VALUE_LABELS: Record<string, string> = {
 
 // ── Main Component ──
 
+type TabKey = "transcript" | "insights" | "report";
+
 export default function SessionDetail() {
   const { id } = useParams<{ id: string }>();
+  const [activeTab, setActiveTab] = useState<TabKey>("transcript");
+  const [showConvoGraph, setShowConvoGraph] = useState(false);
 
   const { data: detail, isLoading: loadingDetail } = useQuery({
     queryKey: ["session", id],
@@ -481,28 +493,29 @@ export default function SessionDetail() {
         </div>
       </div>
 
-      {/* 2. EXECUTIVE SUMMARY */}
-      {content?.executive_summary ? (
-        <section className="rounded-lg border border-accent-purple-30 bg-nexus-surface p-5">
-          <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-nexus-accent-purple">
-            <Sparkles className="h-4 w-4" />
-            Executive Summary
-          </h2>
-          <p className="text-sm leading-relaxed text-nexus-text-primary">
-            {content.executive_summary}
-          </p>
-        </section>
-      ) : report?.narrative ? (
-        <section className="rounded-lg border border-accent-purple-30 bg-nexus-surface p-5">
-          <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-nexus-accent-purple">
-            <Sparkles className="h-4 w-4" />
-            Executive Summary
-          </h2>
-          <p className="text-sm leading-relaxed text-nexus-text-primary">
-            {report.narrative}
-          </p>
-        </section>
-      ) : null}
+      {/* TAB BAR */}
+      <div className="flex gap-1 rounded-lg bg-nexus-surface p-1 border border-nexus-border">
+        {([
+          { key: "transcript" as TabKey, label: "Transcript", icon: "📝" },
+          { key: "insights" as TabKey, label: "Insights", icon: "💡" },
+          { key: "report" as TabKey, label: "Report", icon: "📊" },
+        ]).map((tab) => (
+          <button
+            key={tab.key}
+            onClick={() => setActiveTab(tab.key)}
+            className={`flex-1 rounded-md px-3 py-2 text-xs font-medium transition-colors ${
+              activeTab === tab.key
+                ? "bg-nexus-surface-hover text-nexus-text-primary shadow-sm"
+                : "text-nexus-text-muted hover:text-nexus-text-secondary"
+            }`}
+          >
+            {tab.icon} {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {/* ═══ TRANSCRIPT TAB ═══ */}
+      {activeTab === "transcript" && (<>
 
       {/* 3. CALL OUTCOME (sales_call only) */}
       {session.meeting_type === "sales_call" && speakerStats.length > 0 && (
@@ -736,86 +749,192 @@ export default function SessionDetail() {
         )}
       </div>
 
-      {/* 7. KEY MOMENTS */}
-      {content?.key_moments && content.key_moments.length > 0 && (
-        <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
-          <h2 className="mb-4 flex items-center gap-2 text-sm font-semibold text-nexus-text-primary">
-            <Target className="h-4 w-4 text-nexus-accent-blue" />
-            Key Moments
-          </h2>
-          <div className="space-y-4">
-            {content.key_moments.map((moment, i) => (
-              <div
-                key={i}
-                className="border-l-2 border-accent-blue-40 pl-3"
-              >
-                <div className="flex items-center gap-2 text-xs">
-                  <span className="flex h-5 w-5 items-center justify-center rounded-full bg-accent-blue-15 font-mono text-[10px] font-bold text-nexus-accent-blue">
-                    {i + 1}
-                  </span>
-                  {moment.time_description && (
-                    <span className="font-mono text-nexus-text-muted">
-                      {moment.time_description}
-                    </span>
-                  )}
+      </>)}
+
+      {/* ═══ INSIGHTS TAB ═══ */}
+      {activeTab === "insights" && (
+        <div className="space-y-6">
+          {content?.entities?.topics || content?.key_paths ? (
+            <>
+              {/* Topic Timeline (full width) */}
+              {content?.entities?.topics && content.entities.topics.length > 0 && (
+                <TopicTimeline
+                  topics={content.entities.topics}
+                  signals={signals}
+                  durationMs={session.duration_ms || 0}
+                />
+              )}
+
+              {/* SpeakerGraph + InsightPanel (two-column) */}
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
+                <div className="lg:col-span-2">
+                  <SpeakerGraph
+                    speakers={speakerStats.map((s) => ({
+                      ...s,
+                      talkTimePct: 100 / speakerStats.length,
+                    }))}
+                    contentType={session.meeting_type}
+                    entities={content?.entities || {}}
+                    signals={signals}
+                    speakerRoles={speakerRoles}
+                  />
                 </div>
-                <p className="mt-1 text-sm text-nexus-text-primary">
-                  {moment.description}
-                </p>
-                {moment.significance && (
-                  <p className="mt-0.5 text-xs text-nexus-text-secondary italic">
-                    {moment.significance}
-                  </p>
-                )}
+                <div className="lg:col-span-3">
+                  <InsightPanel
+                    contentType={session.meeting_type}
+                    entities={content?.entities || {}}
+                    signals={signals}
+                    speakers={speakerStats.map((s) => ({
+                      ...s,
+                      role: speakerRoles[s.label],
+                      talkTimePct: 100 / speakerStats.length,
+                    }))}
+                    speakerRoles={speakerRoles}
+                  />
+                </div>
               </div>
-            ))}
-          </div>
-        </section>
+
+              {/* Signal Chain Cards (full width) */}
+              {content?.key_paths && content.key_paths.length > 0 && (
+                <SignalChainCards keyPaths={content.key_paths} />
+              )}
+
+              {/* Graph Insights */}
+              {content?.graph_analytics && (
+                <GraphInsightsCard
+                  analytics={content.graph_analytics as Record<string, unknown>}
+                  speakerRoles={speakerRoles}
+                />
+              )}
+
+              {/* Conversation Graph toggle */}
+              {!showConvoGraph ? (
+                <button
+                  onClick={() => setShowConvoGraph(true)}
+                  className="w-full rounded-lg border border-dashed border-nexus-border bg-nexus-surface px-4 py-3 text-sm text-nexus-text-secondary hover:bg-nexus-surface-hover hover:text-nexus-text-primary transition-colors"
+                >
+                  🔗 Open Conversation Graph
+                </button>
+              ) : (
+                <ConversationGraph
+                  segments={segments}
+                  signals={signals}
+                  entities={content?.entities || {}}
+                  speakerRoles={speakerRoles}
+                  durationMs={session.duration_ms || 0}
+                  onClose={() => setShowConvoGraph(false)}
+                />
+              )}
+            </>
+          ) : (
+            <div className="flex h-48 items-center justify-center rounded-lg border border-nexus-border bg-nexus-surface text-sm text-nexus-text-muted">
+              Insights not available for this session. Re-analyse to generate.
+            </div>
+          )}
+        </div>
       )}
 
-      {/* 8. CROSS-MODAL INSIGHTS */}
-      <section className="rounded-lg border-l-[3px] border-nexus-accent-purple bg-nexus-surface p-5">
-        <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-nexus-accent-purple">
-          <Lightbulb className="h-4 w-4" />
-          Cross-Modal Insights
-        </h2>
-        {content?.cross_modal_insights && content.cross_modal_insights.length > 0 ? (
-          <ul className="space-y-2">
-            {content.cross_modal_insights.map((insight, i) => (
-              <li
-                key={i}
-                className="flex items-start gap-2 text-sm text-nexus-text-primary"
-              >
-                <span className="mt-1 text-nexus-accent-purple font-bold">→</span>
-                {insight}
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="text-sm text-nexus-text-muted italic">
-            Insufficient cross-modal data for insights in this session.
-          </p>
-        )}
-      </section>
+      {/* ═══ REPORT TAB ═══ */}
+      {activeTab === "report" && (
+        <div className="space-y-6">
+          {/* Executive Summary */}
+          {content?.executive_summary ? (
+            <section className="rounded-lg border border-accent-purple-30 bg-nexus-surface p-5">
+              <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-nexus-accent-purple">
+                <Sparkles className="h-4 w-4" />
+                Executive Summary
+              </h2>
+              <p className="text-sm leading-relaxed text-nexus-text-primary">
+                {content.executive_summary}
+              </p>
+            </section>
+          ) : report?.narrative ? (
+            <section className="rounded-lg border border-accent-purple-30 bg-nexus-surface p-5">
+              <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-nexus-accent-purple">
+                <Sparkles className="h-4 w-4" />
+                Executive Summary
+              </h2>
+              <p className="text-sm leading-relaxed text-nexus-text-primary">
+                {report.narrative}
+              </p>
+            </section>
+          ) : null}
 
-      {/* 9. COACHING RECOMMENDATIONS */}
-      {content?.recommendations && content.recommendations.length > 0 && (
-        <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
-          <h2 className="mb-3 text-sm font-semibold text-nexus-text-primary">
-            Coaching Recommendations
-          </h2>
-          <ul className="space-y-2">
-            {content.recommendations.map((rec, i) => (
-              <li
-                key={i}
-                className="flex items-start gap-2 text-sm text-nexus-text-primary"
-              >
-                <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-nexus-stress-low" />
-                {rec}
-              </li>
-            ))}
-          </ul>
-        </section>
+          {/* Key Moments */}
+          {content?.key_moments && content.key_moments.length > 0 && (
+            <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
+              <h2 className="mb-4 flex items-center gap-2 text-sm font-semibold text-nexus-text-primary">
+                <Target className="h-4 w-4 text-nexus-accent-blue" />
+                Key Moments
+              </h2>
+              <div className="space-y-4">
+                {content.key_moments.map((moment, i) => (
+                  <div key={i} className="border-l-2 border-accent-blue-40 pl-3">
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="flex h-5 w-5 items-center justify-center rounded-full bg-accent-blue-15 font-mono text-[10px] font-bold text-nexus-accent-blue">
+                        {i + 1}
+                      </span>
+                      {moment.time_description && (
+                        <span className="font-mono text-nexus-text-muted">
+                          {moment.time_description}
+                        </span>
+                      )}
+                    </div>
+                    <p className="mt-1 text-sm text-nexus-text-primary">{moment.description}</p>
+                    {moment.significance && (
+                      <p className="mt-0.5 text-xs text-nexus-text-secondary italic">{moment.significance}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* Cross-Modal Insights */}
+          <section className="rounded-lg border-l-[3px] border-nexus-accent-purple bg-nexus-surface p-5">
+            <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-nexus-accent-purple">
+              <Lightbulb className="h-4 w-4" />
+              Cross-Modal Insights
+            </h2>
+            {content?.cross_modal_insights && content.cross_modal_insights.length > 0 ? (
+              <ul className="space-y-2">
+                {content.cross_modal_insights.map((insight, i) => (
+                  <li key={i} className="flex items-start gap-2 text-sm text-nexus-text-primary">
+                    <span className="mt-1 text-nexus-accent-purple font-bold">→</span>
+                    {insight}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-sm text-nexus-text-muted italic">
+                Insufficient cross-modal data for insights in this session.
+              </p>
+            )}
+          </section>
+
+          {/* Coaching Recommendations */}
+          {content?.recommendations && content.recommendations.length > 0 && (
+            <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
+              <h2 className="mb-3 text-sm font-semibold text-nexus-text-primary">
+                Coaching Recommendations
+              </h2>
+              <ul className="space-y-2">
+                {content.recommendations.map((rec, i) => (
+                  <li key={i} className="flex items-start gap-2 text-sm text-nexus-text-primary">
+                    <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-nexus-stress-low" />
+                    {rec}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {!content?.executive_summary && !report?.narrative && (
+            <div className="flex h-48 items-center justify-center rounded-lg border border-nexus-border bg-nexus-surface text-sm text-nexus-text-muted">
+              No report available for this session.
+            </div>
+          )}
+        </div>
       )}
     </div>
   );

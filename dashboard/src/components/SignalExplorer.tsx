@@ -157,6 +157,33 @@ const SIGNAL_TYPE_META: Record<string, SignalTypeMeta> = {
     category: "fusion",
     interpret: (s) => ({ label: s.value_text?.replace(/_/g, " ") || "Mismatch detected", severity: "med" }),
   },
+  tension_cluster: {
+    label: "Tension Cluster",
+    description: "Multiple negative signals concentrated in a short time window",
+    category: "fusion",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt.includes("high")) return { label: "High tension cluster", severity: "high" };
+      return { label: "Moderate tension cluster", severity: "med" };
+    },
+  },
+  momentum_shift: {
+    label: "Momentum Shift",
+    description: "Detected shift in conversation trajectory (positive or negative)",
+    category: "fusion",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt.includes("positive")) return { label: "Positive momentum shift", severity: "low" };
+      if (txt.includes("negative")) return { label: "Negative momentum shift", severity: "high" };
+      return { label: "Momentum change detected", severity: "med" };
+    },
+  },
+  persistent_incongruence: {
+    label: "Persistent Incongruence",
+    description: "Speaker shows sustained mismatch between verbal and vocal signals across multiple time windows",
+    category: "fusion",
+    interpret: (s) => ({ label: "Persistent incongruence pattern", severity: "high" }),
+  },
 };
 
 // ── Helpers ──

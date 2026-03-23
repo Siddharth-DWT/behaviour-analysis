@@ -18,6 +18,12 @@ Architecture reference: docs/ARCHITECTURE.md — Fusion Temporal Alignment
 import json
 import time
 import logging
+
+try:
+    from shared.utils.conversions import to_float as _to_float, to_int as _to_int
+    _SHARED_CONVERSIONS = True
+except ImportError:
+    _SHARED_CONVERSIONS = False
 from collections import defaultdict
 from typing import Optional
 from dataclasses import asdict
@@ -82,8 +88,14 @@ class SignalBuffer:
         Returns:
             List of matching signals, oldest first
         """
-        if reference_time_ms is None:
-            reference_time_ms = int(time.time() * 1000)
+        if reference_time_ms is None or reference_time_ms == 0:
+            # Use latest signal timestamp, not wall clock
+            latest = 0
+            for s in self._buffer[speaker_id].get(agent, []):
+                end = _to_int(s.get("window_end_ms", 0))
+                if end > latest:
+                    latest = end
+            reference_time_ms = latest if latest > 0 else 0
 
         cutoff = reference_time_ms - window_ms
         results = []
@@ -105,8 +117,14 @@ class SignalBuffer:
         reference_time_ms: int = None,
     ) -> dict[str, list[dict]]:
         """Get all signals for a speaker within window, grouped by agent."""
-        if reference_time_ms is None:
-            reference_time_ms = int(time.time() * 1000)
+        if reference_time_ms is None or reference_time_ms == 0:
+            latest = 0
+            for _agent, sigs in self._buffer[speaker_id].items():
+                for s in sigs:
+                    end = _to_int(s.get("window_end_ms", 0))
+                    if end > latest:
+                        latest = end
+            reference_time_ms = latest if latest > 0 else 0
 
         cutoff = reference_time_ms - window_ms
         result = {}
@@ -285,21 +303,19 @@ def compute_unified_state(
     return state
 
 
-def _to_float(v) -> float:
-    """Safely convert a value (possibly string from Redis) to float."""
-    if v is None or v == "":
-        return 0.0
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return 0.0
+if not _SHARED_CONVERSIONS:
+    def _to_float(v) -> float:
+        if v is None or v == "":
+            return 0.0
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return 0.0
 
-
-def _to_int(v) -> int:
-    """Safely convert a value (possibly string from Redis) to int."""
-    if v is None or v == "":
-        return 0
-    try:
-        return int(float(v))
-    except (ValueError, TypeError):
-        return 0
+    def _to_int(v) -> int:
+        if v is None or v == "":
+            return 0
+        try:
+            return int(float(v))
+        except (ValueError, TypeError):
+            return 0

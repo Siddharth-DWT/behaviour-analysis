@@ -25,25 +25,26 @@ Confidence caps from RULES.md:
 import logging
 from typing import Optional
 
+try:
+    from shared.utils.conversions import to_float as _to_float, to_int as _to_int
+except ImportError:
+    def _to_float(v) -> float:
+        if v is None or v == "":
+            return 0.0
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return 0.0
+
+    def _to_int(v) -> int:
+        if v is None or v == "":
+            return 0
+        try:
+            return int(float(v))
+        except (ValueError, TypeError):
+            return 0
+
 logger = logging.getLogger("nexus.fusion.rules")
-
-
-def _to_float(v) -> float:
-    if v is None or v == "":
-        return 0.0
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return 0.0
-
-
-def _to_int(v) -> int:
-    if v is None or v == "":
-        return 0
-    try:
-        return int(float(v))
-    except (ValueError, TypeError):
-        return 0
 
 
 class FusionRuleEngine:
@@ -530,3 +531,67 @@ class FusionRuleEngine:
             "confidence": raw_confidence,
             "evidence": evidence,
         }
+
+    # ════════════════════════════════════════════════════════
+    # GRAPH-BASED FUSION RULES
+    # ════════════════════════════════════════════════════════
+
+    def evaluate_graph_insights(
+        self,
+        graph_insights: dict,
+        speakers: list[str],
+        existing_fusion_signals: list[dict],
+    ) -> list[dict]:
+        """Generate fusion signals from graph analytics."""
+        signals = []
+
+        # FUSION-GRAPH-01: Tension Cluster Detection
+        for cluster in graph_insights.get("tension_clusters", []):
+            if cluster["signal_count"] >= 3:
+                conf = min(0.50 + (cluster["signal_count"] - 3) * 0.05, 0.75)
+                signals.append({
+                    "agent": "fusion",
+                    "speaker_id": cluster["speaker_id"],
+                    "signal_type": "tension_cluster",
+                    "value": round(cluster["signal_count"] / 10.0, 3),
+                    "value_text": "high_tension" if cluster["signal_count"] >= 5 else "moderate_tension",
+                    "confidence": round(conf, 3),
+                    "window_start_ms": cluster["timestamp_ms"],
+                    "window_end_ms": cluster["timestamp_ms"] + cluster["duration_ms"],
+                    "metadata": cluster,
+                })
+
+        # FUSION-GRAPH-02: Momentum Shift Detection
+        momentum = graph_insights.get("momentum", {})
+        if (
+            momentum.get("turning_point_ms")
+            and momentum.get("overall_trajectory") in ("positive", "negative")
+        ):
+            signals.append({
+                "agent": "fusion",
+                "speaker_id": "all",
+                "signal_type": "momentum_shift",
+                "value": momentum.get("momentum_score", 0),
+                "value_text": f"{momentum['overall_trajectory']}_trajectory",
+                "confidence": 0.55,
+                "window_start_ms": momentum["turning_point_ms"],
+                "window_end_ms": momentum["turning_point_ms"],
+                "metadata": momentum,
+            })
+
+        # FUSION-GRAPH-03: Persistent Incongruence
+        for speaker_id, pattern in graph_insights.get("incongruence_patterns", {}).items():
+            if pattern.get("consistency") == "persistent":
+                signals.append({
+                    "agent": "fusion",
+                    "speaker_id": speaker_id,
+                    "signal_type": "persistent_incongruence",
+                    "value": round(pattern["total_contradicts_edges"] / 10.0, 3),
+                    "value_text": "persistent_incongruence",
+                    "confidence": 0.60,
+                    "window_start_ms": pattern.get("worst_incongruence_ms", 0),
+                    "window_end_ms": pattern.get("worst_incongruence_ms", 0),
+                    "metadata": pattern,
+                })
+
+        return signals

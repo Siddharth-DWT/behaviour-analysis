@@ -51,6 +51,8 @@ def generate_session_narrative(
     fusion_signals: list[dict],
     unified_states: list[dict],
     meeting_type: str = "sales_call",
+    entities: Optional[dict] = None,
+    graph_analytics: Optional[dict] = None,
 ) -> Optional[dict]:
     """
     Generate a structured narrative report for the session using the LLM.
@@ -75,16 +77,19 @@ def generate_session_narrative(
             "raw_response": str
         }
     """
+    entities = entities or {}
+    graph_analytics = graph_analytics or {}
     llm_complete = _get_llm_complete()
     if llm_complete is None:
         return _fallback_narrative(
-            speakers, voice_summary, language_summary, fusion_signals
+            speakers, voice_summary, language_summary, fusion_signals, entities
         )
 
     # ── Build the structured context for the LLM ──
     context = _build_context(
         session_id, duration_seconds, speakers,
         voice_summary, language_summary, fusion_signals, unified_states,
+        entities, graph_analytics,
     )
 
     system_prompt, user_prompt = _build_prompt(context, meeting_type)
@@ -104,7 +109,7 @@ def generate_session_narrative(
     except Exception as e:
         logger.warning(f"LLM narrative generation failed: {e}")
         return _fallback_narrative(
-            speakers, voice_summary, language_summary, fusion_signals
+            speakers, voice_summary, language_summary, fusion_signals, entities
         )
 
 
@@ -116,6 +121,8 @@ def _build_context(
     language_summary: dict,
     fusion_signals: list[dict],
     unified_states: list[dict],
+    entities: Optional[dict] = None,
+    graph_analytics: Optional[dict] = None,
 ) -> str:
     """Build a structured text context block for the LLM."""
     lines = []
@@ -211,6 +218,97 @@ def _build_context(
             alerts = state.get("active_alerts", [])
             if alerts:
                 lines.append(f"  Active alerts: {json.dumps(alerts)}")
+
+    # Entities (from Language Agent entity extraction)
+    if entities:
+        lines.append("\n=== EXTRACTED ENTITIES ===")
+
+        people = entities.get("people", [])
+        if people:
+            lines.append("PEOPLE:")
+            for p in people:
+                role = p.get("role", "unknown")
+                label = p.get("speaker_label", "")
+                lines.append(f"  {p.get('name', '?')} — role: {role}, speaker: {label}")
+
+        topics = entities.get("topics", [])
+        if topics:
+            lines.append("CONVERSATION PHASES:")
+            for t in topics:
+                s = t.get("start_ms", 0) // 1000
+                e = t.get("end_ms", 0) // 1000
+                lines.append(f"  {s}s-{e}s: {t.get('name', '?')}")
+
+        objections = entities.get("objections", [])
+        if objections:
+            lines.append("OBJECTIONS:")
+            for o in objections:
+                ts = o.get("timestamp_ms", 0) // 1000
+                status = "RESOLVED" if o.get("resolved") else "UNRESOLVED"
+                lines.append(f'  [{ts}s] "{o.get("text", "")}" — {status}')
+
+        commitments = entities.get("commitments", [])
+        if commitments:
+            lines.append("COMMITMENTS:")
+            for c in commitments:
+                ts = c.get("timestamp_ms", 0) // 1000
+                lines.append(f'  [{ts}s] {c.get("speaker", "?")}: "{c.get("text", "")}"')
+
+        key_terms = entities.get("key_terms", [])
+        if key_terms:
+            lines.append(f"KEY TERMS: {', '.join(key_terms)}")
+
+    # Graph analytics
+    if graph_analytics:
+        lines.append("\n=== GRAPH ANALYTICS ===")
+
+        clusters = graph_analytics.get("tension_clusters", [])
+        if clusters:
+            lines.append(f"\nTENSION CLUSTERS ({len(clusters)} detected):")
+            for c in clusters[:5]:
+                lines.append(
+                    f"  {c['timestamp_ms']//1000}s — {c['signal_count']} signals, "
+                    f"severity={c['severity']}, speaker={c['speaker_id']}"
+                )
+
+        topics_density = graph_analytics.get("topic_signal_density", [])
+        if topics_density:
+            lines.append("\nTOPIC ANALYSIS:")
+            for t in topics_density:
+                lines.append(
+                    f"  {t['topic_name']}: risk={t['risk_level']}, "
+                    f"opportunity={t['opportunity_level']}, "
+                    f"{t['total_signals']} signals"
+                )
+
+        momentum = graph_analytics.get("momentum", {})
+        if momentum:
+            lines.append(
+                f"\nMOMENTUM: trajectory={momentum.get('overall_trajectory')}, "
+                f"score={momentum.get('momentum_score', 0):.2f}"
+            )
+            if momentum.get("turning_point_ms"):
+                lines.append(f"  Turning point at {momentum['turning_point_ms']//1000}s")
+
+        patterns = graph_analytics.get("speaker_patterns", {})
+        if patterns:
+            lines.append("\nSPEAKER PATTERNS:")
+            for sid, p in patterns.items():
+                lines.append(
+                    f"  {sid}: {p.get('response_pattern', 'unknown')} pattern, "
+                    f"escalation={p.get('escalation_trend', 'stable')}, "
+                    f"contradiction_ratio={p.get('contradiction_ratio', 0):.1%}"
+                )
+
+        resolutions = graph_analytics.get("resolution_paths", [])
+        if resolutions:
+            lines.append("\nOBJECTION RESOLUTION PATHS:")
+            for r in resolutions:
+                lines.append(
+                    f"  Objection at {r['objection_ms']//1000}s → resolved at "
+                    f"{r['resolution_ms']//1000}s "
+                    f"({r['time_to_resolve_ms']//1000}s to resolve)"
+                )
 
     return "\n".join(lines)
 
@@ -356,12 +454,21 @@ def _fallback_narrative(
     voice_summary: dict,
     language_summary: dict,
     fusion_signals: list[dict],
+    entities: Optional[dict] = None,
 ) -> dict:
     """
     Generate a basic narrative without LLM API.
     Used when API key is not configured or API call fails.
     """
+    entities = entities or {}
     insights = []
+
+    # Entity-based insights (richer than signal counts)
+    for obj in entities.get("objections", []):
+        status = "resolved" if obj.get("resolved") else "unresolved"
+        insights.append(f'Objection ({status}): "{obj.get("text", "")}"')
+    for com in entities.get("commitments", []):
+        insights.append(f'{com.get("speaker", "?")}: "{com.get("text", "")}"')
 
     # Extract basic insights from summaries
     for speaker_id, data in language_summary.get("per_speaker", {}).items():
@@ -369,7 +476,7 @@ def _fallback_narrative(
             insights.append(
                 f"{speaker_id} showed {data['buying_signal_count']} buying signal(s)"
             )
-        if data.get("objection_count", 0) > 0:
+        if data.get("objection_count", 0) > 0 and not entities.get("objections"):
             insights.append(
                 f"{speaker_id} raised {data['objection_count']} objection(s)"
             )

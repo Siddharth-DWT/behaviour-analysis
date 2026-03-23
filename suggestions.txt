@@ -1,0 +1,54 @@
+1. The "Think → Act → Observe → Write" Loop
+
+  MiroFish's report agent doesn't just write a report all at once. It thinks about
+  what it needs, goes and fetches that specific piece of information, reads it,
+  then thinks again before writing the next part.
+
+  For NEXUS: Your post-call report should work the same way. Instead of dumping
+  all signals into one big summary, the system should think "what was the most
+  important moment in this call?", go look at the data for that moment, 
+  understand it, then write about it — one insight at a time. This makes the 
+  report feel like a human analyst wrote it, not a data export.
+
+
+2. We are now checking the baseline in first 3 minute of the recording but 
+   what if any participant start to speak after 3-4 minute? are we checking each
+   person separately?
+
+
+3.  Memory That Grows Over Time
+
+    MiroFish uses a knowledge graph that remembers not just facts but 
+    relationships — and those relationships update as the simulation runs. 
+    It remembers that Agent A mentioned Agent B in round 3, and that they fell 
+    out by round 7.
+
+    For NEXUS: Across multiple calls with the same prospect or client, NEXUS 
+    should remember patterns. "This person always shows stress when pricing 
+    comes up." "Rapport typically breaks down around the 20-minute mark with 
+    this client." That kind of memory turns NEXUS from a single-call analyser 
+    into a relationship intelligence tool.
+
+
+4.  Running Two Things at the Same Time
+
+    MiroFish runs two social media simulations in parallel — Twitter and Reddit 
+    simultaneously — using two separate API keys so neither one slows the other 
+    down.
+    For NEXUS: Your heaviest tasks during a live call — generating narrative 
+    insights every 30 seconds AND responding to urgent alerts instantly — 
+    should run separately, not in a queue. If a buying signal fires at the 
+    exact moment the 30-second narrative is being generated, the alert 
+    shouldn't have to wait. Two separate lanes, two separate processes.
+
+5.  Writing Down Everything That Happened and Why
+
+    MiroFish keeps a detailed log of every single action every agent took — 
+    what they posted, when, why, in response to what. This means you can 
+    always trace back any finding in the report to the exact moment that 
+    caused it.
+    For NEXUS: Every alert, every insight, every signal that fires should be 
+    logged with the reason it fired. Not just "stress detected at 14:32" but 
+    "stress detected at 14:32 because pitch went up 18%, jitter went up, and 
+    fillers spiked — all within 3 seconds of the pricing question." If a 
+    client ever challenges a finding, you can show your work.
