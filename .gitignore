@@ -36,7 +36,6 @@ infrastructure/postgres/init/
 .DS_Store
 
 # Models (downloaded at runtime)
-models/
 *.pt
 *.bin
 *.onnx
