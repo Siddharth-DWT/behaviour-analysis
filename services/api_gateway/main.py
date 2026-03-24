@@ -5,13 +5,20 @@ the Voice → Language → Fusion pipeline, persists results to PostgreSQL,
 and serves session data to the React dashboard.
 
 Endpoints:
-  POST /sessions                → Upload audio, trigger full analysis pipeline
-  GET  /sessions                → List sessions (paginated)
-  GET  /sessions/{id}           → Session detail with signals + alerts
-  GET  /sessions/{id}/signals   → Signals for a session (filterable)
-  GET  /sessions/{id}/report    → Get or generate narrative report
-  GET  /sessions/{id}/transcript→ Get transcript segments
-  GET  /health                  → Health check
+  POST /auth/signup             → Register new user
+  POST /auth/login              → Authenticate user
+  POST /auth/refresh            → Refresh access token
+  POST /auth/logout             → Invalidate refresh token
+  GET  /auth/me                 → Current user profile
+  PUT  /auth/me                 → Update user profile
+  PUT  /auth/change-password    → Change password
+  POST /sessions                → Upload audio, trigger full analysis pipeline (auth)
+  GET  /sessions                → List sessions (auth, user-scoped)
+  GET  /sessions/{id}           → Session detail with signals + alerts (auth)
+  GET  /sessions/{id}/signals   → Signals for a session (auth)
+  GET  /sessions/{id}/report    → Get or generate narrative report (auth)
+  GET  /sessions/{id}/transcript→ Get transcript segments (auth)
+  GET  /health                  → Health check (public)
 """
 import os
 import sys
@@ -20,10 +27,12 @@ import time
 import json
 import logging
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import httpx
 
 # isort: split
@@ -43,6 +52,15 @@ try:
         insert_transcript_segments, get_transcript,
         DEV_ORG_ID,
     )
+    from auth import (
+        hash_password, verify_password,
+        validate_email, validate_password,
+        create_access_token, create_refresh_token_value,
+        verify_access_token,
+        get_current_user, require_role,
+        store_refresh_token, verify_and_consume_refresh_token,
+        delete_refresh_token, cleanup_expired_tokens,
+    )
 except ImportError:
     from services.api_gateway.database import (
         get_pool, close_pool,
@@ -52,6 +70,15 @@ except ImportError:
         save_report, get_report,
         insert_transcript_segments, get_transcript,
         DEV_ORG_ID,
+    )
+    from services.api_gateway.auth import (
+        hash_password, verify_password,
+        validate_email, validate_password,
+        create_access_token, create_refresh_token_value,
+        verify_access_token,
+        get_current_user, require_role,
+        store_refresh_token, verify_and_consume_refresh_token,
+        delete_refresh_token, cleanup_expired_tokens,
     )
 
 logging.basicConfig(level=logging.INFO)
@@ -135,6 +162,252 @@ async def health():
 
 
 # ─────────────────────────────────────────────────────────
+# AUTH — Request / Response models
+# ─────────────────────────────────────────────────────────
+
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+    full_name: str
+    company: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+class LogoutRequest(BaseModel):
+    refresh_token: str
+
+class UpdateProfileRequest(BaseModel):
+    full_name: Optional[str] = None
+    company: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+# ─────────────────────────────────────────────────────────
+# AUTH — Endpoints (public)
+# ─────────────────────────────────────────────────────────
+
+@app.post("/auth/signup")
+async def signup(body: SignupRequest):
+    """Register a new user account."""
+    email = validate_email(body.email)
+    validate_password(body.password)
+
+    pool = await get_pool()
+
+    # Check duplicate email
+    existing = await pool.fetchrow(
+        "SELECT id FROM users WHERE email = $1", email
+    )
+    if existing:
+        raise HTTPException(409, "Email already registered")
+
+    password_hash = hash_password(body.password)
+
+    row = await pool.fetchrow(
+        """
+        INSERT INTO users (org_id, email, name, full_name, password_hash, company, role)
+        VALUES ($1, $2, $3, $3, $4, $5, 'member')
+        RETURNING id, email, full_name, role, company, avatar_url, org_id, created_at
+        """,
+        DEV_ORG_ID, email, body.full_name, password_hash, body.company,
+    )
+
+    user_id = str(row["id"])
+    access_token = create_access_token(user_id, email, row["role"])
+    refresh_token, expires_at = create_refresh_token_value()
+    await store_refresh_token(user_id, refresh_token, expires_at)
+
+    return {
+        "user": {
+            "id": user_id,
+            "email": row["email"],
+            "full_name": row["full_name"],
+            "role": row["role"],
+            "company": row["company"],
+        },
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+    }
+
+
+@app.post("/auth/login")
+async def login(body: LoginRequest):
+    """Authenticate with email and password."""
+    email = body.email.strip().lower()
+
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        SELECT id, email, full_name, role, company, avatar_url, org_id,
+               password_hash, is_active, created_at, last_login_at
+        FROM users WHERE email = $1
+        """,
+        email,
+    )
+
+    if not row or not row["password_hash"]:
+        raise HTTPException(401, "Invalid email or password")
+
+    if not row["is_active"]:
+        raise HTTPException(403, "Account is deactivated")
+
+    if not verify_password(body.password, row["password_hash"]):
+        raise HTTPException(401, "Invalid email or password")
+
+    user_id = str(row["id"])
+
+    # Update last_login_at
+    await pool.execute(
+        "UPDATE users SET last_login_at = $1 WHERE id = $2",
+        datetime.now(timezone.utc), row["id"],
+    )
+
+    access_token = create_access_token(user_id, row["email"], row["role"])
+    refresh_token, expires_at = create_refresh_token_value()
+    await store_refresh_token(user_id, refresh_token, expires_at)
+
+    return {
+        "user": {
+            "id": user_id,
+            "email": row["email"],
+            "full_name": row["full_name"],
+            "role": row["role"],
+            "company": row["company"],
+            "avatar_url": row["avatar_url"],
+        },
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+    }
+
+
+@app.post("/auth/refresh")
+async def refresh(body: RefreshRequest):
+    """Exchange a valid refresh token for new access + refresh tokens."""
+    user = await verify_and_consume_refresh_token(body.refresh_token)
+    if not user:
+        raise HTTPException(401, "Invalid or expired refresh token")
+
+    access_token = create_access_token(user["id"], user["email"], user["role"])
+    new_refresh, expires_at = create_refresh_token_value()
+    await store_refresh_token(user["id"], new_refresh, expires_at)
+
+    return {
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "full_name": user["full_name"],
+            "role": user["role"],
+            "company": user.get("company"),
+            "avatar_url": user.get("avatar_url"),
+        },
+        "access_token": access_token,
+        "refresh_token": new_refresh,
+    }
+
+
+# ─────────────────────────────────────────────────────────
+# AUTH — Endpoints (authenticated)
+# ─────────────────────────────────────────────────────────
+
+@app.post("/auth/logout")
+async def logout(body: LogoutRequest, current_user: dict = Depends(get_current_user)):
+    """Invalidate a refresh token."""
+    await delete_refresh_token(body.refresh_token)
+    return {"success": True}
+
+
+@app.get("/auth/me")
+async def get_me(current_user: dict = Depends(get_current_user)):
+    """Get current user profile."""
+    return current_user
+
+
+@app.put("/auth/me")
+async def update_me(body: UpdateProfileRequest, current_user: dict = Depends(get_current_user)):
+    """Update current user profile fields (not email or password)."""
+    pool = await get_pool()
+
+    sets = []
+    params = []
+    idx = 1
+
+    if body.full_name is not None:
+        sets.append(f"full_name = ${idx}")
+        params.append(body.full_name)
+        idx += 1
+    if body.company is not None:
+        sets.append(f"company = ${idx}")
+        params.append(body.company)
+        idx += 1
+    if body.avatar_url is not None:
+        sets.append(f"avatar_url = ${idx}")
+        params.append(body.avatar_url)
+        idx += 1
+
+    if not sets:
+        raise HTTPException(422, "No fields to update")
+
+    sets.append(f"updated_at = ${idx}")
+    params.append(datetime.now(timezone.utc))
+    idx += 1
+
+    params.append(current_user["id"])
+    set_clause = ", ".join(sets)
+
+    row = await pool.fetchrow(
+        f"""
+        UPDATE users SET {set_clause}
+        WHERE id = ${idx}
+        RETURNING id, email, full_name, role, company, avatar_url, created_at, last_login_at
+        """,
+        *params,
+    )
+
+    return {
+        "id": str(row["id"]),
+        "email": row["email"],
+        "full_name": row["full_name"],
+        "role": row["role"],
+        "company": row["company"],
+        "avatar_url": row["avatar_url"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "last_login_at": row["last_login_at"].isoformat() if row["last_login_at"] else None,
+    }
+
+
+@app.put("/auth/change-password")
+async def change_password(body: ChangePasswordRequest, current_user: dict = Depends(get_current_user)):
+    """Change the current user's password."""
+    validate_password(body.new_password)
+
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT password_hash FROM users WHERE id = $1",
+        current_user["id"],
+    )
+
+    if not row or not verify_password(body.current_password, row["password_hash"]):
+        raise HTTPException(401, "Current password is incorrect")
+
+    new_hash = hash_password(body.new_password)
+    await pool.execute(
+        "UPDATE users SET password_hash = $1, updated_at = $2 WHERE id = $3",
+        new_hash, datetime.now(timezone.utc), current_user["id"],
+    )
+
+    return {"success": True}
+
+
+# ─────────────────────────────────────────────────────────
 # POST /sessions — Upload + full pipeline
 # ─────────────────────────────────────────────────────────
 
@@ -146,6 +419,7 @@ async def create_session_endpoint(
     title: str = Form(default=""),
     meeting_type: str = Form(default="sales_call"),
     num_speakers: Optional[int] = Form(default=None),
+    current_user: dict = Depends(require_role("member")),
 ):
     """
     Upload an audio file and run the full analysis pipeline:
@@ -189,6 +463,7 @@ async def create_session_endpoint(
             session_type="recording",
             meeting_type=meeting_type,
             media_url=str(file_path.resolve()),
+            user_id=current_user["id"],
         )
         session_id = str(session["id"])
         await update_session_status(session_id, "processing")
@@ -369,14 +644,17 @@ async def list_sessions_endpoint(
     offset: int = Query(default=0, ge=0),
     status: Optional[str] = Query(default=None),
     meeting_type: Optional[str] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
 ):
-    """List sessions with pagination and optional filters."""
+    """List sessions with pagination and optional filters. User-scoped (admin sees all)."""
+    user_id = None if current_user["role"] == "admin" else current_user["id"]
     try:
         sessions, total = await list_sessions(
             limit=limit,
             offset=offset,
             status=status,
             meeting_type=meeting_type,
+            user_id=user_id,
         )
     except Exception as e:
         logger.error(f"Failed to list sessions: {e}")
@@ -395,10 +673,14 @@ async def list_sessions_endpoint(
 # ─────────────────────────────────────────────────────────
 
 @app.get("/sessions/{session_id}")
-async def get_session_detail(session_id: str):
+async def get_session_detail(session_id: str, current_user: dict = Depends(get_current_user)):
     """Get session detail including signals, alerts, and unified states."""
     session = await get_session(session_id)
     if not session:
+        raise HTTPException(404, "Session not found")
+
+    # Ownership check: user can only see their own sessions (admin sees all)
+    if current_user["role"] != "admin" and str(session.get("user_id", "")) != current_user["id"]:
         raise HTTPException(404, "Session not found")
 
     # Fetch related data in parallel-ish
@@ -437,10 +719,14 @@ async def get_session_signals(
     signal_type: Optional[str] = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    current_user: dict = Depends(get_current_user),
 ):
     """Get signals for a session with optional filtering by agent/type."""
     session = await get_session(session_id)
     if not session:
+        raise HTTPException(404, "Session not found")
+
+    if current_user["role"] != "admin" and str(session.get("user_id", "")) != current_user["id"]:
         raise HTTPException(404, "Session not found")
 
     signals = await get_signals(
@@ -470,6 +756,7 @@ async def get_session_signals(
 async def get_session_report(
     session_id: str,
     regenerate: bool = Query(default=False),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Get the narrative report for a session.
@@ -477,6 +764,9 @@ async def get_session_report(
     """
     session = await get_session(session_id)
     if not session:
+        raise HTTPException(404, "Session not found")
+
+    if current_user["role"] != "admin" and str(session.get("user_id", "")) != current_user["id"]:
         raise HTTPException(404, "Session not found")
 
     # Return existing report unless regenerate requested
@@ -544,10 +834,13 @@ async def get_session_report(
 # ─────────────────────────────────────────────────────────
 
 @app.get("/sessions/{session_id}/transcript")
-async def get_session_transcript(session_id: str):
+async def get_session_transcript(session_id: str, current_user: dict = Depends(get_current_user)):
     """Get transcript segments for a session."""
     session = await get_session(session_id)
     if not session:
+        raise HTTPException(404, "Session not found")
+
+    if current_user["role"] != "admin" and str(session.get("user_id", "")) != current_user["id"]:
         raise HTTPException(404, "Session not found")
 
     segments = await get_transcript(session_id)

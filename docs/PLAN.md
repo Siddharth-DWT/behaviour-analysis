@@ -184,10 +184,14 @@ Current status: **Week 2** (infrastructure + Voice Agent built).
 - [ ] Load test: target 5 concurrent sessions on single server
 
 ### Weeks 27-28: Authentication + Multi-Tenancy
-- [ ] OAuth 2.0 / SSO integration
+- [x] JWT authentication (access tokens + refresh tokens) — **done early (Phase 1)**
+- [x] Password hashing (bcrypt) — **done early**
+- [x] User roles: admin, member, viewer — **done early**
+- [x] Session access control (user ownership + admin override) — **done early**
+- [x] Login/Signup pages in dashboard — **done early**
+- [x] Protected routes + auto-refresh tokens — **done early**
+- [ ] OAuth 2.0 / SSO integration (Google, Microsoft, SAML)
 - [ ] Per-tenant data isolation (PostgreSQL row-level security)
-- [ ] User roles: admin, member, viewer
-- [ ] Session access control (who can view whose analysis)
 - [ ] API key management for per-customer usage tracking
 
 ### Weeks 29-30: Production Hardening

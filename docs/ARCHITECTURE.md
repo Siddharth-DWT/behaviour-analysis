@@ -444,12 +444,34 @@ Kubernetes cluster:
 
 ---
 
-## Security Considerations
+## Security & Authentication
 
+### Current Implementation (Phase 1)
+- **JWT authentication** — Access tokens (HS256, 30 min expiry) + refresh tokens (30 days, single-use, stored in `auth_tokens` table)
+- **Password hashing** — bcrypt with auto-generated salts
+- **Role-based access** — Three roles: `admin` (sees all sessions), `member` (sees own sessions), `viewer` (read-only)
+- **Session ownership** — `sessions.user_id` foreign key; non-admin users can only access their own sessions
+- **XSS protection** — Access token stored in React state (memory only), never in localStorage. Refresh token in localStorage (needed for persistence)
+- **Token refresh** — Auto-refresh 2 minutes before expiry; 401 interceptor retries with fresh token
+- **Public endpoints** — Only `GET /health`, `POST /auth/signup`, `POST /auth/login`, `POST /auth/refresh`
+
+### Auth Flow
+```
+                                 ┌────────────┐
+  POST /auth/signup ──────────→  │            │ ──→ access_token (JWT, 30min)
+  POST /auth/login  ──────────→  │  API       │ ──→ refresh_token (opaque, 30 days)
+                                 │  Gateway   │
+  Authorization: Bearer {jwt} →  │            │ ──→ get_current_user dependency
+                                 │  auth.py   │ ──→ require_role("member")
+  POST /auth/refresh ─────────→  │            │ ──→ new token pair (old refresh deleted)
+                                 └────────────┘
+```
+
+### Planned (Future Phases)
+- **OAuth 2.0 / SSO** — Google, Microsoft, SAML (Phase 4)
+- **Data isolation** — PostgreSQL row-level security per tenant (Phase 4)
 - **Media files are ephemeral** — deleted after processing unless user opts into storage
 - **Signals are de-identified** — speaker IDs are session-scoped UUIDs, not names
-- **API authentication** — JWT tokens via OAuth 2.0 (Phase 4)
-- **Data isolation** — PostgreSQL row-level security per tenant (Phase 4)
 - **Encryption** — TLS in transit, AES-256 at rest for media files
 - **GDPR compliance** — right-to-deletion API endpoint, configurable retention policies
 - **No biometric storage** — voice/face embeddings are used for within-session matching only; cross-session matching requires explicit user consent

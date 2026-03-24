@@ -1,5 +1,5 @@
-import { ReactNode, useState } from "react";
-import { Link, useLocation } from "react-router-dom";
+import { ReactNode, useState, useRef, useEffect } from "react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
   BarChart3,
   FolderOpen,
@@ -9,8 +9,12 @@ import {
   ChevronRight,
   Sun,
   Moon,
+  LogOut,
+  User,
+  ChevronDown,
 } from "lucide-react";
 import { useTheme } from "../contexts/ThemeContext";
+import { useAuth } from "../contexts/AuthContext";
 
 const NAV_ITEMS = [
   { path: "/sessions", label: "Sessions", icon: FolderOpen },
@@ -18,10 +22,46 @@ const NAV_ITEMS = [
   { path: "/settings", label: "Settings", icon: Settings, disabled: true },
 ];
 
+function UserInitials({ name }: { name: string }) {
+  const initials = name
+    .split(" ")
+    .map((w) => w[0])
+    .join("")
+    .toUpperCase()
+    .slice(0, 2);
+
+  return (
+    <div className="flex h-7 w-7 items-center justify-center rounded-full bg-nexus-accent-blue text-[10px] font-bold text-white">
+      {initials}
+    </div>
+  );
+}
+
 export default function Layout({ children }: { children: ReactNode }) {
   const [collapsed, setCollapsed] = useState(true);
+  const [menuOpen, setMenuOpen] = useState(false);
   const location = useLocation();
+  const navigate = useNavigate();
   const { theme, toggleTheme } = useTheme();
+  const { user, logout } = useAuth();
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  const handleLogout = () => {
+    setMenuOpen(false);
+    logout();
+    navigate("/login", { replace: true });
+  };
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -105,6 +145,64 @@ export default function Layout({ children }: { children: ReactNode }) {
             <span className="rounded bg-nexus-surface-hover px-2 py-1 font-mono">
               v0.1.0
             </span>
+
+            {/* User menu */}
+            {user && (
+              <div className="relative" ref={menuRef}>
+                <button
+                  onClick={() => setMenuOpen(!menuOpen)}
+                  className="flex items-center gap-2 rounded-lg px-2 py-1 transition-colors hover:bg-nexus-surface-hover"
+                >
+                  <UserInitials name={user.full_name} />
+                  <span className="max-w-[120px] truncate text-xs text-nexus-text-secondary">
+                    {user.full_name}
+                  </span>
+                  <ChevronDown
+                    className={`h-3 w-3 text-nexus-text-muted transition-transform ${
+                      menuOpen ? "rotate-180" : ""
+                    }`}
+                  />
+                </button>
+
+                {menuOpen && (
+                  <div className="absolute right-0 top-full z-50 mt-1 w-48 rounded-lg border border-nexus-border bg-nexus-surface py-1 shadow-lg">
+                    <div className="border-b border-nexus-border px-3 py-2">
+                      <p className="truncate text-xs font-medium text-nexus-text-primary">
+                        {user.full_name}
+                      </p>
+                      <p className="truncate text-[10px] text-nexus-text-muted">
+                        {user.email}
+                      </p>
+                    </div>
+
+                    <button
+                      onClick={() => setMenuOpen(false)}
+                      className="flex w-full items-center gap-2 px-3 py-2 text-xs text-nexus-text-secondary hover:bg-nexus-surface-hover"
+                    >
+                      <User className="h-3.5 w-3.5" />
+                      Profile
+                    </button>
+                    <button
+                      onClick={() => setMenuOpen(false)}
+                      className="flex w-full items-center gap-2 px-3 py-2 text-xs text-nexus-text-secondary hover:bg-nexus-surface-hover"
+                    >
+                      <Settings className="h-3.5 w-3.5" />
+                      Settings
+                    </button>
+
+                    <div className="border-t border-nexus-border" />
+
+                    <button
+                      onClick={handleLogout}
+                      className="flex w-full items-center gap-2 px-3 py-2 text-xs text-nexus-stress-high hover:bg-nexus-surface-hover"
+                    >
+                      <LogOut className="h-3.5 w-3.5" />
+                      Sign Out
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </header>
 

@@ -68,11 +68,19 @@ NEXUS runs **7 independent agents** as microservices communicating via Redis Str
   - Rule engine (stress, fillers, pitch, rate, tone)
   - Transcriber (faster-whisper + simple diarization)
 
+- **Authentication**: JWT-based auth with bcrypt password hashing
+  - Signup/Login/Logout/Refresh token endpoints
+  - Role-based access control (admin, member, viewer)
+  - Session ownership (users only see their own sessions, admin sees all)
+  - Protected React dashboard with Login/Signup pages
+  - Auto-refresh tokens, auth state in memory (XSS safe)
+
 ### 🔲 NOT YET BUILT
 - Facial/Body/Gaze agents (Phase 2)
 - Recall.ai live call integration (Phase 4)
 - Neo4j knowledge graph (Phase 3+)
-- Authentication / multi-tenancy
+- OAuth 2.0 / SSO integration (Phase 4)
+- Per-tenant data isolation / row-level security (Phase 4)
 
 ## Tech Stack
 
@@ -84,6 +92,7 @@ NEXUS runs **7 independent agents** as microservices communicating via Redis Str
 | Language Agent | Python FastAPI + DistilBERT + Claude API | ✅ Built |
 | Fusion Agent | Python FastAPI + Claude API | ✅ Built |
 | API Gateway | Python FastAPI + WebSocket | ✅ Built |
+| Authentication | JWT (python-jose) + bcrypt | ✅ Built |
 | Dashboard | React + Tailwind + Recharts | ✅ Built |
 | External Whisper | GPU Whisper API (RTX 5090, optional) | ✅ Integrated |
 | External TTS | Coqui XTTS v2 API (RTX 5090, optional) | ✅ Integrated |
@@ -164,7 +173,9 @@ nexus/
 │   ├── language-agent/          ← ✅ Built
 │   ├── fusion-agent/            ← ✅ Built
 │   └── api-gateway/             ← ✅ Built
-├── dashboard/                   ← ✅ React dashboard
+│       ├── auth.py              ← JWT + bcrypt auth module
+│       └── database.py          ← Async PostgreSQL (sessions, signals, users)
+├── dashboard/                   ← ✅ React dashboard (with Login/Signup)
 ├── shared/
 │   ├── config/settings.py       ← Central config (DB, Redis, external APIs)
 │   ├── models/signals.py

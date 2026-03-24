@@ -1,6 +1,6 @@
 # STATUS.md — NEXUS Build Status Tracker
 
-**Last updated**: March 15, 2026
+**Last updated**: March 24, 2026
 **Current phase**: Phase 1 Week 6+ — Universal Media Input & Content-Adaptive Analysis
 
 ---
@@ -23,6 +23,36 @@
 | Health check script | ✅ Done | Verifies PostgreSQL, pgvector, Redis, env vars |
 | .env.example | ✅ Done | All environment variable templates |
 | .gitignore | ✅ Done | Python + Node + Docker + media files |
+
+---
+
+## Recent Changes (March 24, 2026)
+
+### Authentication System (`services/api_gateway/auth.py`)
+- **NEW**: User authentication with JWT access tokens (30 min) + refresh tokens (30 days)
+- **NEW**: bcrypt password hashing (direct `bcrypt` library, not passlib)
+- **NEW**: Auth endpoints: `POST /auth/signup`, `/auth/login`, `/auth/refresh`, `/auth/logout`
+- **NEW**: Profile endpoints: `GET /auth/me`, `PUT /auth/me`, `PUT /auth/change-password`
+- **NEW**: Role-based access control (admin > member > viewer)
+- **NEW**: Session ownership — users only see their own sessions, admin sees all
+- **NEW**: All session endpoints now require authentication (Bearer token)
+- **NEW**: `GET /health` remains public (no auth required)
+
+### Database Migration (`infrastructure/postgres/init/02-auth.sql`)
+- **NEW**: Auth columns on `users` table: `password_hash`, `full_name`, `company`, `avatar_url`, `is_active`, `is_verified`, `last_login_at`
+- **NEW**: `auth_tokens` table for refresh token storage (single-use, server-side)
+- **NEW**: `user_id` foreign key on `sessions` table for ownership
+
+### Dashboard Authentication
+- **NEW**: `AuthContext` — React context for auth state (login, signup, logout, auto-refresh)
+- **NEW**: Login page (`/login`) — email/password with show/hide toggle
+- **NEW**: Signup page (`/signup`) — with password strength indicator (weak/fair/strong)
+- **NEW**: Route protection — `ProtectedRoute` redirects to `/login` if not authenticated
+- **NEW**: User menu in navbar — initials avatar + dropdown (Profile, Settings, Sign Out)
+- **UPDATED**: API client adds `Authorization: Bearer` header to all requests
+- **UPDATED**: 401 interceptor auto-refreshes token, retries request, redirects to login on failure
+- **UPDATED**: Access token stored in memory (not localStorage) for XSS protection
+- **UPDATED**: Refresh token in localStorage for session persistence across page refreshes
 
 ---
 
@@ -157,19 +187,27 @@
 
 ---
 
-## API Gateway — ✅ COMPLETE (v0.1)
+## API Gateway — ✅ COMPLETE (v0.2)
 
 | Component | Status | File |
 |-----------|--------|------|
-| FastAPI application | ✅ Done | `services/api-gateway/main.py` |
-| Database module (asyncpg) | ✅ Done | `services/api-gateway/database.py` |
-| POST /sessions (upload + full pipeline) | ✅ Done | Upload → Voice → Language → Fusion → PostgreSQL |
-| GET /sessions (list, paginated) | ✅ Done | Filterable by status, meeting_type |
-| GET /sessions/:id (detail) | ✅ Done | Includes signal counts, alerts, report status |
-| GET /sessions/:id/signals | ✅ Done | Filterable by agent, signal_type |
-| GET /sessions/:id/report | ✅ Done | Returns existing or generates via Fusion Agent |
-| GET /sessions/:id/transcript | ✅ Done | Ordered transcript segments |
-| GET /health | ✅ Done | Probes all downstream agents + DB |
+| FastAPI application | ✅ Done | `services/api_gateway/main.py` |
+| Database module (asyncpg) | ✅ Done | `services/api_gateway/database.py` |
+| Auth module (JWT + bcrypt) | ✅ Done | `services/api_gateway/auth.py` |
+| POST /auth/signup | ✅ Done | Register with email, password, name |
+| POST /auth/login | ✅ Done | Returns access + refresh tokens |
+| POST /auth/refresh | ✅ Done | Exchange refresh token for new pair |
+| POST /auth/logout | ✅ Done | Invalidate refresh token (auth required) |
+| GET /auth/me | ✅ Done | Current user profile (auth required) |
+| PUT /auth/me | ✅ Done | Update profile fields (auth required) |
+| PUT /auth/change-password | ✅ Done | Change password (auth required) |
+| POST /sessions (upload + full pipeline) | ✅ Done | Auth required (member+), sets session owner |
+| GET /sessions (list, paginated) | ✅ Done | Auth required, user-scoped (admin sees all) |
+| GET /sessions/:id (detail) | ✅ Done | Auth required, ownership check |
+| GET /sessions/:id/signals | ✅ Done | Auth required, ownership check |
+| GET /sessions/:id/report | ✅ Done | Auth required, ownership check |
+| GET /sessions/:id/transcript | ✅ Done | Auth required, ownership check |
+| GET /health | ✅ Done | Public (no auth) |
 
 ---
 
@@ -214,4 +252,4 @@
 | ffmpeg not installed on dev machine | Low | afconvert (macOS) works for audio; ffmpeg needed for video |
 | Whisper "medium" model slow on CPU | Low | Use "small" for dev, "medium" for production |
 | No real data testing yet | High | Priority: test with diverse content types |
-| No authentication | Low (dev only) | Phase 4 |
+| ~~No authentication~~ | ~~Low~~ | ✅ JWT auth implemented (March 24, 2026) |

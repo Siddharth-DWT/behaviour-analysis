@@ -64,6 +64,7 @@ nexus/
 │
 ├── infrastructure/
 │   ├── postgres/init/01-schema.sql  ← 15 tables auto-created
+│   ├── postgres/init/02-auth.sql    ← Auth tables (users, auth_tokens)
 │   └── redis/valkey.conf            ← Streams-optimised config
 │
 ├── services/
@@ -102,11 +103,50 @@ nexus/
 | REDIS_HOST | Yes | localhost | Valkey/Redis host |
 | REDIS_PORT | Yes | 6379 | Valkey/Redis port |
 | ANTHROPIC_API_KEY | Yes* | (none) | For Language Agent + Fusion Agent |
+| JWT_SECRET | No | auto-generated | Secret for signing JWT tokens. Auto-generated if not set (changes on restart) |
+| JWT_ACCESS_TOKEN_EXPIRE_MINUTES | No | 30 | Access token lifetime in minutes |
+| JWT_REFRESH_TOKEN_EXPIRE_DAYS | No | 30 | Refresh token lifetime in days |
 | WHISPER_MODEL | No | medium | Whisper model size (tiny/base/small/medium/large-v3) |
 | USE_PYANNOTE | No | false | Enable pyannote speaker diarisation |
 | HF_TOKEN | No | (none) | HuggingFace token (if USE_PYANNOTE=true) |
 
 *Not needed for Voice Agent alone. Required when Language Agent is built.
+
+## Authentication
+
+The API Gateway requires authentication for all session endpoints. Auth is JWT-based.
+
+### Create an account
+```bash
+curl -X POST http://localhost:8000/auth/signup \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@company.com","password":"Pass1234","full_name":"Your Name"}'
+# Returns: { user, access_token, refresh_token }
+```
+
+### Login
+```bash
+curl -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@company.com","password":"Pass1234"}'
+```
+
+### Use authenticated endpoints
+```bash
+# Replace {token} with the access_token from login/signup
+curl http://localhost:8000/sessions -H "Authorization: Bearer {token}"
+```
+
+### Dashboard
+Open `http://localhost:3000` — you'll be redirected to the login page. Sign up or log in to access sessions.
+
+### Set a stable JWT secret (recommended)
+```bash
+# Without this, the secret is auto-generated and changes on restart (invalidating all tokens)
+echo "JWT_SECRET=$(python -c 'import secrets; print(secrets.token_hex(32))')" >> .env
+```
+
+---
 
 ## Common Tasks
 

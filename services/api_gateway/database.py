@@ -58,18 +58,19 @@ async def create_session(
     meeting_type: str = "sales_call",
     media_url: Optional[str] = None,
     org_id: str = DEV_ORG_ID,
+    user_id: Optional[str] = None,
 ) -> dict:
     """Create a new session record. Returns the created session."""
     pool = await get_pool()
     row = await pool.fetchrow(
         """
-        INSERT INTO sessions (org_id, title, session_type, meeting_type, media_url, status)
-        VALUES ($1, $2, $3, $4, $5, 'created')
+        INSERT INTO sessions (org_id, title, session_type, meeting_type, media_url, status, user_id)
+        VALUES ($1, $2, $3, $4, $5, 'created', $6)
         RETURNING id, org_id, title, session_type, meeting_type, status,
-                  media_url, duration_ms, speaker_count,
+                  media_url, duration_ms, speaker_count, user_id,
                   created_at, started_at, completed_at
         """,
-        org_id, title, session_type, meeting_type, media_url,
+        org_id, title, session_type, meeting_type, media_url, user_id,
     )
     return _row_to_dict(row)
 
@@ -80,7 +81,7 @@ async def get_session(session_id: str, org_id: str = DEV_ORG_ID) -> Optional[dic
     row = await pool.fetchrow(
         """
         SELECT id, org_id, title, session_type, meeting_type, status,
-               media_url, duration_ms, speaker_count,
+               media_url, duration_ms, speaker_count, user_id,
                created_at, started_at, completed_at
         FROM sessions
         WHERE id = $1 AND org_id = $2
@@ -98,8 +99,10 @@ async def list_sessions(
     offset: int = 0,
     status: Optional[str] = None,
     meeting_type: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> tuple[list[dict], int]:
-    """List sessions with pagination. Returns (sessions, total_count)."""
+    """List sessions with pagination. Returns (sessions, total_count).
+    If user_id is provided, only returns sessions owned by that user."""
     pool = await get_pool()
 
     # Build WHERE clause
@@ -107,6 +110,10 @@ async def list_sessions(
     params: list = [org_id]
     idx = 2
 
+    if user_id:
+        conditions.append(f"user_id = ${idx}")
+        params.append(user_id)
+        idx += 1
     if status:
         conditions.append(f"status = ${idx}")
         params.append(status)
@@ -130,7 +137,7 @@ async def list_sessions(
     rows = await pool.fetch(
         f"""
         SELECT id, org_id, title, session_type, meeting_type, status,
-               media_url, duration_ms, speaker_count,
+               media_url, duration_ms, speaker_count, user_id,
                created_at, started_at, completed_at
         FROM sessions
         WHERE {where}

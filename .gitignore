@@ -26,6 +26,7 @@ node_modules/
 # Docker volumes
 postgres_data/
 redis_data/
+infrastructure/postgres/init/
 
 # IDE
 .vscode/

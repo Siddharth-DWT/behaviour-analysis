@@ -26,9 +26,11 @@ NEXUS analyses audio and video from calls and meetings through **7 parallel AI a
 - ✅ 94 detection rules designed across all 7 agents (research-backed)
 - ✅ Infrastructure running (PostgreSQL + pgvector + Valkey)
 - ✅ Voice Agent built and working (5 core rules)
-- 🔲 Language Agent (next)
-- 🔲 Fusion Agent
-- 🔲 Dashboard
+- ✅ Language Agent (sentiment, buying signals, objections, power language, intent)
+- ✅ Fusion Agent (3 pairwise rules, compound patterns, narrative reports)
+- ✅ API Gateway (full pipeline orchestration)
+- ✅ Dashboard (session list, detail, report, signal explorer)
+- ✅ Authentication (JWT + bcrypt, login/signup, role-based access, session ownership)
 
 See [docs/STATUS.md](docs/STATUS.md) for detailed build tracker.
 
@@ -38,15 +40,20 @@ See [docs/STATUS.md](docs/STATUS.md) for detailed build tracker.
 # Start databases
 docker compose up -d
 
-# Run Voice Agent
-cd services/voice-agent
-pip install -r requirements.txt
-uvicorn main:app --port 8001 --reload
+# Start all services
+bash scripts/start_all.sh
 
-# Analyse a recording
-curl -X POST http://localhost:8001/analyse \
+# Open dashboard
+open http://localhost:3000    # Sign up → upload a recording → view analysis
+
+# Or use the API directly:
+# 1. Create account
+curl -X POST http://localhost:8000/auth/signup \
   -H "Content-Type: application/json" \
-  -d '{"file_path": "/path/to/recording.wav"}'
+  -d '{"email":"you@company.com","password":"Pass1234","full_name":"Your Name"}'
+
+# 2. Use the returned access_token for authenticated requests
+curl http://localhost:8000/sessions -H "Authorization: Bearer {token}"
 ```
 
 See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for full setup instructions.
@@ -72,6 +79,7 @@ All open source, $0 licensing cost.
 | Database | PostgreSQL 16 + pgvector |
 | Message Bus | Valkey 8 (Redis Streams) |
 | Agent Services | Python 3.11 + FastAPI |
+| Authentication | JWT (python-jose) + bcrypt |
 | Audio Processing | librosa + faster-whisper |
 | NLP | DistilBERT + Claude API |
 | Computer Vision | MediaPipe + DeepFace (Phase 2) |

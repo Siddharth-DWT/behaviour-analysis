@@ -1,10 +1,81 @@
 const API_BASE = "/api";
 
+// ── Auth token management ──
+// Access token is stored in memory (not localStorage) for XSS protection.
+// It's set by AuthContext after login/signup/refresh.
+
+let _accessToken: string | null = null;
+
+export function setAccessToken(token: string | null) {
+  _accessToken = token;
+}
+
+export function getAccessToken(): string | null {
+  return _accessToken;
+}
+
+// ── Core request function with auth ──
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(options?.headers as Record<string, string>),
+  };
+
+  if (_accessToken) {
+    headers["Authorization"] = `Bearer ${_accessToken}`;
+  }
+
+  // Don't set Content-Type for FormData (browser sets it with boundary)
+  if (options?.body instanceof FormData) {
+    delete headers["Content-Type"];
+  }
+
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
     ...options,
+    headers,
   });
+
+  if (res.status === 401 && _accessToken) {
+    // Try to refresh the token
+    const refreshToken = localStorage.getItem("nexus_refresh_token");
+    if (refreshToken) {
+      try {
+        const refreshRes = await fetch(`${API_BASE}/auth/refresh`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refresh_token: refreshToken }),
+        });
+        if (refreshRes.ok) {
+          const data = await refreshRes.json();
+          _accessToken = data.access_token;
+          localStorage.setItem("nexus_refresh_token", data.refresh_token);
+
+          // Retry original request with new token
+          const retryHeaders: Record<string, string> = { ...headers, Authorization: `Bearer ${data.access_token}` };
+          if (options?.body instanceof FormData) {
+            delete retryHeaders["Content-Type"];
+          }
+          const retryRes = await fetch(`${API_BASE}${path}`, {
+            ...options,
+            headers: retryHeaders,
+          });
+          if (!retryRes.ok) {
+            const body = await retryRes.text();
+            throw new Error(`API ${retryRes.status}: ${body}`);
+          }
+          return retryRes.json();
+        }
+      } catch {
+        // Refresh failed — clear auth and redirect to login
+      }
+      _accessToken = null;
+      localStorage.removeItem("nexus_refresh_token");
+      window.location.href = "/login";
+      throw new Error("Session expired");
+    }
+  }
+
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`API ${res.status}: ${body}`);
@@ -202,12 +273,7 @@ export async function uploadSession(
   form.append("title", title);
   form.append("meeting_type", meetingType);
 
-  const res = await fetch(`${API_BASE}/sessions`, { method: "POST", body: form });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Upload failed ${res.status}: ${body}`);
-  }
-  return res.json();
+  return request("/sessions", { method: "POST", body: form });
 }
 
 export async function getHealth(): Promise<{

@@ -87,6 +87,55 @@ Agent Colours (for multi-agent timeline):
 
 ---
 
+## Authentication Views
+
+### Login Page (`/login`)
+Centered card on dark background. Public route (redirects to `/sessions` if already authenticated).
+
+- NEXUS logo + "Behavioural Analysis System" subtitle
+- Email input
+- Password input with show/hide toggle (eye icon)
+- "Sign In" button (primary blue, full width)
+- Error message (red border) for wrong credentials
+- Loading spinner on submit
+- "Don't have an account? Sign Up" link → `/signup`
+- On success: redirect to `/sessions`
+
+### Signup Page (`/signup`)
+Same layout as login. Public route.
+
+- NEXUS logo + subtitle
+- Full Name input
+- Email input
+- Company input (optional)
+- Password input with strength indicator bar:
+  - Red (1/3 width): < 8 chars — "Weak — need 8+ characters"
+  - Yellow (2/3 width): 8+ chars but missing uppercase or number — "Fair — add number + uppercase"
+  - Green (full width): 8+ chars + uppercase + number — "Strong"
+- Confirm Password input (red border if mismatch)
+- "Create Account" button
+- "Already have an account? Sign In" link → `/login`
+- On success: auto-login and redirect to `/sessions`
+
+### Route Protection
+- `ProtectedRoute` wrapper: checks `isAuthenticated` from AuthContext → redirects to `/login` if false, shows loading spinner while checking
+- `PublicRoute` wrapper: redirects to `/sessions` if already authenticated
+- `/` redirects to `/sessions` (which redirects to `/login` if not authenticated)
+
+### User Menu (Topbar, right side)
+When logged in, the topbar right side shows:
+- User initials circle (blue bg, white text, first letters of name)
+- User name (truncated)
+- Chevron dropdown arrow
+- Dropdown menu:
+  - User name + email (header)
+  - Profile (link)
+  - Settings (link)
+  - Divider
+  - Sign Out (red text) — clears tokens, redirects to `/login`
+
+---
+
 ## View 1: Session List (`/sessions`)
 
 The landing page showing all analysed sessions.
