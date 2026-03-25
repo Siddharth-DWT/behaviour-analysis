@@ -637,6 +637,83 @@ class Transcriber:
 
         return min(round(confidence, 3), 0.85)
 
+    def _auto_detect_speaker_count(
+        self, segments: list[dict], audio_path: str, estimated: int,
+    ) -> int:
+        """
+        Verify estimated speaker count using ECAPA-TDNN embeddings.
+        Computes embeddings for 6 evenly-spaced windows and checks pairwise
+        cosine similarity. If all similar → single speaker.
+        Prevents false 2-speaker splits on single-narrator content.
+        """
+        if estimated < 2:
+            return estimated
+        try:
+            model = self._load_embedding_model()
+            if model is None:
+                return estimated
+
+            if self._audio_data is not None:
+                y, sr = self._audio_data
+            else:
+                import librosa
+                y, sr = librosa.load(audio_path, sr=16000, mono=True)
+
+            duration_s = len(y) / sr
+            if duration_s < 5:
+                return estimated
+
+            n_windows, window_s = 6, 2.0
+            step = (duration_s - window_s) / max(n_windows - 1, 1)
+            embeddings = []
+
+            for i in range(n_windows):
+                start = i * step
+                chunk = y[int(start * sr):int(min(start + window_s, duration_s) * sr)]
+                if len(chunk) < sr * 0.5:
+                    continue
+                waveform = torch.from_numpy(chunk).unsqueeze(0).float()
+                if sr != 16000:
+                    waveform = _ta.functional.resample(waveform, sr, 16000)
+                with torch.no_grad():
+                    emb = model.encode_batch(waveform)
+                embeddings.append(emb.squeeze().cpu().numpy())
+
+            if len(embeddings) < 3:
+                return estimated
+
+            emb_arr = np.array(embeddings)
+            sims = []
+            for i in range(len(emb_arr)):
+                for j in range(i + 1, len(emb_arr)):
+                    a, b = emb_arr[i], emb_arr[j]
+                    sims.append(float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)))
+
+            mean_sim = np.mean(sims)
+            min_sim = np.min(sims)
+            sim_std = float(np.std(sims))
+
+            logger.info(
+                f"Auto speaker count: {len(embeddings)} windows, "
+                f"mean_sim={mean_sim:.3f}, min_sim={min_sim:.3f}, std={sim_std:.3f}"
+            )
+
+            if mean_sim > 0.82 and min_sim > 0.70:
+                logger.info(f"Auto speaker count: highly similar → 1 speaker")
+                return 1
+
+            # Low variance in similarities = uniform voice = likely 1 speaker
+            if mean_sim > 0.20 and sim_std < 0.06 and min_sim > 0.10:
+                logger.info(
+                    f"Auto speaker count: uniform similarity (std={sim_std:.3f}) → likely 1 speaker"
+                )
+                return 1
+
+            return estimated
+        except Exception as e:
+            logger.debug(f"Auto speaker count failed: {e}")
+            return estimated
+
     def _diarize_simple(
         self,
         segments: list[dict],
@@ -664,6 +741,10 @@ class Transcriber:
             max_speakers = estimated
         else:
             max_speakers = min(max(1, num_speakers), 10)
+
+        # Auto-verify speaker count with embeddings
+        if audio_path and max_speakers >= 2:
+            max_speakers = self._auto_detect_speaker_count(segments, audio_path, max_speakers)
 
         # Single speaker — assign all segments and skip clustering
         if max_speakers < 2:
@@ -1102,6 +1183,38 @@ class Transcriber:
                 nxt["speaker"] = other_speaker(curr["speaker"])
                 corrections += 1
 
+        # Rule 4: Greeting → response pattern
+        # "Hi, how are you?" → "I'm good/fine" = different speakers
+        # "Who am I speaking to?" → "No problem" / polite reply = different speakers
+        for i in range(len(segments) - 1):
+            curr = segments[i]
+            nxt = segments[i + 1]
+            if curr.get("speaker") != nxt.get("speaker"):
+                continue
+
+            curr_text = curr.get("text", "").strip().lower()
+            nxt_text = nxt.get("text", "").strip().lower()
+            nxt_duration = nxt["end_ms"] - nxt["start_ms"]
+            gap_ms = nxt["start_ms"] - curr["end_ms"]
+
+            polite_responses = [
+                "i'm good", "i'm fine", "i'm great", "i'm doing",
+                "no problem", "no worries", "sure", "of course",
+            ]
+            is_greeting_or_q = (
+                any(curr_text.startswith(p) for p in ["hi", "hello", "hey", "how are"])
+                or curr_text.endswith("?")
+            )
+            is_polite = (
+                any(nxt_text.startswith(p) for p in polite_responses)
+                and nxt_duration < 2000
+                and len(nxt_text.split()) <= 6
+            )
+
+            if is_greeting_or_q and is_polite and gap_ms < 500:
+                nxt["speaker"] = other_speaker(curr["speaker"])
+                corrections += 1
+
         if corrections > 0:
             logger.info(f"Linguistic post-correction: {corrections} fixes applied")
 
@@ -1492,6 +1605,21 @@ class Transcriber:
             # Short segments with tiny gaps are unreliable
             if ev["duration_ms"] < 600 and ev["gap_ms"] < 100 and ev["confidence_tier"] == "HIGH":
                 ev["confidence_tier"] = "MEDIUM"
+
+            # Short polite responses after greetings/questions — downgrade so LLM can review
+            if i > 0 and ev["duration_ms"] < 2000 and ev["gap_ms"] < 500:
+                prev_text = segments[i - 1].get("text", "").strip().lower()
+                curr_text_low = seg.get("text", "").strip().lower()
+                prev_is_greeting_or_q = (
+                    any(prev_text.startswith(p) for p in ["hi", "hello", "hey", "how are", "good morning"])
+                    or prev_text.endswith("?")
+                )
+                curr_is_polite = any(curr_text_low.startswith(p) for p in [
+                    "i'm good", "i'm fine", "i'm great", "no problem", "no worries",
+                    "sure", "of course",
+                ])
+                if prev_is_greeting_or_q and curr_is_polite and ev["confidence_tier"] == "HIGH":
+                    ev["confidence_tier"] = "MEDIUM"
 
             evidence.append(ev)
 
