@@ -827,14 +827,15 @@ class Transcriber:
         # ── Layer 2: Linguistic post-correction ──
         segments = self._linguistic_post_correction(segments, num_speakers)
 
-        # ── Layer 3: Pitch Kalman filter (optional — enable with DIARIZATION_KALMAN=true) ──
+        # ── Layer 3: Pitch Kalman filter (optional) ──
         if os.getenv("DIARIZATION_KALMAN", "false").lower() == "true":
             segments = self._apply_pitch_kalman_correction(segments, audio_path)
 
-        # ── Layer 4: LLM post-correction (optional — enable with DIARIZATION_LLM=true) ──
+        # ── Layer 4: Evidence-based LLM correction (optional) ──
         if os.getenv("DIARIZATION_LLM", "false").lower() == "true":
+            evidence = self._collect_evidence(segments, audio_path, pyannote_output=diarization)
             meeting_type = getattr(self, "_meeting_type", "sales_call") or "sales_call"
-            segments = self._apply_llm_correction(segments, meeting_type)
+            segments = self._apply_llm_correction(segments, meeting_type, evidence=evidence)
 
         # ── Balance check ──
         counts = Counter(seg["speaker"] for seg in segments)
@@ -990,10 +991,11 @@ class Transcriber:
         if os.getenv("DIARIZATION_KALMAN", "false").lower() == "true":
             segments = self._apply_pitch_kalman_correction(segments, audio_path)
 
-        # ── Layer 4: LLM post-correction (optional) ──
+        # ── Layer 4: Evidence-based LLM correction (optional) ──
         if os.getenv("DIARIZATION_LLM", "false").lower() == "true":
+            evidence = self._collect_evidence(segments, audio_path)
             meeting_type = getattr(self, "_meeting_type", "sales_call") or "sales_call"
-            segments = self._apply_llm_correction(segments, meeting_type)
+            segments = self._apply_llm_correction(segments, meeting_type, evidence=evidence)
 
         # Log results
         speaker_counts = Counter(seg["speaker"] for seg in segments)
@@ -1315,25 +1317,212 @@ class Transcriber:
         confidence = min(confidence, 1.0)
         return confidence > 0.4, confidence
 
-    # ── Layer 4: LLM Post-Correction ──
+    # ── Layer 4: Evidence-Based LLM Post-Correction ──
+
+    def _collect_evidence(
+        self,
+        segments: list[dict],
+        audio_path: str,
+        pyannote_output=None,
+    ) -> list[dict]:
+        """
+        Build multi-signal evidence card per segment. Fuses:
+        - Pyannote frame-level probability
+        - ECAPA-TDNN embedding cosine similarity to each speaker centroid
+        - Pitch median + Kalman flag
+        - Linguistic patterns
+        Then assigns confidence tier: HIGH / MEDIUM / LOW.
+        """
+        from collections import Counter
+        from torch.nn.functional import cosine_similarity
+
+        # ── Load audio ──
+        if self._audio_data is not None:
+            y, sr = self._audio_data
+        else:
+            import librosa
+            y, sr = librosa.load(audio_path, sr=16000, mono=True)
+
+        # ── ECAPA-TDNN embeddings + centroids ──
+        seg_embeddings = self._compute_speaker_embeddings(segments, y, sr)
+        speaker_centroids = {}
+        if seg_embeddings is not None:
+            spk_embs: dict[str, list] = {}
+            for i, seg in enumerate(segments):
+                if np.linalg.norm(seg_embeddings[i]) < 0.01:
+                    continue
+                spk = seg.get("speaker", "")
+                if spk not in spk_embs:
+                    spk_embs[spk] = []
+                spk_embs[spk].append(seg_embeddings[i])
+            for spk, embs in spk_embs.items():
+                speaker_centroids[spk] = np.mean(embs, axis=0)
+
+        # ── Pitch data per segment ──
+        pitch_times, pitch_values = self._extract_pitch_track(y, sr)
+        seg_pitch: dict[int, float] = {}
+        if pitch_times is not None:
+            for i, seg in enumerate(segments):
+                start_s = seg["start_ms"] / 1000
+                end_s = seg["end_ms"] / 1000
+                mask = (pitch_times >= start_s) & (pitch_times <= end_s) & (pitch_values > 0)
+                voiced = pitch_values[mask]
+                seg_pitch[i] = float(np.median(voiced)) if len(voiced) > 2 else 0.0
+
+        # ── Speaker pitch ranges (from long, high-confidence segments) ──
+        spk_pitches: dict[str, list[float]] = {}
+        for i, seg in enumerate(segments):
+            f0 = seg_pitch.get(i, 0)
+            dur = seg["end_ms"] - seg["start_ms"]
+            if f0 > 0 and dur > 1000:
+                spk = seg.get("speaker", "")
+                spk_pitches.setdefault(spk, []).append(f0)
+        spk_pitch_ranges = {}
+        for spk, vals in spk_pitches.items():
+            if len(vals) >= 2:
+                spk_pitch_ranges[spk] = (float(np.percentile(vals, 20)), float(np.percentile(vals, 80)))
+
+        # ── Build evidence cards ──
+        evidence = []
+        speakers = sorted(set(seg.get("speaker", "") for seg in segments))
+        s0 = speakers[0] if len(speakers) > 0 else "Speaker_0"
+        s1 = speakers[1] if len(speakers) > 1 else "Speaker_1"
+
+        for i, seg in enumerate(segments):
+            ev: dict[str, Any] = {
+                "pyannote_speaker": seg.get("speaker", ""),
+                "pyannote_probability": 0.5,
+                "ecapa_sim_s0": 0.0, "ecapa_sim_s1": 0.0,
+                "ecapa_assigned": "", "ecapa_margin": 0.0,
+                "median_pitch_hz": seg_pitch.get(i, 0.0),
+                "pitch_matches": "",
+                "kalman_suspicious": seg.get("pitch_kalman_suspicious", False),
+                "kalman_confidence": seg.get("pitch_kalman_confidence", 0.0),
+                "duration_ms": seg["end_ms"] - seg["start_ms"],
+                "gap_ms": (seg["start_ms"] - segments[i - 1]["end_ms"]) if i > 0 else 0,
+                "word_count": len(seg.get("text", "").split()),
+                "linguistic": [],
+                "confidence_tier": "MEDIUM",
+                "agreement": 0.0,
+            }
+
+            # Pyannote confidence from raw output
+            if pyannote_output is not None:
+                try:
+                    start_s = seg["start_ms"] / 1000
+                    end_s = seg["end_ms"] / 1000
+                    dur = end_s - start_s
+                    overlap = 0.0
+                    for turn, _, spk_label in pyannote_output.itertracks(yield_label=True):
+                        if spk_label != seg.get("_raw_pyannote_label", seg.get("speaker", "")):
+                            continue
+                        o = max(0, min(end_s, turn.end) - max(start_s, turn.start))
+                        overlap += o
+                    ev["pyannote_probability"] = round(min(overlap / max(dur, 0.001), 1.0), 2)
+                except Exception:
+                    pass
+
+            # ECAPA similarity
+            if seg_embeddings is not None and np.linalg.norm(seg_embeddings[i]) > 0.01:
+                emb = seg_embeddings[i]
+                for spk, centroid in speaker_centroids.items():
+                    sim = float(np.dot(emb, centroid) / (np.linalg.norm(emb) * np.linalg.norm(centroid) + 1e-8))
+                    if spk == s0:
+                        ev["ecapa_sim_s0"] = round(sim, 3)
+                    else:
+                        ev["ecapa_sim_s1"] = round(sim, 3)
+                ev["ecapa_margin"] = round(abs(ev["ecapa_sim_s0"] - ev["ecapa_sim_s1"]), 3)
+                ev["ecapa_assigned"] = s0 if ev["ecapa_sim_s0"] > ev["ecapa_sim_s1"] else s1
+
+            # Pitch match
+            f0 = ev["median_pitch_hz"]
+            if f0 > 0 and spk_pitch_ranges:
+                for spk, (lo, hi) in spk_pitch_ranges.items():
+                    if lo <= f0 <= hi:
+                        ev["pitch_matches"] = spk
+                        break
+                if not ev["pitch_matches"]:
+                    best_spk, best_dist = "", 999
+                    for spk, (lo, hi) in spk_pitch_ranges.items():
+                        d = min(abs(f0 - lo), abs(f0 - hi))
+                        if d < best_dist:
+                            best_dist, best_spk = d, spk
+                    if best_dist < 30:
+                        ev["pitch_matches"] = best_spk
+
+            # Linguistic patterns
+            text = seg.get("text", "").strip().lower()
+            if text.endswith("?"):
+                ev["linguistic"].append("question")
+            if any(g in text for g in ["good morning", "hi,", "hello,", "this is "]):
+                ev["linguistic"].append("greeting")
+            if any(o in text for o in ["not looking", "not interested", "busy", "don't need"]):
+                ev["linguistic"].append("objection")
+            if ev["word_count"] <= 4 and ev["duration_ms"] < 1500:
+                ev["linguistic"].append("short_response")
+
+            # ── Confidence tier ──
+            votes = []
+            if ev["pyannote_probability"] > 0.6:
+                votes.append(ev["pyannote_speaker"])
+            if ev["ecapa_margin"] > 0.1 and ev["ecapa_assigned"]:
+                votes.append(ev["ecapa_assigned"])
+            if ev["pitch_matches"]:
+                votes.append(ev["pitch_matches"])
+
+            agreement = 0.0
+            if votes:
+                majority = Counter(votes).most_common(1)[0][1]
+                agreement = majority / len(votes)
+            ev["agreement"] = round(agreement, 2)
+
+            if ev["pyannote_probability"] >= 0.85 and not ev["kalman_suspicious"]:
+                ev["confidence_tier"] = "HIGH"
+            elif agreement >= 0.9 and len(votes) >= 2:
+                ev["confidence_tier"] = "HIGH"
+            elif ev["ecapa_margin"] > 0.3 and not ev["kalman_suspicious"]:
+                ev["confidence_tier"] = "HIGH"
+            elif ev["kalman_suspicious"] or ev["pyannote_probability"] < 0.6:
+                ev["confidence_tier"] = "LOW"
+            elif agreement < 0.5 and len(votes) >= 2:
+                ev["confidence_tier"] = "LOW"
+            else:
+                ev["confidence_tier"] = "MEDIUM"
+
+            # Short segments with tiny gaps are unreliable
+            if ev["duration_ms"] < 600 and ev["gap_ms"] < 100 and ev["confidence_tier"] == "HIGH":
+                ev["confidence_tier"] = "MEDIUM"
+
+            evidence.append(ev)
+
+        tiers = Counter(e["confidence_tier"] for e in evidence)
+        logger.info(f"Evidence tiers: {dict(tiers)}")
+        return evidence
 
     def _apply_llm_correction(
         self,
         segments: list[dict],
         meeting_type: str = "sales_call",
+        evidence: Optional[list[dict]] = None,
     ) -> list[dict]:
         """
-        Use Claude API to fix speaker labels based on conversational logic.
-        Only changes speaker labels, never text. Integrates pitch Kalman flags.
+        Evidence-based LLM post-correction. The LLM sees structured evidence
+        cards with confidence tiers and can ONLY flip LOW-tier segments.
+        HIGH-tier flips are blocked at the code level even if the LLM tries.
         """
         import re
 
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
         openai_key = os.environ.get("OPENAI_API_KEY", "")
-        llm_provider = os.environ.get("LLM_PROVIDER", "anthropic" if anthropic_key else "openai")
-
         if not (anthropic_key or openai_key) or len(segments) < 2:
             return segments
+
+        # Skip if no LOW-confidence segments
+        if evidence:
+            low_count = sum(1 for e in evidence if e["confidence_tier"] == "LOW")
+            if low_count == 0:
+                logger.info("LLM correction: no LOW-confidence segments — skipping")
+                return segments
 
         try:
             import httpx
@@ -1341,88 +1530,85 @@ class Transcriber:
             return segments
 
         try:
-            # Build transcript with annotations
-            lines = []
+            # Build evidence cards
+            cards = []
             for i, seg in enumerate(segments):
-                spk = seg.get("speaker", "Unknown")
                 text = seg.get("text", "").strip()
+                ev = evidence[i] if evidence and i < len(evidence) else {}
 
-                ann = []
-                if i > 0:
-                    gap_ms = seg["start_ms"] - segments[i - 1]["end_ms"]
-                    ann.append(f"gap:{gap_ms}ms")
-                if seg.get("pitch_kalman_suspicious"):
-                    ann.append(f"PITCH_SUSPICIOUS:{seg.get('pitch_kalman_confidence', 0):.2f}")
+                tier = ev.get("confidence_tier", "MEDIUM")
+                card = (
+                    f"--- Segment {i+1} ---\n"
+                    f"Speaker: {seg.get('speaker', '')}\n"
+                    f'Text: "{text}"\n'
+                    f"Confidence: {tier}\n"
+                    f"Duration: {ev.get('duration_ms', 0)}ms | Gap: {ev.get('gap_ms', 0)}ms\n"
+                    f"Acoustic signals:\n"
+                    f"  pyannote: {ev.get('pyannote_speaker', '?')} (conf={ev.get('pyannote_probability', 0):.0%})\n"
+                    f"  ecapa: closest to {ev.get('ecapa_assigned', '?')} (margin={ev.get('ecapa_margin', 0)})\n"
+                    f"  pitch: {ev.get('median_pitch_hz', 0):.0f}Hz → matches {ev.get('pitch_matches', '?')}\n"
+                    f"  kalman: {'FLAGGED' if ev.get('kalman_suspicious') else 'clean'}\n"
+                    f"  agreement: {ev.get('agreement', 0):.0%}\n"
+                    f"Linguistic: {', '.join(ev.get('linguistic', [])) or 'none'}"
+                )
+                cards.append(card)
 
-                ann_str = f" [{', '.join(ann)}]" if ann else ""
-                lines.append(f'{i+1}. [{spk}]{ann_str} "{text}"')
-
-            transcript_text = "\n".join(lines)
+            high_count = sum(1 for e in (evidence or []) if e.get("confidence_tier") == "HIGH")
+            low_count = sum(1 for e in (evidence or []) if e.get("confidence_tier") == "LOW")
 
             prompt = (
-                "You are a speaker diarization correction system. Below is a 2-person phone call "
-                "transcript with speaker labels from an acoustic model. Some labels may be wrong.\n\n"
+                f"You are a speaker diarization correction system analyzing a 2-person phone call.\n\n"
+                f"Below are {len(segments)} segments with MULTI-SIGNAL EVIDENCE CARDS.\n\n"
                 f"Context: {meeting_type}. Speaker_0=caller, Speaker_1=prospect.\n\n"
-                "Rules:\n"
-                "1. ONLY output the corrected transcript in the exact same numbered format\n"
-                "2. NEVER change the quoted text — only change [Speaker_0] or [Speaker_1]\n"
-                "3. Only flip a label if you are HIGHLY confident\n"
-                "4. Segments marked PITCH_SUSPICIOUS had F0 discontinuity — extra scrutiny\n"
-                "5. Patterns: statement+question=different speakers, objection+rebuttal=different speakers\n"
-                "6. When uncertain, DO NOT change the label\n\n"
-                f"Transcript:\n{transcript_text}\n\n"
-                "Output ONLY the corrected transcript lines. No explanation."
+                f"CONFIDENCE TIERS:\n"
+                f"- HIGH ({high_count} segments): Multiple acoustic signals agree. Almost certainly correct.\n"
+                f"- MEDIUM: Some agreement.\n"
+                f"- LOW ({low_count} segments): Signals disagree. Candidates for correction.\n\n"
+                f"HARD RULES:\n"
+                f"1. NEVER flip a segment marked 'Confidence: HIGH'\n"
+                f"2. ONLY consider flipping 'Confidence: LOW' segments\n"
+                f"3. Use conversational logic for LOW segments only\n"
+                f"4. NEVER change the text in quotes\n"
+                f"5. When uncertain, DO NOT flip\n"
+                f"6. Output ONLY numbered lines: 1. [Speaker_X] \"text\"\n\n"
+                + "\n\n".join(cards)
+                + "\n\nOutput the corrected segment list. No explanations."
             )
 
-            # Call the configured LLM provider
+            # Call LLM
+            llm_provider = os.environ.get("LLM_PROVIDER", "anthropic" if anthropic_key else "openai")
             if llm_provider == "openai" and openai_key:
                 response = httpx.post(
                     "https://api.openai.com/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {openai_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": "gpt-4o-mini",
-                        "temperature": 0,
-                        "max_tokens": 2048,
-                        "messages": [{"role": "user", "content": prompt}],
-                    },
-                    timeout=15,
+                    headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
+                    json={"model": "gpt-4o-mini", "temperature": 0, "max_tokens": 2048,
+                          "messages": [{"role": "user", "content": prompt}]},
+                    timeout=20,
                 )
                 if response.status_code != 200:
-                    logger.warning(f"LLM correction API error: {response.status_code}")
+                    logger.warning(f"LLM API error: {response.status_code}")
                     return segments
-                data = response.json()
-                completion = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                completion = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
             else:
                 response = httpx.post(
                     "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key": anthropic_key,
-                        "content-type": "application/json",
-                        "anthropic-version": "2023-06-01",
-                    },
-                    json={
-                        "model": "claude-sonnet-4-20250514",
-                        "max_tokens": 2048,
-                        "temperature": 0,
-                        "messages": [{"role": "user", "content": prompt}],
-                    },
-                    timeout=15,
+                    headers={"x-api-key": anthropic_key, "content-type": "application/json",
+                             "anthropic-version": "2023-06-01"},
+                    json={"model": "claude-sonnet-4-20250514", "max_tokens": 2048, "temperature": 0,
+                          "messages": [{"role": "user", "content": prompt}]},
+                    timeout=20,
                 )
                 if response.status_code != 200:
-                    logger.warning(f"LLM correction API error: {response.status_code}")
+                    logger.warning(f"LLM API error: {response.status_code}")
                     return segments
-                data = response.json()
                 completion = "".join(
-                    b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"
+                    b.get("text", "") for b in response.json().get("content", []) if b.get("type") == "text"
                 )
 
             if not completion.strip():
                 return segments
 
-            # Parse corrected labels
+            # Parse response
             pattern = re.compile(r"^\d+\.\s*\[(Speaker_\d+)\]")
             new_labels = []
             for line in completion.strip().split("\n"):
@@ -1434,19 +1620,31 @@ class Transcriber:
                 logger.warning(f"LLM returned {len(new_labels)} labels for {len(segments)} segments")
                 return segments
 
-            # Apply — validate only labels changed, cap at 30%
-            changes = sum(1 for s, l in zip(segments, new_labels) if s.get("speaker") != l)
-            if changes > len(segments) * 0.3:
-                logger.warning(f"LLM flipped {changes}/{len(segments)} — too aggressive, rejecting")
-                return segments
-
-            for seg, label in zip(segments, new_labels):
+            # ── CODE-LEVEL ENFORCEMENT: block HIGH-tier flips ──
+            changes = 0
+            blocked = 0
+            for i, (seg, label) in enumerate(zip(segments, new_labels)):
+                if seg.get("speaker") == label:
+                    continue
+                ev = evidence[i] if evidence and i < len(evidence) else {}
+                if ev.get("confidence_tier") == "HIGH":
+                    logger.info(
+                        f"LLM tried to flip HIGH segment {i+1} "
+                        f"'{seg.get('text', '')[:30]}' — BLOCKED"
+                    )
+                    blocked += 1
+                    continue  # do NOT apply this flip
                 seg["speaker"] = label
+                changes += 1
+
+            # Clean up flags
+            for seg in segments:
                 seg.pop("pitch_kalman_suspicious", None)
                 seg.pop("pitch_kalman_confidence", None)
+                seg.pop("_raw_pyannote_label", None)
 
-            if changes > 0:
-                logger.info(f"LLM correction: flipped {changes} speaker label(s)")
+            if changes > 0 or blocked > 0:
+                logger.info(f"LLM correction v2: flipped {changes}, blocked {blocked} HIGH-tier")
             return segments
 
         except Exception as e:
