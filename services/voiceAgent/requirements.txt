@@ -13,9 +13,9 @@ scikit-learn>=1.3.0
 # Whisper transcription (local via faster-whisper for speed)
 faster-whisper==1.1.0
 
-# Speaker diarization
-pyannote.audio==3.4.0
-huggingface_hub>=0.20.0,<0.24.0
+# Speaker diarization (community-1 requires >=4.0)
+pyannote.audio>=4.0
+huggingface_hub>=0.20.0
 
 # Speaker embeddings (ECAPA-TDNN — install from develop branch, NOT PyPI)
 speechbrain @ git+https://github.com/speechbrain/speechbrain.git@develop

@@ -39,6 +39,54 @@ EXTERNAL_WHISPER_URL = os.getenv("EXTERNAL_WHISPER_URL", "")
 EXTERNAL_API_KEY = os.getenv("EXTERNAL_API_KEY", "")
 EXTERNAL_WHISPER_MODEL = os.getenv("EXTERNAL_WHISPER_MODEL", "base")
 
+# ── Pyannote Community-1 Pipeline (global singleton — loaded once) ──
+_pyannote_community_pipeline = None
+_pyannote_community_load_attempted = False
+
+
+def get_pyannote_community_pipeline():
+    """
+    Load pyannote community-1 pipeline. Returns None if unavailable.
+    Called once — result is cached globally. Requires HF_TOKEN.
+    """
+    global _pyannote_community_pipeline, _pyannote_community_load_attempted
+
+    if _pyannote_community_load_attempted:
+        return _pyannote_community_pipeline
+
+    _pyannote_community_load_attempted = True
+
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    if not hf_token:
+        logger.warning(
+            "No HuggingFace token found (HF_TOKEN or HUGGINGFACE_TOKEN). "
+            "Pyannote community-1 disabled. Falling back to ECAPA-TDNN."
+        )
+        return None
+
+    try:
+        from pyannote.audio import Pipeline
+
+        logger.info("Loading pyannote community-1 pipeline...")
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-community-1",
+            token=hf_token,
+        )
+
+        if torch.cuda.is_available():
+            pipeline.to(torch.device("cuda"))
+            logger.info("Pyannote community-1 loaded on GPU")
+        else:
+            logger.info("Pyannote community-1 loaded on CPU")
+
+        _pyannote_community_pipeline = pipeline
+        return pipeline
+
+    except Exception as e:
+        logger.error(f"Failed to load pyannote community-1: {e}")
+        logger.info("Falling back to ECAPA-TDNN diarization")
+        return None
+
 
 class Transcriber:
     """
@@ -598,12 +646,14 @@ class Transcriber:
         """
         Speaker diarization cascade.
 
-        Priority order (configurable via DIARIZATION_MODE env var):
-          1. Pyannote (neural end-to-end) — if USE_PYANNOTE=true
-          2. Embedding clustering (ECAPA-TDNN + agglomerative) — default
+        Priority order:
+          1. Pyannote Community-1 (frame-level, neural) — DEFAULT when HF_TOKEN set
+          2. ECAPA-TDNN embedding clustering — fallback
           3. Acoustic KMeans (MFCCs + pitch + energy)
           4. Gap + pitch heuristic (2-speaker fallback)
           5. Heuristic multi-speaker (round-robin, last resort)
+
+        DIARIZATION_MODE env var overrides: auto|pyannote|ecapa|kmeans
         """
         if not segments:
             return segments
@@ -625,17 +675,28 @@ class Transcriber:
 
         mode = self.DIARIZATION_MODE
 
-        # ── Tier 1: Pyannote (if enabled) ──
+        # ── Tier 1: Pyannote Community-1 (frame-level, default) ──
+        if mode in ("pyannote", "auto") and audio_path:
+            try:
+                result = self._diarize_pyannote_community(
+                    segments, max_speakers, audio_path
+                )
+                if result is not None:
+                    return result
+            except Exception as e:
+                logger.warning(f"Pyannote community-1 failed: {e}")
+
+        # ── Tier 1b: Legacy Pyannote 3.1 (if USE_PYANNOTE=true) ──
         if mode in ("pyannote", "auto") and USE_PYANNOTE and audio_path:
             try:
                 result = self._diarize_pyannote(audio_path, segments)
                 if result is not None:
                     return result
             except Exception as e:
-                logger.warning(f"Pyannote diarization failed: {e}")
+                logger.warning(f"Pyannote 3.1 failed: {e}")
 
         # ── Tier 2: Speaker embedding clustering (ECAPA-TDNN) ──
-        if mode in ("embedding", "auto") and audio_path:
+        if mode in ("ecapa", "embedding", "auto") and audio_path:
             try:
                 result = self._diarize_embedding_clustering(
                     segments, max_speakers, audio_path
@@ -660,6 +721,148 @@ class Transcriber:
         if max_speakers == 2:
             return self._diarize_gap_two_speaker(segments, audio_path)
         return self._diarize_simple_multi_speaker(segments, max_speakers)
+
+    # ── Pyannote Community-1 Diarization (Tier 1) ──
+
+    def _diarize_pyannote_community(
+        self,
+        segments: list[dict],
+        num_speakers: int,
+        audio_path: str,
+    ) -> Optional[list[dict]]:
+        """
+        Frame-level speaker diarization using pyannote community-1.
+
+        Operates at ~16ms frame resolution — detects speaker changes even with
+        <300ms gaps. Solves the root cause: Whisper segments by silence, not
+        by speaker identity.
+
+        Uses exclusive_speaker_diarization for clean 1-speaker-at-a-time output.
+        """
+        from collections import Counter
+
+        pipeline = get_pyannote_community_pipeline()
+        if pipeline is None:
+            return None
+
+        logger.info(
+            f"Running pyannote community-1 diarization: "
+            f"{num_speakers} speakers, {len(segments)} segments"
+        )
+
+        # Build audio input — pass pre-loaded waveform to avoid torchcodec issues
+        if self._audio_data is not None:
+            y, sr = self._audio_data
+            waveform = torch.from_numpy(y).unsqueeze(0).float()
+            audio_input = {"waveform": waveform, "sample_rate": sr}
+        else:
+            audio_input = audio_path
+
+        # Run diarization with explicit speaker count
+        diarize_kwargs = {"num_speakers": min(max(1, num_speakers), 10)}
+
+        diarization = pipeline(audio_input, **diarize_kwargs)
+
+        # Extract speaker turns
+        speaker_turns = []
+        # Try exclusive_speaker_diarization first (community-1 feature)
+        if hasattr(diarization, "exclusive_speaker_diarization"):
+            for turn, speaker in diarization.exclusive_speaker_diarization:
+                speaker_turns.append({
+                    "start": turn.start,
+                    "end": turn.end,
+                    "speaker": speaker,
+                })
+        else:
+            for turn, _, speaker in diarization.itertracks(yield_label=True):
+                speaker_turns.append({
+                    "start": turn.start,
+                    "end": turn.end,
+                    "speaker": speaker,
+                })
+
+        if not speaker_turns:
+            logger.warning("Pyannote returned no speaker turns")
+            return None
+
+        logger.info(f"Pyannote produced {len(speaker_turns)} speaker turns")
+
+        # ── Assign speakers to Whisper segments ──
+        has_words = any(seg.get("words") for seg in segments)
+
+        for seg in segments:
+            if has_words and seg.get("words"):
+                # Word-level assignment (highest precision)
+                word_speakers = []
+                for word in seg["words"]:
+                    w_start = word.get("start", seg["start_ms"] / 1000)
+                    w_end = word.get("end", seg["end_ms"] / 1000)
+                    spk = self._get_dominant_speaker(w_start, w_end, speaker_turns)
+                    word_speakers.append(spk)
+
+                # Segment speaker = majority among its words
+                valid_speakers = [s for s in word_speakers if s is not None]
+                if valid_speakers:
+                    seg["speaker"] = Counter(valid_speakers).most_common(1)[0][0]
+                else:
+                    seg["speaker"] = self._get_dominant_speaker(
+                        seg["start_ms"] / 1000, seg["end_ms"] / 1000, speaker_turns
+                    ) or "SPEAKER_00"
+            else:
+                # Segment-level assignment via overlap
+                seg["speaker"] = self._get_dominant_speaker(
+                    seg["start_ms"] / 1000, seg["end_ms"] / 1000, speaker_turns
+                ) or "SPEAKER_00"
+
+        # ── Normalize labels to Speaker_0, Speaker_1, ... ──
+        label_map = {}
+        counter = 0
+        for seg in segments:
+            raw = seg.get("speaker", "")
+            if raw not in label_map:
+                label_map[raw] = f"Speaker_{counter}"
+                counter += 1
+            seg["speaker"] = label_map[raw]
+
+        # ── Linguistic post-correction ──
+        segments = self._linguistic_post_correction(segments, num_speakers)
+
+        # ── Balance check ──
+        counts = Counter(seg["speaker"] for seg in segments)
+        total = len(segments)
+        max_pct = max(counts.values()) / total if total > 0 else 1.0
+        if max_pct > 0.95:
+            logger.warning(
+                f"Pyannote produced imbalanced split: {dict(counts)} "
+                f"({max_pct:.0%}). Falling through."
+            )
+            return None
+
+        self._last_diarization_backend = "pyannote_community"
+        logger.info(
+            f"Pyannote community-1 diarization complete: "
+            f"{len(counts)} speakers — "
+            + ", ".join(f"{k}: {v} segs" for k, v in sorted(counts.items()))
+        )
+        return segments
+
+    @staticmethod
+    def _get_dominant_speaker(
+        start: float,
+        end: float,
+        speaker_turns: list[dict],
+    ) -> Optional[str]:
+        """Find the speaker with the most overlap in the given time range."""
+        overlap_by_speaker: dict[str, float] = {}
+        for turn in speaker_turns:
+            overlap = max(0.0, min(end, turn["end"]) - max(start, turn["start"]))
+            if overlap > 0:
+                sp = turn["speaker"]
+                overlap_by_speaker[sp] = overlap_by_speaker.get(sp, 0) + overlap
+
+        if not overlap_by_speaker:
+            return None
+        return max(overlap_by_speaker, key=overlap_by_speaker.get)
 
     # ── Embedding-Based Diarization (Tier 2) ──
 
@@ -849,6 +1052,35 @@ class Transcriber:
                 if gap_before < 150 and gap_after < 150:
                     segments[i]["speaker"] = prev_spk
                     corrections += 1
+
+        # Rule 3: Greeting → query pattern
+        # If segment N is a greeting/intro and segment N+1 is a short question
+        # from the SAME speaker, flip N+1 (the response is from the other person).
+        for i in range(len(segments) - 1):
+            curr = segments[i]
+            nxt = segments[i + 1]
+            if curr.get("speaker") != nxt.get("speaker"):
+                continue
+
+            curr_text = curr.get("text", "").strip().lower()
+            nxt_text = nxt.get("text", "").strip()
+            nxt_duration = nxt["end_ms"] - nxt["start_ms"]
+            gap_ms = nxt["start_ms"] - curr["end_ms"]
+
+            greeting_patterns = [
+                "good morning", "good afternoon", "good evening",
+                "hi,", "hello,", "hey,", "this is ", "my name is ",
+            ]
+            is_greeting = any(curr_text.startswith(p) for p in greeting_patterns)
+            is_short_question = (
+                nxt_text.endswith("?")
+                and nxt_duration < 2000
+                and len(nxt_text.split()) <= 6
+            )
+
+            if is_greeting and is_short_question and gap_ms > 100:
+                nxt["speaker"] = other_speaker(curr["speaker"])
+                corrections += 1
 
         if corrections > 0:
             logger.info(f"Linguistic post-correction: {corrections} fixes applied")
