@@ -1581,7 +1581,7 @@ class Transcriber:
                 response = httpx.post(
                     "https://api.openai.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
-                    json={"model": "gpt-4o-mini", "temperature": 0, "max_tokens": 2048,
+                    json={"model": "gpt-4o", "temperature": 0, "max_tokens": 2048,
                           "messages": [{"role": "user", "content": prompt}]},
                     timeout=20,
                 )
