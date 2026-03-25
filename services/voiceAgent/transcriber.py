@@ -55,6 +55,7 @@ class Transcriber:
         self._external_client = None
         self._use_external = False
         self._num_speakers = None  # Speaker count hint (2-10), None = auto
+        self._audio_data = None    # Pre-loaded (y, sr) tuple, avoids redundant disk reads
         self._last_diarization_backend = "uninitialized"
 
         # Try to initialise external Whisper client (API key is optional)
@@ -119,7 +120,7 @@ class Transcriber:
             logger.error("faster-whisper not installed. Run: pip install faster-whisper")
             raise
 
-    def transcribe(self, audio_path: str, num_speakers: Optional[int] = None) -> dict:
+    def transcribe(self, audio_path: str, num_speakers: Optional[int] = None, audio_data: tuple = None, meeting_type: str = "sales_call") -> dict:
         """
         Transcribe an audio file with word-level timestamps.
 
@@ -147,10 +148,18 @@ class Transcriber:
             }
         """
         self._num_speakers = num_speakers
-        if self._use_external:
-            return self._transcribe_external(audio_path)
-        else:
-            return self._transcribe_local(audio_path)
+        self._audio_data = audio_data
+        self._meeting_type = meeting_type
+        try:
+            if self._use_external:
+                return self._transcribe_external(audio_path)
+            else:
+                return self._transcribe_local(audio_path)
+        finally:
+            # Clear per-request state to prevent leaking into next request
+            self._num_speakers = None
+            self._audio_data = None
+            self._meeting_type = None
 
     # ═══════════════════════════════════════════════════════════
     # EXTERNAL BACKEND (GPU Whisper API)
@@ -167,6 +176,7 @@ class Transcriber:
                 language="en",
                 word_timestamps=True,
                 vad_filter=True,
+                stream=True,
             )
         except Exception as e:
             logger.error(
@@ -209,10 +219,16 @@ class Transcriber:
             f"server_time={proc_time:.2f}s"
         )
 
-        # Apply speaker diarization (same as local)
-        if USE_PYANNOTE:
+        # Apply speaker diarization
+        # Pyannote is slow on CPU — only use for calls > 10 min where
+        # speaker patterns are complex enough to justify the cost.
+        # KMeans is fast (<10s) and accurate enough for shorter calls.
+        duration_min = duration / 60.0
+        if USE_PYANNOTE and duration_min > 10:
             segments = self._diarize_pyannote(audio_path, segments)
         else:
+            if USE_PYANNOTE and duration_min <= 10:
+                logger.info(f"Audio is {duration_min:.1f}min — using KMeans instead of pyannote")
             segments = self._diarize_simple(segments, self._num_speakers, audio_path)
 
         return {
@@ -277,10 +293,13 @@ class Transcriber:
 
         logger.info(f"Local transcription complete: {duration:.1f}s, {len(segments)} segments")
 
-        # Apply speaker diarization
-        if USE_PYANNOTE:
+        # Apply speaker diarization (same duration gate as external backend)
+        duration_min = duration / 60.0
+        if USE_PYANNOTE and duration_min > 10:
             segments = self._diarize_pyannote(audio_path, segments)
         else:
+            if USE_PYANNOTE and duration_min <= 10:
+                logger.info(f"Audio is {duration_min:.1f}min — using KMeans instead of pyannote")
             segments = self._diarize_simple(segments, self._num_speakers, audio_path)
 
         return {
@@ -297,19 +316,23 @@ class Transcriber:
     @staticmethod
     def _strip_hallucinations(segments: list[dict], max_repeat: int = 5) -> list[dict]:
         """
-        Remove Whisper hallucination loops.
+        Remove Whisper hallucination loops while preserving real speech.
 
-        Whisper hallucinates repetitive short tokens (\"yeah\", \"you\",
-        \"thank you\", punctuation) when audio is silent, noisy, or has
-        music. Detected by: N+ consecutive segments with identical
+        Whisper hallucinates repetitive short tokens ("yeah", "you",
+        "thank you", punctuation) when audio is silent, noisy, or has
+        music.  Detected by: N+ consecutive segments with identical
         short text (after lowering + stripping punctuation).
+
+        Unlike the old tail-truncation approach, this scans the ENTIRE
+        transcript and marks only the hallucinated runs for removal,
+        so real speech on both sides of a hallucination gap is kept.
 
         Args:
             segments: transcript segments
             max_repeat: how many identical consecutive segments before
                         we consider it a hallucination loop (default 5)
         Returns:
-            Cleaned segment list with hallucination tail removed.
+            Cleaned segment list with hallucination runs excised.
         """
         if len(segments) < max_repeat + 1:
             return segments
@@ -317,32 +340,40 @@ class Transcriber:
         def _norm(text: str) -> str:
             return text.lower().strip(" .,!?;:'\"-")
 
-        # Walk backwards to find where the repetition starts
-        last_real = len(segments) - 1
-        i = len(segments) - 1
-        while i >= max_repeat:
-            # Check if segments [i-max_repeat+1 .. i] are all identical short text
-            window = segments[i - max_repeat + 1: i + 1]
-            texts = [_norm(s.get("text", "")) for s in window]
-            # All same, short (< 4 words), and non-empty
-            if (
-                len(set(texts)) == 1
-                and texts[0]
-                and len(texts[0].split()) <= 3
-            ):
-                last_real = i - max_repeat
-                i = last_real
-            else:
-                break
+        # Pass 1: find all runs of identical short text
+        hallucinated = set()  # indices to remove
+        i = 0
+        while i < len(segments):
+            # Look ahead for a run of identical short segments
+            norm_i = _norm(segments[i].get("text", ""))
+            if not norm_i or len(norm_i.split()) > 3:
+                i += 1
+                continue
 
-        if last_real < len(segments) - 1:
-            removed = len(segments) - last_real - 1
-            kept = last_real + 1
+            # Count how many consecutive segments share this text
+            run_end = i + 1
+            while run_end < len(segments):
+                if _norm(segments[run_end].get("text", "")) == norm_i:
+                    run_end += 1
+                else:
+                    break
+
+            run_length = run_end - i
+            if run_length >= max_repeat:
+                # Mark the entire run as hallucinated
+                for idx in range(i, run_end):
+                    hallucinated.add(idx)
+                i = run_end
+            else:
+                i += 1
+
+        if hallucinated:
+            kept = [s for idx, s in enumerate(segments) if idx not in hallucinated]
             logger.warning(
-                f"Whisper hallucination detected: removed {removed} "
-                f"repetitive segments (kept {kept} of {len(segments)})"
+                f"Whisper hallucination detected: removed {len(hallucinated)} "
+                f"repetitive segments (kept {len(kept)} of {len(segments)})"
             )
-            return segments[: last_real + 1]
+            return kept
 
         return segments
 
@@ -350,10 +381,33 @@ class Transcriber:
     # SPEAKER DIARIZATION
     # ═══════════════════════════════════════════════════════════
 
+    # Speaker count defaults and ranges per meeting type
+    SPEAKER_DEFAULTS = {
+        "sales_call":            {"default": 2, "min": 2, "max": 3},
+        "interview":             {"default": 2, "min": 2, "max": 4},
+        "internal":              {"default": 4, "min": 2, "max": 8},
+        "client_meeting":        {"default": 3, "min": 2, "max": 8},
+        "meeting":               {"default": 4, "min": 2, "max": 8},
+        "podcast":               {"default": 2, "min": 2, "max": 4},
+        "lecture":               {"default": 1, "min": 1, "max": 2},
+        "presentation":          {"default": 1, "min": 1, "max": 3},
+        "debate":                {"default": 2, "min": 2, "max": 4},
+        "casual_conversation":   {"default": 2, "min": 2, "max": 4},
+    }
+
     def _estimate_speaker_count(self, segments: list[dict]) -> int:
-        """Estimate number of speakers from turn patterns."""
+        """
+        Estimate number of speakers from turn patterns + meeting type.
+        """
         if len(segments) <= 1:
             return 1
+
+        meeting_type = getattr(self, "_meeting_type", "sales_call") or "sales_call"
+        config = self.SPEAKER_DEFAULTS.get(meeting_type, {"default": 2, "min": 2, "max": 8})
+        type_default = config["default"]
+        type_min = config["min"]
+        type_max = config["max"]
+
         turn_gap_ms = 1200
         turns = 1
         short_turns = 0
@@ -369,13 +423,27 @@ class Transcriber:
             gap_ms = seg["start_ms"] - segments[i - 1]["end_ms"]
             if gap_ms > turn_gap_ms:
                 turns += 1
+
         if turns <= 2 and len(segments) <= 3:
-            return 1  # Truly minimal audio — maybe a single utterance
-        if turns <= 8:
-            return 2  # Default for most calls
-        if short_turns > long_turns and turns >= 12:
-            return 3
-        return 2
+            return max(1, type_min)
+
+        if turns <= 6:
+            estimated = type_default
+        elif turns <= 15:
+            estimated = type_default + (1 if short_turns > long_turns else 0)
+        elif turns <= 30:
+            estimated = type_default + 1
+        else:
+            estimated = type_default + 2
+
+        estimated = max(type_min, min(estimated, type_max))
+
+        logger.info(
+            f"Speaker estimate: {estimated} (type={meeting_type}, "
+            f"turns={turns}, short={short_turns}, long={long_turns}, "
+            f"range={type_min}-{type_max})"
+        )
+        return estimated
 
     def _diarize_simple(
         self,
@@ -405,9 +473,13 @@ class Transcriber:
         else:
             max_speakers = min(max(1, num_speakers), 10)
 
-        # Never run KMeans or gap heuristic with 1 cluster
+        # Single speaker — assign all segments and skip clustering
         if max_speakers < 2:
-            max_speakers = 2
+            for seg in segments:
+                seg["speaker"] = "Speaker_0"
+            self._last_diarization_backend = "single_speaker"
+            logger.info("Single-speaker mode: all segments assigned to Speaker_0")
+            return segments
 
         # Try acoustic KMeans clustering first (when we have the audio)
         if audio_path and max_speakers >= 2:
@@ -448,15 +520,18 @@ class Transcriber:
             f"{len(segments)} segments"
         )
 
-        # Load full audio once
-        try:
-            from shared.utils.audio_loader import load_audio
-            y, sr = load_audio(audio_path, sr=16000)
-        except ImportError:
-            y, sr = librosa.load(audio_path, sr=16000, mono=True)
-        except ValueError:
-            logger.warning("Could not decode audio — skipping KMeans diarization")
-            return None
+        # Use pre-loaded audio if available, otherwise load from disk
+        if self._audio_data is not None:
+            y, sr = self._audio_data
+        else:
+            try:
+                from shared.utils.audio_loader import load_audio
+                y, sr = load_audio(audio_path, sr=16000)
+            except ImportError:
+                y, sr = librosa.load(audio_path, sr=16000, mono=True)
+            except ValueError:
+                logger.warning("Could not decode audio — skipping KMeans diarization")
+                return None
         total_samples = len(y)
 
         features = []  # 5 features per segment
@@ -534,12 +609,11 @@ class Transcriber:
                 else:
                     features_arr[:, col] = 0.5
 
-        # Fill invalid segments with column means
+        # Fill invalid segments with zeros so they don't bias clustering
+        # toward the centroid (short/silent segments should be neutral)
         for i, valid in enumerate(valid_mask):
             if not valid:
-                for col in range(features_arr.shape[1]):
-                    valid_vals = features_arr[np.array(valid_mask), col]
-                    features_arr[i, col] = np.mean(valid_vals) if len(valid_vals) > 0 else 0.5
+                features_arr[i, :] = 0.0
 
         # KMeans clustering
         kmeans = KMeans(
@@ -633,8 +707,10 @@ class Transcriber:
         # Compute real mean pitch (F0) per segment from audio
         seg_pitches: list[Optional[float]] = [None] * len(segments)
 
-        if audio_path:
-            y, sr = None, 16000
+        y, sr = None, 16000
+        if self._audio_data is not None:
+            y, sr = self._audio_data
+        elif audio_path:
             try:
                 from shared.utils.audio_loader import load_audio
                 y, sr = load_audio(audio_path, sr=16000)
@@ -646,7 +722,7 @@ class Transcriber:
             except Exception:
                 pass
 
-            if y is not None:
+        if y is not None:
                 total_samples = len(y)
                 for idx, seg in enumerate(segments):
                     start_sample = int(seg["start_ms"] / 1000 * sr)
@@ -823,13 +899,20 @@ class Transcriber:
                 # Store token in HF cache so hf_hub finds it automatically
                 login(token=hf_token, add_to_git_credential=False)
 
-                # Monkey-patch hf_hub_download to strip the deprecated
-                # use_auth_token kwarg that pyannote 3.x passes unconditionally
-                _orig = _hf_hub.hf_hub_download
-                def _patched(*args, **kwargs):
-                    kwargs.pop("use_auth_token", None)
-                    return _orig(*args, **kwargs)
-                _hf_hub.hf_hub_download = _patched
+                # Monkey-patch all hf_hub functions that pyannote 3.x calls
+                # with the deprecated use_auth_token kwarg
+                _originals = {}
+                _funcs_to_patch = ["hf_hub_download", "model_info", "snapshot_download"]
+                for fn_name in _funcs_to_patch:
+                    orig_fn = getattr(_hf_hub, fn_name, None)
+                    if orig_fn is not None:
+                        _originals[fn_name] = orig_fn
+                        def _make_patched(orig):
+                            def _patched(*args, **kwargs):
+                                kwargs.pop("use_auth_token", None)
+                                return orig(*args, **kwargs)
+                            return _patched
+                        setattr(_hf_hub, fn_name, _make_patched(orig_fn))
 
                 logger.info("Loading pyannote diarization pipeline...")
                 try:
@@ -837,14 +920,35 @@ class Transcriber:
                         "pyannote/speaker-diarization-3.1",
                     )
                 finally:
-                    _hf_hub.hf_hub_download = _orig  # Always restore original
+                    for fn_name, orig_fn in _originals.items():
+                        setattr(_hf_hub, fn_name, orig_fn)
                 logger.info("Pyannote pipeline loaded.")
 
             if torch.cuda.is_available():
                 self._diarization_pipeline.to(torch.device("cuda"))
 
-            # Run diarization
-            diarization = self._diarization_pipeline(audio_path)
+            # Build speaker count hints for pyannote
+            diarize_params = {}
+            if self._num_speakers is not None:
+                diarize_params["num_speakers"] = min(max(1, self._num_speakers), 10)
+            else:
+                meeting_type = getattr(self, "_meeting_type", "sales_call") or "sales_call"
+                config = self.SPEAKER_DEFAULTS.get(meeting_type, {"default": 2, "min": 2, "max": 8})
+                diarize_params["min_speakers"] = config["min"]
+                diarize_params["max_speakers"] = config["max"]
+
+            # Run diarization — pass waveform tensor if available (pyannote
+            # can't read video containers like MP4/WebM directly, and
+            # pre-loaded 16kHz mono avoids redundant resampling)
+            if self._audio_data is not None:
+                y, sr = self._audio_data
+                waveform = torch.from_numpy(y).unsqueeze(0).float()  # (1, samples)
+                audio_input = {"waveform": waveform, "sample_rate": sr}
+            else:
+                audio_input = audio_path
+
+            logger.info(f"Running pyannote diarization: {diarize_params}")
+            diarization = self._diarization_pipeline(audio_input, **diarize_params)
 
             # Create speaker timeline
             speaker_timeline = []
@@ -855,11 +959,12 @@ class Transcriber:
                     "end_ms": int(turn.end * 1000),
                 })
 
-            # Assign speakers to transcript segments by overlap
+            # Assign speakers to transcript segments by overlap,
+            # falling back to nearest speaker if no overlap found
             for seg in segments:
-                # seg_mid = (seg["start_ms"] + seg["end_ms"]) / 2
-                best_speaker = "Speaker_0"
+                best_speaker = None
                 best_overlap = 0
+                seg_mid = (seg["start_ms"] + seg["end_ms"]) / 2
 
                 for turn in speaker_timeline:
                     overlap_start = max(seg["start_ms"], turn["start_ms"])
@@ -870,7 +975,17 @@ class Transcriber:
                         best_overlap = overlap
                         best_speaker = turn["speaker"]
 
-                seg["speaker"] = best_speaker
+                # No overlap — find nearest speaker turn by time distance
+                if best_speaker is None and speaker_timeline:
+                    best_dist = float("inf")
+                    for turn in speaker_timeline:
+                        turn_mid = (turn["start_ms"] + turn["end_ms"]) / 2
+                        dist = abs(seg_mid - turn_mid)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_speaker = turn["speaker"]
+
+                seg["speaker"] = best_speaker or "Speaker_0"
 
             speakers = set(seg["speaker"] for seg in segments)
             self._last_diarization_backend = "pyannote"

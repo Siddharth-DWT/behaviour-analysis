@@ -7,6 +7,7 @@ defined in infrastructure/postgres/init/01-schema.sql.
 """
 import os
 import json
+import uuid as _uuid
 import logging
 from typing import Optional
 from datetime import datetime, timezone
@@ -70,7 +71,9 @@ async def create_session(
                   media_url, duration_ms, speaker_count, user_id,
                   created_at, started_at, completed_at
         """,
-        org_id, title, session_type, meeting_type, media_url, user_id,
+        _uuid.UUID(org_id) if isinstance(org_id, str) else org_id,
+        title, session_type, meeting_type, media_url,
+        _uuid.UUID(user_id) if isinstance(user_id, str) and user_id else user_id,
     )
     return _row_to_dict(row)
 
@@ -112,7 +115,7 @@ async def list_sessions(
 
     if user_id:
         conditions.append(f"user_id = ${idx}")
-        params.append(user_id)
+        params.append(_uuid.UUID(user_id) if isinstance(user_id, str) else user_id)
         idx += 1
     if status:
         conditions.append(f"status = ${idx}")
@@ -531,6 +534,8 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
     for k, v in d.items():
         if isinstance(v, datetime):
             d[k] = v.isoformat()
+        elif isinstance(v, _uuid.UUID):
+            d[k] = str(v)
         elif isinstance(v, memoryview):
             d[k] = bytes(v).decode("utf-8", errors="replace")
     return d

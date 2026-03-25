@@ -41,9 +41,12 @@ def load_audio(path: str, sr: int = 16000) -> tuple[np.ndarray, int]:
     native_sr = stream.sample_rate
 
     samples = []
+    skipped_frames = 0
+    total_packets = 0
     for packet in container.demux(stream):
         if packet.dts is None:
             continue
+        total_packets += 1
         try:
             for frame in packet.decode():
                 arr = frame.to_ndarray()
@@ -56,10 +59,17 @@ def load_audio(path: str, sr: int = 16000) -> tuple[np.ndarray, int]:
                 elif frame.format.name in ("s32", "s32p"):
                     arr = arr / 2147483648.0     # 2^31
                 samples.append(arr)
-        except Exception:
+        except Exception as e:
+            skipped_frames += 1
             continue
 
     container.close()
+
+    if skipped_frames > 0:
+        logger.warning(
+            f"pyav skipped {skipped_frames}/{total_packets} packets "
+            f"while decoding {path}"
+        )
 
     if not samples:
         raise ValueError(f"pyav decoded no audio frames from {path}")

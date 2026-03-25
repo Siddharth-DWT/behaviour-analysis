@@ -174,12 +174,12 @@ class VoiceRuleEngine:
         Weighted composite stress score from 7 acoustic features.
         
         Weights (from research reliability ranking):
-          pitch delta:   0.25 (most reliable - Streeter 1977)
+          pitch delta:   0.30 (most reliable - Streeter 1977)
           jitter delta:  0.20 (Kappen 2022)
           rate change:   0.15
           filler rate:   0.15
           pause freq:    0.10
-          HNR inverse:   0.10
+          HNR inverse:   0.05 (spectral-flatness proxy, reduced weight)
           shimmer:       0.05
         """
         if b.f0_mean == 0:
@@ -208,12 +208,12 @@ class VoiceRuleEngine:
         
         # Weighted composite
         score = (
-            0.25 * components["f0_norm"] +
+            0.30 * components["f0_norm"] +
             0.20 * components["jitter_norm"] +
             0.15 * components["rate_norm"] +
             0.15 * components["filler_norm"] +
             0.10 * components["pause_norm"] +
-            0.10 * components["hnr_norm"] +
+            0.05 * components["hnr_norm"] +
             0.05 * components["shimmer_norm"]
         )
         

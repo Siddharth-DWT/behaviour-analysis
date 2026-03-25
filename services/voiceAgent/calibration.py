@@ -45,17 +45,21 @@ class CalibrationModule:
         speaker_id: str,
         session_id: str,
         features_list: list[dict],
-        max_windows: int = CALIBRATION_TARGET_WINDOWS
+        max_windows: int = CALIBRATION_TARGET_WINDOWS,
+        transcript_speech_sec: float = 0.0,
     ) -> SpeakerBaseline:
         """
         Build a baseline from the first N feature windows.
-        
+
         Args:
             speaker_id: Speaker identifier
             session_id: Session identifier
             features_list: List of feature dicts from VoiceFeatureExtractor
             max_windows: How many windows to use for calibration
-            
+            transcript_speech_sec: Total speaking time from transcript segments.
+                Used as a floor for speech_seconds so that calibration confidence
+                isn't penalised by short windows skipped during feature extraction.
+
         Returns:
             SpeakerBaseline with computed means, stds, and confidence
         """
@@ -117,8 +121,10 @@ class CalibrationModule:
             baseline.pause_ratio_pct = float(np.mean(pause_values))
         
         # ── Compute speaking time and calibration confidence ──
+        # Use transcript-derived speaking time as floor so that short windows
+        # skipped by the feature extractor (<300ms) don't undercount speech.
         total_speaking = sum(f.get("speaking_time_sec", 0) for f in cal_features)
-        baseline.speech_seconds = total_speaking
+        baseline.speech_seconds = max(total_speaking, transcript_speech_sec)
         baseline.sample_count = len(cal_features)
         baseline.update_confidence()
         

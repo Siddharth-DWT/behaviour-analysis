@@ -5,7 +5,7 @@ python-multipart==0.0.20
 
 # NLP - Sentiment analysis (local DistilBERT)
 transformers==4.47.1
-torch==2.5.1
+# torch installed separately in Dockerfile (CPU-only build)
 
 # LLM APIs for intent classification + sentiment + complex NLP
 anthropic==0.40.0

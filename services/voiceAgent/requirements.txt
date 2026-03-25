@@ -15,9 +15,8 @@ faster-whisper==1.1.0
 
 # Speaker diarization
 pyannote.audio==3.4.0
-huggingface_hub>=0.20.0
-torch==2.4.1
-torchaudio==2.4.1
+huggingface_hub>=0.20.0,<0.24.0
+# torch + torchaudio installed separately in Dockerfile (CPU-only build)
 
 # Database
 psycopg2-binary==2.9.10

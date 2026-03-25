@@ -93,7 +93,7 @@ FUSION_AGENT_URL = os.getenv("FUSION_AGENT_URL", "http://localhost:8007")
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/recordings"))
 
 # ── HTTP client timeout (Voice Agent with Whisper can be slow) ──
-AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "900"))  # 15 minutes
+AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "1800"))  # 30 minutes
 
 app = FastAPI(
     title="NEXUS API Gateway",
@@ -474,7 +474,7 @@ async def create_session_endpoint(
     # ── Step 3: Voice Agent ──
     voice_result = None
     try:
-        voice_result = await _call_voice_agent(session_id, str(file_path.resolve()), num_speakers=num_speakers)
+        voice_result = await _call_voice_agent(session_id, str(file_path.resolve()), num_speakers=num_speakers, meeting_type=meeting_type)
         logger.info(
             f"[{session_id}] Voice Agent: "
             f"{voice_result.get('duration_seconds', 0):.0f}s, "
@@ -684,7 +684,7 @@ async def get_session_detail(session_id: str, current_user: dict = Depends(get_c
         raise HTTPException(404, "Session not found")
 
     # Fetch related data in parallel-ish
-    signals = await get_signals(session_id, limit=500)
+    signals = await get_signals(session_id, limit=5000)
     session_alerts = await get_alerts(session_id)
     report = await get_report(session_id)
     transcript = await get_transcript(session_id)
@@ -717,7 +717,7 @@ async def get_session_signals(
     session_id: str,
     agent: Optional[str] = Query(default=None),
     signal_type: Optional[str] = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(default=100, ge=1, le=5000),
     offset: int = Query(default=0, ge=0),
     current_user: dict = Depends(get_current_user),
 ):
@@ -776,7 +776,7 @@ async def get_session_report(
             return {"session_id": session_id, "report": existing}
 
     # Generate new report via Fusion Agent
-    signals = await get_signals(session_id, limit=500)
+    signals = await get_signals(session_id, limit=5000)
 
     voice_signals = [s for s in signals if s.get("agent") == "voice"]
     language_signals = [s for s in signals if s.get("agent") == "language"]
@@ -856,11 +856,12 @@ async def get_session_transcript(session_id: str, current_user: dict = Depends(g
 # Agent call helpers
 # ─────────────────────────────────────────────────────────
 
-async def _call_voice_agent(session_id: str, file_path: str, num_speakers: Optional[int] = None) -> dict:
+async def _call_voice_agent(session_id: str, file_path: str, num_speakers: Optional[int] = None, meeting_type: str = "sales_call") -> dict:
     """Call Voice Agent POST /analyse with file path."""
     payload = {
         "file_path": file_path,
         "session_id": session_id,
+        "meeting_type": meeting_type,
     }
     if num_speakers is not None:
         payload["num_speakers"] = num_speakers

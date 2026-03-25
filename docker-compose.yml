@@ -12,10 +12,10 @@
 # SERVICES:
 #   postgres   → PostgreSQL 16 + pgvector (config, transcripts, signals, vectors)
 #   redis      → Valkey 8 (inter-agent message bus)
-#   voice      → Voice Agent (Python FastAPI)
-#   language   → Language Agent (Python FastAPI)
-#   fusion     → Fusion Agent (Python FastAPI)
-#   api        → API Gateway (Python FastAPI) - dashboard backend
+#   voiceAgent      → Voice Agent (Python FastAPI)
+#   language_agent  → Language Agent (Python FastAPI)
+#   fusion_agent    → Fusion Agent (Python FastAPI)
+#   api_gateway     → API Gateway (Python FastAPI) - dashboard backend
 #   dashboard  → React Admin Dashboard (dev server)
 #
 # PORTS:
@@ -78,100 +78,128 @@ services:
   # AGENTS (uncomment when ready to develop each service)
   # --------------------------------------------------------------------------
 
-  # voice:
-  #   build:
-  #     context: ./services/voice-agent
-  #     dockerfile: Dockerfile
-  #   container_name: nexus-voice-agent
-  #   restart: unless-stopped
-  #   ports:
-  #     - "8001:8001"
-  #   environment:
-  #     - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
-  #     - REDIS_URL=redis://redis:6379/0
-  #     - OPENAI_API_KEY=${OPENAI_API_KEY}
-  #   volumes:
-  #     - ./services/voice-agent:/app
-  #     - ./shared:/app/shared
-  #     - ./data:/app/data
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #   networks:
-  #     - nexus-network
+  voice_agent:
+    build:
+      context: ./services/voiceAgent
+      dockerfile: Dockerfile
+    container_name: nexus-voice-agent
+    image: nexus-voice-agent
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
+      - REDIS_URL=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - EXTERNAL_WHISPER_URL=${EXTERNAL_WHISPER_URL}
+      - EXTERNAL_WHISPER_MODEL=${EXTERNAL_WHISPER_MODEL:-large-v3}
+      - EXTERNAL_API_KEY=${EXTERNAL_API_KEY}
+      - USE_PYANNOTE=${USE_PYANNOTE:-false}
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - ./services/voiceAgent:/app
+      - ./shared:/app/shared
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - nexus-network
 
-  # language:
-  #   build:
-  #     context: ./services/language-agent
-  #     dockerfile: Dockerfile
-  #   container_name: nexus-language-agent
-  #   restart: unless-stopped
-  #   ports:
-  #     - "8002:8002"
-  #   environment:
-  #     - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
-  #     - REDIS_URL=redis://redis:6379/0
-  #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-  #   volumes:
-  #     - ./services/language-agent:/app
-  #     - ./shared:/app/shared
-  #     - ./data:/app/data
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #   networks:
-  #     - nexus-network
+  language_agent:
+    build:
+      context: ./services/language_agent
+      dockerfile: Dockerfile
+    container_name: nexus-language-agent
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    environment:
+      - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
+      - REDIS_URL=redis://redis:6379/0
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      - ./services/language_agent:/app
+      - ./shared:/app/shared
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - nexus-network
 
-  # fusion:
-  #   build:
-  #     context: ./services/fusion-agent
-  #     dockerfile: Dockerfile
-  #   container_name: nexus-fusion-agent
-  #   restart: unless-stopped
-  #   ports:
-  #     - "8003:8003"
-  #   environment:
-  #     - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
-  #     - REDIS_URL=redis://redis:6379/0
-  #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-  #   volumes:
-  #     - ./services/fusion-agent:/app
-  #     - ./shared:/app/shared
-  #     - ./data:/app/data
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #   networks:
-  #     - nexus-network
+  fusion_agent:
+    build:
+      context: ./services/fusion_agent
+      dockerfile: Dockerfile
+    container_name: nexus-fusion-agent
+    restart: unless-stopped
+    ports:
+      - "8003:8007"
+    environment:
+      - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
+      - REDIS_URL=redis://redis:6379/0
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      - ./services/fusion_agent:/app
+      - ./shared:/app/shared
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - nexus-network
 
-  # api:
-  #   build:
-  #     context: ./services/api-gateway
-  #     dockerfile: Dockerfile
-  #   container_name: nexus-api-gateway
-  #   restart: unless-stopped
-  #   ports:
-  #     - "8000:8000"
-  #   environment:
-  #     - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
-  #     - REDIS_URL=redis://redis:6379/0
-  #   volumes:
-  #     - ./services/api-gateway:/app
-  #     - ./shared:/app/shared
-  #     - ./data:/app/data
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #   networks:
-  #     - nexus-network
+  api_gateway:
+    build:
+      context: ./services/api_gateway
+      dockerfile: Dockerfile
+    container_name: nexus-api-gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
+      - REDIS_URL=redis://redis:6379/0
+      - VOICE_AGENT_URL=http://voice_agent:8001
+      - LANGUAGE_AGENT_URL=http://language_agent:8002
+      - FUSION_AGENT_URL=http://fusion_agent:8007
+      - JWT_SECRET=${JWT_SECRET:-nexus-dev-jwt-secret-2026}
+    volumes:
+      - ./services/api_gateway:/app
+      - ./shared:/app/shared
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - nexus-network
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: nexus-dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - API_GATEWAY_URL=http://api_gateway:8000
+    volumes:
+      - ./dashboard:/app
+      - /app/node_modules
+    depends_on:
+      - api_gateway
+    networks:
+      - nexus-network
 
 # --------------------------------------------------------------------------
 # VOLUMES & NETWORKS

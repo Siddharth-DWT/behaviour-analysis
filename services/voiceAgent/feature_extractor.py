@@ -29,24 +29,29 @@ class VoiceFeatureExtractor:
         self.sr = sr  # Target sample rate
     
     def extract_all(
-        self, 
-        audio_path: str, 
-        segments: list[dict]
+        self,
+        audio_path: str,
+        segments: list[dict],
+        audio_data: tuple = None,
     ) -> dict[str, list[dict]]:
         """
         Extract features for all speakers across the full audio.
-        
+
         Args:
             audio_path: Path to audio file
-            segments: List of diarised transcript segments 
+            segments: List of diarised transcript segments
                       [{speaker, start_ms, end_ms, text, words}, ...]
-        
+            audio_data: Optional pre-loaded (y, sr) tuple to avoid redundant disk I/O.
+
         Returns:
             Dict of {speaker_id: [feature_vector, feature_vector, ...]}
             Each feature_vector covers a WINDOW_SIZE_SEC window.
         """
-        # Load full audio (soundfile for WAV/FLAC, pyav fallback for MP3/M4A/WebM etc.)
-        y, sr = self._load_audio(audio_path)
+        # Use pre-loaded audio if available, otherwise load from disk
+        if audio_data is not None:
+            y, sr = audio_data
+        else:
+            y, sr = self._load_audio(audio_path)
         duration_sec = len(y) / sr
         
         # Group segments by speaker
@@ -163,8 +168,8 @@ class VoiceFeatureExtractor:
                 hop_length=512
             )
 
-            # Filter to voiced frames only
-            f0_voiced = f0[~np.isnan(f0)]
+            # Filter to voiced frames only (use VAD mask, not just NaN check)
+            f0_voiced = f0[voiced_flag] if voiced_flag is not None else f0[~np.isnan(f0)]
 
             if len(f0_voiced) > 0:
                 features["f0_mean"] = float(np.mean(f0_voiced))
@@ -292,11 +297,11 @@ class VoiceFeatureExtractor:
         Reuses f0_voiced from _extract_features to avoid a redundant pyin call.
         """
         if f0_voiced is None or len(f0_voiced) == 0:
-            f0, _, _ = librosa.pyin(
+            f0, voiced_flag, _ = librosa.pyin(
                 audio, fmin=65, fmax=600, sr=sr,
                 frame_length=2048, hop_length=512
             )
-            f0_voiced = f0[~np.isnan(f0)]
+            f0_voiced = f0[voiced_flag] if voiced_flag is not None else f0[~np.isnan(f0)]
 
         if len(f0_voiced) < 3:
             return 0.0, 0.0

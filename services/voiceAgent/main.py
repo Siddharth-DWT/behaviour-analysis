@@ -116,10 +116,19 @@ async def analyse_audio(request: AnalysisRequest):
     start_time = time.time()
     
     logger.info(f"[{session_id}] Analysing: {file_path.name}")
-    
+
+    # ── Load audio once (reused by diarisation + feature extraction) ──
+    try:
+        from shared.utils.audio_loader import load_audio
+        audio_data = load_audio(str(file_path), sr=16000)
+    except ImportError:
+        import librosa as _lr
+        audio_data = _lr.load(str(file_path), sr=16000, mono=True)
+
     # ── Step 1: Transcribe + diarise ──
-    logger.info(f"[{session_id}] Step 1: Transcribing (num_speakers={request.num_speakers})...")
-    transcript = transcriber.transcribe(str(file_path), num_speakers=request.num_speakers)
+    meeting_type = request.meeting_type or "sales_call"
+    logger.info(f"[{session_id}] Step 1: Transcribing (num_speakers={request.num_speakers}, meeting_type={meeting_type})...")
+    transcript = transcriber.transcribe(str(file_path), num_speakers=request.num_speakers, audio_data=audio_data, meeting_type=meeting_type)
     
     duration_sec = transcript["duration_seconds"]
     speakers = list(set(seg["speaker"] for seg in transcript["segments"]))
@@ -130,7 +139,8 @@ async def analyse_audio(request: AnalysisRequest):
     try:
         features_by_speaker = feature_extractor.extract_all(
             str(file_path),
-            transcript["segments"]
+            transcript["segments"],
+            audio_data=audio_data,
         )
     except ValueError as e:
         raise HTTPException(
@@ -139,11 +149,21 @@ async def analyse_audio(request: AnalysisRequest):
         )
     
     # ── Step 3: Build baselines ──
+    # Compute true speaking time per speaker from transcript (not feature windows)
+    # so calibration confidence isn't penalised by skipped short windows.
+    transcript_speech = {}
+    for seg in transcript["segments"]:
+        spk = seg["speaker"]
+        transcript_speech[spk] = transcript_speech.get(spk, 0.0) + (seg["end_ms"] - seg["start_ms"]) / 1000.0
+
     logger.info(f"[{session_id}] Step 3: Calibrating baselines...")
     calibration = CalibrationModule()
     baselines = {}
     for speaker_id, features_list in features_by_speaker.items():
-        baseline = calibration.build_baseline(speaker_id, session_id, features_list)
+        baseline = calibration.build_baseline(
+            speaker_id, session_id, features_list,
+            transcript_speech_sec=transcript_speech.get(speaker_id, 0.0),
+        )
         baselines[speaker_id] = baseline
         logger.info(
             f"[{session_id}] Baseline for {speaker_id}: "
@@ -166,10 +186,10 @@ async def analyse_audio(request: AnalysisRequest):
                 baseline=baseline,
                 speaker_id=speaker_id,
                 transcript_segments=[
-                    s for s in transcript["segments"] 
+                    s for s in transcript["segments"]
                     if s["speaker"] == speaker_id
-                    and s["start_ms"] >= features["window_start_ms"]
-                    and s["start_ms"] <= features["window_end_ms"]
+                    and s["end_ms"] > features["window_start_ms"]
+                    and s["start_ms"] < features["window_end_ms"]
                 ]
             )
             all_signals.extend(signals)
