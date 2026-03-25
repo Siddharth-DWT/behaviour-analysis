@@ -32,6 +32,8 @@ import SignalChainCards from "../components/SignalChainCards";
 import SpeakerGraph from "../components/SpeakerGraph";
 import InsightPanel from "../components/InsightPanel";
 import ConversationGraph from "../components/ConversationGraph";
+import SwimlaneTimeline from "../components/SwimlaneTimeline";
+import TranscriptView from "../components/TranscriptView";
 import GraphInsightsCard from "../components/GraphInsightsCard";
 
 // ── Helpers ──
@@ -349,6 +351,7 @@ type TabKey = "transcript" | "insights" | "report";
 export default function SessionDetail() {
   const { id } = useParams<{ id: string }>();
   const [activeTab, setActiveTab] = useState<TabKey>("transcript");
+  const [transcriptViewMode, setTranscriptViewMode] = useState<"list" | "chat">("list");
   const [showConvoGraph, setShowConvoGraph] = useState(false);
 
   const { data: detail, isLoading: loadingDetail } = useQuery({
@@ -359,7 +362,7 @@ export default function SessionDetail() {
 
   const { data: signalData } = useQuery({
     queryKey: ["signals", id],
-    queryFn: () => getSignals(id!, { limit: 500 }),
+    queryFn: () => getSignals(id!, { limit: 5000 }),
     enabled: !!id,
   });
 
@@ -720,22 +723,48 @@ export default function SessionDetail() {
         )}
       </section>
 
-      {/* 6. TRANSCRIPT */}
+      {/* 6. TRANSCRIPT with view toggle */}
       <div>
-        <h2 className="mb-3 text-sm font-medium text-nexus-text-secondary">
-          Transcript
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-sm font-medium text-nexus-text-secondary">
+            Transcript
+            {segments.length > 0 && (
+              <span className="ml-2 text-nexus-text-muted">
+                ({segments.length} segments)
+              </span>
+            )}
+          </h2>
           {segments.length > 0 && (
-            <span className="ml-2 text-nexus-text-muted">
-              ({segments.length} segments)
-            </span>
+            <div className="flex overflow-hidden rounded-full border border-nexus-border" style={{ height: 28 }}>
+              <button
+                onClick={() => setTranscriptViewMode("list")}
+                className={`px-3 text-[11px] font-medium transition-colors ${
+                  transcriptViewMode === "list"
+                    ? "bg-blue-600 text-white"
+                    : "bg-transparent text-nexus-text-muted hover:text-nexus-text-primary"
+                }`}
+              >
+                List View
+              </button>
+              <button
+                onClick={() => setTranscriptViewMode("chat")}
+                className={`px-3 text-[11px] font-medium transition-colors ${
+                  transcriptViewMode === "chat"
+                    ? "bg-blue-600 text-white"
+                    : "bg-transparent text-nexus-text-muted hover:text-nexus-text-primary"
+                }`}
+              >
+                Chat View
+              </button>
+            </div>
           )}
-        </h2>
+        </div>
 
         {segments.length === 0 ? (
           <div className="flex h-48 items-center justify-center rounded-lg border border-nexus-border bg-nexus-surface text-sm text-nexus-text-muted">
             No transcript available
           </div>
-        ) : (
+        ) : transcriptViewMode === "list" ? (
           <div className="space-y-2 max-h-[700px] overflow-y-auto pr-1">
             {segments.map((segment) => (
               <TranscriptBlock
@@ -746,6 +775,13 @@ export default function SessionDetail() {
               />
             ))}
           </div>
+        ) : (
+          <TranscriptView
+            segments={segments}
+            signals={signals}
+            speakerRoles={speakerRoles}
+            durationMs={session.duration_ms || 0}
+          />
         )}
       </div>
 
@@ -765,14 +801,35 @@ export default function SessionDetail() {
                 />
               )}
 
+              {/* Swimlane Conversation Timeline (timeline only, no transcript toggle) */}
+              {segments.length > 0 && (
+                <SwimlaneTimeline
+                  segments={segments}
+                  signals={signals}
+                  durationMs={session.duration_ms || 0}
+                  entities={content?.entities || {}}
+                  speakerRoles={speakerRoles}
+                  hideTranscriptToggle
+                />
+              )}
+
               {/* SpeakerGraph + InsightPanel (two-column) */}
               <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
                 <div className="lg:col-span-2">
                   <SpeakerGraph
-                    speakers={speakerStats.map((s) => ({
-                      ...s,
-                      talkTimePct: 100 / speakerStats.length,
-                    }))}
+                    speakers={(() => {
+                      // Calculate real talk time from transcript segments
+                      const talkMs: Record<string, number> = {};
+                      for (const seg of segments) {
+                        const spk = seg.speaker_label || "unknown";
+                        talkMs[spk] = (talkMs[spk] || 0) + Math.max(0, (seg.end_ms || 0) - (seg.start_ms || 0));
+                      }
+                      const totalMs = Object.values(talkMs).reduce((a, b) => a + b, 0) || 1;
+                      return speakerStats.map((s) => ({
+                        ...s,
+                        talkTimePct: ((talkMs[s.label] || 0) / totalMs) * 100,
+                      }));
+                    })()}
                     contentType={session.meeting_type}
                     entities={content?.entities || {}}
                     signals={signals}
@@ -784,11 +841,19 @@ export default function SessionDetail() {
                     contentType={session.meeting_type}
                     entities={content?.entities || {}}
                     signals={signals}
-                    speakers={speakerStats.map((s) => ({
-                      ...s,
-                      role: speakerRoles[s.label],
-                      talkTimePct: 100 / speakerStats.length,
-                    }))}
+                    speakers={(() => {
+                      const talkMs: Record<string, number> = {};
+                      for (const seg of segments) {
+                        const spk = seg.speaker_label || "unknown";
+                        talkMs[spk] = (talkMs[spk] || 0) + Math.max(0, (seg.end_ms || 0) - (seg.start_ms || 0));
+                      }
+                      const totalMs = Object.values(talkMs).reduce((a, b) => a + b, 0) || 1;
+                      return speakerStats.map((s) => ({
+                        ...s,
+                        role: speakerRoles[s.label],
+                        talkTimePct: ((talkMs[s.label] || 0) / totalMs) * 100,
+                      }));
+                    })()}
                     speakerRoles={speakerRoles}
                   />
                 </div>
@@ -813,7 +878,7 @@ export default function SessionDetail() {
                   onClick={() => setShowConvoGraph(true)}
                   className="w-full rounded-lg border border-dashed border-nexus-border bg-nexus-surface px-4 py-3 text-sm text-nexus-text-secondary hover:bg-nexus-surface-hover hover:text-nexus-text-primary transition-colors"
                 >
-                  🔗 Open Conversation Graph
+                  🔗 Open Advanced Signal Node Graph
                 </button>
               ) : (
                 <ConversationGraph

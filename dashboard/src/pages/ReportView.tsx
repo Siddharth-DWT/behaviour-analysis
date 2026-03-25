@@ -43,7 +43,7 @@ export default function ReportView() {
 
   const { data: signalData } = useQuery({
     queryKey: ["signals", id],
-    queryFn: () => getSignals(id!, { limit: 500 }),
+    queryFn: () => getSignals(id!, { limit: 5000 }),
     enabled: !!id,
   });
 

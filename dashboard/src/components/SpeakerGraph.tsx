@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { Signal } from "../api/client";
 
 interface SpeakerInfo {
@@ -27,20 +28,12 @@ interface SpeakerGraphProps {
 }
 
 function stressColor(stress: number): string {
-  if (stress > 0.5) return "var(--stress-high, #EF4444)";
-  if (stress > 0.3) return "var(--stress-med, #F59E0B)";
-  return "var(--stress-low, #22C55E)";
+  if (stress > 0.5) return "#EF4444";
+  if (stress > 0.3) return "#F59E0B";
+  return "#22C55E";
 }
 
-function speakerFill(idx: number): string {
-  const fills = [
-    "var(--accent-blue, #4F8BFF)",
-    "var(--accent-purple, #8B5CF6)",
-    "var(--stress-med, #F59E0B)",
-    "var(--engagement, #10B981)",
-  ];
-  return fills[idx % fills.length];
-}
+const SPEAKER_FILLS = ["#4F8BFF", "#8B5CF6", "#F59E0B", "#10B981", "#EC4899", "#06B6D4", "#F97316", "#6366F1"];
 
 function getSpeakerName(
   label: string,
@@ -51,7 +44,6 @@ function getSpeakerName(
   let displayRole = role || "";
 
   if (entities.people) {
-    // Match by speaker_label first, then by role
     const byLabel = entities.people.find(
       (p) => (p as Record<string, unknown>).speaker_label === label
     );
@@ -67,7 +59,6 @@ function getSpeakerName(
     }
   }
 
-  // If no name extracted, show role as primary text (not "Speaker_0")
   if (!displayName || displayName === label) {
     displayName = displayRole || label;
     displayRole = displayRole && displayRole !== displayName ? displayRole : "";
@@ -95,6 +86,38 @@ function statLine(contentType: string, speaker: SpeakerInfo): string {
   return `${Math.round(speaker.talkTimePct)}% talk time`;
 }
 
+/** Count per-pair speaker exchanges from sorted vocal_stress_score signals */
+function computePairExchanges(
+  signals: Signal[],
+  speakerLabels: string[]
+): Map<string, number> {
+  const pairKey = (a: string, b: string) => [a, b].sort().join("↔");
+  const exchanges = new Map<string, number>();
+
+  // Init all pairs to 0
+  for (let i = 0; i < speakerLabels.length; i++) {
+    for (let j = i + 1; j < speakerLabels.length; j++) {
+      exchanges.set(pairKey(speakerLabels[i], speakerLabels[j]), 0);
+    }
+  }
+
+  // Count transitions between consecutive stress signals
+  const stressSignals = signals
+    .filter((s) => s.signal_type === "vocal_stress_score" && s.speaker_label)
+    .sort((a, b) => (a.window_start_ms || 0) - (b.window_start_ms || 0));
+
+  for (let i = 1; i < stressSignals.length; i++) {
+    const prev = stressSignals[i - 1].speaker_label!;
+    const curr = stressSignals[i].speaker_label!;
+    if (prev !== curr) {
+      const key = pairKey(prev, curr);
+      exchanges.set(key, (exchanges.get(key) || 0) + 1);
+    }
+  }
+
+  return exchanges;
+}
+
 export default function SpeakerGraph({
   speakers,
   contentType,
@@ -102,43 +125,39 @@ export default function SpeakerGraph({
   signals,
   speakerRoles,
 }: SpeakerGraphProps) {
+  const [hoveredSpeaker, setHoveredSpeaker] = useState<string | null>(null);
+
   if (speakers.length < 2) return null;
 
-  // Count actual speaker alternations (not signal count)
-  let turnCount = 0;
-  for (let i = 1; i < signals.length; i++) {
-    if (
-      signals[i].speaker_label &&
-      signals[i - 1].speaker_label &&
-      signals[i].speaker_label !== signals[i - 1].speaker_label &&
-      signals[i].signal_type === "vocal_stress_score" &&
-      signals[i - 1].signal_type === "vocal_stress_score"
-    ) {
-      turnCount++;
-    }
-  }
+  const labels = speakers.map((s) => s.label);
+  const pairExchanges = computePairExchanges(signals, labels);
+  const totalExchanges = Array.from(pairExchanges.values()).reduce((a, b) => a + b, 0);
+  const pairKey = (a: string, b: string) => [a, b].sort().join("↔");
 
   const W = 460;
-  const H = 220;
+  const H = speakers.length <= 3 ? 240 : 280;
   const CY = H / 2;
 
-  // Position speakers
+  // Position speakers in a circle (or left-right for 2)
   const positions = speakers.map((_, i) => {
     const count = speakers.length;
     if (count === 2) {
-      return { cx: i === 0 ? 110 : W - 110, cy: CY };
+      return { cx: i === 0 ? 120 : W - 120, cy: CY };
     }
     const angle = (Math.PI * 2 * i) / count - Math.PI / 2;
+    const rx = Math.min(150, W / 2 - 80);
+    const ry = Math.min(80, H / 2 - 50);
     return {
-      cx: W / 2 + Math.cos(angle) * 130,
-      cy: H / 2 + Math.sin(angle) * 70,
+      cx: W / 2 + Math.cos(angle) * rx,
+      cy: H / 2 + Math.sin(angle) * ry,
     };
   });
 
-  // Circle radii based on talk time
+  // Circle radii proportional to talk time (bigger = more talk time)
+  const maxPct = Math.max(...speakers.map((s) => s.talkTimePct), 1);
   const radii = speakers.map((s) => {
-    const pct = s.talkTimePct || 50;
-    return Math.max(36, Math.min(58, 30 + pct * 0.5));
+    const norm = s.talkTimePct / maxPct; // 0 to 1
+    return Math.max(32, Math.min(60, 28 + norm * 32));
   });
 
   return (
@@ -150,40 +169,56 @@ export default function SpeakerGraph({
       <svg
         viewBox={`0 0 ${W} ${H}`}
         className="w-full"
-        style={{ maxHeight: 240 }}
+        style={{ maxHeight: 300 }}
       >
-        {/* Connection lines */}
-        {speakers.length >= 2 &&
-          speakers.map((_, i) =>
-            speakers.map((_, j) => {
-              if (j <= i) return null;
-              const lineWidth = Math.min(4, 1.5 + turnCount * 0.02);
-              return (
-                <g key={`line-${i}-${j}`}>
-                  <line
-                    x1={positions[i].cx}
-                    y1={positions[i].cy}
-                    x2={positions[j].cx}
-                    y2={positions[j].cy}
-                    stroke="var(--border, #333)"
-                    strokeWidth={lineWidth}
-                    strokeDasharray={turnCount < 5 ? "6 4" : "none"}
-                    opacity={0.5}
-                  />
-                  {/* Turn count label */}
+        {/* Connection lines with per-pair exchange counts */}
+        {speakers.map((_, i) =>
+          speakers.map((_, j) => {
+            if (j <= i) return null;
+            const key = pairKey(labels[i], labels[j]);
+            const count = pairExchanges.get(key) || 0;
+            const maxPairCount = Math.max(...Array.from(pairExchanges.values()), 1);
+            const lineWidth = Math.max(1, Math.min(5, 1 + (count / maxPairCount) * 4));
+            const opacity = count === 0 ? 0.2 : 0.3 + (count / maxPairCount) * 0.5;
+
+            const mx = (positions[i].cx + positions[j].cx) / 2;
+            const my = (positions[i].cy + positions[j].cy) / 2;
+
+            // Offset label perpendicular to the line to avoid overlap
+            const dx = positions[j].cx - positions[i].cx;
+            const dy = positions[j].cy - positions[i].cy;
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
+            const offsetX = (-dy / len) * 12;
+            const offsetY = (dx / len) * 12;
+
+            return (
+              <g key={`line-${i}-${j}`}>
+                <line
+                  x1={positions[i].cx}
+                  y1={positions[i].cy}
+                  x2={positions[j].cx}
+                  y2={positions[j].cy}
+                  stroke="var(--border, #444)"
+                  strokeWidth={lineWidth}
+                  strokeDasharray={count < 3 ? "6 4" : "none"}
+                  opacity={opacity}
+                />
+                {count > 0 && (
                   <text
-                    x={(positions[i].cx + positions[j].cx) / 2}
-                    y={(positions[i].cy + positions[j].cy) / 2 - 8}
+                    x={mx + offsetX}
+                    y={my + offsetY}
                     textAnchor="middle"
-                    fontSize={10}
-                    fill="var(--text-muted, #666)"
+                    dominantBaseline="central"
+                    fontSize={9}
+                    fill="var(--text-muted, #888)"
                   >
-                    {turnCount > 0 ? `${turnCount} exchanges` : ""}
+                    {count} exchange{count !== 1 ? "s" : ""}
                   </text>
-                </g>
-              );
-            })
-          )}
+                )}
+              </g>
+            );
+          })
+        )}
 
         {/* Speaker circles */}
         {speakers.map((speaker, i) => {
@@ -194,11 +229,19 @@ export default function SpeakerGraph({
             speaker.label, assignedRole, entities
           );
           const borderColor = stressColor(speaker.avgStress);
-          const fillColor = speakerFill(i);
+          const fillColor = SPEAKER_FILLS[i % SPEAKER_FILLS.length];
           const stat = statLine(contentType, { ...speaker, role: assignedRole });
+          const isHovered = hoveredSpeaker === speaker.label;
+          const scale = isHovered ? 1.08 : 1;
 
           return (
-            <g key={speaker.label}>
+            <g
+              key={speaker.label}
+              onMouseEnter={() => setHoveredSpeaker(speaker.label)}
+              onMouseLeave={() => setHoveredSpeaker(null)}
+              style={{ cursor: "pointer", transition: "transform 0.2s" }}
+              transform={`translate(${cx}, ${cy}) scale(${scale}) translate(${-cx}, ${-cy})`}
+            >
               {/* Stress ring */}
               <circle
                 cx={cx}
@@ -207,6 +250,7 @@ export default function SpeakerGraph({
                 fill="none"
                 stroke={borderColor}
                 strokeWidth={3}
+                opacity={isHovered ? 1 : 0.8}
               />
               {/* Main circle */}
               <circle
@@ -214,67 +258,83 @@ export default function SpeakerGraph({
                 cy={cy}
                 r={r}
                 fill={fillColor}
-                opacity={0.15}
+                opacity={isHovered ? 0.25 : 0.15}
                 stroke={fillColor}
                 strokeWidth={1.5}
               />
               {/* Name */}
               <text
                 x={cx}
-                y={cy - 8}
+                y={cy - (displayRole ? 6 : 0)}
                 textAnchor="middle"
-                fontSize={12}
+                dominantBaseline="central"
+                fontSize={11}
                 fontWeight={600}
                 fill="var(--text-primary, #E8E8E8)"
               >
-                {displayName}
+                {displayName.length > 12 ? displayName.slice(0, 11) + "…" : displayName}
               </text>
-              {/* Role subtitle */}
+              {/* Role subtitle (inside circle, below name) */}
               {displayRole && (
                 <text
                   x={cx}
-                  y={cy + 6}
+                  y={cy + 10}
                   textAnchor="middle"
-                  fontSize={10}
+                  dominantBaseline="central"
+                  fontSize={8}
                   fill={fillColor}
                   opacity={0.9}
                 >
-                  {displayRole}
+                  ({displayRole})
                 </text>
               )}
-              {/* Speaker label */}
+              {/* Stat below circle — outside, no overlap */}
               <text
                 x={cx}
-                y={cy + 18}
+                y={cy + r + 14}
                 textAnchor="middle"
-                fontSize={8}
-                fill="var(--text-muted, #888)"
-              >
-                ({speaker.label})
-              </text>
-              {/* Stat below circle */}
-              <text
-                x={cx}
-                y={cy + r + 18}
-                textAnchor="middle"
-                fontSize={10}
+                fontSize={9}
                 fill="var(--text-secondary, #AAA)"
               >
                 {stat}
               </text>
-              {/* Stress badge */}
+              {/* Stress badge above circle */}
               <text
                 x={cx}
                 y={cy - r - 8}
                 textAnchor="middle"
-                fontSize={9}
+                fontSize={8}
                 fill={borderColor}
               >
                 Stress {Math.round(speaker.avgStress * 100)}%
               </text>
+
+              {/* Talk time badge — small number inside circle at bottom */}
+              <text
+                x={cx}
+                y={cy + (displayRole ? 22 : 14)}
+                textAnchor="middle"
+                fontSize={8}
+                fill="var(--text-muted, #999)"
+              >
+                {Math.round(speaker.talkTimePct)}%
+              </text>
             </g>
           );
         })}
+
+        {/* Total exchanges label */}
+        {totalExchanges > 0 && (
+          <text
+            x={W / 2}
+            y={H - 6}
+            textAnchor="middle"
+            fontSize={9}
+            fill="var(--text-muted, #666)"
+          >
+            {totalExchanges} total exchanges
+          </text>
+        )}
       </svg>
     </div>
   );
