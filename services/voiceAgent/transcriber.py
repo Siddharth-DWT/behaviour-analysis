@@ -392,24 +392,40 @@ class Transcriber:
     # ── Speaker Embedding Model (ECAPA-TDNN) ──
 
     def _load_embedding_model(self):
-        """Lazy-load the Resemblyzer GE2E speaker encoder (256-dim embeddings)."""
+        """Lazy-load SpeechBrain ECAPA-TDNN speaker encoder (192-dim embeddings).
+
+        MUST install from develop branch: pip install git+https://github.com/speechbrain/speechbrain.git@develop
+        PyPI release has broken hf_hub compatibility. See Rule 2 in SpeechBrain guide.
+        """
         if self._embedding_model is not None:
             return self._embedding_model
 
         try:
-            from resemblyzer import VoiceEncoder
-            logger.info("Loading Resemblyzer speaker embedding model...")
-            self._embedding_model = VoiceEncoder(device="cpu")
-            logger.info("Resemblyzer speaker embedding model loaded.")
+            from speechbrain.inference.speaker import EncoderClassifier
+
+            savedir = os.getenv(
+                "SPEECHBRAIN_CACHE_DIR",
+                str(Path(__file__).parent / "pretrained_models" / "spkrec-ecapa-voxceleb"),
+            )
+            logger.info("Loading SpeechBrain ECAPA-TDNN speaker embedding model...")
+            self._embedding_model = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir=savedir,
+                run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
+            )
+            logger.info("SpeechBrain ECAPA-TDNN model loaded.")
             return self._embedding_model
         except ImportError:
-            logger.warning("resemblyzer not installed — embedding diarization unavailable")
+            logger.warning(
+                "speechbrain not installed — embedding diarization unavailable. "
+                "Install with: pip install git+https://github.com/speechbrain/speechbrain.git@develop"
+            )
             return None
         except Exception as e:
-            logger.warning(f"Failed to load speaker embedding model: {e}")
+            logger.warning(f"Failed to load ECAPA-TDNN model: {e}")
             return None
 
-    EMBEDDING_DIM = 256  # Resemblyzer GE2E produces 256-dim vectors
+    EMBEDDING_DIM = 192  # ECAPA-TDNN produces 192-dim speaker embeddings
 
     def _compute_speaker_embeddings(
         self,
@@ -418,16 +434,13 @@ class Transcriber:
         sr: int,
     ) -> Optional[np.ndarray]:
         """
-        Compute GE2E speaker embedding (256-dim) for each segment using Resemblyzer.
+        Compute ECAPA-TDNN speaker embedding (192-dim) for each segment.
 
-        Wan et al. 2018: GE2E loss produces embeddings that cluster by speaker
-        identity, regardless of content. Self-contained model (no HuggingFace auth).
+        Desplanques et al. 2020: ECAPA-TDNN achieves ~0.8% EER on VoxCeleb1.
+        Audio must be 16kHz mono. Segments shorter than 0.5s get a zero vector.
 
-        Returns (N_segments, 256) numpy array, or None if unavailable.
-        Segments shorter than 0.5s get a zero vector.
+        Returns (N_segments, 192) numpy array, or None if unavailable.
         """
-        from resemblyzer import preprocess_wav
-
         model = self._load_embedding_model()
         if model is None:
             return None
@@ -437,17 +450,14 @@ class Transcriber:
         valid_mask = []
         MIN_DURATION_S = 0.5
 
-        # Resemblyzer expects float32 in [-1, 1], 16kHz
-        wav = preprocess_wav(y, source_sr=sr)
-
         for seg in segments:
-            start_sample = int(seg["start_ms"] / 1000 * 16000)
-            end_sample = int(seg["end_ms"] / 1000 * 16000)
-            start_sample = max(0, min(start_sample, len(wav) - 1))
-            end_sample = max(start_sample + 1, min(end_sample, len(wav)))
+            start_sample = int(seg["start_ms"] / 1000 * sr)
+            end_sample = int(seg["end_ms"] / 1000 * sr)
+            start_sample = max(0, min(start_sample, total_samples - 1))
+            end_sample = max(start_sample + 1, min(end_sample, total_samples))
 
-            chunk = wav[start_sample:end_sample]
-            duration_s = len(chunk) / 16000
+            chunk = y[start_sample:end_sample]
+            duration_s = len(chunk) / sr
 
             if duration_s < MIN_DURATION_S:
                 embeddings.append(np.zeros(self.EMBEDDING_DIM))
@@ -455,8 +465,15 @@ class Transcriber:
                 continue
 
             try:
-                emb = model.embed_utterance(chunk)
-                embeddings.append(emb)
+                # ECAPA-TDNN expects (batch, samples) tensor at 16kHz
+                waveform = torch.from_numpy(chunk).unsqueeze(0).float()
+                # Resample if not 16kHz
+                if sr != 16000:
+                    waveform = _ta.functional.resample(waveform, sr, 16000)
+                with torch.no_grad():
+                    emb = model.encode_batch(waveform)
+                emb_np = emb.squeeze().cpu().numpy()
+                embeddings.append(emb_np)
                 valid_mask.append(True)
             except Exception as e:
                 logger.debug(f"Embedding failed for segment: {e}")
@@ -468,7 +485,7 @@ class Transcriber:
             logger.warning(f"Only {n_valid} valid embeddings — need at least 2")
             return None
 
-        logger.info(f"Computed {n_valid}/{len(segments)} speaker embeddings")
+        logger.info(f"Computed {n_valid}/{len(segments)} ECAPA-TDNN speaker embeddings")
         return np.array(embeddings, dtype=np.float32)
 
     def _estimate_speaker_count(self, segments: list[dict]) -> int:
