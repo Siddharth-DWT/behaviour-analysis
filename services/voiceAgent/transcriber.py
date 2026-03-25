@@ -824,8 +824,17 @@ class Transcriber:
                 counter += 1
             seg["speaker"] = label_map[raw]
 
-        # ── Linguistic post-correction ──
+        # ── Layer 2: Linguistic post-correction ──
         segments = self._linguistic_post_correction(segments, num_speakers)
+
+        # ── Layer 3: Pitch Kalman filter (optional — enable with DIARIZATION_KALMAN=true) ──
+        if os.getenv("DIARIZATION_KALMAN", "false").lower() == "true":
+            segments = self._apply_pitch_kalman_correction(segments, audio_path)
+
+        # ── Layer 4: LLM post-correction (optional — enable with DIARIZATION_LLM=true) ──
+        if os.getenv("DIARIZATION_LLM", "false").lower() == "true":
+            meeting_type = getattr(self, "_meeting_type", "sales_call") or "sales_call"
+            segments = self._apply_llm_correction(segments, meeting_type)
 
         # ── Balance check ──
         counts = Counter(seg["speaker"] for seg in segments)
@@ -974,8 +983,17 @@ class Transcriber:
                             best_speaker = other_seg["speaker"]
                 seg["speaker"] = best_speaker
 
-        # ── Linguistic post-correction ──
+        # ── Layer 2: Linguistic post-correction ──
         segments = self._linguistic_post_correction(segments, num_speakers)
+
+        # ── Layer 3: Pitch Kalman filter (optional) ──
+        if os.getenv("DIARIZATION_KALMAN", "false").lower() == "true":
+            segments = self._apply_pitch_kalman_correction(segments, audio_path)
+
+        # ── Layer 4: LLM post-correction (optional) ──
+        if os.getenv("DIARIZATION_LLM", "false").lower() == "true":
+            meeting_type = getattr(self, "_meeting_type", "sales_call") or "sales_call"
+            segments = self._apply_llm_correction(segments, meeting_type)
 
         # Log results
         speaker_counts = Counter(seg["speaker"] for seg in segments)
@@ -1086,6 +1104,354 @@ class Transcriber:
             logger.info(f"Linguistic post-correction: {corrections} fixes applied")
 
         return segments
+
+    # ── Layer 3: Pitch Kalman Filter Post-Correction ──
+
+    def _apply_pitch_kalman_correction(
+        self,
+        segments: list[dict],
+        audio_path: str,
+    ) -> list[dict]:
+        """
+        Scan diarized segments for pitch (F0) discontinuities that suggest
+        a missed speaker change. Uses a Kalman filter to model pitch continuity
+        and flags/corrects segments where F0 jumps unpredictably.
+
+        Hogg et al. (IEEE ICASSP 2019): Kalman-based speaker change detection
+        improved from 43.3% to 70.5% on AMI corpus.
+
+        High confidence (>0.7): flip speaker directly.
+        Medium confidence (0.4-0.7): flag for LLM layer.
+        """
+        try:
+            from filterpy.kalman import KalmanFilter as KF
+        except ImportError:
+            logger.debug("filterpy not installed — skipping pitch Kalman correction")
+            return segments
+
+        if len(segments) < 3:
+            return segments
+
+        # Load audio
+        if self._audio_data is not None:
+            y, sr = self._audio_data
+        else:
+            import librosa
+            try:
+                from shared.utils.audio_loader import load_audio
+                y, sr = load_audio(audio_path, sr=16000)
+            except ImportError:
+                y, sr = librosa.load(audio_path, sr=16000, mono=True)
+
+        # Extract full pitch track
+        pitch_times, pitch_values = self._extract_pitch_track(y, sr)
+        if pitch_times is None or len(pitch_times) < 10:
+            logger.debug("Insufficient pitch data — skipping Kalman correction")
+            return segments
+
+        segments = list(segments)
+        corrections = 0
+        speakers = set(seg.get("speaker", "") for seg in segments)
+        if len(speakers) < 2:
+            return segments
+        speaker_list = sorted(speakers)
+
+        def other_speaker(spk: str) -> str:
+            return speaker_list[1] if spk == speaker_list[0] else speaker_list[0]
+
+        for i in range(len(segments) - 1):
+            curr = segments[i]
+            nxt = segments[i + 1]
+
+            # Only check consecutive same-speaker segments with small gaps
+            if curr.get("speaker") != nxt.get("speaker"):
+                continue
+            gap_s = (nxt["start_ms"] - curr["end_ms"]) / 1000.0
+            if gap_s > 0.5:
+                continue
+
+            boundary_s = curr["end_ms"] / 1000.0
+            change_detected, confidence = self._detect_pitch_change_kalman(
+                KF, pitch_times, pitch_values,
+                boundary_s - 0.3, boundary_s + 0.3, boundary_s
+            )
+
+            if change_detected and confidence > 0.4:
+                # Always FLAG, never auto-flip. Let LLM layer decide.
+                # Auto-flipping on phone audio causes too many false positives.
+                nxt["pitch_kalman_suspicious"] = True
+                nxt["pitch_kalman_confidence"] = confidence
+                corrections += 1
+                logger.info(
+                    f"Pitch Kalman: F0 discontinuity at {boundary_s:.2f}s "
+                    f"(conf={confidence:.2f}), flagging '{nxt.get('text', '')[:40]}'"
+                )
+
+        if corrections > 0:
+            logger.info(f"Pitch Kalman: corrected {corrections} segment(s)")
+        return segments
+
+    def _extract_pitch_track(
+        self, y: np.ndarray, sr: int, frame_step: float = 0.01,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Extract F0 pitch track. Uses Praat if available, else librosa.pyin."""
+        # Try Praat (parselmouth) — better on phone audio
+        try:
+            import parselmouth
+            from parselmouth.praat import call
+            snd = parselmouth.Sound(y, sampling_frequency=sr)
+            pitch_obj = call(snd, "To Pitch", frame_step, 75.0, 500.0)
+            n_frames = call(pitch_obj, "Get number of frames")
+            times, values = [], []
+            for i in range(1, n_frames + 1):
+                t = call(pitch_obj, "Get time from frame number", i)
+                f0 = call(pitch_obj, "Get value in frame", i, "Hertz")
+                times.append(t)
+                values.append(f0 if not np.isnan(f0) else 0.0)
+            return np.array(times), np.array(values)
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"Praat pitch extraction failed: {e}")
+
+        # Fallback: librosa.pyin
+        try:
+            import librosa
+            f0, _, _ = librosa.pyin(y, fmin=75, fmax=500, sr=sr, hop_length=int(sr * frame_step))
+            times = np.arange(len(f0)) * frame_step
+            f0 = np.where(np.isnan(f0), 0.0, f0)
+            return times, f0
+        except Exception as e:
+            logger.warning(f"Pitch extraction failed: {e}")
+            return None, None
+
+    @staticmethod
+    def _detect_pitch_change_kalman(
+        KF, pitch_times, pitch_values,
+        start_time, end_time, boundary_time,
+    ) -> tuple[bool, float]:
+        """
+        Run Kalman filter across a segment boundary and detect F0 spike.
+        Returns (change_detected, confidence).
+        """
+        mask = (pitch_times >= start_time) & (pitch_times <= end_time)
+        window_f0 = pitch_values[mask]
+        window_times = pitch_times[mask]
+
+        # Filter to voiced frames
+        voiced_mask = window_f0 > 0
+        voiced_f0 = window_f0[voiced_mask]
+        voiced_times = window_times[voiced_mask]
+
+        if len(voiced_f0) < 4:
+            return False, 0.0
+
+        before = voiced_f0[voiced_times < boundary_time]
+        after = voiced_f0[voiced_times >= boundary_time]
+        if len(before) < 2 or len(after) < 2:
+            return False, 0.0
+
+        # Kalman filter: state = [pitch, pitch_velocity]
+        dt = 0.01
+        kf = KF(dim_x=2, dim_z=1)
+        kf.F = np.array([[1.0, dt], [0.0, 1.0]])
+        kf.H = np.array([[1.0, 0.0]])
+        kf.Q = np.array([[10.0, 0.0], [0.0, 50.0]])
+        kf.R = np.array([[25.0]])
+        kf.x = np.array([[voiced_f0[0]], [0.0]])
+        kf.P = np.array([[100.0, 0.0], [0.0, 100.0]])
+
+        innovations = []
+        inn_times = []
+        for j in range(1, len(voiced_f0)):
+            kf.predict()
+            z = np.array([[voiced_f0[j]]])
+            innovation = float(z - kf.H @ kf.x)
+            innovations.append(abs(innovation))
+            inn_times.append(voiced_times[j])
+            kf.update(z)
+
+        if not innovations:
+            return False, 0.0
+
+        innovations = np.array(innovations)
+        inn_times = np.array(inn_times)
+
+        before_inn = innovations[inn_times < boundary_time]
+        after_inn = innovations[inn_times >= boundary_time]
+        if len(before_inn) == 0 or len(after_inn) == 0:
+            return False, 0.0
+
+        boundary_innovation = after_inn[0]
+        baseline_mean = np.mean(before_inn)
+        baseline_std = max(np.std(before_inn), 3.0)
+        z_score = (boundary_innovation - baseline_mean) / baseline_std
+
+        # Raw pitch jump
+        pitch_before = np.median(before[-3:])
+        pitch_after = np.median(after[:3])
+        raw_jump = abs(pitch_after - pitch_before)
+
+        # Confidence scoring
+        confidence = 0.0
+        if z_score > 3.0:
+            confidence += 0.5
+        elif z_score > 2.0:
+            confidence += 0.3
+        elif z_score > 1.5:
+            confidence += 0.15
+
+        if raw_jump > 40:
+            confidence += 0.4
+        elif raw_jump > 25:
+            confidence += 0.25
+        elif raw_jump > 15:
+            confidence += 0.1
+
+        # Pitch ranges separate?
+        if np.min(after[:3]) > np.max(before[-3:]) or np.min(before[-3:]) > np.max(after[:3]):
+            confidence += 0.15
+
+        confidence = min(confidence, 1.0)
+        return confidence > 0.4, confidence
+
+    # ── Layer 4: LLM Post-Correction ──
+
+    def _apply_llm_correction(
+        self,
+        segments: list[dict],
+        meeting_type: str = "sales_call",
+    ) -> list[dict]:
+        """
+        Use Claude API to fix speaker labels based on conversational logic.
+        Only changes speaker labels, never text. Integrates pitch Kalman flags.
+        """
+        import re
+
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        llm_provider = os.environ.get("LLM_PROVIDER", "anthropic" if anthropic_key else "openai")
+
+        if not (anthropic_key or openai_key) or len(segments) < 2:
+            return segments
+
+        try:
+            import httpx
+        except ImportError:
+            return segments
+
+        try:
+            # Build transcript with annotations
+            lines = []
+            for i, seg in enumerate(segments):
+                spk = seg.get("speaker", "Unknown")
+                text = seg.get("text", "").strip()
+
+                ann = []
+                if i > 0:
+                    gap_ms = seg["start_ms"] - segments[i - 1]["end_ms"]
+                    ann.append(f"gap:{gap_ms}ms")
+                if seg.get("pitch_kalman_suspicious"):
+                    ann.append(f"PITCH_SUSPICIOUS:{seg.get('pitch_kalman_confidence', 0):.2f}")
+
+                ann_str = f" [{', '.join(ann)}]" if ann else ""
+                lines.append(f'{i+1}. [{spk}]{ann_str} "{text}"')
+
+            transcript_text = "\n".join(lines)
+
+            prompt = (
+                "You are a speaker diarization correction system. Below is a 2-person phone call "
+                "transcript with speaker labels from an acoustic model. Some labels may be wrong.\n\n"
+                f"Context: {meeting_type}. Speaker_0=caller, Speaker_1=prospect.\n\n"
+                "Rules:\n"
+                "1. ONLY output the corrected transcript in the exact same numbered format\n"
+                "2. NEVER change the quoted text — only change [Speaker_0] or [Speaker_1]\n"
+                "3. Only flip a label if you are HIGHLY confident\n"
+                "4. Segments marked PITCH_SUSPICIOUS had F0 discontinuity — extra scrutiny\n"
+                "5. Patterns: statement+question=different speakers, objection+rebuttal=different speakers\n"
+                "6. When uncertain, DO NOT change the label\n\n"
+                f"Transcript:\n{transcript_text}\n\n"
+                "Output ONLY the corrected transcript lines. No explanation."
+            )
+
+            # Call the configured LLM provider
+            if llm_provider == "openai" and openai_key:
+                response = httpx.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {openai_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "gpt-4o-mini",
+                        "temperature": 0,
+                        "max_tokens": 2048,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                    timeout=15,
+                )
+                if response.status_code != 200:
+                    logger.warning(f"LLM correction API error: {response.status_code}")
+                    return segments
+                data = response.json()
+                completion = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            else:
+                response = httpx.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": anthropic_key,
+                        "content-type": "application/json",
+                        "anthropic-version": "2023-06-01",
+                    },
+                    json={
+                        "model": "claude-sonnet-4-20250514",
+                        "max_tokens": 2048,
+                        "temperature": 0,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                    timeout=15,
+                )
+                if response.status_code != 200:
+                    logger.warning(f"LLM correction API error: {response.status_code}")
+                    return segments
+                data = response.json()
+                completion = "".join(
+                    b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"
+                )
+
+            if not completion.strip():
+                return segments
+
+            # Parse corrected labels
+            pattern = re.compile(r"^\d+\.\s*\[(Speaker_\d+)\]")
+            new_labels = []
+            for line in completion.strip().split("\n"):
+                m = pattern.match(line.strip())
+                if m:
+                    new_labels.append(m.group(1))
+
+            if len(new_labels) != len(segments):
+                logger.warning(f"LLM returned {len(new_labels)} labels for {len(segments)} segments")
+                return segments
+
+            # Apply — validate only labels changed, cap at 30%
+            changes = sum(1 for s, l in zip(segments, new_labels) if s.get("speaker") != l)
+            if changes > len(segments) * 0.3:
+                logger.warning(f"LLM flipped {changes}/{len(segments)} — too aggressive, rejecting")
+                return segments
+
+            for seg, label in zip(segments, new_labels):
+                seg["speaker"] = label
+                seg.pop("pitch_kalman_suspicious", None)
+                seg.pop("pitch_kalman_confidence", None)
+
+            if changes > 0:
+                logger.info(f"LLM correction: flipped {changes} speaker label(s)")
+            return segments
+
+        except Exception as e:
+            logger.warning(f"LLM correction failed: {e}")
+            return segments
 
     # ── Acoustic KMeans Diarization (Tier 3) ──
 

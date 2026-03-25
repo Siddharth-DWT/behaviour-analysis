@@ -21,6 +21,10 @@ huggingface_hub>=0.20.0
 speechbrain @ git+https://github.com/speechbrain/speechbrain.git@develop
 # torch + torchaudio installed separately in Dockerfile (CPU-only build)
 
+# Pitch Kalman filter post-correction
+filterpy>=1.4.5
+praat-parselmouth>=0.4.3
+
 # Database
 psycopg2-binary==2.9.10
 sqlalchemy==2.0.36
