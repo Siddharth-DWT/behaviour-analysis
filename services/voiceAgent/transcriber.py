@@ -771,6 +771,9 @@ class Transcriber:
                             best_speaker = other_seg["speaker"]
                 seg["speaker"] = best_speaker
 
+        # ── Linguistic post-correction ──
+        segments = self._linguistic_post_correction(segments, num_speakers)
+
         # Log results
         speaker_counts = Counter(seg["speaker"] for seg in segments)
         self._last_diarization_backend = "embedding"
@@ -779,6 +782,77 @@ class Transcriber:
             f"{len(speaker_counts)} speakers — "
             + ", ".join(f"{k}: {v} segs" for k, v in sorted(speaker_counts.items()))
         )
+        return segments
+
+    def _linguistic_post_correction(
+        self,
+        segments: list[dict],
+        num_speakers: int = 2,
+    ) -> list[dict]:
+        """
+        Fix obvious diarization errors using linguistic patterns (conservative).
+
+        Rule 1: Question → short answer: if a short segment ends with '?' and the
+        next segment is short (<2s), same speaker, and separated by >200ms gap,
+        flip the response to the other speaker.
+
+        Rule 2: Isolated flip: if a single short (<1.5s) segment breaks an
+        otherwise consistent speaker run on both sides, with tiny gaps (<150ms),
+        re-assign it to match the surrounding speaker.
+        """
+        if num_speakers != 2 or len(segments) < 3:
+            return segments
+
+        speakers = set(seg.get("speaker", "") for seg in segments)
+        if len(speakers) < 2:
+            return segments
+        speaker_list = sorted(speakers)
+
+        def other_speaker(spk: str) -> str:
+            return speaker_list[1] if spk == speaker_list[0] else speaker_list[0]
+
+        corrections = 0
+
+        # Rule 1: Question → response pattern (conservative)
+        for i in range(len(segments) - 1):
+            curr = segments[i]
+            nxt = segments[i + 1]
+            curr_text = curr.get("text", "").strip()
+            nxt_duration = nxt["end_ms"] - nxt["start_ms"]
+            curr_duration = curr["end_ms"] - curr["start_ms"]
+            gap_ms = nxt["start_ms"] - curr["end_ms"]
+
+            if (
+                curr_text.endswith("?")
+                and curr.get("speaker") == nxt.get("speaker")
+                and nxt_duration < 2000
+                and curr_duration < 3000
+                and gap_ms > 200
+            ):
+                nxt["speaker"] = other_speaker(curr["speaker"])
+                corrections += 1
+
+        # Rule 2: Isolated single-segment flip
+        for i in range(1, len(segments) - 1):
+            prev_spk = segments[i - 1].get("speaker")
+            curr_spk = segments[i].get("speaker")
+            next_spk = segments[i + 1].get("speaker")
+            seg_duration = segments[i]["end_ms"] - segments[i]["start_ms"]
+
+            if (
+                prev_spk == next_spk
+                and curr_spk != prev_spk
+                and seg_duration < 1500
+            ):
+                gap_before = segments[i]["start_ms"] - segments[i - 1]["end_ms"]
+                gap_after = segments[i + 1]["start_ms"] - segments[i]["end_ms"]
+                if gap_before < 150 and gap_after < 150:
+                    segments[i]["speaker"] = prev_spk
+                    corrections += 1
+
+        if corrections > 0:
+            logger.info(f"Linguistic post-correction: {corrections} fixes applied")
+
         return segments
 
     # ── Acoustic KMeans Diarization (Tier 3) ──
