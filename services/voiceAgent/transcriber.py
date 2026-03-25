@@ -52,6 +52,7 @@ class Transcriber:
     def __init__(self):
         self._model = None
         self._diarization_pipeline = None
+        self._embedding_model = None  # ECAPA-TDNN speaker embedding model
         self._external_client = None
         self._use_external = False
         self._num_speakers = None  # Speaker count hint (2-10), None = auto
@@ -219,17 +220,8 @@ class Transcriber:
             f"server_time={proc_time:.2f}s"
         )
 
-        # Apply speaker diarization
-        # Pyannote is slow on CPU — only use for calls > 10 min where
-        # speaker patterns are complex enough to justify the cost.
-        # KMeans is fast (<10s) and accurate enough for shorter calls.
-        duration_min = duration / 60.0
-        if USE_PYANNOTE and duration_min > 10:
-            segments = self._diarize_pyannote(audio_path, segments)
-        else:
-            if USE_PYANNOTE and duration_min <= 10:
-                logger.info(f"Audio is {duration_min:.1f}min — using KMeans instead of pyannote")
-            segments = self._diarize_simple(segments, self._num_speakers, audio_path)
+        # Apply speaker diarization (cascade handles pyannote/embedding/kmeans)
+        segments = self._diarize_simple(segments, self._num_speakers, audio_path)
 
         return {
             "duration_seconds": duration,
@@ -239,6 +231,8 @@ class Transcriber:
             "language_probability": result.get("language_probability", 0),
             "processing_time": proc_time,
             "segments": segments,
+            "diarization_backend": self._last_diarization_backend,
+            "diarization_confidence": self._compute_diarization_confidence(segments),
         }
 
     # ═══════════════════════════════════════════════════════════
@@ -293,20 +287,16 @@ class Transcriber:
 
         logger.info(f"Local transcription complete: {duration:.1f}s, {len(segments)} segments")
 
-        # Apply speaker diarization (same duration gate as external backend)
-        duration_min = duration / 60.0
-        if USE_PYANNOTE and duration_min > 10:
-            segments = self._diarize_pyannote(audio_path, segments)
-        else:
-            if USE_PYANNOTE and duration_min <= 10:
-                logger.info(f"Audio is {duration_min:.1f}min — using KMeans instead of pyannote")
-            segments = self._diarize_simple(segments, self._num_speakers, audio_path)
+        # Apply speaker diarization (cascade handles pyannote/embedding/kmeans)
+        segments = self._diarize_simple(segments, self._num_speakers, audio_path)
 
         return {
             "duration_seconds": duration,
             "backend": "local",
             "model": WHISPER_MODEL,
             "segments": segments,
+            "diarization_backend": self._last_diarization_backend,
+            "diarization_confidence": self._compute_diarization_confidence(segments),
         }
 
     # ═══════════════════════════════════════════════════════════
@@ -381,19 +371,105 @@ class Transcriber:
     # SPEAKER DIARIZATION
     # ═══════════════════════════════════════════════════════════
 
+    # Diarization mode from environment
+    DIARIZATION_MODE = os.getenv("DIARIZATION_MODE", "auto")  # auto|pyannote|embedding|kmeans
+
     # Speaker count defaults and ranges per meeting type
+    # turn_gap_ms: gap threshold for that conversation style
     SPEAKER_DEFAULTS = {
-        "sales_call":            {"default": 2, "min": 2, "max": 3},
-        "interview":             {"default": 2, "min": 2, "max": 4},
-        "internal":              {"default": 4, "min": 2, "max": 8},
-        "client_meeting":        {"default": 3, "min": 2, "max": 8},
-        "meeting":               {"default": 4, "min": 2, "max": 8},
-        "podcast":               {"default": 2, "min": 2, "max": 4},
-        "lecture":               {"default": 1, "min": 1, "max": 2},
-        "presentation":          {"default": 1, "min": 1, "max": 3},
-        "debate":                {"default": 2, "min": 2, "max": 4},
-        "casual_conversation":   {"default": 2, "min": 2, "max": 4},
+        "sales_call":            {"default": 2, "min": 2, "max": 3, "turn_gap_ms": 400},
+        "interview":             {"default": 2, "min": 2, "max": 4, "turn_gap_ms": 600},
+        "internal":              {"default": 4, "min": 2, "max": 8, "turn_gap_ms": 800},
+        "client_meeting":        {"default": 3, "min": 2, "max": 8, "turn_gap_ms": 600},
+        "meeting":               {"default": 4, "min": 2, "max": 8, "turn_gap_ms": 800},
+        "podcast":               {"default": 2, "min": 2, "max": 4, "turn_gap_ms": 600},
+        "lecture":               {"default": 1, "min": 1, "max": 2, "turn_gap_ms": 1000},
+        "presentation":          {"default": 1, "min": 1, "max": 3, "turn_gap_ms": 1000},
+        "debate":                {"default": 2, "min": 2, "max": 4, "turn_gap_ms": 400},
+        "casual_conversation":   {"default": 2, "min": 2, "max": 4, "turn_gap_ms": 400},
     }
+
+    # ── Speaker Embedding Model (ECAPA-TDNN) ──
+
+    def _load_embedding_model(self):
+        """Lazy-load the Resemblyzer GE2E speaker encoder (256-dim embeddings)."""
+        if self._embedding_model is not None:
+            return self._embedding_model
+
+        try:
+            from resemblyzer import VoiceEncoder
+            logger.info("Loading Resemblyzer speaker embedding model...")
+            self._embedding_model = VoiceEncoder(device="cpu")
+            logger.info("Resemblyzer speaker embedding model loaded.")
+            return self._embedding_model
+        except ImportError:
+            logger.warning("resemblyzer not installed — embedding diarization unavailable")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to load speaker embedding model: {e}")
+            return None
+
+    EMBEDDING_DIM = 256  # Resemblyzer GE2E produces 256-dim vectors
+
+    def _compute_speaker_embeddings(
+        self,
+        segments: list[dict],
+        y: np.ndarray,
+        sr: int,
+    ) -> Optional[np.ndarray]:
+        """
+        Compute GE2E speaker embedding (256-dim) for each segment using Resemblyzer.
+
+        Wan et al. 2018: GE2E loss produces embeddings that cluster by speaker
+        identity, regardless of content. Self-contained model (no HuggingFace auth).
+
+        Returns (N_segments, 256) numpy array, or None if unavailable.
+        Segments shorter than 0.5s get a zero vector.
+        """
+        from resemblyzer import preprocess_wav
+
+        model = self._load_embedding_model()
+        if model is None:
+            return None
+
+        total_samples = len(y)
+        embeddings = []
+        valid_mask = []
+        MIN_DURATION_S = 0.5
+
+        # Resemblyzer expects float32 in [-1, 1], 16kHz
+        wav = preprocess_wav(y, source_sr=sr)
+
+        for seg in segments:
+            start_sample = int(seg["start_ms"] / 1000 * 16000)
+            end_sample = int(seg["end_ms"] / 1000 * 16000)
+            start_sample = max(0, min(start_sample, len(wav) - 1))
+            end_sample = max(start_sample + 1, min(end_sample, len(wav)))
+
+            chunk = wav[start_sample:end_sample]
+            duration_s = len(chunk) / 16000
+
+            if duration_s < MIN_DURATION_S:
+                embeddings.append(np.zeros(self.EMBEDDING_DIM))
+                valid_mask.append(False)
+                continue
+
+            try:
+                emb = model.embed_utterance(chunk)
+                embeddings.append(emb)
+                valid_mask.append(True)
+            except Exception as e:
+                logger.debug(f"Embedding failed for segment: {e}")
+                embeddings.append(np.zeros(self.EMBEDDING_DIM))
+                valid_mask.append(False)
+
+        n_valid = sum(valid_mask)
+        if n_valid < 2:
+            logger.warning(f"Only {n_valid} valid embeddings — need at least 2")
+            return None
+
+        logger.info(f"Computed {n_valid}/{len(segments)} speaker embeddings")
+        return np.array(embeddings, dtype=np.float32)
 
     def _estimate_speaker_count(self, segments: list[dict]) -> int:
         """
@@ -445,6 +521,57 @@ class Transcriber:
         )
         return estimated
 
+    def _compute_diarization_confidence(self, segments: list[dict]) -> float:
+        """
+        Estimate confidence in diarization quality (0.0 - 0.85).
+
+        Factors:
+          - Backend quality (pyannote > embedding > kmeans > gap_pitch > heuristic)
+          - Speaker balance (more balanced = higher confidence)
+          - Turn count (more alternation evidence = higher confidence)
+
+        Max 0.85 per NEXUS confidence ceiling principle.
+        """
+        from collections import Counter
+
+        backend = self._last_diarization_backend
+
+        # Base confidence from backend quality
+        backend_base = {
+            "pyannote": 0.80,
+            "embedding": 0.70,
+            "kmeans": 0.50,
+            "gap_pitch": 0.30,
+            "heuristic_multi": 0.20,
+            "single_speaker": 0.60,
+            "uninitialized": 0.0,
+        }
+        confidence = backend_base.get(backend, 0.25)
+
+        if not segments or len(segments) < 2:
+            return min(confidence, 0.85)
+
+        # Speaker balance bonus (0 to +0.10)
+        speaker_counts = Counter(seg.get("speaker", "Speaker_0") for seg in segments)
+        n_speakers = len(speaker_counts)
+        if n_speakers >= 2:
+            total = sum(speaker_counts.values())
+            max_pct = max(speaker_counts.values()) / total
+            # Perfect balance (50/50) → +0.10, 90/10 → +0.01
+            balance_score = 1.0 - max_pct
+            confidence += balance_score * 0.15
+
+        # Turn alternation bonus (0 to +0.05)
+        turns = 1
+        for i in range(1, len(segments)):
+            if segments[i].get("speaker") != segments[i - 1].get("speaker"):
+                turns += 1
+        # More turns relative to segments = better evidence
+        turn_ratio = turns / len(segments) if len(segments) > 0 else 0
+        confidence += turn_ratio * 0.05
+
+        return min(round(confidence, 3), 0.85)
+
     def _diarize_simple(
         self,
         segments: list[dict],
@@ -452,16 +579,14 @@ class Transcriber:
         audio_path: Optional[str] = None,
     ) -> list[dict]:
         """
-        Speaker diarization using acoustic clustering.
+        Speaker diarization cascade.
 
-        When num_speakers is specified AND audio_path is available:
-          - Extracts mean pitch (F0) and mean energy (RMS) per segment
-          - Runs KMeans(n_clusters=num_speakers) on [pitch, energy] features
-          - Assigns Speaker_0, Speaker_1, ... based on cluster labels
-
-        Falls back to gap-based heuristic when clustering is unavailable.
-
-        For production: replace with pyannote diarization.
+        Priority order (configurable via DIARIZATION_MODE env var):
+          1. Pyannote (neural end-to-end) — if USE_PYANNOTE=true
+          2. Embedding clustering (ECAPA-TDNN + agglomerative) — default
+          3. Acoustic KMeans (MFCCs + pitch + energy)
+          4. Gap + pitch heuristic (2-speaker fallback)
+          5. Heuristic multi-speaker (round-robin, last resort)
         """
         if not segments:
             return segments
@@ -481,8 +606,30 @@ class Transcriber:
             logger.info("Single-speaker mode: all segments assigned to Speaker_0")
             return segments
 
-        # Try acoustic KMeans clustering first (when we have the audio)
-        if audio_path and max_speakers >= 2:
+        mode = self.DIARIZATION_MODE
+
+        # ── Tier 1: Pyannote (if enabled) ──
+        if mode in ("pyannote", "auto") and USE_PYANNOTE and audio_path:
+            try:
+                result = self._diarize_pyannote(audio_path, segments)
+                if result is not None:
+                    return result
+            except Exception as e:
+                logger.warning(f"Pyannote diarization failed: {e}")
+
+        # ── Tier 2: Speaker embedding clustering (ECAPA-TDNN) ──
+        if mode in ("embedding", "auto") and audio_path:
+            try:
+                result = self._diarize_embedding_clustering(
+                    segments, max_speakers, audio_path
+                )
+                if result is not None:
+                    return result
+            except Exception as e:
+                logger.warning(f"Embedding clustering failed: {e}")
+
+        # ── Tier 3: Acoustic KMeans (enhanced with MFCCs) ──
+        if mode in ("kmeans", "auto") and audio_path and max_speakers >= 2:
             try:
                 clustered = self._diarize_acoustic_kmeans(
                     segments, max_speakers, audio_path
@@ -492,10 +639,132 @@ class Transcriber:
             except Exception as e:
                 logger.warning(f"Acoustic KMeans diarization failed: {e}")
 
-        # Fallback: gap-based heuristic (needs audio for real pitch)
+        # ── Tier 4/5: Gap+pitch or heuristic ──
         if max_speakers == 2:
             return self._diarize_gap_two_speaker(segments, audio_path)
         return self._diarize_simple_multi_speaker(segments, max_speakers)
+
+    # ── Embedding-Based Diarization (Tier 2) ──
+
+    def _diarize_embedding_clustering(
+        self,
+        segments: list[dict],
+        num_speakers: int,
+        audio_path: str,
+    ) -> Optional[list[dict]]:
+        """
+        Speaker diarization using ECAPA-TDNN speaker embeddings + agglomerative
+        clustering with cosine affinity.
+
+        Desplanques et al. 2020: ECAPA-TDNN produces 192-dim vectors that encode
+        speaker identity regardless of what is being said.
+        """
+        from sklearn.cluster import AgglomerativeClustering
+        from sklearn.metrics.pairwise import cosine_distances
+
+        logger.info(
+            f"Running embedding diarization: {num_speakers} speakers, "
+            f"{len(segments)} segments"
+        )
+
+        # Load audio
+        if self._audio_data is not None:
+            y, sr = self._audio_data
+        else:
+            import librosa
+            try:
+                from shared.utils.audio_loader import load_audio
+                y, sr = load_audio(audio_path, sr=16000)
+            except ImportError:
+                y, sr = librosa.load(audio_path, sr=16000, mono=True)
+
+        # Compute embeddings
+        embeddings = self._compute_speaker_embeddings(segments, y, sr)
+        if embeddings is None:
+            return None
+
+        # Build valid mask (non-zero embeddings)
+        valid_mask = [np.linalg.norm(e) > 0.01 for e in embeddings]
+        n_valid = sum(valid_mask)
+        if n_valid < num_speakers:
+            logger.warning(
+                f"Only {n_valid} valid embeddings, need {num_speakers}. Falling back."
+            )
+            return None
+
+        # Agglomerative clustering with cosine distance
+        dist_matrix = cosine_distances(embeddings)
+        clustering = AgglomerativeClustering(
+            n_clusters=num_speakers,
+            metric="precomputed",
+            linkage="average",
+        )
+        labels = clustering.fit_predict(dist_matrix)
+
+        # ── Temporal smoothing: reassign isolated micro-fragments ──
+        labels = labels.tolist()
+        for i in range(1, len(labels) - 1):
+            prev_label, next_label = labels[i - 1], labels[i + 1]
+            if prev_label == next_label and labels[i] != prev_label:
+                seg_duration_ms = segments[i]["end_ms"] - segments[i]["start_ms"]
+                gap_before = segments[i]["start_ms"] - segments[i - 1]["end_ms"]
+                gap_after = segments[i + 1]["start_ms"] - segments[i]["end_ms"]
+                if seg_duration_ms < 1500 and gap_before < 200 and gap_after < 200:
+                    labels[i] = prev_label
+
+        # ── Balance check (relaxed for embeddings: 1/N + 0.45) ──
+        from collections import Counter
+        counts = Counter(labels)
+        total = len(labels)
+        max_pct = max(counts.values()) / total if total > 0 else 1.0
+        max_allowed_pct = (1.0 / num_speakers) + 0.45
+        if max_pct > max_allowed_pct:
+            logger.warning(
+                f"Embedding clustering imbalanced: {dict(counts)} "
+                f"({max_pct:.0%} in one cluster, limit={max_allowed_pct:.0%}). "
+                f"Falling back."
+            )
+            return None
+
+        # ── Assign labels by first-appearance order ──
+        label_order = []
+        for lbl in labels:
+            if lbl not in label_order:
+                label_order.append(lbl)
+        cluster_to_speaker = {
+            lbl: f"Speaker_{rank}" for rank, lbl in enumerate(label_order)
+        }
+
+        for i, seg in enumerate(segments):
+            seg["speaker"] = cluster_to_speaker[labels[i]]
+
+        # ── Assign invalid segments from nearest valid neighbor ──
+        for i, (seg, valid) in enumerate(zip(segments, valid_mask)):
+            if not valid:
+                # Find nearest valid neighbor by time
+                best_dist = float("inf")
+                best_speaker = "Speaker_0"
+                seg_mid = (seg["start_ms"] + seg["end_ms"]) / 2
+                for j, (other_seg, other_valid) in enumerate(zip(segments, valid_mask)):
+                    if other_valid and j != i:
+                        other_mid = (other_seg["start_ms"] + other_seg["end_ms"]) / 2
+                        dist = abs(seg_mid - other_mid)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_speaker = other_seg["speaker"]
+                seg["speaker"] = best_speaker
+
+        # Log results
+        speaker_counts = Counter(seg["speaker"] for seg in segments)
+        self._last_diarization_backend = "embedding"
+        logger.info(
+            f"Embedding diarization complete: "
+            f"{len(speaker_counts)} speakers — "
+            + ", ".join(f"{k}: {v} segs" for k, v in sorted(speaker_counts.items()))
+        )
+        return segments
+
+    # ── Acoustic KMeans Diarization (Tier 3) ──
 
     def _diarize_acoustic_kmeans(
         self,
@@ -504,16 +773,16 @@ class Transcriber:
         audio_path: str,
     ) -> Optional[list[dict]]:
         """
-        Cluster transcript segments into speakers using pitch + energy features.
+        Cluster transcript segments into speakers using MFCCs + pitch + energy.
 
-        For each segment:
-          1. Extract the audio slice [start_ms..end_ms]
-          2. Compute mean F0 (pitch) via librosa.pyin
-          3. Compute mean RMS energy
-        Then KMeans(n_clusters=num_speakers) on the 2D feature matrix.
+        Enhanced feature set (16D per segment):
+          - 13 mean MFCCs (vocal tract shape — Davis & Mermelstein 1980)
+          - mean F0 pitch + pitch std (speaker-specific F0 range)
+          - mean RMS energy (speaking style)
         """
         import librosa
         from sklearn.cluster import KMeans
+        from sklearn.preprocessing import StandardScaler
 
         logger.info(
             f"Running acoustic KMeans diarization: {num_speakers} speakers, "
@@ -534,22 +803,32 @@ class Transcriber:
                 return None
         total_samples = len(y)
 
-        features = []  # 5 features per segment
-        valid_mask = []  # Track which segments have valid features
+        N_MFCC = 13
+        N_FEATURES = N_MFCC + 3  # 13 MFCCs + pitch + pitch_std + energy
+        features = []
+        valid_mask = []
 
         for seg in segments:
             start_sample = int(seg["start_ms"] / 1000 * sr)
             end_sample = int(seg["end_ms"] / 1000 * sr)
-            # Clamp to audio bounds
             start_sample = max(0, min(start_sample, total_samples - 1))
             end_sample = max(start_sample + 1, min(end_sample, total_samples))
 
             chunk = y[start_sample:end_sample]
 
             if len(chunk) < sr * 0.1:  # Skip very short chunks (< 100ms)
-                features.append([0.0, 0.0, 0.0, 0.0, 0.0])
+                features.append([0.0] * N_FEATURES)
                 valid_mask.append(False)
                 continue
+
+            # 13 MFCCs — vocal tract shape (most discriminative non-neural feature)
+            try:
+                mfccs = librosa.feature.mfcc(
+                    y=chunk, sr=sr, n_mfcc=N_MFCC, n_fft=2048, hop_length=512
+                )
+                mean_mfccs = np.mean(mfccs, axis=1).tolist()  # (13,)
+            except Exception:
+                mean_mfccs = [0.0] * N_MFCC
 
             # Mean pitch + pitch std via pyin
             try:
@@ -568,21 +847,7 @@ class Transcriber:
             rms = librosa.feature.rms(y=chunk, frame_length=2048, hop_length=512)[0]
             mean_energy = float(np.mean(rms)) if len(rms) > 0 else 0.0
 
-            # Spectral centroid
-            try:
-                sc = librosa.feature.spectral_centroid(y=chunk, sr=sr)[0]
-                spectral_centroid = float(np.mean(sc)) if len(sc) > 0 else 0.0
-            except Exception:
-                spectral_centroid = 0.0
-
-            # Zero crossing rate
-            try:
-                zcr = librosa.feature.zero_crossing_rate(chunk)[0]
-                zero_crossing = float(np.mean(zcr)) if len(zcr) > 0 else 0.0
-            except Exception:
-                zero_crossing = 0.0
-
-            features.append([mean_pitch, mean_energy, spectral_centroid, zero_crossing, pitch_std])
+            features.append(mean_mfccs + [mean_pitch, pitch_std, mean_energy])
             valid_mask.append(mean_pitch > 0)
 
         features_arr = np.array(features, dtype=np.float64)
@@ -596,21 +861,13 @@ class Transcriber:
             )
             return None
 
-        # Normalise features to [0, 1] for balanced clustering
-        for col in range(features_arr.shape[1]):
-            col_data = features_arr[:, col]
-            valid_data = col_data[np.array(valid_mask)]
-            if len(valid_data) > 0:
-                col_min = valid_data.min()
-                col_max = valid_data.max()
-                col_range = col_max - col_min
-                if col_range > 0:
-                    features_arr[:, col] = (col_data - col_min) / col_range
-                else:
-                    features_arr[:, col] = 0.5
+        # StandardScaler (robust across different feature ranges)
+        valid_indices = [i for i, v in enumerate(valid_mask) if v]
+        scaler = StandardScaler()
+        scaler.fit(features_arr[valid_indices])
+        features_arr = scaler.transform(features_arr)
 
-        # Fill invalid segments with zeros so they don't bias clustering
-        # toward the centroid (short/silent segments should be neutral)
+        # Zero out invalid segments
         for i, valid in enumerate(valid_mask):
             if not valid:
                 features_arr[i, :] = 0.0
@@ -623,10 +880,7 @@ class Transcriber:
         )
         labels = kmeans.fit_predict(features_arr)
 
-        # ── Temporal smoothing: reassign truly isolated micro-fragments.
-        # Only smooth if the segment is very short (<1.5s) AND gaps to both
-        # neighbours are very small (<200ms). This catches Whisper artefacts
-        # without destroying real A-B-A-B speaker alternation. ──
+        # ── Temporal smoothing: reassign isolated micro-fragments ──
         labels = labels.tolist()
         for i in range(1, len(labels) - 1):
             prev_label = labels[i - 1]
@@ -639,14 +893,15 @@ class Transcriber:
                     labels[i] = prev_label
         labels = np.array(labels)
 
-        # ── Cluster balance check: adaptive threshold based on speaker count.
-        # For N speakers, dominant speaker should not exceed (1/N + 0.40).
-        # e.g. 2 speakers: max 90%, 3 speakers: max 73%, 4 speakers: max 65%
+        # ── Balance check: relaxed for short audio (<2 min) ──
         from collections import Counter
         counts = Counter(labels.tolist())
         total = len(labels)
         max_pct = max(counts.values()) / total if total > 0 else 1.0
-        max_allowed_pct = (1.0 / num_speakers) + 0.40
+        duration_s = (segments[-1]["end_ms"] - segments[0]["start_ms"]) / 1000 if segments else 0
+        # Short audio genuinely can be dominated by one speaker (cold call pitch)
+        balance_slack = 0.50 if duration_s < 120 else 0.40
+        max_allowed_pct = (1.0 / num_speakers) + balance_slack
         if max_pct > max_allowed_pct:
             logger.warning(
                 f"KMeans produced imbalanced split: {dict(counts)} "
@@ -657,11 +912,11 @@ class Transcriber:
 
         # Assign speaker labels; order clusters by mean pitch (lower pitch = Speaker_0)
         cluster_pitches = {}
+        # Pitch is at index N_MFCC (after MFCCs)
         for cluster_id in range(num_speakers):
             mask = labels == cluster_id
-            cluster_pitches[cluster_id] = float(np.mean(features_arr[mask, 0]))
+            cluster_pitches[cluster_id] = float(np.mean(features_arr[mask, N_MFCC]))
 
-        # Sort clusters by pitch: lowest pitch → Speaker_0
         sorted_clusters = sorted(cluster_pitches, key=lambda c: cluster_pitches[c])
         cluster_to_speaker = {
             cluster_id: f"Speaker_{rank}"
@@ -672,11 +927,7 @@ class Transcriber:
             seg["speaker"] = cluster_to_speaker[labels[i]]
 
         # Log results
-        speaker_counts = {}
-        for seg in segments:
-            spk = seg["speaker"]
-            speaker_counts[spk] = speaker_counts.get(spk, 0) + 1
-
+        speaker_counts = Counter(seg["speaker"] for seg in segments)
         self._last_diarization_backend = "kmeans"
         logger.info(
             f"Acoustic KMeans diarization complete: "
@@ -692,20 +943,31 @@ class Transcriber:
         audio_path: Optional[str] = None,
     ) -> list[dict]:
         """
-        Fallback: 2-speaker alternation based on gaps + real pitch shifts.
+        Enhanced fallback: 2-speaker alternation based on gaps + pitch + MFCC.
 
-        Speaker changes are detected when EITHER:
-          - Silence gap > 800ms between segments, OR
-          - Mean F0 pitch jump > 25 Hz between adjacent segments
+        Speaker changes are detected when ANY of:
+          - Silence gap > meeting-type threshold (400ms for sales_call, 800ms default)
+          - Mean F0 pitch jump > 15Hz between adjacent segments
+          - MFCC cosine distance > 0.3 between adjacent segments (timbre change)
+
+        Correction pass: if same speaker talks >15s straight, force-check for
+        missed turn boundaries.
         """
         import librosa
+        from scipy.spatial.distance import cosine as cosine_dist
 
         current_speaker = "Speaker_0"
-        TURN_GAP_MS = 800
-        PITCH_JUMP_HZ = 25.0
 
-        # Compute real mean pitch (F0) per segment from audio
+        # Meeting-type-aware thresholds
+        meeting_type = getattr(self, "_meeting_type", "sales_call") or "sales_call"
+        config = self.SPEAKER_DEFAULTS.get(meeting_type, {})
+        TURN_GAP_MS = config.get("turn_gap_ms", 800)
+        PITCH_JUMP_HZ = 15.0  # Lowered from 25Hz for phone-quality audio
+        MFCC_DISTANCE_THRESHOLD = 0.3
+
+        # Compute per-segment features from audio
         seg_pitches: list[Optional[float]] = [None] * len(segments)
+        seg_mfccs: list[Optional[np.ndarray]] = [None] * len(segments)
 
         y, sr = None, 16000
         if self._audio_data is not None:
@@ -723,41 +985,92 @@ class Transcriber:
                 pass
 
         if y is not None:
-                total_samples = len(y)
-                for idx, seg in enumerate(segments):
-                    start_sample = int(seg["start_ms"] / 1000 * sr)
-                    end_sample = int(seg["end_ms"] / 1000 * sr)
-                    start_sample = max(0, min(start_sample, total_samples - 1))
-                    end_sample = max(start_sample + 1, min(end_sample, total_samples))
-                    chunk = y[start_sample:end_sample]
+            total_samples = len(y)
+            for idx, seg in enumerate(segments):
+                start_sample = int(seg["start_ms"] / 1000 * sr)
+                end_sample = int(seg["end_ms"] / 1000 * sr)
+                start_sample = max(0, min(start_sample, total_samples - 1))
+                end_sample = max(start_sample + 1, min(end_sample, total_samples))
+                chunk = y[start_sample:end_sample]
 
-                    if len(chunk) < sr * 0.2:
-                        continue
-                    try:
-                        f0, voiced, _ = librosa.pyin(
-                            chunk, fmin=60, fmax=500, sr=sr,
-                            frame_length=2048, hop_length=512,
-                        )
-                        voiced_f0 = f0[voiced] if voiced is not None else f0[~np.isnan(f0)]
-                        if len(voiced_f0) > 0:
-                            seg_pitches[idx] = float(np.nanmean(voiced_f0))
-                    except Exception:
-                        pass
+                if len(chunk) < sr * 0.2:
+                    continue
+                try:
+                    f0, voiced, _ = librosa.pyin(
+                        chunk, fmin=60, fmax=500, sr=sr,
+                        frame_length=2048, hop_length=512,
+                    )
+                    voiced_f0 = f0[voiced] if voiced is not None else f0[~np.isnan(f0)]
+                    if len(voiced_f0) > 0:
+                        seg_pitches[idx] = float(np.nanmean(voiced_f0))
+                except Exception:
+                    pass
+
+                # MFCC vector for timbre comparison
+                try:
+                    mfccs = librosa.feature.mfcc(
+                        y=chunk, sr=sr, n_mfcc=13, n_fft=2048, hop_length=512
+                    )
+                    seg_mfccs[idx] = np.mean(mfccs, axis=1)
+                except Exception:
+                    pass
 
         # Detect speaker changes
         for i, seg in enumerate(segments):
             if i > 0:
-                gap_ms = seg["start_ms"] - segments[i-1]["end_ms"]
-                pitch_shift = False
-                if seg_pitches[i] is not None and seg_pitches[i-1] is not None:
-                    pitch_shift = abs(seg_pitches[i] - seg_pitches[i-1]) > PITCH_JUMP_HZ
+                gap_ms = seg["start_ms"] - segments[i - 1]["end_ms"]
 
-                if gap_ms > TURN_GAP_MS or pitch_shift:
+                # Pitch shift check
+                pitch_shift = False
+                if seg_pitches[i] is not None and seg_pitches[i - 1] is not None:
+                    pitch_shift = abs(seg_pitches[i] - seg_pitches[i - 1]) > PITCH_JUMP_HZ
+
+                # MFCC timbre distance check
+                mfcc_change = False
+                if seg_mfccs[i] is not None and seg_mfccs[i - 1] is not None:
+                    try:
+                        dist = cosine_dist(seg_mfccs[i], seg_mfccs[i - 1])
+                        mfcc_change = dist > MFCC_DISTANCE_THRESHOLD
+                    except Exception:
+                        pass
+
+                if gap_ms > TURN_GAP_MS or pitch_shift or mfcc_change:
                     current_speaker = (
                         "Speaker_1" if current_speaker == "Speaker_0"
                         else "Speaker_0"
                     )
             seg["speaker"] = current_speaker
+
+        # ── Correction pass: if same speaker talks >15s straight, look for
+        # the largest gap within that run and force a turn boundary there ──
+        MAX_MONO_MS = 15000
+        i = 0
+        while i < len(segments):
+            run_start = i
+            run_speaker = segments[i]["speaker"]
+            while i < len(segments) and segments[i]["speaker"] == run_speaker:
+                i += 1
+            run_end = i  # exclusive
+
+            run_duration = segments[run_end - 1]["end_ms"] - segments[run_start]["start_ms"]
+            if run_duration > MAX_MONO_MS and (run_end - run_start) >= 3:
+                # Find the largest gap within this run
+                best_gap_idx = run_start + 1
+                best_gap = 0
+                for j in range(run_start + 1, run_end):
+                    gap = segments[j]["start_ms"] - segments[j - 1]["end_ms"]
+                    if gap > best_gap:
+                        best_gap = gap
+                        best_gap_idx = j
+
+                # Force speaker change at the largest gap
+                other_speaker = "Speaker_1" if run_speaker == "Speaker_0" else "Speaker_0"
+                for j in range(best_gap_idx, run_end):
+                    segments[j]["speaker"] = other_speaker
+
+                # Re-scan from the split point
+                i = best_gap_idx
+                continue
 
         # Log balance
         from collections import Counter
@@ -766,7 +1079,8 @@ class Transcriber:
         self._last_diarization_backend = "gap_pitch"
         logger.info(
             f"Gap+pitch diarization: {dict(counts)} "
-            f"({len(segments)} segments, {pitched} with pitch data)"
+            f"(gap={TURN_GAP_MS}ms, pitch={PITCH_JUMP_HZ}Hz, "
+            f"{len(segments)} segments, {pitched} with pitch data)"
         )
 
         return segments

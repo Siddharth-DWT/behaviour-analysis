@@ -16,6 +16,9 @@ faster-whisper==1.1.0
 # Speaker diarization
 pyannote.audio==3.4.0
 huggingface_hub>=0.20.0,<0.24.0
+
+# Speaker embeddings (GE2E encoder for speaker ID clustering)
+resemblyzer>=0.1.3
 # torch + torchaudio installed separately in Dockerfile (CPU-only build)
 
 # Database
