@@ -85,9 +85,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nexus.gateway")
 
 # ── Agent URLs (configurable via environment) ──
-VOICE_AGENT_URL = os.getenv("VOICE_AGENT_URL", "http://localhost:8001")
-LANGUAGE_AGENT_URL = os.getenv("LANGUAGE_AGENT_URL", "http://localhost:8002")
-FUSION_AGENT_URL = os.getenv("FUSION_AGENT_URL", "http://localhost:8007")
+VOICE_AGENT_URL = os.getenv("VOICE_AGENT_URL", "http://localhost:8002")
+LANGUAGE_AGENT_URL = os.getenv("LANGUAGE_AGENT_URL", "http://localhost:8003")
+FUSION_AGENT_URL = os.getenv("FUSION_AGENT_URL", "http://localhost:8004")
 
 # ── Upload directory ──
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/recordings"))

@@ -12,10 +12,10 @@
 # SERVICES:
 #   postgres   → PostgreSQL 16 + pgvector (config, transcripts, signals, vectors)
 #   redis      → Valkey 8 (inter-agent message bus)
-#   voiceAgent      → Voice Agent (Python FastAPI)
-#   language_agent  → Language Agent (Python FastAPI)
-#   fusion_agent    → Fusion Agent (Python FastAPI)
-#   api_gateway     → API Gateway (Python FastAPI) - dashboard backend
+#   voice      → Voice Agent (Python FastAPI)
+#   language   → Language Agent (Python FastAPI)
+#   fusion     → Fusion Agent (Python FastAPI)
+#   api        → API Gateway (Python FastAPI) - dashboard backend
 #   dashboard  → React Admin Dashboard (dev server)
 #
 # PORTS:
@@ -61,7 +61,7 @@ services:
     container_name: nexus-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "6381:6379"
     volumes:
       - redis_data:/data
       - ./infrastructure/redis/valkey.conf:/etc/valkey/valkey.conf
@@ -78,16 +78,16 @@ services:
   # AGENTS (uncomment when ready to develop each service)
   # --------------------------------------------------------------------------
 
-  voice_agent:
+  voice:
     build:
       context: ./services/voiceAgent
       dockerfile: Dockerfile
     container_name: nexus-voice-agent
-    image: nexus-voice-agent
     restart: unless-stopped
     ports:
-      - "8001:8001"
+      - "8002:8001"
     environment:
+      - PYTHONPATH=/app
       - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
       - REDIS_URL=redis://redis:6379/0
       - OPENAI_API_KEY=${OPENAI_API_KEY}
@@ -108,18 +108,19 @@ services:
     networks:
       - nexus-network
 
-  language_agent:
+  language:
     build:
       context: ./services/language_agent
       dockerfile: Dockerfile
     container_name: nexus-language-agent
     restart: unless-stopped
     ports:
-      - "8002:8002"
+      - "8003:8002"
     environment:
+      - PYTHONPATH=/app
       - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
       - REDIS_URL=redis://redis:6379/0
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
     volumes:
       - ./services/language_agent:/app
       - ./shared:/app/shared
@@ -132,18 +133,19 @@ services:
     networks:
       - nexus-network
 
-  fusion_agent:
+  fusion:
     build:
       context: ./services/fusion_agent
       dockerfile: Dockerfile
     container_name: nexus-fusion-agent
     restart: unless-stopped
     ports:
-      - "8003:8007"
+      - "8004:8007"
     environment:
+      - PYTHONPATH=/app
       - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
       - REDIS_URL=redis://redis:6379/0
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
     volumes:
       - ./services/fusion_agent:/app
       - ./shared:/app/shared
@@ -156,7 +158,7 @@ services:
     networks:
       - nexus-network
 
-  api_gateway:
+  api:
     build:
       context: ./services/api_gateway
       dockerfile: Dockerfile
@@ -165,11 +167,12 @@ services:
     ports:
       - "8000:8000"
     environment:
+      - PYTHONPATH=/app
       - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
       - REDIS_URL=redis://redis:6379/0
-      - VOICE_AGENT_URL=http://voice_agent:8001
-      - LANGUAGE_AGENT_URL=http://language_agent:8002
-      - FUSION_AGENT_URL=http://fusion_agent:8007
+      - VOICE_AGENT_URL=http://voice:8001
+      - LANGUAGE_AGENT_URL=http://language:8002
+      - FUSION_AGENT_URL=http://fusion:8007
       - JWT_SECRET=${JWT_SECRET:-nexus-dev-jwt-secret-2026}
     volumes:
       - ./services/api_gateway:/app
@@ -190,14 +193,14 @@ services:
     container_name: nexus-dashboard
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "3006:3000"
     environment:
-      - API_GATEWAY_URL=http://api_gateway:8000
+      - API_GATEWAY_URL=http://api:8000
     volumes:
       - ./dashboard:/app
       - /app/node_modules
     depends_on:
-      - api_gateway
+      - api
     networks:
       - nexus-network
 
