@@ -25,6 +25,7 @@ import sys
 import uuid
 import time
 import json
+import asyncio
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
@@ -471,19 +472,55 @@ async def create_session_endpoint(
     except Exception as e:
         logger.warning(f"[{session_id}] DB create failed (continuing without DB): {e}")
 
-    # ── Step 3: Voice Agent ──
-    voice_result = None
+    # ── Step 3: Get transcript fast, then run Voice features + Language in parallel ──
+    # Optimization 1: Language Agent only needs transcript, not voice features/rules.
+    # So we get transcript first, then run full Voice analysis and Language in parallel.
+
+    resolved_path = str(file_path.resolve())
+
+    # Step 3a: Get transcript (fast path via /transcribe)
+    transcript_result = None
     try:
         voice_result = await _call_voice_agent(session_id, str(file_path.resolve()), num_speakers=num_speakers, meeting_type=meeting_type)
         logger.info(
-            f"[{session_id}] Voice Agent: "
-            f"{voice_result.get('duration_seconds', 0):.0f}s, "
-            f"{len(voice_result.get('signals', []))} signals"
+            f"[{session_id}] Transcription: "
+            f"{transcript_result.get('duration_seconds', 0):.0f}s, "
+            f"{len(transcript_result.get('speakers', []))} speakers"
         )
     except Exception as e:
-        logger.error(f"[{session_id}] Voice Agent failed: {e}")
+        logger.error(f"[{session_id}] Voice Agent transcription failed: {e}")
         await _try_update_status(session_id, "failed")
         raise HTTPException(502, f"Voice Agent failed: {e}")
+
+    transcript_segments = transcript_result.get("segments", [])
+
+    # Step 3b: Run full Voice analysis + Language Agent IN PARALLEL
+    async def _voice_task():
+        return await _call_voice_agent(session_id, resolved_path, num_speakers=num_speakers)
+
+    async def _language_task():
+        if not transcript_segments:
+            return None
+        return await _call_language_agent(session_id, transcript_segments, meeting_type)
+
+    results = await asyncio.gather(
+        _voice_task(), _language_task(), return_exceptions=True
+    )
+    voice_result_or_exc, language_result_or_exc = results
+
+    # Voice failure is fatal
+    if isinstance(voice_result_or_exc, Exception):
+        logger.error(f"[{session_id}] Voice Agent failed: {voice_result_or_exc}")
+        await _try_update_status(session_id, "failed")
+        raise HTTPException(502, f"Voice Agent failed: {voice_result_or_exc}")
+    voice_result = voice_result_or_exc
+
+    # Language failure is non-fatal
+    if isinstance(language_result_or_exc, Exception):
+        logger.warning(f"[{session_id}] Language Agent failed (continuing): {language_result_or_exc}")
+        language_result = None
+    else:
+        language_result = language_result_or_exc
 
     duration_seconds = voice_result.get("duration_seconds", 0)
     voice_signals = voice_result.get("signals", [])
@@ -491,19 +528,25 @@ async def create_session_endpoint(
     voice_summary = voice_result.get("summary", {})
     speaker_count = len(voice_speakers)
 
-    # Persist speakers
+    language_signals = language_result.get("signals", []) if language_result else []
+    language_summary = language_result.get("summary", {}) if language_result else {}
+    if language_result:
+        logger.info(f"[{session_id}] Language Agent: {len(language_signals)} signals")
+
+    # Persist speakers (blocking — required for foreign key on signals)
     speaker_map = {}
     try:
         speaker_map = await upsert_speakers(session_id, voice_speakers)
     except Exception as e:
         logger.warning(f"[{session_id}] Speaker upsert failed: {e}")
 
-    # Persist voice signals
-    try:
-        count = await insert_signals(session_id, voice_signals, speaker_map)
-        logger.info(f"[{session_id}] Persisted {count} voice signals")
-    except Exception as e:
-        logger.warning(f"[{session_id}] Voice signal persist failed: {e}")
+    # Optimization 7: Persist voice signals, language signals, transcript in background
+    async def _bg_persist_voice():
+        try:
+            count = await insert_signals(session_id, voice_signals, speaker_map)
+            logger.info(f"[{session_id}] Persisted {count} voice signals")
+        except Exception as e:
+            logger.warning(f"[{session_id}] Voice signal persist failed: {e}")
 
     # ── Step 4: Language Agent ──
     language_result = None

@@ -22,6 +22,7 @@ import sys
 import uuid
 import time
 import json
+import asyncio
 import logging
 from pathlib import Path
 from typing import Optional
@@ -156,32 +157,32 @@ async def analyse_signals(request: AnalyseRequest):
     buffer.add_many(voice_dicts)
     buffer.add_many(language_dicts)
 
-    # ── Step 2: Run fusion per speaker ──
+    # ── Step 2: Run fusion per speaker (parallel via asyncio.gather) ──
     speakers = buffer.speakers
     all_fusion_signals = []
     all_unified_states = []
     all_alerts = []
 
-    for speaker_id in speakers:
+    ref_time = _max_time(voice_dicts + language_dicts)
+
+    async def _analyse_speaker(speaker_id: str) -> dict:
         speaker_voice = buffer.get_signals(
             speaker_id, "voice", window_ms=WINDOW_SHORT_MS,
-            reference_time_ms=_max_time(voice_dicts + language_dicts),
+            reference_time_ms=ref_time,
         )
         speaker_language = buffer.get_signals(
             speaker_id, "language", window_ms=WINDOW_SHORT_MS,
-            reference_time_ms=_max_time(voice_dicts + language_dicts),
+            reference_time_ms=ref_time,
         )
 
-        # If no short-window signals, use all available signals
         if not speaker_voice:
             speaker_voice = [s for s in voice_dicts if s.get("speaker_id") == speaker_id]
         if not speaker_language:
             speaker_language = [s for s in language_dicts if s.get("speaker_id") == speaker_id]
 
         if not speaker_voice and not speaker_language:
-            continue
+            return {"signals": [], "state": None, "alerts": []}
 
-        # Compute time window
         all_starts = [
             _to_int(s.get("window_start_ms", 0))
             for s in speaker_voice + speaker_language
@@ -193,7 +194,6 @@ async def analyse_signals(request: AnalyseRequest):
         window_start = min(all_starts) if all_starts else 0
         window_end = max(all_ends) if all_ends else 0
 
-        # ── Run pairwise rules ──
         fusion_signals = rule_engine.evaluate(
             speaker_id=speaker_id,
             voice_signals=speaker_voice,
@@ -201,25 +201,20 @@ async def analyse_signals(request: AnalyseRequest):
             window_start_ms=window_start,
             window_end_ms=window_end,
         )
-        all_fusion_signals.extend(fusion_signals)
 
-        # ── Compute Unified Speaker State ──
         state = compute_unified_state(
             speaker_id=speaker_id,
             voice_signals=speaker_voice,
             language_signals=speaker_language,
             fusion_signals=fusion_signals,
         )
-        state_dict = asdict(state)
-        all_unified_states.append(state_dict)
 
-        # ── Generate alerts for significant fusion signals ──
+        speaker_alerts = []
         for fs in fusion_signals:
-            confidence = fs.get("confidence", 0)
-            if confidence >= 0.50:
+            if fs.get("confidence", 0) >= 0.50:
                 alert = _create_alert(session_id, speaker_id, fs)
                 if alert:
-                    all_alerts.append(alert)
+                    speaker_alerts.append(alert)
 
         logger.info(
             f"[{session_id}] Speaker {speaker_id}: "
@@ -228,6 +223,18 @@ async def analyse_signals(request: AnalyseRequest):
             f"confidence={state.confidence_level:.2f}, "
             f"authenticity={state.authenticity_score:.2f}"
         )
+
+        return {"signals": fusion_signals, "state": state, "alerts": speaker_alerts}
+
+    speaker_results = await asyncio.gather(
+        *[_analyse_speaker(sid) for sid in speakers]
+    )
+
+    for result in speaker_results:
+        all_fusion_signals.extend(result["signals"])
+        if result["state"] is not None:
+            all_unified_states.append(asdict(result["state"]))
+        all_alerts.extend(result["alerts"])
 
     # ── Step 3: Publish to Redis ──
     if HAS_MESSAGE_BUS:
@@ -271,58 +278,62 @@ async def analyse_signals(request: AnalyseRequest):
     if request.language_summary:
         entities = request.language_summary.get("entities", {})
 
-    # ── Step 4: Build signal graph + analytics ──
+    # ── Step 4+5: Build graph + generate narrative IN PARALLEL ──
     graph_json = {}
     key_paths = []
     graph_insights = {}
-    try:
-        graph = SignalGraph()
-        graph.build_from_session(
-            voice_signals=voice_dicts,
-            language_signals=language_dicts,
-            fusion_signals=all_fusion_signals,
-            transcript_segments=[],
-            entities=entities,
-        )
-        graph_json = graph.to_json()
-        key_paths = graph.get_key_paths(max_paths=5)
-
-        # Run graph analytics
-        analytics = GraphAnalytics(graph)
-        graph_insights = analytics.compute_all()
-
-        # Generate graph-based fusion signals
-        graph_signals = rule_engine.evaluate_graph_insights(
-            graph_insights, speakers, all_fusion_signals
-        )
-        all_fusion_signals.extend(graph_signals)
-
-        logger.info(
-            f"[{session_id}] Signal graph: "
-            f"{graph_json['stats']['node_count']} nodes, "
-            f"{graph_json['stats']['edge_count']} edges, "
-            f"{len(key_paths)} key paths, "
-            f"{len(graph_signals)} graph-based signals"
-        )
-    except Exception as e:
-        logger.warning(f"[{session_id}] Signal graph/analytics failed (non-fatal): {e}")
-
-    # ── Step 5: Generate narrative report ──
     report = None
-    if request.generate_report:
+
+    # Compute duration from signal timestamps (needed by narrative)
+    all_timestamps = [
+        _to_int(s.get("window_end_ms", 0))
+        for s in voice_dicts + language_dicts
+    ]
+    duration_seconds = (max(all_timestamps) - min(all_timestamps)) / 1000.0 if all_timestamps else 0
+    report_type = request.content_type or request.meeting_type or "sales_call"
+
+    async def _build_graph():
+        """Build signal graph + analytics."""
+        _graph_json = {}
+        _key_paths = []
+        _graph_insights = {}
+        _graph_signals = []
+        try:
+            graph = SignalGraph()
+            graph.build_from_session(
+                voice_signals=voice_dicts,
+                language_signals=language_dicts,
+                fusion_signals=all_fusion_signals,
+                transcript_segments=[],
+                entities=entities,
+            )
+            _graph_json = graph.to_json()
+            _key_paths = graph.get_key_paths(max_paths=5)
+
+            analytics = GraphAnalytics(graph)
+            _graph_insights = analytics.compute_all()
+
+            _graph_signals = rule_engine.evaluate_graph_insights(
+                _graph_insights, speakers, all_fusion_signals
+            )
+
+            logger.info(
+                f"[{session_id}] Signal graph: "
+                f"{_graph_json['stats']['node_count']} nodes, "
+                f"{_graph_json['stats']['edge_count']} edges, "
+                f"{len(_key_paths)} key paths, "
+                f"{len(_graph_signals)} graph-based signals"
+            )
+        except Exception as e:
+            logger.warning(f"[{session_id}] Signal graph/analytics failed (non-fatal): {e}")
+        return _graph_json, _key_paths, _graph_insights, _graph_signals
+
+    async def _build_narrative():
+        """Generate narrative report (runs without graph analytics for speed)."""
+        if not request.generate_report:
+            return None
         logger.info(f"[{session_id}] Generating narrative report...")
-
-        # Compute duration from signal timestamps
-        all_timestamps = [
-            _to_int(s.get("window_end_ms", 0))
-            for s in voice_dicts + language_dicts
-        ]
-        duration_seconds = (max(all_timestamps) - min(all_timestamps)) / 1000.0 if all_timestamps else 0
-
-        # Use content_type if provided, falling back to meeting_type
-        report_type = request.content_type or request.meeting_type or "sales_call"
-
-        report = generate_session_narrative(
+        return await generate_session_narrative(
             session_id=session_id,
             duration_seconds=duration_seconds,
             speakers=speakers,
@@ -332,8 +343,20 @@ async def analyse_signals(request: AnalyseRequest):
             unified_states=all_unified_states,
             meeting_type=report_type,
             entities=entities,
-            graph_analytics=graph_insights,
+            graph_analytics={},  # Graph runs in parallel; narrative proceeds without it
         )
+
+    (graph_json, key_paths, graph_insights, graph_signals), report = await asyncio.gather(
+        _build_graph(), _build_narrative()
+    )
+    all_fusion_signals.extend(graph_signals)
+
+    # Enrich report with graph analytics summary after both complete
+    if report and graph_insights:
+        report["graph_analytics_summary"] = {
+            "tension_clusters": len(graph_insights.get("tension_clusters", [])),
+            "trajectory": graph_insights.get("momentum", {}).get("overall_trajectory"),
+        }
 
     # ── Build summary ──
     elapsed = time.time() - start_time
@@ -416,7 +439,7 @@ async def generate_report(request: ReportRequest):
     """Generate a narrative report for a completed session."""
     logger.info(f"[{request.session_id}] Generating narrative report...")
 
-    report = generate_session_narrative(
+    report = await generate_session_narrative(
         session_id=request.session_id,
         duration_seconds=request.duration_seconds,
         speakers=request.speakers,

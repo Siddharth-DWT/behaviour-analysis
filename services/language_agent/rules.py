@@ -36,11 +36,12 @@ except ImportError:
 
 # ── LLM client (supports Anthropic + OpenAI via LLM_PROVIDER env var) ──
 try:
-    from shared.utils.llm_client import is_configured, get_provider_info, complete as llm_complete
+    from shared.utils.llm_client import is_configured, get_provider_info, complete as llm_complete, acomplete as llm_acomplete
     _LLM_IMPORT_OK = True
 except ImportError:
     _LLM_IMPORT_OK = False
     llm_complete = None  # type: ignore[assignment]
+    llm_acomplete = None  # type: ignore[assignment]
 
 _llm_ready = None  # None = not checked yet, True/False = checked
 
@@ -204,7 +205,7 @@ class LanguageRuleEngine:
 
         return signals
 
-    def evaluate_batch_intent(
+    async def evaluate_batch_intent(
         self,
         features_list: list[dict],
     ) -> list[dict]:
@@ -223,7 +224,7 @@ class LanguageRuleEngine:
         # Process in batches of INTENT_BATCH_SIZE
         for batch_start in range(0, len(features_list), INTENT_BATCH_SIZE):
             batch = features_list[batch_start:batch_start + INTENT_BATCH_SIZE]
-            batch_signals = self._classify_intent_batch(batch)
+            batch_signals = await self._classify_intent_batch(batch)
             signals.extend(batch_signals)
 
         return signals
@@ -443,7 +444,7 @@ class LanguageRuleEngine:
     # Batched: 10-20 utterances per API call
     # ════════════════════════════════════════════════════════
 
-    def _classify_intent_batch(
+    async def _classify_intent_batch(
         self, batch: list[dict]
     ) -> list[dict]:
         """
@@ -491,7 +492,7 @@ Utterances:
 {utterance_block}"""
 
         try:
-            response_text = llm_complete(
+            response_text = await llm_acomplete(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=1024,

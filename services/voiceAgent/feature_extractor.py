@@ -13,6 +13,7 @@ import numpy as np
 import librosa
 import soundfile as sf
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 import logging
 
 logger = logging.getLogger("nexus.voice.features")
@@ -56,54 +57,70 @@ class VoiceFeatureExtractor:
         
         # Group segments by speaker
         speakers = set(seg["speaker"] for seg in segments)
-        
-        features_by_speaker = {}
-        
-        for speaker_id in speakers:
-            speaker_segments = [s for s in segments if s["speaker"] == speaker_id]
-            speaker_features = []
-            
-            # Create windows across the full audio
-            window_samples = int(WINDOW_SIZE_SEC * sr)
-            hop_samples = int(HOP_SIZE_SEC * sr)
-            
-            for win_start_sample in range(0, len(y) - window_samples + 1, hop_samples):
-                win_end_sample = win_start_sample + window_samples
-                win_start_ms = int(win_start_sample / sr * 1000)
-                win_end_ms = int(win_end_sample / sr * 1000)
-                
-                # Find segments from THIS speaker in THIS window
-                win_segments = [
-                    s for s in speaker_segments
-                    if s["end_ms"] > win_start_ms and s["start_ms"] < win_end_ms
-                ]
-                
-                if not win_segments:
-                    continue  # Speaker not talking in this window
-                
-                # Extract audio for this speaker's segments in this window
-                speaker_audio = self._extract_speaker_audio(
-                    y, sr, win_segments, win_start_ms, win_end_ms
+
+        # Parallelise across speakers — each speaker's features are independent
+        with ThreadPoolExecutor(max_workers=min(len(speakers), 4)) as executor:
+            futures = {}
+            for speaker_id in speakers:
+                speaker_segments = [s for s in segments if s["speaker"] == speaker_id]
+                futures[speaker_id] = executor.submit(
+                    self._extract_speaker_features, y, sr, speaker_id, speaker_segments
                 )
-                
-                if len(speaker_audio) < sr * 0.3:  # Less than 300ms of speech
-                    continue
-                
-                # Extract features
-                features = self._extract_features(
-                    speaker_audio, sr, win_segments, win_start_ms, win_end_ms
-                )
-                
-                if features:
-                    features["speaker_id"] = speaker_id
-                    features["window_start_ms"] = win_start_ms
-                    features["window_end_ms"] = win_end_ms
-                    speaker_features.append(features)
-            
-            if speaker_features:
-                features_by_speaker[speaker_id] = speaker_features
-        
+
+            features_by_speaker = {}
+            for speaker_id, future in futures.items():
+                result = future.result()
+                if result:
+                    features_by_speaker[speaker_id] = result
+
         return features_by_speaker
+
+    def _extract_speaker_features(
+        self,
+        y: np.ndarray,
+        sr: int,
+        speaker_id: str,
+        speaker_segments: list[dict],
+    ) -> list[dict]:
+        """Extract all windows for one speaker. Thread-safe — no shared mutable state."""
+        speaker_features = []
+        window_samples = int(WINDOW_SIZE_SEC * sr)
+        hop_samples = int(HOP_SIZE_SEC * sr)
+
+        for win_start_sample in range(0, len(y) - window_samples + 1, hop_samples):
+            win_end_sample = win_start_sample + window_samples
+            win_start_ms = int(win_start_sample / sr * 1000)
+            win_end_ms = int(win_end_sample / sr * 1000)
+
+            # Find segments from THIS speaker in THIS window
+            win_segments = [
+                s for s in speaker_segments
+                if s["end_ms"] > win_start_ms and s["start_ms"] < win_end_ms
+            ]
+
+            if not win_segments:
+                continue  # Speaker not talking in this window
+
+            # Extract audio for this speaker's segments in this window
+            speaker_audio = self._extract_speaker_audio(
+                y, sr, win_segments, win_start_ms, win_end_ms
+            )
+
+            if len(speaker_audio) < sr * 0.3:  # Less than 300ms of speech
+                continue
+
+            # Extract features
+            features = self._extract_features(
+                speaker_audio, sr, win_segments, win_start_ms, win_end_ms
+            )
+
+            if features:
+                features["speaker_id"] = speaker_id
+                features["window_start_ms"] = win_start_ms
+                features["window_end_ms"] = win_end_ms
+                speaker_features.append(features)
+
+        return speaker_features
     
     def _load_audio(self, audio_path: str) -> tuple[np.ndarray, int]:
         """

@@ -33,6 +33,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # isort: split
 from shared.models.requests import VoiceAnalysisRequest as AnalysisRequest, VoiceAnalysisResponse as AnalysisResponse
 
+try:
+    from shared.utils.audio_loader import load_audio as _load_audio
+except ImportError:
+    import librosa as _librosa
+    def _load_audio(path, sr=16000):
+        return _librosa.load(path, sr=sr, mono=True)
+
 # Import from same directory (works in Docker /app context)
 try:
     from feature_extractor import VoiceFeatureExtractor
@@ -96,6 +103,40 @@ async def health():
 
 
 
+@app.post("/transcribe")
+async def transcribe_only(request: AnalysisRequest):
+    """
+    Fast path: return transcript + diarisation without features/rules.
+    Used by API Gateway to start Language Agent early while Voice features
+    continue processing in parallel (Optimization 1).
+    """
+    file_path = Path(request.file_path)
+    if not file_path.exists():
+        raise HTTPException(404, f"Audio file not found: {file_path}")
+
+    session_id = request.session_id or str(uuid.uuid4())
+    start_time = time.time()
+
+    logger.info(f"[{session_id}] Transcribe-only: {file_path.name}")
+
+    transcript = transcriber.transcribe(str(file_path), num_speakers=request.num_speakers)
+
+    elapsed = time.time() - start_time
+    speakers = list(set(seg["speaker"] for seg in transcript["segments"]))
+    logger.info(
+        f"[{session_id}] Transcribe-only complete: "
+        f"{transcript['duration_seconds']:.1f}s, {len(speakers)} speakers, "
+        f"{len(transcript['segments'])} segments in {elapsed:.1f}s"
+    )
+
+    return {
+        "session_id": session_id,
+        "duration_seconds": transcript["duration_seconds"],
+        "segments": transcript["segments"],
+        "speakers": speakers,
+    }
+
+
 @app.post("/analyse", response_model=AnalysisResponse)
 async def analyse_audio(request: AnalysisRequest):
     """
@@ -146,6 +187,28 @@ async def analyse_audio(request: AnalysisRequest):
         raise HTTPException(
             status_code=400,
             detail=f"Audio file could not be decoded — it may be empty or corrupted. ({e})",
+        )
+
+    # ── Step 1: Transcribe + diarise (Whisper uses file path; diarisation reuses loaded audio) ──
+    logger.info(f"[{session_id}] Step 1: Transcribing (num_speakers={request.num_speakers})...")
+    transcript = transcriber.transcribe(
+        str(file_path), num_speakers=request.num_speakers, preloaded_audio=(y, sr)
+    )
+
+    duration_sec = transcript["duration_seconds"]
+    speakers = list(set(seg["speaker"] for seg in transcript["segments"]))
+    logger.info(f"[{session_id}] Transcribed: {duration_sec:.1f}s, {len(speakers)} speakers, {len(transcript['segments'])} segments")
+
+    # ── Step 2: Extract acoustic features (reuses loaded audio, parallel per speaker) ──
+    logger.info(f"[{session_id}] Step 2: Extracting features...")
+    try:
+        features_by_speaker = feature_extractor.extract_all_from_array(
+            y, sr, transcript["segments"]
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Feature extraction failed. ({e})",
         )
     
     # ── Step 3: Build baselines ──

@@ -290,21 +290,14 @@ class LanguageFeatureExtractor:
 
     def extract_all(self, segments: list[dict]) -> list[dict]:
         """
-        Extract linguistic features for every segment.
+        Extract linguistic features for every segment (includes sync LLM sentiment).
 
         Args:
             segments: list of transcript segments from Voice Agent
                       [{speaker, start_ms, end_ms, text, words}, ...]
 
         Returns:
-            List of feature dicts, one per segment:
-            [{
-                speaker_id, start_ms, end_ms, text,
-                sentiment_label, sentiment_score,
-                buying_signals, objection_signals,
-                power_score, powerless_features,
-                is_question, word_count, ...
-            }, ...]
+            List of feature dicts, one per segment.
         """
         if not segments:
             return []
@@ -313,8 +306,195 @@ class LanguageFeatureExtractor:
         texts = [seg.get("text", "") for seg in segments]
         sentiments = self._batch_sentiment(texts)
 
+        features_list = self._extract_non_llm_features(segments)
+
+        # Merge sentiment into features
+        for i, features in enumerate(features_list):
+            sent = sentiments[i] if i < len(sentiments) else {"label": "NEUTRAL", "score": 0.0}
+            features["sentiment_label"] = sent["label"]
+            features["sentiment_score"] = sent["score"]
+            features["sentiment_value"] = sent["score"]
+
+        return features_list
+
+    def extract_all_no_llm(self, segments: list[dict]) -> list[dict]:
+        """
+        Extract linguistic features WITHOUT LLM sentiment (fast path).
+        Sentiment fields are set to neutral defaults; caller should merge
+        real sentiment later via batch_sentiment_async().
+        """
+        features_list = self._extract_non_llm_features(segments)
+
+        # Set neutral sentiment defaults
+        for features in features_list:
+            features["sentiment_label"] = "NEUTRAL"
+            features["sentiment_score"] = 0.0
+            features["sentiment_value"] = 0.0
+
+        return features_list
+
+    async def batch_sentiment_async(self, texts: list[str]) -> list[dict]:
+        """
+        Run sentiment analysis asynchronously via LLM (acomplete).
+        Falls back to sync VADER/DistilBERT if LLM unavailable.
+        Returns list of {label, score} dicts.
+        """
+        if not texts:
+            return []
+
+        valid_indices = [i for i, t in enumerate(texts) if t.strip()]
+        valid_texts = [texts[i] for i in valid_indices]
+        neutral = {"label": "NEUTRAL", "score": 0.0}
+
+        if not valid_texts:
+            return [neutral] * len(texts)
+
+        # ── 1. Async LLM sentiment (primary) ──
+        llm_result = await self._llm_batch_sentiment_async(valid_texts, valid_indices, len(texts))
+        if llm_result is not None:
+            return llm_result
+
+        # ── 2. Sync fallback (VADER → DistilBERT) — fast, no async needed ──
+        return self._batch_sentiment_sync_fallback(texts, valid_indices, neutral)
+
+    async def _llm_batch_sentiment_async(
+        self,
+        valid_texts: list[str],
+        valid_indices: list[int],
+        total_count: int,
+    ) -> Optional[list[dict]]:
+        """Async version of _llm_batch_sentiment using acomplete()."""
+        import sys, json
+        from pathlib import Path
+        project_root = str(Path(__file__).parent.parent.parent)
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+
+        try:
+            from shared.utils.llm_client import acomplete, is_configured
+            if not is_configured():
+                return None
+        except ImportError:
+            return None
+
+        BATCH_SIZE = 12
+        neutral = {"label": "NEUTRAL", "score": 0.0}
+        output = [neutral.copy() for _ in range(total_count)]
+
+        system_prompt = (
+            "You are a sentiment scoring engine for conversational speech. "
+            "Rate the EMOTIONAL sentiment of each sentence from the SPEAKER'S perspective.\n"
+            "Scale: -1.0 (speaker expressing strong displeasure/frustration) to "
+            "+1.0 (speaker expressing strong approval/enthusiasm). 0.0 = neutral.\n\n"
+            "CRITICAL RULES:\n"
+            "- Factual descriptions of problems or situations are NEUTRAL (0.0), not negative. "
+            "'We don't have time for social media' is factual (0.0), not a complaint.\n"
+            "- Greetings, introductions, and self-identification are NEUTRAL (0.0). "
+            "'This is Sadam calling from HOS' = 0.0.\n"
+            "- Explaining a situation without emotion is NEUTRAL: "
+            "'executives are so busy right now' = 0.0.\n"
+            "- Only score negative when the speaker expresses personal displeasure: "
+            "'This is terrible and I hate it' = -0.8.\n"
+            "- Only score positive when the speaker expresses genuine enthusiasm: "
+            "'sounds great awesome' = +0.7.\n\n"
+            "Return ONLY a JSON array of numbers, one per sentence. No explanations."
+        )
+
+        try:
+            for batch_start in range(0, len(valid_texts), BATCH_SIZE):
+                batch = valid_texts[batch_start:batch_start + BATCH_SIZE]
+                batch_indices = valid_indices[batch_start:batch_start + BATCH_SIZE]
+
+                numbered = "\n".join(f"{i+1}. \"{t}\"" for i, t in enumerate(batch))
+                user_prompt = f"Score these {len(batch)} sentences:\n{numbered}"
+
+                raw = await acomplete(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    max_tokens=200,
+                    temperature=0.0,
+                )
+
+                text = raw.strip()
+                if text.startswith("```"):
+                    text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                scores = json.loads(text)
+
+                if not isinstance(scores, list):
+                    logger.warning(f"LLM returned non-array: {text[:100]}")
+                    continue
+
+                for j, idx in enumerate(batch_indices):
+                    if j < len(scores):
+                        val = float(scores[j])
+                        val = max(-1.0, min(1.0, val))
+                        if val > 0.35:
+                            output[idx] = {"label": "POSITIVE", "score": round(val, 4)}
+                        elif val < -0.35:
+                            output[idx] = {"label": "NEGATIVE", "score": round(val, 4)}
+                        else:
+                            output[idx] = {"label": "NEUTRAL", "score": round(val, 4)}
+
+            logger.info(f"LLM async sentiment scored {len(valid_texts)} segments")
+            return output
+
+        except Exception as e:
+            logger.warning(f"Async LLM sentiment failed: {e}, falling back")
+            return None
+
+    def _batch_sentiment_sync_fallback(
+        self,
+        texts: list[str],
+        valid_indices: list[int],
+        neutral: dict,
+    ) -> list[dict]:
+        """Sync VADER → DistilBERT fallback for sentiment."""
+        vader = _get_vader_analyzer()
+        if vader is not None:
+            output = [neutral.copy() for _ in texts]
+            for idx in valid_indices:
+                compound = vader.polarity_scores(texts[idx])["compound"]
+                if compound > 0.2:
+                    output[idx] = {"label": "POSITIVE", "score": round(compound, 4)}
+                elif compound < -0.2:
+                    output[idx] = {"label": "NEGATIVE", "score": round(compound, 4)}
+                else:
+                    output[idx] = {"label": "NEUTRAL", "score": 0.0}
+            return output
+
+        pipe = _get_sentiment_pipeline()
+        if pipe is not None and _sentiment_backend == "distilbert":
+            try:
+                valid_texts = [texts[i] for i in valid_indices]
+                results = pipe(valid_texts, batch_size=32)
+                output = [neutral.copy() for _ in texts]
+                for idx, result in zip(valid_indices, results):
+                    label = result["label"]
+                    raw = result["score"]
+                    signed = raw if label == "POSITIVE" else -raw
+                    if abs(signed) < 0.4:
+                        output[idx] = {"label": "NEUTRAL", "score": 0.0}
+                    else:
+                        output[idx] = {
+                            "label": "POSITIVE" if signed > 0 else "NEGATIVE",
+                            "score": round(signed, 4),
+                        }
+                return output
+            except Exception as e:
+                logger.warning(f"DistilBERT batch failed: {e}")
+
+        return [neutral.copy() for _ in texts]
+
+    def _extract_non_llm_features(self, segments: list[dict]) -> list[dict]:
+        """
+        Extract all non-LLM features (buying, objection, power, lexical).
+        Shared by extract_all() and extract_all_no_llm().
+        """
+        if not segments:
+            return []
+
         features_list = []
-        for i, seg in enumerate(segments):
+        for seg in segments:
             text = seg.get("text", "").strip()
             if not text:
                 continue
@@ -325,12 +505,6 @@ class LanguageFeatureExtractor:
                 "end_ms": seg.get("end_ms", 0),
                 "text": text,
             }
-
-            # Sentiment (score is already -1.0 to +1.0 from _batch_sentiment)
-            sent = sentiments[i] if i < len(sentiments) else {"label": "NEUTRAL", "score": 0.0}
-            features["sentiment_label"] = sent["label"]
-            features["sentiment_score"] = sent["score"]
-            features["sentiment_value"] = sent["score"]
 
             # Buying signals
             buying = self._detect_buying_signals(text)

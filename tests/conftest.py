@@ -103,7 +103,8 @@ def fake_transcript_sales():
 def mock_llm_client(monkeypatch):
     """
     Patches shared.utils.llm_client so no real API call is made.
-    Returns a factory: call mock_llm_client(response_text) to set the response.
+    Mocks both sync (complete) and async (acomplete) paths.
+    Returns a factory: call mock_llm_client.set_response(text) to set the response.
     """
     import shared.utils.llm_client as llm_mod
 
@@ -117,7 +118,20 @@ def mock_llm_client(monkeypatch):
         def complete(self, system_prompt, user_prompt, **kwargs):
             return self._response
 
+        async def acomplete(self, system_prompt, user_prompt, **kwargs):
+            return self._response
+
     mock = _Mock()
     monkeypatch.setattr(llm_mod, "complete", mock.complete)
+    monkeypatch.setattr(llm_mod, "acomplete", mock.acomplete)
     monkeypatch.setattr(llm_mod, "is_configured", lambda: True)
+
+    # Also patch the module-level alias in rules.py so async intent classification works
+    try:
+        import services.language_agent.rules as rules_mod
+        monkeypatch.setattr(rules_mod, "llm_complete", mock.complete)
+        monkeypatch.setattr(rules_mod, "llm_acomplete", mock.acomplete)
+    except (ImportError, AttributeError):
+        pass
+
     return mock

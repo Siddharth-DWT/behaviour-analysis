@@ -42,7 +42,7 @@ def _get_llm_complete():
         return None
 
 
-def generate_session_narrative(
+async def generate_session_narrative(
     session_id: str,
     duration_seconds: float,
     speakers: list[str],
@@ -95,7 +95,8 @@ def generate_session_narrative(
     system_prompt, user_prompt = _build_prompt(context, meeting_type)
 
     try:
-        raw_text = llm_complete(
+        from shared.utils.llm_client import acomplete
+        raw_text = await acomplete(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             max_tokens=2048,

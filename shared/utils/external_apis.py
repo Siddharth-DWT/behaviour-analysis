@@ -28,10 +28,12 @@ logger = logging.getLogger("nexus.external_apis")
 # ── Configuration ──────────────────────────────────────────────
 WHISPER_URL = os.getenv("EXTERNAL_WHISPER_URL", "")
 TTS_URL = os.getenv("EXTERNAL_TTS_URL", "")
+DIARIZE_URL = os.getenv("EXTERNAL_DIARIZE_URL", "")
 API_KEY = os.getenv("EXTERNAL_API_KEY", "")
 
 DEFAULT_WHISPER_MODEL = os.getenv("EXTERNAL_WHISPER_MODEL", "base")
 DEFAULT_TIMEOUT = 120  # seconds
+DIARIZE_TIMEOUT = 300  # 5 minutes for long audio diarization
 
 
 def is_whisper_available() -> bool:
@@ -42,6 +44,11 @@ def is_whisper_available() -> bool:
 def is_tts_available() -> bool:
     """Check if external Coqui TTS API is configured."""
     return bool(TTS_URL)
+
+
+def is_diarize_available() -> bool:
+    """Check if external GPU diarization API is configured."""
+    return bool(DIARIZE_URL)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -490,6 +497,131 @@ class TTSClient:
 
 
 # ═══════════════════════════════════════════════════════════════
+# GPU DIARIZATION CLIENT
+# ═══════════════════════════════════════════════════════════════
+
+class DiarizeClient:
+    """
+    Client for GPU-accelerated speaker diarization API (pyannote on GPU).
+
+    Usage:
+        client = DiarizeClient()
+        if client.is_healthy():
+            result = client.diarize("path/to/audio.wav", min_speakers=2, max_speakers=4)
+            print(result["speakers"])     # ["SPEAKER_00", "SPEAKER_01"]
+            print(result["timeline"])     # [{"speaker": ..., "start": ..., "end": ...}]
+    """
+
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        timeout: int = DIARIZE_TIMEOUT,
+    ):
+        self.base_url = (base_url or DIARIZE_URL).rstrip("/")
+        self.api_key = api_key or API_KEY
+        self.timeout = timeout
+
+        if not self.base_url:
+            raise ValueError(
+                "Diarize URL not configured. Set EXTERNAL_DIARIZE_URL env var."
+            )
+
+    @property
+    def _headers(self) -> dict:
+        if self.api_key:
+            return {"X-API-Key": self.api_key}
+        return {}
+
+    def is_healthy(self) -> bool:
+        """Check if the diarization service is running and GPU is available."""
+        try:
+            resp = httpx.get(f"{self.base_url}/health", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                healthy = data.get("status") == "healthy"
+                if healthy:
+                    logger.info(
+                        f"Diarize API healthy: GPU={data.get('gpu_name', '?')}, "
+                        f"pipeline_loaded={data.get('pipeline_loaded', False)}"
+                    )
+                return healthy
+        except Exception as e:
+            logger.warning(f"Diarize health check failed: {e}")
+        return False
+
+    def diarize(
+        self,
+        audio_path: str,
+        min_speakers: int = 2,
+        max_speakers: int = 8,
+        num_speakers: int = 0,
+    ) -> dict:
+        """
+        Diarize an audio file via the external GPU API.
+
+        Args:
+            audio_path: Path to audio file
+            min_speakers: Minimum expected speakers
+            max_speakers: Maximum expected speakers
+            num_speakers: Exact count (0 = auto-detect using min/max)
+
+        Returns:
+            {
+                "speakers": ["SPEAKER_00", ...],
+                "timeline": [{"speaker": str, "start": float, "end": float}, ...],
+                "num_speakers": int,
+                "duration": float,
+                "processing_time": float,
+            }
+        """
+        audio_file = Path(audio_path)
+        if not audio_file.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        logger.info(
+            f"Diarizing via external GPU API: {audio_file.name} "
+            f"(min={min_speakers}, max={max_speakers}, exact={num_speakers})"
+        )
+
+        start_time = time.time()
+
+        with open(audio_path, "rb") as f:
+            files = {"file": (audio_file.name, f, "audio/wav")}
+            data = {
+                "min_speakers": str(min_speakers),
+                "max_speakers": str(max_speakers),
+                "num_speakers": str(num_speakers),
+            }
+
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.post(
+                    f"{self.base_url}/diarize",
+                    files=files,
+                    data=data,
+                    headers=self._headers,
+                )
+
+        elapsed = time.time() - start_time
+
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Diarize API error ({resp.status_code}): {resp.text[:500]}"
+            )
+
+        result = resp.json()
+
+        logger.info(
+            f"GPU diarization complete: {result.get('num_speakers', '?')} speakers, "
+            f"{len(result.get('timeline', []))} turns, "
+            f"API time={result.get('processing_time', 0):.1f}s, "
+            f"total={elapsed:.1f}s"
+        )
+
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════
 # CONVENIENCE — Quick access for common patterns
 # ═══════════════════════════════════════════════════════════════
 
@@ -515,5 +647,18 @@ def get_tts_client(**kwargs) -> Optional[TTSClient]:
         return None
     try:
         return TTSClient(**kwargs)
+    except ValueError:
+        return None
+
+
+def get_diarize_client(**kwargs) -> Optional[DiarizeClient]:
+    """
+    Get a DiarizeClient if the external GPU diarization API is configured.
+    Returns None if not configured.
+    """
+    if not is_diarize_available():
+        return None
+    try:
+        return DiarizeClient(**kwargs)
     except ValueError:
         return None

@@ -17,6 +17,7 @@ import os
 import sys
 import uuid
 import time
+import asyncio
 import logging
 from pathlib import Path
 from typing import Optional
@@ -156,13 +157,52 @@ async def analyse_transcript(request: AnalysisRequest):
     # Convert to dicts (segments may already be dicts or Pydantic models)
     segments = [seg.model_dump() if hasattr(seg, 'model_dump') else dict(seg) for seg in request.segments]
 
-    # ── Step 1: Extract features ──
-    logger.info(f"[{session_id}] Step 1: Extracting linguistic features...")
-    features_list = feature_extractor.extract_all(segments)
+    # ── Step 1: Extract non-LLM features (fast — buying, objection, power, lexical) ──
+    logger.info(f"[{session_id}] Step 1: Extracting linguistic features (non-LLM)...")
+    features_list = feature_extractor.extract_all_no_llm(segments)
+    # Build texts list matching features_list (non-empty segments only)
+    texts = [f["text"] for f in features_list]
     logger.info(f"[{session_id}] Extracted features for {len(features_list)} segments")
 
-    # ── Step 2: Run synchronous rules (SENT, BUY, OBJ, PWR) ──
-    logger.info(f"[{session_id}] Step 2: Running rule engine (content_type={content_type})...")
+    # ── Step 2: Run LLM tasks in parallel (sentiment + intent + entities) ──
+    logger.info(f"[{session_id}] Step 2: Running LLM tasks in parallel...")
+
+    async def _safe_sentiment():
+        try:
+            return await feature_extractor.batch_sentiment_async(texts)
+        except Exception as e:
+            logger.warning(f"[{session_id}] Async sentiment failed: {e}")
+            return [{"label": "NEUTRAL", "score": 0.0}] * len(texts)
+
+    async def _safe_intent():
+        if not request.run_intent_classification:
+            return []
+        try:
+            return await rule_engine.evaluate_batch_intent(features_list)
+        except Exception as e:
+            logger.warning(f"[{session_id}] Intent classification failed: {e}")
+            return []
+
+    async def _safe_entities():
+        try:
+            return await entity_extractor.extract(segments, content_type)
+        except Exception as e:
+            logger.warning(f"[{session_id}] Entity extraction failed (non-fatal): {e}")
+            return {}
+
+    sentiments, intent_signals, entities = await asyncio.gather(
+        _safe_sentiment(), _safe_intent(), _safe_entities()
+    )
+
+    # ── Step 3: Merge sentiment into features ──
+    for i, features in enumerate(features_list):
+        sent = sentiments[i] if i < len(sentiments) else {"label": "NEUTRAL", "score": 0.0}
+        features["sentiment_label"] = sent["label"]
+        features["sentiment_score"] = sent["score"]
+        features["sentiment_value"] = sent["score"]
+
+    # ── Step 4: Run synchronous rules (SENT, BUY, OBJ, PWR) — now with sentiment populated ──
+    logger.info(f"[{session_id}] Step 4: Running rule engine (content_type={content_type})...")
     all_signals = []
 
     for features in features_list:
@@ -172,27 +212,15 @@ async def analyse_transcript(request: AnalysisRequest):
         )
         all_signals.extend(signals)
 
-    # ── Step 3: Run intent classification (Claude API, batched) ──
-    if request.run_intent_classification:
-        logger.info(f"[{session_id}] Step 3: Running intent classification (Claude API)...")
-        intent_signals = rule_engine.evaluate_batch_intent(features_list)
-        all_signals.extend(intent_signals)
-        logger.info(f"[{session_id}] Intent classification: {len(intent_signals)} intents detected")
-    else:
-        logger.info(f"[{session_id}] Step 3: Intent classification skipped (disabled)")
-
-    # ── Step 3b: Entity & topic extraction ──
-    entities = {}
-    try:
-        logger.info(f"[{session_id}] Step 3b: Extracting entities & topics...")
-        entities = await entity_extractor.extract(segments, content_type)
-        logger.info(
-            f"[{session_id}] Entities: {len(entities.get('people', []))} people, "
-            f"{len(entities.get('topics', []))} topics, "
-            f"{len(entities.get('commitments', []))} commitments"
-        )
-    except Exception as e:
-        logger.warning(f"[{session_id}] Entity extraction failed (non-fatal): {e}")
+    # Add intent signals from parallel LLM task
+    all_signals.extend(intent_signals)
+    logger.info(
+        f"[{session_id}] Sentiment: {len(sentiments)} scores, "
+        f"Intent: {len(intent_signals)} intents, "
+        f"Entities: {len(entities.get('people', []))} people, "
+        f"{len(entities.get('topics', []))} topics, "
+        f"{len(entities.get('commitments', []))} commitments"
+    )
 
     # ── Step 4: Publish to Redis Streams ──
     if HAS_MESSAGE_BUS:

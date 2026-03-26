@@ -220,44 +220,50 @@ class TestIntent01:
         self.engine = LanguageRuleEngine()
 
     def _run_intent(self, mock_llm, response_json: str, text: str, speaker="spk"):
+        import asyncio
         mock_llm.set_response(response_json)
         features = [{"text": text, "speaker_id": speaker, "start_ms": 0, "end_ms": 3000}]
-        return self.engine.evaluate_batch_intent(features)
+        return asyncio.run(self.engine.evaluate_batch_intent(features))
 
     def test_intent_question(self, mock_llm_client):
+        import asyncio
         mock_llm_client.set_response('[{"id": 1, "intent": "QUESTION", "confidence": 0.85}]')
         features = [{"text": "What features do you offer?", "speaker_id": "spk", "start_ms": 0, "end_ms": 3000}]
-        signals = self.engine.evaluate_batch_intent(features)
+        signals = asyncio.run(self.engine.evaluate_batch_intent(features))
         assert len(signals) == 1
         assert signals[0]["value_text"] == "QUESTION"
 
     def test_intent_objection(self, mock_llm_client):
+        import asyncio
         mock_llm_client.set_response('[{"id": 1, "intent": "OBJECTION", "confidence": 0.80}]')
         features = [{"text": "We can't afford that right now.", "speaker_id": "spk", "start_ms": 0, "end_ms": 3000}]
-        signals = self.engine.evaluate_batch_intent(features)
+        signals = asyncio.run(self.engine.evaluate_batch_intent(features))
         assert len(signals) == 1
         assert signals[0]["value_text"] == "OBJECTION"
 
     def test_intent_commit(self, mock_llm_client):
+        import asyncio
         mock_llm_client.set_response('[{"id": 1, "intent": "COMMIT", "confidence": 0.90}]')
         features = [{"text": "Let's go ahead with the enterprise plan.", "speaker_id": "spk", "start_ms": 0, "end_ms": 3000}]
-        signals = self.engine.evaluate_batch_intent(features)
+        signals = asyncio.run(self.engine.evaluate_batch_intent(features))
         assert len(signals) == 1
         assert signals[0]["value_text"] == "COMMIT"
 
     def test_intent_low_confidence_filtered(self, mock_llm_client):
         """Responses with confidence < 0.40 are filtered out."""
+        import asyncio
         mock_llm_client.set_response('[{"id": 1, "intent": "DEFLECT", "confidence": 0.30}]')
         features = [{"text": "Hmm, interesting.", "speaker_id": "spk", "start_ms": 0, "end_ms": 3000}]
-        signals = self.engine.evaluate_batch_intent(features)
+        signals = asyncio.run(self.engine.evaluate_batch_intent(features))
         assert signals == []
 
     def test_intent_llm_not_configured_returns_empty(self, monkeypatch):
         """If LLM not configured, evaluate_batch_intent returns []."""
+        import asyncio
         import services.language_agent.rules as rules_mod
         monkeypatch.setattr(rules_mod, "_llm_ready", False)
         features = [{"text": "Some text", "speaker_id": "spk", "start_ms": 0, "end_ms": 3000}]
-        signals = self.engine.evaluate_batch_intent(features)
+        signals = asyncio.run(self.engine.evaluate_batch_intent(features))
         assert signals == []
 
 
