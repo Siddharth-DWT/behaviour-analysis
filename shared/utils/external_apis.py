@@ -28,10 +28,13 @@ logger = logging.getLogger("nexus.external_apis")
 # ── Configuration ──────────────────────────────────────────────
 WHISPER_URL = os.getenv("EXTERNAL_WHISPER_URL", "")
 TTS_URL = os.getenv("EXTERNAL_TTS_URL", "")
+DIARIZE_URL = os.getenv("EXTERNAL_DIARIZE_URL", "")
 API_KEY = os.getenv("EXTERNAL_API_KEY", "")
+HF_TOKEN = os.getenv("HF_TOKEN", "")
 
 DEFAULT_WHISPER_MODEL = os.getenv("EXTERNAL_WHISPER_MODEL", "base")
 DEFAULT_TIMEOUT = 120  # seconds
+DIARIZE_TIMEOUT = 600  # 10 min for long audio diarization
 
 
 def is_whisper_available() -> bool:
@@ -42,6 +45,11 @@ def is_whisper_available() -> bool:
 def is_tts_available() -> bool:
     """Check if external Coqui TTS API is configured."""
     return bool(TTS_URL)
+
+
+def is_diarize_available() -> bool:
+    """Check if external GPU diarization API is configured."""
+    return bool(DIARIZE_URL)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -515,5 +523,127 @@ def get_tts_client(**kwargs) -> Optional[TTSClient]:
         return None
     try:
         return TTSClient(**kwargs)
+    except ValueError:
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# GPU DIARIZATION CLIENT
+# ═══════════════════════════════════════════════════════════════
+
+class DiarizeClient:
+    """Client for external GPU-based speaker diarization (pyannote on GPU)."""
+
+    def __init__(self, base_url: str = "", api_key: str = "", hf_token: str = "", timeout: int = DIARIZE_TIMEOUT):
+        self.base_url = (base_url or DIARIZE_URL).rstrip("/")
+        self.api_key = api_key or API_KEY
+        self.hf_token = hf_token or HF_TOKEN
+        self.timeout = timeout
+        if not self.base_url:
+            raise ValueError("EXTERNAL_DIARIZE_URL not configured")
+
+        self._headers = {}
+        if self.api_key:
+            self._headers["X-API-Key"] = self.api_key
+
+    def health_check(self) -> bool:
+        try:
+            with httpx.Client(timeout=10) as client:
+                resp = client.get(f"{self.base_url}/health", headers=self._headers)
+                return resp.status_code == 200
+        except Exception:
+            return False
+
+    def diarize(
+        self,
+        audio_path: str,
+        min_speakers: int = 2,
+        max_speakers: int = 6,
+        num_speakers: Optional[int] = None,
+        clustering_threshold: Optional[float] = None,
+        segmentation_threshold: Optional[float] = None,
+        min_duration_off: Optional[float] = None,
+    ) -> Optional[dict]:
+        """
+        Send audio to GPU diarization endpoint.
+        Returns dict with 'speakers' list of {speaker, start, end} segments.
+
+        Args:
+            clustering_threshold: Lower = more aggressive speaker separation.
+                Default 0.5. Use 0.3-0.4 for same-gender / similar voices.
+            segmentation_threshold: Lower = detects more speech activity. Default 0.5.
+            min_duration_off: Min pause gap in seconds to keep. Default 0.0.
+        """
+        audio_file = Path(audio_path)
+        if not audio_file.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        logger.info(
+            f"Diarizing via external GPU API: {audio_file.name} "
+            f"(min={min_speakers}, max={max_speakers}, "
+            f"clustering_threshold={clustering_threshold})"
+        )
+
+        data = {
+            "min_speakers": str(min_speakers),
+            "max_speakers": str(max_speakers),
+        }
+        if num_speakers is not None:
+            data["num_speakers"] = str(num_speakers)
+        if clustering_threshold is not None:
+            data["clustering_threshold"] = str(clustering_threshold)
+        if segmentation_threshold is not None:
+            data["segmentation_threshold"] = str(segmentation_threshold)
+        if min_duration_off is not None:
+            data["min_duration_off"] = str(min_duration_off)
+        if self.hf_token:
+            data["hf_token"] = self.hf_token
+
+        start_time = time.time()
+
+        with open(audio_path, "rb") as f:
+            files = {"file": (audio_file.name, f, "audio/wav")}
+
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.post(
+                    f"{self.base_url}/diarize",
+                    files=files,
+                    data=data,
+                    headers=self._headers,
+                )
+
+                if resp.status_code != 200:
+                    logger.error(f"GPU diarize failed ({resp.status_code}): {resp.text[:200]}")
+                    return None
+
+                result = resp.json()
+
+        elapsed = time.time() - start_time
+        # Log response keys for debugging format mismatches
+        logger.info(f"GPU diarize response keys: {list(result.keys())}")
+        if not result.get("segments"):
+            logger.info(f"GPU diarize full response (no segments): {json.dumps(result)[:500]}")
+        # Server returns "timeline" not "segments" — normalize
+        if "timeline" in result and "segments" not in result:
+            result["segments"] = result["timeline"]
+        num_spk = result.get("num_speakers", 0)
+        num_segs = len(result.get("segments", []))
+        logger.info(
+            f"GPU diarization complete: {num_spk} speakers, {num_segs} segments, "
+            f"time={elapsed:.1f}s"
+        )
+        return result
+
+
+def create_diarize_client(**kwargs) -> Optional[DiarizeClient]:
+    """Factory: create a DiarizeClient if configured."""
+    if not is_diarize_available():
+        return None
+    try:
+        client = DiarizeClient(**kwargs)
+        if client.health_check():
+            return client
+        logger.warning(f"External diarize API at {DIARIZE_URL} is not healthy")
+        return None
     except ValueError:
         return None

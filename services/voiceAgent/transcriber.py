@@ -39,6 +39,10 @@ EXTERNAL_WHISPER_URL = os.getenv("EXTERNAL_WHISPER_URL", "")
 EXTERNAL_API_KEY = os.getenv("EXTERNAL_API_KEY", "")
 EXTERNAL_WHISPER_MODEL = os.getenv("EXTERNAL_WHISPER_MODEL", "base")
 
+# GPU diarization clustering threshold (lower = more aggressive speaker merging)
+# API default is 0.5. Use 0.3-0.4 if same-gender speakers are being over-split.
+DIARIZE_CLUSTERING_THRESHOLD = float(os.getenv("DIARIZE_CLUSTERING_THRESHOLD", "0.5"))
+
 # ── Pyannote Community-1 Pipeline (global singleton — loaded once) ──
 _pyannote_community_pipeline = None
 _pyannote_community_load_attempted = False
@@ -641,10 +645,12 @@ class Transcriber:
         self, segments: list[dict], audio_path: str, estimated: int,
     ) -> int:
         """
-        Verify estimated speaker count using ECAPA-TDNN embeddings.
-        Computes embeddings for 6 evenly-spaced windows and checks pairwise
-        cosine similarity. If all similar → single speaker.
-        Prevents false 2-speaker splits on single-narrator content.
+        Verify and refine estimated speaker count using ECAPA-TDNN embeddings.
+
+        Samples embeddings from transcript segments (where speech exists) and:
+          - Reduces to 1 if all windows are highly similar (single speaker)
+          - Increases by 1 if agglomerative clustering of samples suggests
+            more distinct voices than the heuristic estimate
         """
         if estimated < 2:
             return estimated
@@ -663,13 +669,24 @@ class Transcriber:
             if duration_s < 5:
                 return estimated
 
-            n_windows, window_s = 6, 2.0
-            step = (duration_s - window_s) / max(n_windows - 1, 1)
-            embeddings = []
+            # Sample from transcript segments (where speech exists)
+            candidate_segs = [
+                s for s in segments
+                if (s.get("end_ms", 0) - s.get("start_ms", 0)) >= 1000
+            ]
+            if len(candidate_segs) < 3:
+                candidate_segs = segments
 
-            for i in range(n_windows):
-                start = i * step
-                chunk = y[int(start * sr):int(min(start + window_s, duration_s) * sr)]
+            # Pick up to 12 segments spread across the recording
+            n_pick = min(12, len(candidate_segs))
+            step = max(1, len(candidate_segs) // n_pick)
+            chosen = [candidate_segs[i * step] for i in range(n_pick) if i * step < len(candidate_segs)]
+
+            embeddings = []
+            for seg in chosen:
+                start_s = seg.get("start_ms", 0) / 1000.0
+                end_s = seg.get("end_ms", 0) / 1000.0
+                chunk = y[int(start_s * sr):int(min(end_s, duration_s) * sr)]
                 if len(chunk) < sr * 0.5:
                     continue
                 waveform = torch.from_numpy(chunk).unsqueeze(0).float()
@@ -679,7 +696,7 @@ class Transcriber:
                     emb = model.encode_batch(waveform)
                 embeddings.append(emb.squeeze().cpu().numpy())
 
-            if len(embeddings) < 3:
+            if len(embeddings) < 4:
                 return estimated
 
             emb_arr = np.array(embeddings)
@@ -698,16 +715,64 @@ class Transcriber:
                 f"mean_sim={mean_sim:.3f}, min_sim={min_sim:.3f}, std={sim_std:.3f}"
             )
 
+            # ── Check for single speaker (high similarity) ──
             if mean_sim > 0.82 and min_sim > 0.70:
-                logger.info(f"Auto speaker count: highly similar → 1 speaker")
+                logger.info("Auto speaker count: highly similar → 1 speaker")
                 return 1
 
-            # Low variance in similarities = uniform voice = likely 1 speaker
             if mean_sim > 0.20 and sim_std < 0.06 and min_sim > 0.10:
                 logger.info(
                     f"Auto speaker count: uniform similarity (std={sim_std:.3f}) → likely 1 speaker"
                 )
                 return 1
+
+            # ── Check if estimate should increase ──
+            # Sample more segments for reliable clustering comparison
+            if len(embeddings) >= estimated + 2 and estimated <= 8:
+                try:
+                    from sklearn.cluster import AgglomerativeClustering
+                    from sklearn.metrics import silhouette_score, calinski_harabasz_score
+
+                    # Cluster at k=estimated
+                    ac_k = AgglomerativeClustering(
+                        n_clusters=estimated, metric="cosine", linkage="average"
+                    )
+                    labels_k = ac_k.fit_predict(emb_arr)
+
+                    # Cluster at k=estimated+1
+                    ac_k1 = AgglomerativeClustering(
+                        n_clusters=estimated + 1, metric="cosine", linkage="average"
+                    )
+                    labels_k1 = ac_k1.fit_predict(emb_arr)
+
+                    # Silhouette score (higher = better separation)
+                    sil_k = silhouette_score(emb_arr, labels_k, metric="cosine")
+                    sil_k1 = silhouette_score(emb_arr, labels_k1, metric="cosine")
+
+                    # Calinski-Harabasz index (higher = better, prefers correct k)
+                    ch_k = calinski_harabasz_score(emb_arr, labels_k)
+                    ch_k1 = calinski_harabasz_score(emb_arr, labels_k1)
+
+                    logger.info(
+                        f"Auto speaker count: silhouette k={estimated}: {sil_k:.3f}, "
+                        f"k={estimated + 1}: {sil_k1:.3f} | "
+                        f"CH k={estimated}: {ch_k:.1f}, k={estimated + 1}: {ch_k1:.1f}"
+                    )
+
+                    # Increase if EITHER metric supports k+1:
+                    #  - Silhouette: k+1 is within 0.03 of k (merged clusters
+                    #    artificially inflate silhouette, so near-equal = prefer higher k)
+                    #  - Calinski-Harabasz: k+1 is better
+                    sil_close = sil_k1 > sil_k - 0.03
+                    ch_better = ch_k1 > ch_k
+                    if sil_close and ch_better:
+                        logger.info(
+                            f"Auto speaker count: increasing {estimated} → {estimated + 1} "
+                            f"(sil diff={sil_k1 - sil_k:+.3f}, CH improved {ch_k:.0f}→{ch_k1:.0f})"
+                        )
+                        return estimated + 1
+                except Exception as e:
+                    logger.debug(f"Auto speaker count silhouette check failed: {e}")
 
             return estimated
         except Exception as e:
@@ -755,8 +820,29 @@ class Transcriber:
             return segments
 
         mode = self.DIARIZATION_MODE
+        logger.info(f"Diarization cascade: mode={mode}, audio_path={'yes' if audio_path else 'no'}, max_speakers={max_speakers}")
 
-        # ── Tier 1: Pyannote Community-1 (frame-level, default) ──
+        # ── Tier 0: External GPU Diarization (fastest, best quality) ──
+        if mode in ("auto", "ecapa", "pyannote") and audio_path:
+            try:
+                result = self._diarize_external_gpu(segments, max_speakers, audio_path)
+                if result is not None:
+                    return result
+            except Exception as e:
+                logger.warning(f"External GPU diarization failed: {e}")
+
+        # ── Tier 1: ECAPA-TDNN Embeddings (192-dim, best identity separation) ──
+        if mode in ("ecapa", "embedding", "auto") and audio_path:
+            try:
+                result = self._diarize_embedding_clustering(
+                    segments, max_speakers, audio_path
+                )
+                if result is not None:
+                    return result
+            except Exception as e:
+                logger.warning(f"ECAPA-TDNN embedding clustering failed: {e}")
+
+        # ── Tier 2: Pyannote Community-1 (frame-level fallback) ──
         if mode in ("pyannote", "auto") and audio_path:
             try:
                 result = self._diarize_pyannote_community(
@@ -767,7 +853,7 @@ class Transcriber:
             except Exception as e:
                 logger.warning(f"Pyannote community-1 failed: {e}")
 
-        # ── Tier 1b: Legacy Pyannote 3.1 (if USE_PYANNOTE=true) ──
+        # ── Tier 2b: Legacy Pyannote 3.1 (if USE_PYANNOTE=true) ──
         if mode in ("pyannote", "auto") and USE_PYANNOTE and audio_path:
             try:
                 result = self._diarize_pyannote(audio_path, segments)
@@ -775,17 +861,6 @@ class Transcriber:
                     return result
             except Exception as e:
                 logger.warning(f"Pyannote 3.1 failed: {e}")
-
-        # ── Tier 2: Speaker embedding clustering (ECAPA-TDNN) ──
-        if mode in ("ecapa", "embedding", "auto") and audio_path:
-            try:
-                result = self._diarize_embedding_clustering(
-                    segments, max_speakers, audio_path
-                )
-                if result is not None:
-                    return result
-            except Exception as e:
-                logger.warning(f"Embedding clustering failed: {e}")
 
         # ── Tier 3: Acoustic KMeans (enhanced with MFCCs) ──
         if mode in ("kmeans", "auto") and audio_path and max_speakers >= 2:
@@ -802,6 +877,233 @@ class Transcriber:
         if max_speakers == 2:
             return self._diarize_gap_two_speaker(segments, audio_path)
         return self._diarize_simple_multi_speaker(segments, max_speakers)
+
+    # ── External GPU Diarization (Tier 0) ──
+
+    def _diarize_external_gpu(
+        self,
+        segments: list[dict],
+        max_speakers: int,
+        audio_path: str,
+    ) -> Optional[list[dict]]:
+        """
+        Send audio to external GPU server for pyannote diarization.
+        Converts to WAV first since pyannote can't read MP4 directly.
+
+        Uses word-level timestamps (when available) for fine-grained speaker
+        mapping instead of whole-segment overlap, which fixes misassignment
+        at speaker turn boundaries.
+
+        Passes clustering_threshold=0.35 by default for better same-gender /
+        similar-voice separation (API default 0.5 over-splits).
+
+        Returns labeled segments or None if unavailable.
+        """
+        import tempfile
+        import soundfile as sf
+
+        try:
+            from shared.utils.external_apis import create_diarize_client
+        except ImportError:
+            logger.warning("External GPU diarization: import failed")
+            return None
+
+        client = create_diarize_client()
+        if client is None:
+            logger.warning("External GPU diarization: client creation failed (health check?)")
+            return None
+
+        logger.info("External GPU diarization: client ready, sending audio...")
+
+        mt = self._meeting_type or "meeting"
+        config = self.SPEAKER_DEFAULTS.get(
+            mt,
+            {"default": 3, "min": 2, "max": 8},
+        )
+        min_spk = config["min"]
+        # Use the auto-detected/estimated max_speakers from the cascade,
+        # NOT the meeting type max. The cascade already ran ECAPA-TDNN
+        # silhouette analysis to estimate the real count — respect that.
+        # Only fall back to config max if max_speakers is unreasonably low.
+        max_spk = max(max_speakers, min_spk)
+        num_spk = self._num_speakers  # explicit user hint, or None
+
+        # Configurable via DIARIZE_CLUSTERING_THRESHOLD env var (default 0.5).
+        # Lower (0.3-0.4) = merges similar voices more aggressively (fewer speakers).
+        # Higher (0.5-0.7) = separates more aggressively (more speakers).
+        clustering_threshold = DIARIZE_CLUSTERING_THRESHOLD
+
+        # Convert to WAV if we have pre-loaded audio (pyannote can't read MP4)
+        wav_path = audio_path
+        tmp_wav = None
+        if self._audio_data is not None:
+            y, sr = self._audio_data
+            # Ensure mono
+            if y.ndim > 1:
+                y = np.mean(y, axis=0) if y.shape[0] < y.shape[1] else np.mean(y, axis=1)
+            # Resample to 16 kHz if needed
+            if sr != 16000:
+                import torchaudio as _ta
+                import torch
+                waveform = torch.from_numpy(y).float()
+                if waveform.ndim == 1:
+                    waveform = waveform.unsqueeze(0)
+                waveform = _ta.functional.resample(waveform, sr, 16000)
+                y = waveform.squeeze(0).numpy()
+                sr = 16000
+            tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            sf.write(tmp_wav.name, y, sr)
+            wav_path = tmp_wav.name
+            logger.info(f"Converted audio to mono 16kHz WAV for GPU diarization: {wav_path}")
+        elif audio_path.lower().endswith((".mp4", ".m4a", ".webm", ".ogg", ".flac", ".mp3")):
+            # Load and convert non-WAV formats
+            try:
+                from shared.utils.audio_loader import load_audio
+                y, sr = load_audio(audio_path, sr=16000)
+            except ImportError:
+                import librosa
+                y, sr = librosa.load(audio_path, sr=16000, mono=True)
+            tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            sf.write(tmp_wav.name, y, sr)
+            wav_path = tmp_wav.name
+            logger.info(f"Converted {audio_path} to WAV for GPU diarization")
+
+        try:
+            result = client.diarize(
+                wav_path,
+                min_speakers=min_spk,
+                max_speakers=max_spk,
+                num_speakers=num_spk,
+                clustering_threshold=clustering_threshold,
+            )
+        finally:
+            # Clean up temp WAV file
+            if tmp_wav is not None:
+                try:
+                    os.unlink(tmp_wav.name)
+                except OSError:
+                    pass
+
+        if result is None:
+            return None
+
+        gpu_segments = result.get("segments", [])
+        if not gpu_segments:
+            logger.warning("GPU diarization returned 0 segments")
+            return None
+
+        # Filter out micro-fragments (<100ms) from diarize output — these are
+        # pyannote noise at speaker boundaries and cause misassignment.
+        MIN_DIARIZE_DURATION_S = 0.1
+        filtered = [ds for ds in gpu_segments if (ds["end"] - ds["start"]) >= MIN_DIARIZE_DURATION_S]
+        if filtered:
+            dropped = len(gpu_segments) - len(filtered)
+            if dropped:
+                logger.info(f"Filtered {dropped} micro-fragments (<{MIN_DIARIZE_DURATION_S}s) from diarize output")
+            gpu_segments = filtered
+
+        # Normalize speaker names: SPEAKER_XX -> Speaker_X
+        speaker_map = {}
+        for ds in gpu_segments:
+            raw = ds["speaker"]
+            if raw not in speaker_map:
+                speaker_map[raw] = f"Speaker_{len(speaker_map)}"
+            ds["_norm_speaker"] = speaker_map[raw]
+
+        # ── Word-level speaker mapping (preferred) ──
+        # When Whisper provides word timestamps, map each WORD to the diarize
+        # timeline individually, then assign each segment's speaker by majority
+        # vote of its words. This is much more accurate at turn boundaries than
+        # mapping whole segments.
+        has_words = any(seg.get("words") for seg in segments)
+
+        for seg in segments:
+            words = seg.get("words", [])
+
+            if has_words and words:
+                # Map each word to a diarize speaker
+                word_speakers = []
+                for w in words:
+                    w_mid_ms = ((w.get("start", 0) + w.get("end", 0)) / 2.0) * 1000
+                    best_spk = None
+                    best_overlap = 0
+                    for ds in gpu_segments:
+                        ds_start_ms = ds["start"] * 1000
+                        ds_end_ms = ds["end"] * 1000
+                        w_start_ms = w.get("start", 0) * 1000
+                        w_end_ms = w.get("end", 0) * 1000
+                        ov_start = max(w_start_ms, ds_start_ms)
+                        ov_end = min(w_end_ms, ds_end_ms)
+                        ov = max(0, ov_end - ov_start)
+                        if ov > best_overlap:
+                            best_overlap = ov
+                            best_spk = ds["_norm_speaker"]
+                    # Fallback: midpoint proximity
+                    if best_spk is None:
+                        best_dist = float("inf")
+                        for ds in gpu_segments:
+                            ds_mid_ms = (ds["start"] + ds["end"]) / 2.0 * 1000
+                            d = abs(w_mid_ms - ds_mid_ms)
+                            if d < best_dist:
+                                best_dist = d
+                                best_spk = ds["_norm_speaker"]
+                    if best_spk:
+                        word_speakers.append(best_spk)
+
+                # Majority vote — assign segment to the speaker who owns most words
+                if word_speakers:
+                    from collections import Counter
+                    vote = Counter(word_speakers).most_common(1)[0][0]
+                    seg["speaker"] = vote
+                else:
+                    seg["speaker"] = "Speaker_0"
+            else:
+                # Fallback: segment-level overlap mapping (original approach)
+                seg_mid = (seg["start_ms"] + seg["end_ms"]) / 2.0
+                best_speaker = "Speaker_0"
+                best_overlap = 0
+
+                for ds in gpu_segments:
+                    ds_start_ms = int(ds["start"] * 1000)
+                    ds_end_ms = int(ds["end"] * 1000)
+                    overlap_start = max(seg["start_ms"], ds_start_ms)
+                    overlap_end = min(seg["end_ms"], ds_end_ms)
+                    overlap = max(0, overlap_end - overlap_start)
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_speaker = ds["_norm_speaker"]
+
+                if best_overlap == 0:
+                    best_dist = float("inf")
+                    for ds in gpu_segments:
+                        ds_mid = (ds["start"] + ds["end"]) / 2.0 * 1000
+                        dist = abs(seg_mid - ds_mid)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_speaker = ds["_norm_speaker"]
+
+                seg["speaker"] = best_speaker
+
+        # Clean up temp key
+        for ds in gpu_segments:
+            ds.pop("_norm_speaker", None)
+
+        # Apply linguistic post-correction (Q→A, isolated flip, greeting→response).
+        # This was previously missing for external GPU path — fixes cases where
+        # pyannote merges two similar voices into one speaker but Q&A patterns
+        # reveal they are different speakers.
+        num_spk_detected = len(set(s["speaker"] for s in segments))
+        segments = self._linguistic_post_correction(segments, num_spk_detected)
+
+        speakers = sorted(set(s["speaker"] for s in segments))
+        counts = {sp: sum(1 for s in segments if s["speaker"] == sp) for sp in speakers}
+        self._last_diarization_backend = "external_gpu"
+        logger.info(
+            f"External GPU diarization mapped: {len(speakers)} speakers — "
+            + ", ".join(f"{sp}: {counts[sp]} segs" for sp in speakers)
+            + f" (clustering_threshold={clustering_threshold})"
+        )
+        return segments
 
     # ── Pyannote Community-1 Diarization (Tier 1) ──
 
@@ -834,7 +1136,18 @@ class Transcriber:
         # Build audio input — pass pre-loaded waveform to avoid torchcodec issues
         if self._audio_data is not None:
             y, sr = self._audio_data
-            waveform = torch.from_numpy(y).unsqueeze(0).float()
+            # Ensure waveform is mono
+            if y.ndim > 1:
+                y = np.mean(y, axis=0) if y.shape[0] < y.shape[1] else np.mean(y, axis=1)
+            # Convert to torch tensor
+            waveform = torch.from_numpy(y).float()
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
+            # Resample to 16 kHz if needed
+            if sr != 16000:
+                import torchaudio as _ta
+                waveform = _ta.functional.resample(waveform, sr, 16000)
+                sr = 16000
             audio_input = {"waveform": waveform, "sample_rate": sr}
         else:
             audio_input = audio_path
@@ -868,32 +1181,38 @@ class Transcriber:
 
         logger.info(f"Pyannote produced {len(speaker_turns)} speaker turns")
 
-        # ── Assign speakers to Whisper segments ──
-        has_words = any(seg.get("words") for seg in segments)
 
+        # --- Split transcript segments at diarization boundaries ---
+        diar_boundaries = sorted(set([turn["start"] for turn in speaker_turns] + [turn["end"] for turn in speaker_turns]))
+        diar_boundaries = [b for b in diar_boundaries if b is not None]
+        new_segments = []
         for seg in segments:
-            if has_words and seg.get("words"):
-                # Word-level assignment (highest precision)
-                word_speakers = []
-                for word in seg["words"]:
-                    w_start = word.get("start", seg["start_ms"] / 1000)
-                    w_end = word.get("end", seg["end_ms"] / 1000)
-                    spk = self._get_dominant_speaker(w_start, w_end, speaker_turns)
-                    word_speakers.append(spk)
-
-                # Segment speaker = majority among its words
-                valid_speakers = [s for s in word_speakers if s is not None]
-                if valid_speakers:
-                    seg["speaker"] = Counter(valid_speakers).most_common(1)[0][0]
-                else:
-                    seg["speaker"] = self._get_dominant_speaker(
-                        seg["start_ms"] / 1000, seg["end_ms"] / 1000, speaker_turns
-                    ) or "SPEAKER_00"
-            else:
-                # Segment-level assignment via overlap
-                seg["speaker"] = self._get_dominant_speaker(
-                    seg["start_ms"] / 1000, seg["end_ms"] / 1000, speaker_turns
-                ) or "SPEAKER_00"
+            seg_start = seg["start_ms"] / 1000
+            seg_end = seg["end_ms"] / 1000
+            # Find all diarization boundaries within this segment
+            split_points = [b for b in diar_boundaries if seg_start < b < seg_end]
+            split_times = [seg_start] + split_points + [seg_end]
+            for i in range(len(split_times) - 1):
+                chunk_start = split_times[i]
+                chunk_end = split_times[i+1]
+                # Assign speaker for this chunk
+                spk = self._get_dominant_speaker(chunk_start, chunk_end, speaker_turns) or "SPEAKER_00"
+                # Split words if present
+                chunk_words = []
+                if seg.get("words"):
+                    for word in seg["words"]:
+                        w_start = word.get("start", seg_start)
+                        w_end = word.get("end", seg_end)
+                        if w_start < chunk_end and w_end > chunk_start:
+                            chunk_words.append(word)
+                new_segments.append({
+                    "start_ms": int(chunk_start * 1000),
+                    "end_ms": int(chunk_end * 1000),
+                    "text": seg["text"],
+                    "words": chunk_words,
+                    "speaker": spk,
+                })
+        segments = new_segments
 
         # ── Normalize labels to Speaker_0, Speaker_1, ... ──
         label_map = {}
@@ -995,7 +1314,7 @@ class Transcriber:
             return None
 
         # Build valid mask (non-zero embeddings)
-        valid_mask = [np.linalg.norm(e) > 0.01 for e in embeddings]
+        valid_mask = [bool(np.linalg.norm(e) > 0.01) for e in embeddings]
         n_valid = sum(valid_mask)
         if n_valid < num_speakers:
             logger.warning(
@@ -1003,39 +1322,68 @@ class Transcriber:
             )
             return None
 
-        # Agglomerative clustering with cosine distance
-        dist_matrix = cosine_distances(embeddings)
-        clustering = AgglomerativeClustering(
-            n_clusters=num_speakers,
-            metric="precomputed",
-            linkage="average",
-        )
-        labels = clustering.fit_predict(dist_matrix)
+        # ── Per-segment F0 extraction (for pitch-aware clustering) ──
+        try:
+            import librosa as _librosa
+            for seg in segments:
+                s_sample = int(seg["start_ms"] * sr / 1000)
+                e_sample = int(seg["end_ms"] * sr / 1000)
+                chunk = y[s_sample:e_sample]
+                if len(chunk) > int(sr * 0.05):
+                    f0, _, _ = _librosa.pyin(chunk, fmin=60, fmax=500, sr=sr, frame_length=2048)
+                    voiced = f0[~np.isnan(f0)] if f0 is not None else np.array([])
+                    seg["f0_mean"] = float(np.mean(voiced)) if len(voiced) > 0 else 0.0
+                else:
+                    seg["f0_mean"] = 0.0
+        except Exception as e:
+            logger.debug(f"F0 extraction skipped: {e}")
 
-        # ── Temporal smoothing: reassign isolated micro-fragments ──
-        labels = labels.tolist()
-        for i in range(1, len(labels) - 1):
-            prev_label, next_label = labels[i - 1], labels[i + 1]
-            if prev_label == next_label and labels[i] != prev_label:
-                seg_duration_ms = segments[i]["end_ms"] - segments[i]["start_ms"]
-                gap_before = segments[i]["start_ms"] - segments[i - 1]["end_ms"]
-                gap_after = segments[i + 1]["start_ms"] - segments[i]["end_ms"]
-                if seg_duration_ms < 1500 and gap_before < 200 and gap_after < 200:
-                    labels[i] = prev_label
+        # ── Clustering method selection ──
+        # CLUSTERING_METHOD env: "spectral" (default) | "agglomerative" (old)
+        clustering_method = os.getenv("CLUSTERING_METHOD", "spectral")
+        labels = None
 
-        # ── Balance check (relaxed for embeddings: 1/N + 0.45) ──
-        from collections import Counter
-        counts = Counter(labels)
-        total = len(labels)
-        max_pct = max(counts.values()) / total if total > 0 else 1.0
-        max_allowed_pct = (1.0 / num_speakers) + 0.45
-        if max_pct > max_allowed_pct:
-            logger.warning(
-                f"Embedding clustering imbalanced: {dict(counts)} "
-                f"({max_pct:.0%} in one cluster, limit={max_allowed_pct:.0%}). "
-                f"Falling back."
+        if clustering_method == "spectral":
+            try:
+                from spectral_clustering import spectral_diarize
+                mt = self._meeting_type or "meeting"
+                config = self.SPEAKER_DEFAULTS.get(mt, {"max": 8})
+                # Pass num_speakers=0 to let eigengap auto-detect from the
+                # affinity matrix. The heuristic estimate is only used as
+                # max_speakers upper bound. This avoids forcing a wrong k
+                # (e.g. heuristic says 5 but there are actually 6 speakers).
+                labels = spectral_diarize(
+                    segments, embeddings, 0, valid_mask,
+                    max_speakers=max(num_speakers + 1, config.get("max", 8)),
+                )
+            except Exception as e:
+                logger.warning(f"Spectral clustering failed: {e}")
+
+        # ── Fallback or explicit agglomerative ──
+        if labels is None:
+            logger.info(f"Using agglomerative clustering (method={clustering_method})")
+            from sklearn.cluster import AgglomerativeClustering
+            from sklearn.metrics.pairwise import cosine_distances
+            dist_matrix = cosine_distances(embeddings)
+            clustering = AgglomerativeClustering(
+                n_clusters=num_speakers,
+                metric="precomputed",
+                linkage="average",
             )
-            return None
+            raw_labels = clustering.fit_predict(dist_matrix)
+            labels = raw_labels.tolist()
+
+            # Temporal smoothing for agglomerative
+            for i in range(1, len(labels) - 1):
+                prev_label, next_label = labels[i - 1], labels[i + 1]
+                if prev_label == next_label and labels[i] != prev_label:
+                    seg_duration_ms = segments[i]["end_ms"] - segments[i]["start_ms"]
+                    gap_before = segments[i]["start_ms"] - segments[i - 1]["end_ms"]
+                    gap_after = segments[i + 1]["start_ms"] - segments[i]["end_ms"]
+                    if seg_duration_ms < 1500 and gap_before < 200 and gap_after < 200:
+                        labels[i] = prev_label
+
+        from collections import Counter
 
         # ── Assign labels by first-appearance order ──
         label_order = []
@@ -1049,21 +1397,8 @@ class Transcriber:
         for i, seg in enumerate(segments):
             seg["speaker"] = cluster_to_speaker[labels[i]]
 
-        # ── Assign invalid segments from nearest valid neighbor ──
-        for i, (seg, valid) in enumerate(zip(segments, valid_mask)):
-            if not valid:
-                # Find nearest valid neighbor by time
-                best_dist = float("inf")
-                best_speaker = "Speaker_0"
-                seg_mid = (seg["start_ms"] + seg["end_ms"]) / 2
-                for j, (other_seg, other_valid) in enumerate(zip(segments, valid_mask)):
-                    if other_valid and j != i:
-                        other_mid = (other_seg["start_ms"] + other_seg["end_ms"]) / 2
-                        dist = abs(seg_mid - other_mid)
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_speaker = other_seg["speaker"]
-                seg["speaker"] = best_speaker
+        # ── Merged speaker detection: check intra-cluster variance ──
+        segments = self._verify_speaker_clusters(segments, embeddings, valid_mask, max_speakers=num_speakers)
 
         # ── Layer 2: Linguistic post-correction ──
         segments = self._linguistic_post_correction(segments, num_speakers)
@@ -1088,36 +1423,141 @@ class Transcriber:
         )
         return segments
 
+    def _verify_speaker_clusters(
+        self,
+        segments: list[dict],
+        embeddings: np.ndarray,
+        valid_mask: list[bool],
+        max_speakers: int = 0,
+    ) -> list[dict]:
+        """
+        Check if any speaker cluster has high intra-speaker embedding variance,
+        indicating two different speakers were merged into one cluster.
+        If detected, sub-cluster that speaker into 2 and reassign.
+
+        Respects max_speakers — will not split beyond that limit.
+        """
+        from sklearn.cluster import AgglomerativeClustering
+        from sklearn.metrics.pairwise import cosine_similarity
+        from collections import Counter
+
+        speaker_counts = Counter(seg["speaker"] for seg in segments)
+        if len(speaker_counts) < 2:
+            return segments
+
+        splits_made = 0
+        existing_speakers = sorted(speaker_counts.keys())
+        next_speaker_idx = len(existing_speakers)
+
+        for speaker in list(existing_speakers):
+            # Get indices and embeddings for this speaker
+            indices = [
+                i for i, seg in enumerate(segments)
+                if seg["speaker"] == speaker and valid_mask[i]
+            ]
+            if len(indices) < 6:  # need enough segments to detect a merge
+                continue
+
+            spk_embeddings = np.array([embeddings[i] for i in indices])
+            sim_matrix = cosine_similarity(spk_embeddings)
+
+            # Intra-cluster mean similarity (excluding self-similarity diagonal)
+            n = len(sim_matrix)
+            mask = ~np.eye(n, dtype=bool)
+            mean_sim = sim_matrix[mask].mean()
+            std_sim = sim_matrix[mask].std()
+
+            # If mean similarity is low and std is high → likely merged
+            # But don't exceed max_speakers if set
+            current_count = len(set(seg["speaker"] for seg in segments))
+            if max_speakers > 0 and current_count >= max_speakers:
+                logger.info(f"Speaker verification: skipping splits — already at max_speakers={max_speakers}")
+                break
+
+            if mean_sim < 0.65 and std_sim > 0.12 and n >= 8:
+                logger.info(
+                    f"Merged speaker detected: {speaker} "
+                    f"(mean_sim={mean_sim:.3f}, std={std_sim:.3f}, n={n}). "
+                    f"Sub-clustering..."
+                )
+                # Sub-cluster into 2
+                from sklearn.metrics.pairwise import cosine_distances
+                dist = cosine_distances(spk_embeddings)
+                sub_clustering = AgglomerativeClustering(
+                    n_clusters=2,
+                    metric="precomputed",
+                    linkage="average",
+                )
+                sub_labels = sub_clustering.fit_predict(dist)
+
+                # Check if the split is balanced enough (at least 20% each side)
+                sub_counts = Counter(sub_labels)
+                min_pct = min(sub_counts.values()) / sum(sub_counts.values())
+                if min_pct < 0.15:
+                    logger.info(
+                        f"Sub-cluster too imbalanced ({dict(sub_counts)}), keeping merged."
+                    )
+                    continue
+
+                # Assign the smaller sub-cluster to a new speaker
+                new_speaker = f"Speaker_{next_speaker_idx}"
+                next_speaker_idx += 1
+                minority_label = min(sub_counts, key=sub_counts.get)
+
+                for j, idx in enumerate(indices):
+                    if sub_labels[j] == minority_label:
+                        segments[idx]["speaker"] = new_speaker
+
+                splits_made += 1
+                logger.info(
+                    f"Split {speaker} → {speaker} ({sub_counts[1 - minority_label]} segs) + "
+                    f"{new_speaker} ({sub_counts[minority_label]} segs)"
+                )
+
+        if splits_made > 0:
+            logger.info(f"Speaker verification: {splits_made} merged speakers split")
+
+        return segments
+
     def _linguistic_post_correction(
         self,
         segments: list[dict],
         num_speakers: int = 2,
     ) -> list[dict]:
         """
-        Fix obvious diarization errors using linguistic patterns (conservative).
+        Fix obvious diarization errors using linguistic patterns.
+        Works for 2+ speakers (not limited to 2-speaker calls).
 
-        Rule 1: Question → short answer: if a short segment ends with '?' and the
-        next segment is short (<2s), same speaker, and separated by >200ms gap,
-        flip the response to the other speaker.
-
-        Rule 2: Isolated flip: if a single short (<1.5s) segment breaks an
-        otherwise consistent speaker run on both sides, with tiny gaps (<150ms),
-        re-assign it to match the surrounding speaker.
+        Rule 1: Question → Answer — flip response to most recent different speaker
+        Rule 2: Isolated flip — short segment breaking a consistent run
+        Rule 3: Greeting → Query — intro followed by question from same speaker
+        Rule 4: Greeting → Response — greeting followed by polite reply
+        Rule 5: Self-introduction detection — "I'm X" assigns speaker identity
+        Rule 6: Addressed-by-name — "X, can you..." → next speaker is X
         """
-        if num_speakers != 2 or len(segments) < 3:
+        if len(segments) < 3:
             return segments
 
         speakers = set(seg.get("speaker", "") for seg in segments)
         if len(speakers) < 2:
             return segments
-        speaker_list = sorted(speakers)
 
-        def other_speaker(spk: str) -> str:
-            return speaker_list[1] if spk == speaker_list[0] else speaker_list[0]
+        def recent_different_speaker(idx: int, curr_spk: str) -> str:
+            """Find the most recent speaker before idx that isn't curr_spk."""
+            for j in range(idx - 1, -1, -1):
+                spk = segments[j].get("speaker", "")
+                if spk and spk != curr_spk:
+                    return spk
+            # Fallback: pick any other speaker
+            for spk in sorted(speakers):
+                if spk != curr_spk:
+                    return spk
+            return curr_spk
 
         corrections = 0
 
-        # Rule 1: Question → response pattern (conservative)
+        # Rule 1: Question → response pattern
+        # Short question + short answer from same speaker with gap → flip answer
         for i in range(len(segments) - 1):
             curr = segments[i]
             nxt = segments[i + 1]
@@ -1133,10 +1573,11 @@ class Transcriber:
                 and curr_duration < 3000
                 and gap_ms > 200
             ):
-                nxt["speaker"] = other_speaker(curr["speaker"])
+                nxt["speaker"] = recent_different_speaker(i + 1, curr["speaker"])
                 corrections += 1
 
         # Rule 2: Isolated single-segment flip
+        # A-B-A where B is short and tiny gaps → B should be A
         for i in range(1, len(segments) - 1):
             prev_spk = segments[i - 1].get("speaker")
             curr_spk = segments[i].get("speaker")
@@ -1155,8 +1596,6 @@ class Transcriber:
                     corrections += 1
 
         # Rule 3: Greeting → query pattern
-        # If segment N is a greeting/intro and segment N+1 is a short question
-        # from the SAME speaker, flip N+1 (the response is from the other person).
         for i in range(len(segments) - 1):
             curr = segments[i]
             nxt = segments[i + 1]
@@ -1180,12 +1619,10 @@ class Transcriber:
             )
 
             if is_greeting and is_short_question and gap_ms > 100:
-                nxt["speaker"] = other_speaker(curr["speaker"])
+                nxt["speaker"] = recent_different_speaker(i + 1, curr["speaker"])
                 corrections += 1
 
         # Rule 4: Greeting → response pattern
-        # "Hi, how are you?" → "I'm good/fine" = different speakers
-        # "Who am I speaking to?" → "No problem" / polite reply = different speakers
         for i in range(len(segments) - 1):
             curr = segments[i]
             nxt = segments[i + 1]
@@ -1212,8 +1649,47 @@ class Transcriber:
             )
 
             if is_greeting_or_q and is_polite and gap_ms < 500:
-                nxt["speaker"] = other_speaker(curr["speaker"])
+                nxt["speaker"] = recent_different_speaker(i + 1, curr["speaker"])
                 corrections += 1
+
+        # Rule 5: Addressed-by-name detection
+        # "Lucy, can you..." or "Sue, what do you think?" → next segment is that person
+        # Build name→speaker map from self-introductions first
+        name_to_speaker: dict[str, str] = {}
+        import re
+        intro_pattern = re.compile(
+            r"(?:i'm|i am|my name is|this is)\s+(\w+)",
+            re.IGNORECASE,
+        )
+        for seg in segments:
+            match = intro_pattern.search(seg.get("text", ""))
+            if match:
+                name = match.group(1).capitalize()
+                name_to_speaker[name] = seg.get("speaker", "")
+
+        # Now check for addressed-by-name patterns
+        if name_to_speaker:
+            address_pattern = re.compile(
+                r"^(" + "|".join(re.escape(n) for n in name_to_speaker) + r")[,\s]",
+                re.IGNORECASE,
+            )
+            for i in range(len(segments) - 1):
+                curr = segments[i]
+                nxt = segments[i + 1]
+                curr_text = curr.get("text", "").strip()
+                match = address_pattern.match(curr_text)
+                if match:
+                    addressed_name = match.group(1).capitalize()
+                    expected_speaker = name_to_speaker.get(addressed_name)
+                    if (
+                        expected_speaker
+                        and expected_speaker != curr.get("speaker")
+                        and nxt.get("speaker") != expected_speaker
+                    ):
+                        gap_ms = nxt["start_ms"] - curr["end_ms"]
+                        if gap_ms < 2000:
+                            nxt["speaker"] = expected_speaker
+                            corrections += 1
 
         if corrections > 0:
             logger.info(f"Linguistic post-correction: {corrections} fixes applied")

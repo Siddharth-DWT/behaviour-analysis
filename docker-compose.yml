@@ -94,8 +94,12 @@ services:
       - EXTERNAL_WHISPER_URL=${EXTERNAL_WHISPER_URL}
       - EXTERNAL_WHISPER_MODEL=${EXTERNAL_WHISPER_MODEL:-large-v3}
       - EXTERNAL_API_KEY=${EXTERNAL_API_KEY}
+      - EXTERNAL_DIARIZE_URL=${EXTERNAL_DIARIZE_URL}
       - USE_PYANNOTE=${USE_PYANNOTE:-false}
       - HF_TOKEN=${HF_TOKEN}
+      - DIARIZATION_MODE=${DIARIZATION_MODE:-auto}
+      - DIARIZE_CLUSTERING_THRESHOLD=${DIARIZE_CLUSTERING_THRESHOLD:-0.5}
+      - CLUSTERING_METHOD=${CLUSTERING_METHOD:-spectral}
     volumes:
       - ./services/voiceAgent:/app
       - ./shared:/app/shared
@@ -171,6 +175,8 @@ services:
       - LANGUAGE_AGENT_URL=http://language_agent:8002
       - FUSION_AGENT_URL=http://fusion_agent:8007
       - JWT_SECRET=${JWT_SECRET:-nexus-dev-jwt-secret-2026}
+      - JWT_ACCESS_TOKEN_EXPIRE_MINUTES=${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+      - JWT_REFRESH_TOKEN_EXPIRE_DAYS=${JWT_REFRESH_TOKEN_EXPIRE_DAYS:-30}
     volumes:
       - ./services/api_gateway:/app
       - ./shared:/app/shared
