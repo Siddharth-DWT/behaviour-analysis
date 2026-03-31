@@ -13,7 +13,7 @@ logger = logging.getLogger("nexus.gateway.email")
 
 ZEPTOMAIL_TOKEN = os.getenv("ZEPTOMAIL_TOKEN", "")
 ZEPTOMAIL_API_URL = os.getenv(
-    "ZEPTOMAIL_API_URL", "https://api.zeptomail.com/v1.1/email"
+    "ZEPTOMAIL_API_URL", "https://api.zeptomail.in/v1.1/email"
 )
 FROM_EMAIL = os.getenv("FROM_EMAIL", "noreply@yourdomain.com")
 FROM_NAME = os.getenv("FROM_NAME", "NEXUS")
