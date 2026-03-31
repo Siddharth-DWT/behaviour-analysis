@@ -100,6 +100,9 @@ services:
       - DIARIZATION_MODE=${DIARIZATION_MODE:-auto}
       - DIARIZE_CLUSTERING_THRESHOLD=${DIARIZE_CLUSTERING_THRESHOLD:-0.5}
       - CLUSTERING_METHOD=${CLUSTERING_METHOD:-spectral}
+      - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+      - TRANSCRIPTION_BACKEND=${TRANSCRIPTION_BACKEND:-auto}
     volumes:
       - ./services/voiceAgent:/app
       - ./shared:/app/shared
