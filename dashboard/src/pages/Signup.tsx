@@ -1,7 +1,8 @@
-import { useState, FormEvent, useMemo } from "react";
+import { useState, FormEvent, useMemo, useCallback, useEffect, useRef } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { Activity, Eye, EyeOff, Loader2 } from "lucide-react";
+import { Activity, Eye, EyeOff, Loader2, Mail, CheckCircle } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
+import { resendVerification } from "../api/client";
 
 type PasswordStrength = "weak" | "fair" | "strong";
 
@@ -50,8 +51,54 @@ export default function Signup() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
+  // Email verification state
+  const [verificationSent, setVerificationSent] = useState(false);
+  const [verificationEmail, setVerificationEmail] = useState("");
+  const [resendCooldown, setResendCooldown] = useState(0);
+  const [resendLoading, setResendLoading] = useState(false);
+  const [resendMessage, setResendMessage] = useState<string | null>(null);
+  const cooldownRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const strength = useMemo(() => getPasswordStrength(password), [password]);
   const cfg = STRENGTH_CONFIG[strength];
+
+  // Cooldown timer
+  useEffect(() => {
+    if (resendCooldown <= 0) {
+      if (cooldownRef.current) {
+        clearInterval(cooldownRef.current);
+        cooldownRef.current = null;
+      }
+      return;
+    }
+    cooldownRef.current = setInterval(() => {
+      setResendCooldown((prev) => {
+        if (prev <= 1) {
+          if (cooldownRef.current) clearInterval(cooldownRef.current);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => {
+      if (cooldownRef.current) clearInterval(cooldownRef.current);
+    };
+  }, [resendCooldown > 0]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleResend = useCallback(async () => {
+    if (resendCooldown > 0 || resendLoading) return;
+    setResendLoading(true);
+    setResendMessage(null);
+    try {
+      const result = await resendVerification(verificationEmail);
+      setResendMessage(result.message || "Verification email resent.");
+      setResendCooldown(60);
+    } catch (err) {
+      setResendMessage((err as Error).message || "Failed to resend verification email.");
+    } finally {
+      setResendLoading(false);
+    }
+  }, [resendCooldown, resendLoading, verificationEmail]);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -72,12 +119,85 @@ export default function Signup() {
     try {
       await signup(email, password, fullName, company || undefined);
       navigate("/sessions", { replace: true });
-    } catch (err) {
-      setError((err as Error).message || "Signup failed");
+    } catch (err: unknown) {
+      const error = err as Error & { requiresVerification?: boolean; email?: string };
+      if (error.requiresVerification) {
+        setVerificationSent(true);
+        setVerificationEmail(error.email || email);
+        setResendCooldown(60);
+      } else {
+        setError(error.message || "Signup failed");
+      }
     } finally {
       setLoading(false);
     }
   };
+
+  // Verification sent screen
+  if (verificationSent) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-nexus-bg px-4">
+        <div className="w-full max-w-sm">
+          {/* Logo */}
+          <div className="mb-8 text-center">
+            <div className="mb-3 flex items-center justify-center gap-2">
+              <Activity className="h-8 w-8 text-nexus-accent-blue" />
+              <span className="font-mono text-2xl font-bold tracking-wider text-nexus-text-primary">
+                NEXUS
+              </span>
+            </div>
+            <p className="text-xs text-nexus-text-muted">
+              Behavioural Analysis System
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-nexus-border bg-nexus-surface p-6 text-center">
+            <div className="mb-4 flex justify-center">
+              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-nexus-accent-blue/10">
+                <Mail className="h-6 w-6 text-nexus-accent-blue" />
+              </div>
+            </div>
+
+            <h2 className="mb-2 text-sm font-semibold text-nexus-text-primary">
+              Check your email
+            </h2>
+            <p className="mb-5 text-xs text-nexus-text-secondary">
+              We've sent a verification link to{" "}
+              <span className="font-medium text-nexus-text-primary">
+                {verificationEmail}
+              </span>
+              . Please click the link to verify your account.
+            </p>
+
+            {resendMessage && (
+              <div className="mb-4 rounded border border-nexus-border bg-nexus-bg px-3 py-2 text-xs text-nexus-text-secondary">
+                <CheckCircle className="mr-1 inline h-3 w-3 text-emerald-400" />
+                {resendMessage}
+              </div>
+            )}
+
+            <button
+              onClick={handleResend}
+              disabled={resendCooldown > 0 || resendLoading}
+              className="flex w-full items-center justify-center gap-2 rounded border border-nexus-border bg-nexus-bg px-4 py-2 text-xs font-medium text-nexus-text-secondary transition-colors hover:bg-nexus-border hover:text-nexus-text-primary disabled:opacity-50"
+            >
+              {resendLoading && <Loader2 className="h-3 w-3 animate-spin" />}
+              {resendCooldown > 0
+                ? `Resend verification email (${resendCooldown}s)`
+                : "Resend verification email"}
+            </button>
+
+            <Link
+              to="/login"
+              className="mt-4 block text-xs text-nexus-accent-blue hover:underline"
+            >
+              Back to Login
+            </Link>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-nexus-bg px-4">

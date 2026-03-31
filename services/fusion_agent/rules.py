@@ -139,17 +139,11 @@ class FusionRuleEngine:
         When the CONTENT says something positive/certain but the VOICE
         shows elevated stress, the gap suggests reduced credibility.
 
-        Logic:
-          IF sentiment is positive (value > 0.3)
-             AND vocal_stress is elevated (value > 0.40)
-          THEN credibility_concern
-
-          The wider the gap between positive content and vocal stress,
-          the stronger the signal.
+        Scans all time-aligned stress+sentiment pairs (within 10s window)
+        and returns the strongest credibility concern found.
 
         Does NOT claim deception — only flags incongruence for human review.
         """
-        # Get most recent stress signals
         stress_signals = [
             s for s in voice_signals
             if s.get("signal_type") == "vocal_stress_score"
@@ -162,45 +156,6 @@ class FusionRuleEngine:
         if not stress_signals or not sentiment_signals:
             return None
 
-        # Use the most recent of each
-        latest_stress = max(
-            stress_signals, key=lambda s: _to_int(s.get("window_start_ms", 0))
-        )
-        latest_sentiment = max(
-            sentiment_signals, key=lambda s: _to_int(s.get("window_start_ms", 0))
-        )
-
-        stress_value = _to_float(latest_stress.get("value", 0))
-        sentiment_value = _to_float(latest_sentiment.get("value", 0))
-
-        # Only fire when content is positive but voice is stressed
-        if sentiment_value <= 0.30 or stress_value <= 0.40:
-            return None
-
-        # Credibility gap: how far apart are content and voice?
-        # sentiment_value is 0.3-1.0 (positive), stress is 0.4-1.0 (elevated)
-        gap = (sentiment_value - 0.30) * (stress_value - 0.30)
-        # Normalise to 0-1 range (max gap when both are extreme)
-        credibility_score = min(gap / 0.49, 1.0)  # 0.7*0.7 = 0.49
-
-        # Invert: lower score = less credible
-        credibility_score = 1.0 - credibility_score
-
-        # Classify
-        if credibility_score < 0.40:
-            level = "credibility_concern"
-        elif credibility_score < 0.60:
-            level = "mild_incongruence"
-        else:
-            level = "mostly_congruent"
-
-        # Only emit when there's actual concern
-        if credibility_score >= 0.70:
-            return None
-
-        # Confidence calculation (hard cap at 0.55)
-        raw_confidence = min(0.45 + (1.0 - credibility_score) * 0.20, 0.55)
-
         # Check for reinforcing signals (fillers, pitch elevation)
         filler_signals = [
             s for s in voice_signals
@@ -211,29 +166,67 @@ class FusionRuleEngine:
             s for s in voice_signals
             if s.get("signal_type") == "pitch_elevation_flag"
         ]
+        reinforcing_count = (1 if filler_signals else 0) + (1 if pitch_signals else 0)
 
-        reinforcing_count = 0
-        if filler_signals:
-            reinforcing_count += 1
-        if pitch_signals:
-            reinforcing_count += 1
+        # Scan all time-aligned pairs within 10s window
+        ALIGN_MS = 10_000
+        best_result = None
+        best_gap = 0
 
-        if reinforcing_count > 0:
-            raw_confidence = min(raw_confidence + 0.05 * reinforcing_count, 0.55)
+        for stress_sig in stress_signals:
+            stress_value = _to_float(stress_sig.get("value", 0))
+            if stress_value <= 0.40:
+                continue
+            stress_time = _to_int(stress_sig.get("window_start_ms", 0))
 
-        return {
-            "score": credibility_score,
-            "level": level,
-            "confidence": raw_confidence,
-            "evidence": {
-                "sentiment_value": round(sentiment_value, 3),
-                "stress_value": round(stress_value, 3),
-                "gap_magnitude": round(1.0 - credibility_score, 3),
-                "reinforcing_signals": reinforcing_count,
-                "filler_elevated": len(filler_signals) > 0,
-                "pitch_elevated": len(pitch_signals) > 0,
-            },
-        }
+            for sent_sig in sentiment_signals:
+                sentiment_value = _to_float(sent_sig.get("value", 0))
+                if sentiment_value <= 0.30:
+                    continue
+                sent_time = _to_int(sent_sig.get("window_start_ms", 0))
+
+                # Time alignment check
+                if abs(stress_time - sent_time) > ALIGN_MS:
+                    continue
+
+                # Credibility gap
+                gap = (sentiment_value - 0.30) * (stress_value - 0.30)
+                if gap <= best_gap:
+                    continue
+                best_gap = gap
+
+                credibility_score = 1.0 - min(gap / 0.49, 1.0)
+
+                if credibility_score >= 0.70:
+                    continue
+
+                if credibility_score < 0.40:
+                    level = "credibility_concern"
+                elif credibility_score < 0.60:
+                    level = "mild_incongruence"
+                else:
+                    level = "mostly_congruent"
+
+                raw_confidence = min(0.45 + (1.0 - credibility_score) * 0.20, 0.55)
+                if reinforcing_count > 0:
+                    raw_confidence = min(raw_confidence + 0.05 * reinforcing_count, 0.55)
+
+                best_result = {
+                    "score": credibility_score,
+                    "level": level,
+                    "confidence": raw_confidence,
+                    "evidence": {
+                        "sentiment_value": round(sentiment_value, 3),
+                        "stress_value": round(stress_value, 3),
+                        "gap_magnitude": round(1.0 - credibility_score, 3),
+                        "reinforcing_signals": reinforcing_count,
+                        "filler_elevated": len(filler_signals) > 0,
+                        "pitch_elevated": len(pitch_signals) > 0,
+                        "aligned_window_ms": abs(stress_time - sent_time),
+                    },
+                }
+
+        return best_result
 
     # ════════════════════════════════════════════════════════
     # FUSION-07: Hedge Language × Positive Sentiment → Incongruence
@@ -406,13 +399,17 @@ class FusionRuleEngine:
         genuinely enthusiastic about their product from one artificially
         creating time pressure.
         """
-        # Need rate anomaly signal
+        # Need rate anomaly signal (elevated = speaking faster than baseline)
         rate_signals = [
             s for s in voice_signals
             if s.get("signal_type") == "speech_rate_anomaly"
             and s.get("value_text") == "rate_elevated"
         ]
-        # Need buying/persuasion language
+        if not rate_signals:
+            return None
+
+        # Need persuasion/engagement language:
+        # buying signals, specific intents, OR strong positive sentiment
         buying_signals = [
             s for s in language_signals
             if s.get("signal_type") == "buying_signal"
@@ -422,15 +419,37 @@ class FusionRuleEngine:
             if s.get("signal_type") == "intent_classification"
             and s.get("value_text") in ("PROPOSE", "CLOSE", "NEGOTIATE", "COMMIT")
         ]
+        positive_sentiment = [
+            s for s in language_signals
+            if s.get("signal_type") == "sentiment_score"
+            and _to_float(s.get("value", 0)) > 0.40
+        ]
 
-        persuasion_present = len(buying_signals) > 0 or len(intent_signals) > 0
+        persuasion_present = (
+            len(buying_signals) > 0
+            or len(intent_signals) > 0
+            or len(positive_sentiment) > 0
+        )
 
-        if not rate_signals or not persuasion_present:
+        if not persuasion_present:
             return None
 
-        latest_rate = max(
-            rate_signals, key=lambda s: _to_int(s.get("window_start_ms", 0))
-        )
+        # Find time-aligned rate + persuasion pair (within 10s)
+        ALIGN_MS = 10_000
+        all_persuasion = buying_signals + intent_signals + positive_sentiment
+        latest_rate = None
+        for rs in sorted(rate_signals, key=lambda s: _to_int(s.get("window_start_ms", 0)), reverse=True):
+            rs_time = _to_int(rs.get("window_start_ms", 0))
+            for ps in all_persuasion:
+                ps_time = _to_int(ps.get("window_start_ms", 0))
+                if abs(rs_time - ps_time) <= ALIGN_MS:
+                    latest_rate = rs
+                    break
+            if latest_rate:
+                break
+
+        if not latest_rate:
+            return None
 
         # Check what's driving the acceleration
         sub_class = ""

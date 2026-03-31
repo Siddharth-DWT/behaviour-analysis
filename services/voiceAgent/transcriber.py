@@ -43,11 +43,15 @@ EXTERNAL_WHISPER_MODEL = os.getenv("EXTERNAL_WHISPER_MODEL", "base")
 # API default is 0.5. Use 0.3-0.4 if same-gender speakers are being over-split.
 DIARIZE_CLUSTERING_THRESHOLD = float(os.getenv("DIARIZE_CLUSTERING_THRESHOLD", "0.5"))
 
-# Transcription backend selection: auto | assemblyai | deepgram | whisper | local
-# auto = AssemblyAI > Deepgram > External Whisper+Diarize > Local
+# Transcription backend selection:
+#   auto | assemblyai | deepgram | whisper-pyannote | whisper | local
+# auto = AssemblyAI > Deepgram > Whisper+Pyannote combined > Whisper+separate diarize > Local
 TRANSCRIPTION_BACKEND = os.getenv("TRANSCRIPTION_BACKEND", "auto")
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+
+# Whisper+Pyannote combined endpoint (single call, no mapping needed)
+EXTERNAL_TRANSCRIBE_DIARIZE_URL = os.getenv("EXTERNAL_DIARIZE_URL", "")
 
 # ── Pyannote Community-1 Pipeline (global singleton — loaded once) ──
 _pyannote_community_pipeline = None
@@ -70,7 +74,7 @@ def get_pyannote_community_pipeline():
     if not hf_token:
         logger.warning(
             "No HuggingFace token found (HF_TOKEN or HUGGINGFACE_TOKEN). "
-            "Pyannote community-1 disabled. Falling back to ECAPA-TDNN."
+            "Pyannote community-1 disabled. No HF_TOKEN set."
         )
         return None
 
@@ -94,7 +98,7 @@ def get_pyannote_community_pipeline():
 
     except Exception as e:
         logger.error(f"Failed to load pyannote community-1: {e}")
-        logger.info("Falling back to ECAPA-TDNN diarization")
+        logger.info("Falling back to local diarization")
         return None
 
 
@@ -110,31 +114,56 @@ class Transcriber:
     def __init__(self):
         self._model = None
         self._diarization_pipeline = None
-        self._embedding_model = None  # ECAPA-TDNN speaker embedding model
         self._external_client = None
         self._deepgram_client = None
         self._assemblyai_client = None
         self._use_external = False
         self._use_deepgram = False
         self._use_assemblyai = False
+        self._use_whisper_pyannote = False
         self._num_speakers = None  # Speaker count hint (2-10), None = auto
         self._audio_data = None    # Pre-loaded (y, sr) tuple, avoids redundant disk reads
         self._last_diarization_backend = "uninitialized"
 
         backend = TRANSCRIPTION_BACKEND.lower()
 
-        # AssemblyAI: transcription + diarization in one call (Universal-3 Pro)
+        # Fallback chain (each does its own transcription + diarization):
+        #   1. AssemblyAI (one call, Universal-3 Pro)
+        #   2. Deepgram (one call, Nova-3)
+        #   3. Whisper+Pyannote combined (one GPU call, no mapping)
+        #   4. Whisper transcribe + pyannote separate diarize (two calls, mapping)
+        #   5. Local faster-whisper + local diarize cascade
+
         if backend in ("auto", "assemblyai") and ASSEMBLYAI_API_KEY:
             self._init_assemblyai()
 
-        # Deepgram: transcription + diarization in one call (Nova-3)
-        # Used as fallback for diarization even when not primary backend
         if backend in ("auto", "deepgram") and DEEPGRAM_API_KEY:
             self._init_deepgram()
 
-        # External Whisper + separate pyannote GPU diarization
+        if backend in ("auto", "whisper-pyannote") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
+            self._init_whisper_pyannote()
+
         if backend in ("auto", "whisper") and EXTERNAL_WHISPER_URL:
             self._init_external()
+
+    def _init_whisper_pyannote(self):
+        """Try to initialise Whisper+Pyannote combined endpoint (single call, GPU)."""
+        if not EXTERNAL_TRANSCRIBE_DIARIZE_URL:
+            return
+        try:
+            import httpx
+            url = EXTERNAL_TRANSCRIBE_DIARIZE_URL.rstrip("/")
+            # Derive health URL from base (strip /transcribe-diarize path)
+            base = url.rsplit("/", 1)[0] if "/transcribe-diarize" in url else url
+            headers = {"X-API-Key": EXTERNAL_API_KEY} if EXTERNAL_API_KEY else {}
+            resp = httpx.get(f"{base}/health", headers=headers, timeout=10)
+            if resp.status_code == 200:
+                self._use_whisper_pyannote = True
+                logger.info(f"Using Whisper+Pyannote combined endpoint: {url}")
+            else:
+                logger.warning(f"Whisper+Pyannote endpoint not healthy ({resp.status_code})")
+        except Exception as e:
+            logger.warning(f"Could not connect to Whisper+Pyannote endpoint: {e}")
 
     def _init_assemblyai(self):
         """Try to initialise AssemblyAI client (transcription + diarization in one call)."""
@@ -264,12 +293,17 @@ class Transcriber:
         self._meeting_type = meeting_type
         try:
             # Fallback chain:
-            #   AssemblyAI (transcribe+diarize)
-            #     -> Whisper transcribe + Deepgram diarize
-            #       -> Whisper transcribe + pyannote GPU diarize
-            #         -> Local faster-whisper + local diarize cascade
+            #   1. AssemblyAI (one call, Universal-3 Pro)
+            #   2. Deepgram (one call, Nova-3)
+            #   3. Whisper+Pyannote combined (one GPU call, no mapping)
+            #   4. Whisper + pyannote separate (two calls, mapping)
+            #   5. Local faster-whisper + local diarize cascade
             if self._use_assemblyai:
                 return self._transcribe_assemblyai(audio_path)
+            elif self._use_deepgram:
+                return self._transcribe_deepgram(audio_path)
+            elif self._use_whisper_pyannote:
+                return self._transcribe_whisper_pyannote(audio_path)
             elif self._use_external:
                 return self._transcribe_external(audio_path)
             else:
@@ -279,6 +313,151 @@ class Transcriber:
             self._num_speakers = None
             self._audio_data = None
             self._meeting_type = None
+
+    # ═══════════════════════════════════════════════════════════
+    # WHISPER+PYANNOTE COMBINED (single GPU call, no mapping)
+    # ═══════════════════════════════════════════════════════════
+
+    def _transcribe_whisper_pyannote(self, audio_path: str) -> dict:
+        """
+        Transcribe + diarize via combined Whisper+Pyannote GPU endpoint.
+        Single call returns segments with per-word speaker labels.
+        No cross-provider mapping needed.
+
+        Fallback: AssemblyAI -> Deepgram -> Whisper separate -> Local
+        """
+        import tempfile
+        import soundfile as sf
+
+        url = EXTERNAL_TRANSCRIBE_DIARIZE_URL.rstrip("/")
+        if not url.endswith("/transcribe-diarize"):
+            url = f"{url}/transcribe-diarize"
+
+        logger.info(f"Transcribing via Whisper+Pyannote combined: {audio_path}")
+
+        # Convert to WAV if needed (pyannote can't read MP4)
+        wav_path = audio_path
+        tmp_wav = None
+        if self._audio_data is not None:
+            y, sr = self._audio_data
+            if y.ndim > 1:
+                y = np.mean(y, axis=0) if y.shape[0] < y.shape[1] else np.mean(y, axis=1)
+            if sr != 16000:
+                waveform = torch.from_numpy(y).float()
+                if waveform.ndim == 1:
+                    waveform = waveform.unsqueeze(0)
+                waveform = _ta.functional.resample(waveform, sr, 16000)
+                y = waveform.squeeze(0).numpy()
+                sr = 16000
+            tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            sf.write(tmp_wav.name, y, sr)
+            wav_path = tmp_wav.name
+        elif audio_path.lower().endswith((".mp4", ".m4a", ".webm", ".ogg", ".flac", ".mp3")):
+            try:
+                from shared.utils.audio_loader import load_audio
+                y, sr = load_audio(audio_path, sr=16000)
+            except ImportError:
+                import librosa
+                y, sr = librosa.load(audio_path, sr=16000, mono=True)
+            tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            sf.write(tmp_wav.name, y, sr)
+            wav_path = tmp_wav.name
+
+        headers = {"X-API-Key": EXTERNAL_API_KEY} if EXTERNAL_API_KEY else {}
+        data = {
+            "model": EXTERNAL_WHISPER_MODEL,
+            "clustering_threshold": str(DIARIZE_CLUSTERING_THRESHOLD),
+        }
+        hf_token = os.getenv("HF_TOKEN", "")
+        if hf_token:
+            data["hf_token"] = hf_token
+        if self._num_speakers:
+            data["num_speakers"] = str(self._num_speakers)
+
+        try:
+            import httpx
+            with open(wav_path, "rb") as f:
+                with httpx.Client(timeout=600) as client:
+                    resp = client.post(
+                        url,
+                        files={"file": (Path(wav_path).name, f, "audio/wav")},
+                        data=data,
+                        headers=headers,
+                    )
+            if resp.status_code != 200:
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+            result = resp.json()
+        except Exception as e:
+            logger.error(f"Whisper+Pyannote combined failed: {e}. Falling back.")
+            self._use_whisper_pyannote = False
+            if self._use_external:
+                return self._transcribe_external(audio_path)
+            return self._transcribe_local(audio_path)
+        finally:
+            if tmp_wav is not None:
+                try:
+                    os.unlink(tmp_wav.name)
+                except OSError:
+                    pass
+
+        # Convert response to NEXUS format
+        # Response has: segments[{speaker, start, end, text, words}], speakers, duration
+        raw_segments = result.get("segments", [])
+        segments = []
+        spk_map = {}
+        for seg in raw_segments:
+            raw_spk = seg.get("speaker", "SPEAKER_00")
+            if raw_spk == "UNKNOWN":
+                raw_spk = "SPEAKER_00"
+            if raw_spk not in spk_map:
+                spk_map[raw_spk] = f"Speaker_{len(spk_map)}"
+            speaker = spk_map[raw_spk]
+
+            words = []
+            for w in seg.get("words", []):
+                w_spk = w.get("speaker", raw_spk)
+                if w_spk == "UNKNOWN":
+                    w_spk = raw_spk
+                words.append({
+                    "word": w.get("word", ""),
+                    "start": w.get("start", 0),
+                    "end": w.get("end", 0),
+                    "speaker": spk_map.get(w_spk, speaker),
+                })
+
+            text = seg.get("text", "").strip()
+            if text:
+                segments.append({
+                    "speaker": speaker,
+                    "start_ms": int(seg.get("start", 0) * 1000),
+                    "end_ms": int(seg.get("end", 0) * 1000),
+                    "text": text,
+                    "words": words,
+                })
+
+        segments = self._strip_hallucinations(segments)
+        duration = result.get("duration", 0)
+        proc_time = result.get("processing_time", 0)
+        num_speakers = result.get("num_speakers", len(spk_map))
+        self._last_diarization_backend = "whisper_pyannote_combined"
+
+        logger.info(
+            f"Whisper+Pyannote combined complete: {duration:.1f}s audio, "
+            f"{len(segments)} segments, {num_speakers} speakers, "
+            f"time={proc_time:.1f}s"
+        )
+
+        return {
+            "duration_seconds": duration,
+            "backend": "whisper_pyannote_combined",
+            "model": result.get("params_used", {}).get("model", EXTERNAL_WHISPER_MODEL),
+            "language": result.get("language", "en"),
+            "language_probability": result.get("language_probability", 0),
+            "processing_time": proc_time,
+            "segments": segments,
+            "diarization_backend": "whisper_pyannote_combined",
+            "diarization_confidence": 0.90,
+        }
 
     # ═══════════════════════════════════════════════════════════
     # ASSEMBLYAI BACKEND (transcription + diarization in one call)
@@ -303,7 +482,11 @@ class Transcriber:
         except Exception as e:
             logger.error(f"AssemblyAI failed: {e}. Falling back.")
             self._use_assemblyai = False
-            if self._use_external:
+            if self._use_deepgram:
+                return self._transcribe_deepgram(audio_path)
+            elif self._use_whisper_pyannote:
+                return self._transcribe_whisper_pyannote(audio_path)
+            elif self._use_external:
                 return self._transcribe_external(audio_path)
             return self._transcribe_local(audio_path)
 
@@ -328,72 +511,48 @@ class Transcriber:
         }
 
     # ═══════════════════════════════════════════════════════════
-    # DEEPGRAM BACKEND (diarization fallback — used when Whisper
-    # provides transcript but we need speaker labels)
+    # DEEPGRAM BACKEND (own transcription + diarization in one call)
     # ═══════════════════════════════════════════════════════════
 
-    def _diarize_deepgram(self, segments: list[dict], audio_path: str) -> Optional[list[dict]]:
+    def _transcribe_deepgram(self, audio_path: str) -> dict:
         """
-        Use Deepgram to diarize pre-transcribed segments.
-        Sends audio to Deepgram for speaker timeline, then maps
-        speakers onto existing Whisper segments using word-level timestamps.
-        """
-        if not self._deepgram_client:
-            return None
+        Transcribe via Deepgram Nova-3 — returns its own transcript with
+        speaker labels and word-level timestamps. No cross-provider mapping.
 
-        logger.info("Deepgram diarization fallback: sending audio...")
+        Fallback: Whisper + pyannote GPU → Local
+        """
+        logger.info(f"Transcribing via Deepgram: {audio_path}")
+
         try:
             result = self._deepgram_client.transcribe(audio_path)
         except Exception as e:
-            logger.warning(f"Deepgram diarization failed: {e}")
-            return None
+            logger.error(f"Deepgram failed: {e}. Falling back.")
+            self._use_deepgram = False
+            if self._use_whisper_pyannote:
+                return self._transcribe_whisper_pyannote(audio_path)
+            elif self._use_external:
+                return self._transcribe_external(audio_path)
+            return self._transcribe_local(audio_path)
 
-        dg_segments = result.get("segments", [])
-        if not dg_segments:
-            logger.warning("Deepgram returned 0 segments")
-            return None
+        segments = result.get("segments", [])
+        segments = self._strip_hallucinations(segments)
 
-        # Map Deepgram speaker labels onto our Whisper segments by word overlap
-        from collections import Counter
+        self._last_diarization_backend = "deepgram"
 
-        for seg in segments:
-            words = seg.get("words", [])
-            if words:
-                word_speakers = []
-                for w in words:
-                    w_start_ms = w.get("start", 0) * 1000
-                    w_end_ms = w.get("end", 0) * 1000
-                    best_spk = None
-                    best_ov = 0
-                    for ds in dg_segments:
-                        ov = max(0, min(w_end_ms, ds["end_ms"]) - max(w_start_ms, ds["start_ms"]))
-                        if ov > best_ov:
-                            best_ov = ov
-                            best_spk = ds["speaker"]
-                    if best_spk:
-                        word_speakers.append(best_spk)
-                if word_speakers:
-                    seg["speaker"] = Counter(word_speakers).most_common(1)[0][0]
-                else:
-                    seg["speaker"] = "Speaker_0"
-            else:
-                # Fallback: segment midpoint proximity
-                seg_mid = (seg["start_ms"] + seg["end_ms"]) / 2.0
-                best_spk = "Speaker_0"
-                best_dist = float("inf")
-                for ds in dg_segments:
-                    d = abs(seg_mid - (ds["start_ms"] + ds["end_ms"]) / 2.0)
-                    if d < best_dist:
-                        best_dist = d
-                        best_spk = ds["speaker"]
-                seg["speaker"] = best_spk
-
-        speakers = sorted(set(s["speaker"] for s in segments))
         logger.info(
-            f"Deepgram diarization mapped: {len(speakers)} speakers — "
-            + ", ".join(f"{sp}: {sum(1 for s in segments if s['speaker'] == sp)} segs" for sp in speakers)
+            f"Deepgram complete: {result['duration_seconds']:.1f}s audio, "
+            f"{len(segments)} segments, {len(result['speakers'])} speakers, "
+            f"time={result['processing_time']:.1f}s"
         )
-        return segments
+
+        return {
+            "duration_seconds": result["duration_seconds"],
+            "backend": "deepgram",
+            "model": result.get("model", "nova-3"),
+            "segments": segments,
+            "diarization_backend": "deepgram",
+            "diarization_confidence": 0.85,
+        }
 
     # ═══════════════════════════════════════════════════════════
     # EXTERNAL BACKEND (GPU Whisper API)
@@ -622,105 +781,6 @@ class Transcriber:
         "casual_conversation":   {"default": 2, "min": 2, "max": 4, "turn_gap_ms": 400},
     }
 
-    # ── Speaker Embedding Model (ECAPA-TDNN) ──
-
-    def _load_embedding_model(self):
-        """Lazy-load SpeechBrain ECAPA-TDNN speaker encoder (192-dim embeddings).
-
-        MUST install from develop branch: pip install git+https://github.com/speechbrain/speechbrain.git@develop
-        PyPI release has broken hf_hub compatibility. See Rule 2 in SpeechBrain guide.
-        """
-        if self._embedding_model is not None:
-            return self._embedding_model
-
-        try:
-            from speechbrain.inference.speaker import EncoderClassifier
-
-            savedir = os.getenv(
-                "SPEECHBRAIN_CACHE_DIR",
-                str(Path(__file__).parent / "pretrained_models" / "spkrec-ecapa-voxceleb"),
-            )
-            logger.info("Loading SpeechBrain ECAPA-TDNN speaker embedding model...")
-            self._embedding_model = EncoderClassifier.from_hparams(
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                savedir=savedir,
-                run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
-            )
-            logger.info("SpeechBrain ECAPA-TDNN model loaded.")
-            return self._embedding_model
-        except ImportError:
-            logger.warning(
-                "speechbrain not installed — embedding diarization unavailable. "
-                "Install with: pip install git+https://github.com/speechbrain/speechbrain.git@develop"
-            )
-            return None
-        except Exception as e:
-            logger.warning(f"Failed to load ECAPA-TDNN model: {e}")
-            return None
-
-    EMBEDDING_DIM = 192  # ECAPA-TDNN produces 192-dim speaker embeddings
-
-    def _compute_speaker_embeddings(
-        self,
-        segments: list[dict],
-        y: np.ndarray,
-        sr: int,
-    ) -> Optional[np.ndarray]:
-        """
-        Compute ECAPA-TDNN speaker embedding (192-dim) for each segment.
-
-        Desplanques et al. 2020: ECAPA-TDNN achieves ~0.8% EER on VoxCeleb1.
-        Audio must be 16kHz mono. Segments shorter than 0.5s get a zero vector.
-
-        Returns (N_segments, 192) numpy array, or None if unavailable.
-        """
-        model = self._load_embedding_model()
-        if model is None:
-            return None
-
-        total_samples = len(y)
-        embeddings = []
-        valid_mask = []
-        MIN_DURATION_S = 0.5
-
-        for seg in segments:
-            start_sample = int(seg["start_ms"] / 1000 * sr)
-            end_sample = int(seg["end_ms"] / 1000 * sr)
-            start_sample = max(0, min(start_sample, total_samples - 1))
-            end_sample = max(start_sample + 1, min(end_sample, total_samples))
-
-            chunk = y[start_sample:end_sample]
-            duration_s = len(chunk) / sr
-
-            if duration_s < MIN_DURATION_S:
-                embeddings.append(np.zeros(self.EMBEDDING_DIM))
-                valid_mask.append(False)
-                continue
-
-            try:
-                # ECAPA-TDNN expects (batch, samples) tensor at 16kHz
-                waveform = torch.from_numpy(chunk).unsqueeze(0).float()
-                # Resample if not 16kHz
-                if sr != 16000:
-                    waveform = _ta.functional.resample(waveform, sr, 16000)
-                with torch.no_grad():
-                    emb = model.encode_batch(waveform)
-                emb_np = emb.squeeze().cpu().numpy()
-                embeddings.append(emb_np)
-                valid_mask.append(True)
-            except Exception as e:
-                logger.debug(f"Embedding failed for segment: {e}")
-                embeddings.append(np.zeros(self.EMBEDDING_DIM))
-                valid_mask.append(False)
-
-        n_valid = sum(valid_mask)
-        if n_valid < 2:
-            logger.warning(f"Only {n_valid} valid embeddings — need at least 2")
-            return None
-
-        logger.info(f"Computed {n_valid}/{len(segments)} ECAPA-TDNN speaker embeddings")
-        return np.array(embeddings, dtype=np.float32)
-
     def _estimate_speaker_count(self, segments: list[dict]) -> int:
         """
         Estimate number of speakers from turn patterns + meeting type.
@@ -822,144 +882,6 @@ class Transcriber:
 
         return min(round(confidence, 3), 0.85)
 
-    def _auto_detect_speaker_count(
-        self, segments: list[dict], audio_path: str, estimated: int,
-    ) -> int:
-        """
-        Verify and refine estimated speaker count using ECAPA-TDNN embeddings.
-
-        Samples embeddings from transcript segments (where speech exists) and:
-          - Reduces to 1 if all windows are highly similar (single speaker)
-          - Increases by 1 if agglomerative clustering of samples suggests
-            more distinct voices than the heuristic estimate
-        """
-        if estimated < 2:
-            return estimated
-        try:
-            model = self._load_embedding_model()
-            if model is None:
-                return estimated
-
-            if self._audio_data is not None:
-                y, sr = self._audio_data
-            else:
-                import librosa
-                y, sr = librosa.load(audio_path, sr=16000, mono=True)
-
-            duration_s = len(y) / sr
-            if duration_s < 5:
-                return estimated
-
-            # Sample from transcript segments (where speech exists)
-            candidate_segs = [
-                s for s in segments
-                if (s.get("end_ms", 0) - s.get("start_ms", 0)) >= 1000
-            ]
-            if len(candidate_segs) < 3:
-                candidate_segs = segments
-
-            # Pick up to 12 segments spread across the recording
-            n_pick = min(12, len(candidate_segs))
-            step = max(1, len(candidate_segs) // n_pick)
-            chosen = [candidate_segs[i * step] for i in range(n_pick) if i * step < len(candidate_segs)]
-
-            embeddings = []
-            for seg in chosen:
-                start_s = seg.get("start_ms", 0) / 1000.0
-                end_s = seg.get("end_ms", 0) / 1000.0
-                chunk = y[int(start_s * sr):int(min(end_s, duration_s) * sr)]
-                if len(chunk) < sr * 0.5:
-                    continue
-                waveform = torch.from_numpy(chunk).unsqueeze(0).float()
-                if sr != 16000:
-                    waveform = _ta.functional.resample(waveform, sr, 16000)
-                with torch.no_grad():
-                    emb = model.encode_batch(waveform)
-                embeddings.append(emb.squeeze().cpu().numpy())
-
-            if len(embeddings) < 4:
-                return estimated
-
-            emb_arr = np.array(embeddings)
-            sims = []
-            for i in range(len(emb_arr)):
-                for j in range(i + 1, len(emb_arr)):
-                    a, b = emb_arr[i], emb_arr[j]
-                    sims.append(float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)))
-
-            mean_sim = np.mean(sims)
-            min_sim = np.min(sims)
-            sim_std = float(np.std(sims))
-
-            logger.info(
-                f"Auto speaker count: {len(embeddings)} windows, "
-                f"mean_sim={mean_sim:.3f}, min_sim={min_sim:.3f}, std={sim_std:.3f}"
-            )
-
-            # ── Check for single speaker (high similarity) ──
-            if mean_sim > 0.82 and min_sim > 0.70:
-                logger.info("Auto speaker count: highly similar → 1 speaker")
-                return 1
-
-            if mean_sim > 0.20 and sim_std < 0.06 and min_sim > 0.10:
-                logger.info(
-                    f"Auto speaker count: uniform similarity (std={sim_std:.3f}) → likely 1 speaker"
-                )
-                return 1
-
-            # ── Check if estimate should increase ──
-            # Sample more segments for reliable clustering comparison
-            if len(embeddings) >= estimated + 2 and estimated <= 8:
-                try:
-                    from sklearn.cluster import AgglomerativeClustering
-                    from sklearn.metrics import silhouette_score, calinski_harabasz_score
-
-                    # Cluster at k=estimated
-                    ac_k = AgglomerativeClustering(
-                        n_clusters=estimated, metric="cosine", linkage="average"
-                    )
-                    labels_k = ac_k.fit_predict(emb_arr)
-
-                    # Cluster at k=estimated+1
-                    ac_k1 = AgglomerativeClustering(
-                        n_clusters=estimated + 1, metric="cosine", linkage="average"
-                    )
-                    labels_k1 = ac_k1.fit_predict(emb_arr)
-
-                    # Silhouette score (higher = better separation)
-                    sil_k = silhouette_score(emb_arr, labels_k, metric="cosine")
-                    sil_k1 = silhouette_score(emb_arr, labels_k1, metric="cosine")
-
-                    # Calinski-Harabasz index (higher = better, prefers correct k)
-                    ch_k = calinski_harabasz_score(emb_arr, labels_k)
-                    ch_k1 = calinski_harabasz_score(emb_arr, labels_k1)
-
-                    logger.info(
-                        f"Auto speaker count: silhouette k={estimated}: {sil_k:.3f}, "
-                        f"k={estimated + 1}: {sil_k1:.3f} | "
-                        f"CH k={estimated}: {ch_k:.1f}, k={estimated + 1}: {ch_k1:.1f}"
-                    )
-
-                    # Increase if EITHER metric supports k+1:
-                    #  - Silhouette: k+1 is within 0.03 of k (merged clusters
-                    #    artificially inflate silhouette, so near-equal = prefer higher k)
-                    #  - Calinski-Harabasz: k+1 is better
-                    sil_close = sil_k1 > sil_k - 0.03
-                    ch_better = ch_k1 > ch_k
-                    if sil_close and ch_better:
-                        logger.info(
-                            f"Auto speaker count: increasing {estimated} → {estimated + 1} "
-                            f"(sil diff={sil_k1 - sil_k:+.3f}, CH improved {ch_k:.0f}→{ch_k1:.0f})"
-                        )
-                        return estimated + 1
-                except Exception as e:
-                    logger.debug(f"Auto speaker count silhouette check failed: {e}")
-
-            return estimated
-        except Exception as e:
-            logger.debug(f"Auto speaker count failed: {e}")
-            return estimated
-
     def _diarize_simple(
         self,
         segments: list[dict],
@@ -970,13 +892,15 @@ class Transcriber:
         Speaker diarization cascade.
 
         Priority order:
-          1. Pyannote Community-1 (frame-level, neural) — DEFAULT when HF_TOKEN set
-          2. ECAPA-TDNN embedding clustering — fallback
-          3. Acoustic KMeans (MFCCs + pitch + energy)
-          4. Gap + pitch heuristic (2-speaker fallback)
-          5. Heuristic multi-speaker (round-robin, last resort)
+          1. Deepgram diarization (when Whisper provides transcript)
+          2. External GPU pyannote diarization
+          3. Pyannote Community-1 (frame-level, neural)
+          4. Legacy Pyannote 3.1
+          5. Acoustic KMeans (MFCCs + pitch + energy)
+          6. Gap + pitch heuristic (2-speaker fallback)
+          7. Heuristic multi-speaker (round-robin, last resort)
 
-        DIARIZATION_MODE env var overrides: auto|pyannote|ecapa|kmeans
+        DIARIZATION_MODE env var overrides: auto|pyannote|kmeans
         """
         if not segments:
             return segments
@@ -987,10 +911,6 @@ class Transcriber:
             max_speakers = estimated
         else:
             max_speakers = min(max(1, num_speakers), 10)
-
-        # Auto-verify speaker count with embeddings
-        if audio_path and max_speakers >= 2:
-            max_speakers = self._auto_detect_speaker_count(segments, audio_path, max_speakers)
 
         # Single speaker — assign all segments and skip clustering
         if max_speakers < 2:
@@ -1003,18 +923,8 @@ class Transcriber:
         mode = self.DIARIZATION_MODE
         logger.info(f"Diarization cascade: mode={mode}, audio_path={'yes' if audio_path else 'no'}, max_speakers={max_speakers}")
 
-        # ── Tier 0a: Deepgram Diarization (when Whisper provides transcript) ──
-        if mode in ("auto",) and audio_path and self._deepgram_client:
-            try:
-                result = self._diarize_deepgram(segments, audio_path)
-                if result is not None:
-                    self._last_diarization_backend = "deepgram"
-                    return result
-            except Exception as e:
-                logger.warning(f"Deepgram diarization fallback failed: {e}")
-
-        # ── Tier 0b: External GPU pyannote Diarization ──
-        if mode in ("auto", "ecapa", "pyannote") and audio_path:
+        # ── Tier 0: External GPU pyannote Diarization ──
+        if mode in ("auto", "pyannote") and audio_path:
             try:
                 result = self._diarize_external_gpu(segments, max_speakers, audio_path)
                 if result is not None:
@@ -1022,18 +932,7 @@ class Transcriber:
             except Exception as e:
                 logger.warning(f"External GPU diarization failed: {e}")
 
-        # ── Tier 1: ECAPA-TDNN Embeddings (192-dim, best identity separation) ──
-        if mode in ("ecapa", "embedding", "auto") and audio_path:
-            try:
-                result = self._diarize_embedding_clustering(
-                    segments, max_speakers, audio_path
-                )
-                if result is not None:
-                    return result
-            except Exception as e:
-                logger.warning(f"ECAPA-TDNN embedding clustering failed: {e}")
-
-        # ── Tier 2: Pyannote Community-1 (frame-level fallback) ──
+        # ── Tier 1: Pyannote Community-1 (frame-level fallback) ──
         if mode in ("pyannote", "auto") and audio_path:
             try:
                 result = self._diarize_pyannote_community(
@@ -1112,9 +1011,8 @@ class Transcriber:
             {"default": 3, "min": 2, "max": 8},
         )
         min_spk = config["min"]
-        # Use the auto-detected/estimated max_speakers from the cascade,
-        # NOT the meeting type max. The cascade already ran ECAPA-TDNN
-        # silhouette analysis to estimate the real count — respect that.
+        # Use the estimated max_speakers from the cascade,
+        # NOT the meeting type max.
         # Only fall back to config max if max_speakers is unreasonably low.
         max_spk = max(max_speakers, min_spk)
         num_spk = self._num_speakers  # explicit user hint, or None
@@ -1464,251 +1362,6 @@ class Transcriber:
         if not overlap_by_speaker:
             return None
         return max(overlap_by_speaker, key=overlap_by_speaker.get)
-
-    # ── Embedding-Based Diarization (Tier 2) ──
-
-    def _diarize_embedding_clustering(
-        self,
-        segments: list[dict],
-        num_speakers: int,
-        audio_path: str,
-    ) -> Optional[list[dict]]:
-        """
-        Speaker diarization using ECAPA-TDNN speaker embeddings + agglomerative
-        clustering with cosine affinity.
-
-        Desplanques et al. 2020: ECAPA-TDNN produces 192-dim vectors that encode
-        speaker identity regardless of what is being said.
-        """
-        from sklearn.cluster import AgglomerativeClustering
-        from sklearn.metrics.pairwise import cosine_distances
-
-        logger.info(
-            f"Running embedding diarization: {num_speakers} speakers, "
-            f"{len(segments)} segments"
-        )
-
-        # Load audio
-        if self._audio_data is not None:
-            y, sr = self._audio_data
-        else:
-            import librosa
-            try:
-                from shared.utils.audio_loader import load_audio
-                y, sr = load_audio(audio_path, sr=16000)
-            except ImportError:
-                y, sr = librosa.load(audio_path, sr=16000, mono=True)
-
-        # Compute embeddings
-        embeddings = self._compute_speaker_embeddings(segments, y, sr)
-        if embeddings is None:
-            return None
-
-        # Build valid mask (non-zero embeddings)
-        valid_mask = [bool(np.linalg.norm(e) > 0.01) for e in embeddings]
-        n_valid = sum(valid_mask)
-        if n_valid < num_speakers:
-            logger.warning(
-                f"Only {n_valid} valid embeddings, need {num_speakers}. Falling back."
-            )
-            return None
-
-        # ── Per-segment F0 extraction (for pitch-aware clustering) ──
-        try:
-            import librosa as _librosa
-            for seg in segments:
-                s_sample = int(seg["start_ms"] * sr / 1000)
-                e_sample = int(seg["end_ms"] * sr / 1000)
-                chunk = y[s_sample:e_sample]
-                if len(chunk) > int(sr * 0.05):
-                    f0, _, _ = _librosa.pyin(chunk, fmin=60, fmax=500, sr=sr, frame_length=2048)
-                    voiced = f0[~np.isnan(f0)] if f0 is not None else np.array([])
-                    seg["f0_mean"] = float(np.mean(voiced)) if len(voiced) > 0 else 0.0
-                else:
-                    seg["f0_mean"] = 0.0
-        except Exception as e:
-            logger.debug(f"F0 extraction skipped: {e}")
-
-        # ── Clustering method selection ──
-        # CLUSTERING_METHOD env: "spectral" (default) | "agglomerative" (old)
-        clustering_method = os.getenv("CLUSTERING_METHOD", "spectral")
-        labels = None
-
-        if clustering_method == "spectral":
-            try:
-                from spectral_clustering import spectral_diarize
-                mt = self._meeting_type or "meeting"
-                config = self.SPEAKER_DEFAULTS.get(mt, {"max": 8})
-                # Pass num_speakers=0 to let eigengap auto-detect from the
-                # affinity matrix. The heuristic estimate is only used as
-                # max_speakers upper bound. This avoids forcing a wrong k
-                # (e.g. heuristic says 5 but there are actually 6 speakers).
-                labels = spectral_diarize(
-                    segments, embeddings, 0, valid_mask,
-                    max_speakers=max(num_speakers + 1, config.get("max", 8)),
-                )
-            except Exception as e:
-                logger.warning(f"Spectral clustering failed: {e}")
-
-        # ── Fallback or explicit agglomerative ──
-        if labels is None:
-            logger.info(f"Using agglomerative clustering (method={clustering_method})")
-            from sklearn.cluster import AgglomerativeClustering
-            from sklearn.metrics.pairwise import cosine_distances
-            dist_matrix = cosine_distances(embeddings)
-            clustering = AgglomerativeClustering(
-                n_clusters=num_speakers,
-                metric="precomputed",
-                linkage="average",
-            )
-            raw_labels = clustering.fit_predict(dist_matrix)
-            labels = raw_labels.tolist()
-
-            # Temporal smoothing for agglomerative
-            for i in range(1, len(labels) - 1):
-                prev_label, next_label = labels[i - 1], labels[i + 1]
-                if prev_label == next_label and labels[i] != prev_label:
-                    seg_duration_ms = segments[i]["end_ms"] - segments[i]["start_ms"]
-                    gap_before = segments[i]["start_ms"] - segments[i - 1]["end_ms"]
-                    gap_after = segments[i + 1]["start_ms"] - segments[i]["end_ms"]
-                    if seg_duration_ms < 1500 and gap_before < 200 and gap_after < 200:
-                        labels[i] = prev_label
-
-        from collections import Counter
-
-        # ── Assign labels by first-appearance order ──
-        label_order = []
-        for lbl in labels:
-            if lbl not in label_order:
-                label_order.append(lbl)
-        cluster_to_speaker = {
-            lbl: f"Speaker_{rank}" for rank, lbl in enumerate(label_order)
-        }
-
-        for i, seg in enumerate(segments):
-            seg["speaker"] = cluster_to_speaker[labels[i]]
-
-        # ── Merged speaker detection: check intra-cluster variance ──
-        segments = self._verify_speaker_clusters(segments, embeddings, valid_mask, max_speakers=num_speakers)
-
-        # ── Layer 2: Linguistic post-correction ──
-        segments = self._linguistic_post_correction(segments, num_speakers)
-
-        # ── Layer 3: Pitch Kalman filter (optional) ──
-        if os.getenv("DIARIZATION_KALMAN", "false").lower() == "true":
-            segments = self._apply_pitch_kalman_correction(segments, audio_path)
-
-        # ── Layer 4: Evidence-based LLM correction (optional) ──
-        if os.getenv("DIARIZATION_LLM", "false").lower() == "true":
-            evidence = self._collect_evidence(segments, audio_path)
-            meeting_type = getattr(self, "_meeting_type", "sales_call") or "sales_call"
-            segments = self._apply_llm_correction(segments, meeting_type, evidence=evidence)
-
-        # Log results
-        speaker_counts = Counter(seg["speaker"] for seg in segments)
-        self._last_diarization_backend = "embedding"
-        logger.info(
-            f"Embedding diarization complete: "
-            f"{len(speaker_counts)} speakers — "
-            + ", ".join(f"{k}: {v} segs" for k, v in sorted(speaker_counts.items()))
-        )
-        return segments
-
-    def _verify_speaker_clusters(
-        self,
-        segments: list[dict],
-        embeddings: np.ndarray,
-        valid_mask: list[bool],
-        max_speakers: int = 0,
-    ) -> list[dict]:
-        """
-        Check if any speaker cluster has high intra-speaker embedding variance,
-        indicating two different speakers were merged into one cluster.
-        If detected, sub-cluster that speaker into 2 and reassign.
-
-        Respects max_speakers — will not split beyond that limit.
-        """
-        from sklearn.cluster import AgglomerativeClustering
-        from sklearn.metrics.pairwise import cosine_similarity
-        from collections import Counter
-
-        speaker_counts = Counter(seg["speaker"] for seg in segments)
-        if len(speaker_counts) < 2:
-            return segments
-
-        splits_made = 0
-        existing_speakers = sorted(speaker_counts.keys())
-        next_speaker_idx = len(existing_speakers)
-
-        for speaker in list(existing_speakers):
-            # Get indices and embeddings for this speaker
-            indices = [
-                i for i, seg in enumerate(segments)
-                if seg["speaker"] == speaker and valid_mask[i]
-            ]
-            if len(indices) < 6:  # need enough segments to detect a merge
-                continue
-
-            spk_embeddings = np.array([embeddings[i] for i in indices])
-            sim_matrix = cosine_similarity(spk_embeddings)
-
-            # Intra-cluster mean similarity (excluding self-similarity diagonal)
-            n = len(sim_matrix)
-            mask = ~np.eye(n, dtype=bool)
-            mean_sim = sim_matrix[mask].mean()
-            std_sim = sim_matrix[mask].std()
-
-            # If mean similarity is low and std is high → likely merged
-            # But don't exceed max_speakers if set
-            current_count = len(set(seg["speaker"] for seg in segments))
-            if max_speakers > 0 and current_count >= max_speakers:
-                logger.info(f"Speaker verification: skipping splits — already at max_speakers={max_speakers}")
-                break
-
-            if mean_sim < 0.65 and std_sim > 0.12 and n >= 8:
-                logger.info(
-                    f"Merged speaker detected: {speaker} "
-                    f"(mean_sim={mean_sim:.3f}, std={std_sim:.3f}, n={n}). "
-                    f"Sub-clustering..."
-                )
-                # Sub-cluster into 2
-                from sklearn.metrics.pairwise import cosine_distances
-                dist = cosine_distances(spk_embeddings)
-                sub_clustering = AgglomerativeClustering(
-                    n_clusters=2,
-                    metric="precomputed",
-                    linkage="average",
-                )
-                sub_labels = sub_clustering.fit_predict(dist)
-
-                # Check if the split is balanced enough (at least 20% each side)
-                sub_counts = Counter(sub_labels)
-                min_pct = min(sub_counts.values()) / sum(sub_counts.values())
-                if min_pct < 0.15:
-                    logger.info(
-                        f"Sub-cluster too imbalanced ({dict(sub_counts)}), keeping merged."
-                    )
-                    continue
-
-                # Assign the smaller sub-cluster to a new speaker
-                new_speaker = f"Speaker_{next_speaker_idx}"
-                next_speaker_idx += 1
-                minority_label = min(sub_counts, key=sub_counts.get)
-
-                for j, idx in enumerate(indices):
-                    if sub_labels[j] == minority_label:
-                        segments[idx]["speaker"] = new_speaker
-
-                splits_made += 1
-                logger.info(
-                    f"Split {speaker} → {speaker} ({sub_counts[1 - minority_label]} segs) + "
-                    f"{new_speaker} ({sub_counts[minority_label]} segs)"
-                )
-
-        if splits_made > 0:
-            logger.info(f"Speaker verification: {splits_made} merged speakers split")
-
-        return segments
 
     def _linguistic_post_correction(
         self,
@@ -2108,13 +1761,11 @@ class Transcriber:
         """
         Build multi-signal evidence card per segment. Fuses:
         - Pyannote frame-level probability
-        - ECAPA-TDNN embedding cosine similarity to each speaker centroid
         - Pitch median + Kalman flag
         - Linguistic patterns
         Then assigns confidence tier: HIGH / MEDIUM / LOW.
         """
         from collections import Counter
-        from torch.nn.functional import cosine_similarity
 
         # ── Load audio ──
         if self._audio_data is not None:
@@ -2122,21 +1773,6 @@ class Transcriber:
         else:
             import librosa
             y, sr = librosa.load(audio_path, sr=16000, mono=True)
-
-        # ── ECAPA-TDNN embeddings + centroids ──
-        seg_embeddings = self._compute_speaker_embeddings(segments, y, sr)
-        speaker_centroids = {}
-        if seg_embeddings is not None:
-            spk_embs: dict[str, list] = {}
-            for i, seg in enumerate(segments):
-                if np.linalg.norm(seg_embeddings[i]) < 0.01:
-                    continue
-                spk = seg.get("speaker", "")
-                if spk not in spk_embs:
-                    spk_embs[spk] = []
-                spk_embs[spk].append(seg_embeddings[i])
-            for spk, embs in spk_embs.items():
-                speaker_centroids[spk] = np.mean(embs, axis=0)
 
         # ── Pitch data per segment ──
         pitch_times, pitch_values = self._extract_pitch_track(y, sr)
@@ -2164,16 +1800,11 @@ class Transcriber:
 
         # ── Build evidence cards ──
         evidence = []
-        speakers = sorted(set(seg.get("speaker", "") for seg in segments))
-        s0 = speakers[0] if len(speakers) > 0 else "Speaker_0"
-        s1 = speakers[1] if len(speakers) > 1 else "Speaker_1"
 
         for i, seg in enumerate(segments):
             ev: dict[str, Any] = {
                 "pyannote_speaker": seg.get("speaker", ""),
                 "pyannote_probability": 0.5,
-                "ecapa_sim_s0": 0.0, "ecapa_sim_s1": 0.0,
-                "ecapa_assigned": "", "ecapa_margin": 0.0,
                 "median_pitch_hz": seg_pitch.get(i, 0.0),
                 "pitch_matches": "",
                 "kalman_suspicious": seg.get("pitch_kalman_suspicious", False),
@@ -2201,18 +1832,6 @@ class Transcriber:
                     ev["pyannote_probability"] = round(min(overlap / max(dur, 0.001), 1.0), 2)
                 except Exception:
                     pass
-
-            # ECAPA similarity
-            if seg_embeddings is not None and np.linalg.norm(seg_embeddings[i]) > 0.01:
-                emb = seg_embeddings[i]
-                for spk, centroid in speaker_centroids.items():
-                    sim = float(np.dot(emb, centroid) / (np.linalg.norm(emb) * np.linalg.norm(centroid) + 1e-8))
-                    if spk == s0:
-                        ev["ecapa_sim_s0"] = round(sim, 3)
-                    else:
-                        ev["ecapa_sim_s1"] = round(sim, 3)
-                ev["ecapa_margin"] = round(abs(ev["ecapa_sim_s0"] - ev["ecapa_sim_s1"]), 3)
-                ev["ecapa_assigned"] = s0 if ev["ecapa_sim_s0"] > ev["ecapa_sim_s1"] else s1
 
             # Pitch match
             f0 = ev["median_pitch_hz"]
@@ -2245,8 +1864,6 @@ class Transcriber:
             votes = []
             if ev["pyannote_probability"] > 0.6:
                 votes.append(ev["pyannote_speaker"])
-            if ev["ecapa_margin"] > 0.1 and ev["ecapa_assigned"]:
-                votes.append(ev["ecapa_assigned"])
             if ev["pitch_matches"]:
                 votes.append(ev["pitch_matches"])
 
@@ -2259,8 +1876,6 @@ class Transcriber:
             if ev["pyannote_probability"] >= 0.85 and not ev["kalman_suspicious"]:
                 ev["confidence_tier"] = "HIGH"
             elif agreement >= 0.9 and len(votes) >= 2:
-                ev["confidence_tier"] = "HIGH"
-            elif ev["ecapa_margin"] > 0.3 and not ev["kalman_suspicious"]:
                 ev["confidence_tier"] = "HIGH"
             elif ev["kalman_suspicious"] or ev["pyannote_probability"] < 0.6:
                 ev["confidence_tier"] = "LOW"
@@ -2340,8 +1955,7 @@ class Transcriber:
                     f"Duration: {ev.get('duration_ms', 0)}ms | Gap: {ev.get('gap_ms', 0)}ms\n"
                     f"Acoustic signals:\n"
                     f"  pyannote: {ev.get('pyannote_speaker', '?')} (conf={ev.get('pyannote_probability', 0):.0%})\n"
-                    f"  ecapa: closest to {ev.get('ecapa_assigned', '?')} (margin={ev.get('ecapa_margin', 0)})\n"
-                    f"  pitch: {ev.get('median_pitch_hz', 0):.0f}Hz → matches {ev.get('pitch_matches', '?')}\n"
+                    f"  pitch: {ev.get('median_pitch_hz', 0):.0f}Hz -> matches {ev.get('pitch_matches', '?')}\n"
                     f"  kalman: {'FLAGGED' if ev.get('kalman_suspicious') else 'clean'}\n"
                     f"  agreement: {ev.get('agreement', 0):.0%}\n"
                     f"Linguistic: {', '.join(ev.get('linguistic', [])) or 'none'}"

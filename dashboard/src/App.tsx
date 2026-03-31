@@ -9,6 +9,7 @@ import SessionDetail from "./pages/SessionDetail";
 import ReportView from "./pages/ReportView";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
+import VerifyEmail from "./pages/VerifyEmail";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, isLoading } = useAuth();
@@ -76,6 +77,9 @@ export default function App() {
           </PublicRoute>
         }
       />
+
+      {/* Email verification (accessible regardless of auth state) */}
+      <Route path="/verify-email" element={<VerifyEmail />} />
 
       {/* Protected routes */}
       <Route

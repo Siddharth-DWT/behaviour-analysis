@@ -52,6 +52,3 @@ services/voice-agent/
 services/language-agent/
 services/fusion-agent/
 services/api-gateway/
-# SpeechBrain pretrained model cache
-pretrained_models/
-services/voiceAgent/pretrained_models/

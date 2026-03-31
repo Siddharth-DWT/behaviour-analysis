@@ -1,5 +1,5 @@
 # NEXUS Voice Agent - Dependencies
-# NOTE: Heavy packages (torch, pyannote, speechbrain, matplotlib, filterpy, parselmouth)
+# NOTE: Heavy packages (torch, pyannote, matplotlib, filterpy, parselmouth)
 # are installed in separate Dockerfile layers for caching. Only lightweight deps here.
 
 fastapi==0.115.6

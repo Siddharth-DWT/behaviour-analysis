@@ -39,10 +39,7 @@ class NexusConfig:
     calibration_reliable_seconds: int = 180 # Speech duration for reliable baseline
 
     # Diarization
-    diarization_mode: str = os.getenv("DIARIZATION_MODE", "auto")  # auto|pyannote|embedding|kmeans
-    diarization_embedding_model: str = os.getenv(
-        "DIARIZATION_EMBEDDING_MODEL", "speechbrain/spkrec-ecapa-voxceleb"
-    )
+    diarization_mode: str = os.getenv("DIARIZATION_MODE", "auto")  # auto|pyannote|kmeans
 
     # Redis Streams
     stream_prefix: str = "nexus:stream"

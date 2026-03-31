@@ -283,3 +283,27 @@ export async function getHealth(): Promise<{
 }> {
   return request("/health");
 }
+
+// ── Email Verification ──
+
+export async function verifyEmail(token: string): Promise<{ success: boolean; message: string }> {
+  const res = await fetch(`${API_BASE}/auth/verify-email?token=${token}`);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({ detail: "Verification failed" }));
+    throw new Error(data.detail || "Verification failed");
+  }
+  return res.json();
+}
+
+export async function resendVerification(email: string): Promise<{ message: string }> {
+  const res = await fetch(`${API_BASE}/auth/resend-verification`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({ detail: "Failed to resend" }));
+    throw new Error(data.detail || "Failed to resend");
+  }
+  return res.json();
+}

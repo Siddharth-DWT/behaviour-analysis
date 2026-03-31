@@ -1,7 +1,8 @@
-import { useState, FormEvent } from "react";
+import { useState, useCallback, useEffect, useRef, FormEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { Activity, Eye, EyeOff, Loader2 } from "lucide-react";
+import { Activity, Eye, EyeOff, Loader2, AlertCircle } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
+import { resendVerification } from "../api/client";
 
 export default function Login() {
   const navigate = useNavigate();
@@ -13,15 +14,68 @@ export default function Login() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
+  // Email not verified state
+  const [notVerified, setNotVerified] = useState(false);
+  const [resendCooldown, setResendCooldown] = useState(0);
+  const [resendLoading, setResendLoading] = useState(false);
+  const [resendMessage, setResendMessage] = useState<string | null>(null);
+  const cooldownRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Cooldown timer
+  useEffect(() => {
+    if (resendCooldown <= 0) {
+      if (cooldownRef.current) {
+        clearInterval(cooldownRef.current);
+        cooldownRef.current = null;
+      }
+      return;
+    }
+    cooldownRef.current = setInterval(() => {
+      setResendCooldown((prev) => {
+        if (prev <= 1) {
+          if (cooldownRef.current) clearInterval(cooldownRef.current);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => {
+      if (cooldownRef.current) clearInterval(cooldownRef.current);
+    };
+  }, [resendCooldown > 0]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleResend = useCallback(async () => {
+    if (resendCooldown > 0 || resendLoading || !email) return;
+    setResendLoading(true);
+    setResendMessage(null);
+    try {
+      const result = await resendVerification(email);
+      setResendMessage(result.message || "Verification email resent.");
+      setResendCooldown(60);
+    } catch (err) {
+      setResendMessage((err as Error).message || "Failed to resend verification email.");
+    } finally {
+      setResendLoading(false);
+    }
+  }, [resendCooldown, resendLoading, email]);
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError(null);
+    setNotVerified(false);
+    setResendMessage(null);
     setLoading(true);
     try {
       await login(email, password);
       navigate("/sessions", { replace: true });
     } catch (err) {
-      setError((err as Error).message || "Login failed");
+      const message = (err as Error).message || "Login failed";
+      // Detect 403 "not verified" error from the backend
+      if (message.includes("403") && message.toLowerCase().includes("not verified")) {
+        setNotVerified(true);
+      } else {
+        setError(message);
+      }
     } finally {
       setLoading(false);
     }
@@ -55,6 +109,32 @@ export default function Login() {
           {error && (
             <div className="mb-4 rounded border border-stress-high-30 bg-stress-high-10 px-3 py-2 text-xs text-nexus-stress-high">
               {error}
+            </div>
+          )}
+
+          {notVerified && (
+            <div className="mb-4 rounded border border-yellow-500/30 bg-yellow-500/10 px-3 py-3 text-xs">
+              <div className="mb-2 flex items-center gap-1.5 text-yellow-400">
+                <AlertCircle className="h-3.5 w-3.5 flex-shrink-0" />
+                <span className="font-medium">Your email hasn't been verified yet.</span>
+              </div>
+              <p className="mb-3 text-nexus-text-secondary">
+                Please check your inbox for the verification link, or resend it below.
+              </p>
+              {resendMessage && (
+                <p className="mb-2 text-nexus-text-secondary">{resendMessage}</p>
+              )}
+              <button
+                type="button"
+                onClick={handleResend}
+                disabled={resendCooldown > 0 || resendLoading}
+                className="flex w-full items-center justify-center gap-1.5 rounded border border-nexus-border bg-nexus-bg px-3 py-1.5 text-xs font-medium text-nexus-text-secondary transition-colors hover:bg-nexus-border hover:text-nexus-text-primary disabled:opacity-50"
+              >
+                {resendLoading && <Loader2 className="h-3 w-3 animate-spin" />}
+                {resendCooldown > 0
+                  ? `Resend verification email (${resendCooldown}s)`
+                  : "Resend verification email"}
+              </button>
             </div>
           )}
 
