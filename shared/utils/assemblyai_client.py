@@ -21,7 +21,7 @@ logger = logging.getLogger("nexus.assemblyai")
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
 BASE_URL = "https://api.assemblyai.com/v2"
 POLL_INTERVAL = 5  # seconds
-UPLOAD_TIMEOUT = 120
+UPLOAD_TIMEOUT = 300  # 5 min for large file uploads
 POLL_TIMEOUT = 30
 
 

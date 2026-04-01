@@ -154,8 +154,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [scheduleRefresh]
   );
 
-  // Restore session on mount
+  // Restore session on mount (guarded against React StrictMode double-fire)
+  const restoreAttempted = useRef(false);
   useEffect(() => {
+    if (restoreAttempted.current) return;
+    restoreAttempted.current = true;
+
     const storedRefresh = getStoredRefreshToken();
     if (!storedRefresh) {
       setIsLoading(false);

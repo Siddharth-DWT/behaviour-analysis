@@ -156,7 +156,7 @@ class Transcriber:
             # Derive health URL from base (strip /transcribe-diarize path)
             base = url.rsplit("/", 1)[0] if "/transcribe-diarize" in url else url
             headers = {"X-API-Key": EXTERNAL_API_KEY} if EXTERNAL_API_KEY else {}
-            resp = httpx.get(f"{base}/health", headers=headers, timeout=10)
+            resp = httpx.get(f"{base}/health", headers=headers, timeout=30)
             if resp.status_code == 200:
                 self._use_whisper_pyannote = True
                 logger.info(f"Using Whisper+Pyannote combined endpoint: {url}")
@@ -364,9 +364,14 @@ class Transcriber:
             wav_path = tmp_wav.name
 
         headers = {"X-API-Key": EXTERNAL_API_KEY} if EXTERNAL_API_KEY else {}
+
+        mt = self._meeting_type or "meeting"
+        config = self.SPEAKER_DEFAULTS.get(mt, {"default": 3, "min": 2, "max": 10})
+
         data = {
             "model": EXTERNAL_WHISPER_MODEL,
-            "clustering_threshold": str(DIARIZE_CLUSTERING_THRESHOLD),
+            "min_speakers": str(config["min"]),
+            "max_speakers": str(config["max"]),
         }
         hf_token = os.getenv("HF_TOKEN", "")
         if hf_token:
@@ -377,7 +382,7 @@ class Transcriber:
         try:
             import httpx
             with open(wav_path, "rb") as f:
-                with httpx.Client(timeout=600) as client:
+                with httpx.Client(timeout=1800) as client:  # 30 min for large audio files
                     resp = client.post(
                         url,
                         files={"file": (Path(wav_path).name, f, "audio/wav")},
@@ -771,9 +776,9 @@ class Transcriber:
     SPEAKER_DEFAULTS = {
         "sales_call":            {"default": 2, "min": 2, "max": 3, "turn_gap_ms": 400},
         "interview":             {"default": 2, "min": 2, "max": 4, "turn_gap_ms": 600},
-        "internal":              {"default": 4, "min": 2, "max": 8, "turn_gap_ms": 800},
-        "client_meeting":        {"default": 3, "min": 2, "max": 8, "turn_gap_ms": 600},
-        "meeting":               {"default": 4, "min": 2, "max": 8, "turn_gap_ms": 800},
+        "internal":              {"default": 4, "min": 2, "max": 10, "turn_gap_ms": 800},
+        "client_meeting":        {"default": 3, "min": 2, "max": 10, "turn_gap_ms": 600},
+        "meeting":               {"default": 4, "min": 2, "max": 10, "turn_gap_ms": 800},
         "podcast":               {"default": 2, "min": 2, "max": 4, "turn_gap_ms": 600},
         "lecture":               {"default": 1, "min": 1, "max": 2, "turn_gap_ms": 1000},
         "presentation":          {"default": 1, "min": 1, "max": 3, "turn_gap_ms": 1000},

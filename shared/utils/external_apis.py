@@ -33,7 +33,7 @@ API_KEY = os.getenv("EXTERNAL_API_KEY", "")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 
 DEFAULT_WHISPER_MODEL = os.getenv("EXTERNAL_WHISPER_MODEL", "base")
-DEFAULT_TIMEOUT = 120  # seconds
+DEFAULT_TIMEOUT = 600  # 10 min for transcription (large files need upload + processing time)
 DIARIZE_TIMEOUT = 600  # 10 min for long audio diarization
 
 
