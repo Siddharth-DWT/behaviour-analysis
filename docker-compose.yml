@@ -2,7 +2,7 @@
 # NEXUS - Multi-Agent Behavioural Analysis System
 # Docker Compose - Local Development Environment
 # ============================================================================
-# 
+#
 # USAGE:
 #   docker compose up -d          → Start all services
 #   docker compose logs -f        → Watch logs
@@ -10,22 +10,24 @@
 #   docker compose down -v        → Stop + delete data
 #
 # SERVICES:
-#   postgres   → PostgreSQL 16 + pgvector (config, transcripts, signals, vectors)
-#   redis      → Valkey 8 (inter-agent message bus)
-#   voiceAgent      → Voice Agent (Python FastAPI)
-#   language_agent  → Language Agent (Python FastAPI)
-#   fusion_agent    → Fusion Agent (Python FastAPI)
-#   api_gateway     → API Gateway (Python FastAPI) - dashboard backend
-#   dashboard  → React Admin Dashboard (dev server)
+#   postgres      → PostgreSQL 16 + pgvector
+#   redis         → Valkey 8 (inter-agent message bus)
+#   voice         → Voice Agent (Python FastAPI)
+#   language      → Language Agent (Python FastAPI)
+#   conversation  → Conversation Agent (Python FastAPI)
+#   fusion        → Fusion Agent (Python FastAPI)
+#   api           → API Gateway (Python FastAPI)
+#   dashboard     → React Admin Dashboard
 #
-# PORTS:
-#   5432  → PostgreSQL
-#   6379  → Redis/Valkey
-#   8001  → Voice Agent API
-#   8002  → Language Agent API
-#   8003  → Fusion Agent API
-#   8000  → API Gateway
-#   5173  → Dashboard (React dev server)
+# PORTS (host → container):
+#   5436  → PostgreSQL (5432)
+#   6381  → Redis/Valkey (6379)
+#   8002  → Voice Agent (8001)
+#   8003  → Language Agent (8002)
+#   8006  → Conversation Agent (8006)
+#   8004  → Fusion Agent (8007)
+#   8000  → API Gateway (8000)
+#   3006  → Dashboard (3000)
 #
 # ============================================================================
 
@@ -61,7 +63,7 @@ services:
     container_name: nexus-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "6381:6379"
     volumes:
       - redis_data:/data
       - ./infrastructure/redis/valkey.conf:/etc/valkey/valkey.conf
@@ -75,19 +77,19 @@ services:
       - nexus-network
 
   # --------------------------------------------------------------------------
-  # AGENTS (uncomment when ready to develop each service)
+  # AGENTS
   # --------------------------------------------------------------------------
 
-  voice_agent:
+  voice:
     build:
       context: ./services/voiceAgent
       dockerfile: Dockerfile
     container_name: nexus-voice-agent
-    image: nexus-voice-agent
     restart: unless-stopped
     ports:
-      - "8001:8001"
+      - "8002:8001"
     environment:
+      - PYTHONPATH=/app
       - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
       - REDIS_URL=redis://redis:6379/0
       - OPENAI_API_KEY=${OPENAI_API_KEY}
@@ -95,15 +97,15 @@ services:
       - EXTERNAL_WHISPER_MODEL=${EXTERNAL_WHISPER_MODEL:-large-v3}
       - EXTERNAL_API_KEY=${EXTERNAL_API_KEY}
       - EXTERNAL_DIARIZE_URL=${EXTERNAL_DIARIZE_URL}
+      - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+      - PARAKEET_URL=${PARAKEET_URL}
+      - TRANSCRIPTION_BACKEND=${TRANSCRIPTION_BACKEND:-auto}
       - USE_PYANNOTE=${USE_PYANNOTE:-false}
       - HF_TOKEN=${HF_TOKEN}
       - DIARIZATION_MODE=${DIARIZATION_MODE:-auto}
       - DIARIZE_CLUSTERING_THRESHOLD=${DIARIZE_CLUSTERING_THRESHOLD:-0.5}
       - CLUSTERING_METHOD=${CLUSTERING_METHOD:-spectral}
-      - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
-      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
-      - PARAKEET_URL=${PARAKEET_URL}
-      - TRANSCRIPTION_BACKEND=${TRANSCRIPTION_BACKEND:-auto}
     volumes:
       - ./services/voiceAgent:/app
       - ./shared:/app/shared
@@ -116,17 +118,19 @@ services:
     networks:
       - nexus-network
 
-  language_agent:
+  language:
     build:
       context: ./services/language_agent
       dockerfile: Dockerfile
     container_name: nexus-language-agent
     restart: unless-stopped
     ports:
-      - "8002:8002"
+      - "8003:8002"
     environment:
+      - PYTHONPATH=/app
       - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
       - REDIS_URL=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     volumes:
       - ./services/language_agent:/app
@@ -140,17 +144,43 @@ services:
     networks:
       - nexus-network
 
-  fusion_agent:
+  conversation:
+    build:
+      context: ./services/conversation_agent
+      dockerfile: Dockerfile
+    container_name: nexus-conversation-agent
+    restart: unless-stopped
+    ports:
+      - "8006:8006"
+    environment:
+      - PYTHONPATH=/app
+      - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./services/conversation_agent:/app
+      - ./shared:/app/shared
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - nexus-network
+
+  fusion:
     build:
       context: ./services/fusion_agent
       dockerfile: Dockerfile
     container_name: nexus-fusion-agent
     restart: unless-stopped
     ports:
-      - "8003:8007"
+      - "8004:8007"
     environment:
+      - PYTHONPATH=/app
       - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
       - REDIS_URL=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     volumes:
       - ./services/fusion_agent:/app
@@ -164,7 +194,7 @@ services:
     networks:
       - nexus-network
 
-  api_gateway:
+  api:
     build:
       context: ./services/api_gateway
       dockerfile: Dockerfile
@@ -173,18 +203,20 @@ services:
     ports:
       - "8000:8000"
     environment:
+      - PYTHONPATH=/app
       - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
       - REDIS_URL=redis://redis:6379/0
-      - VOICE_AGENT_URL=http://voice_agent:8001
-      - LANGUAGE_AGENT_URL=http://language_agent:8002
-      - FUSION_AGENT_URL=http://fusion_agent:8007
+      - VOICE_AGENT_URL=http://voice:8001
+      - LANGUAGE_AGENT_URL=http://language:8002
+      - CONVERSATION_AGENT_URL=http://conversation:8006
+      - FUSION_AGENT_URL=http://fusion:8007
       - JWT_SECRET=${JWT_SECRET:-nexus-dev-jwt-secret-2026}
       - JWT_ACCESS_TOKEN_EXPIRE_MINUTES=${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
       - JWT_REFRESH_TOKEN_EXPIRE_DAYS=${JWT_REFRESH_TOKEN_EXPIRE_DAYS:-30}
       - ZEPTOMAIL_TOKEN=${ZEPTOMAIL_TOKEN:-}
       - FROM_EMAIL=${FROM_EMAIL:-noreply@yourdomain.com}
       - FROM_NAME=${FROM_NAME:-NEXUS}
-      - APP_URL=${APP_URL:-http://localhost:3000}
+      - APP_URL=${APP_URL:-http://localhost:3006}
     volumes:
       - ./services/api_gateway:/app
       - ./shared:/app/shared
@@ -204,14 +236,14 @@ services:
     container_name: nexus-dashboard
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "3006:3000"
     environment:
-      - API_GATEWAY_URL=http://api_gateway:8000
+      - API_GATEWAY_URL=http://api:8000
     volumes:
       - ./dashboard:/app
       - /app/node_modules
     depends_on:
-      - api_gateway
+      - api
     networks:
       - nexus-network
 
