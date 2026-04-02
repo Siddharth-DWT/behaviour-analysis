@@ -3,7 +3,6 @@ import { Link, useNavigate } from "react-router-dom";
 import { Activity, Eye, EyeOff, Loader2, Mail, CheckCircle } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 import { resendVerification } from "../api/client";
-import { resendVerification } from "../api/client";
 
 type PasswordStrength = "weak" | "fair" | "strong";
 
