@@ -18,14 +18,14 @@
 #   api        → API Gateway (Python FastAPI) - dashboard backend
 #   dashboard  → React Admin Dashboard (dev server)
 #
-# PORTS:
-#   5432  → PostgreSQL
-#   6379  → Redis/Valkey
-#   8001  → Voice Agent API
-#   8002  → Language Agent API
-#   8003  → Fusion Agent API
-#   8000  → API Gateway
-#   5173  → Dashboard (React dev server)
+# PORTS (host → container):
+#   5436  → PostgreSQL (5432)
+#   6381  → Redis/Valkey (6379)
+#   8002  → Voice Agent (8001)
+#   8003  → Language Agent (8002)
+#   8004  → Fusion Agent (8007)
+#   8000  → API Gateway (8000)
+#   3006  → Dashboard (3000)
 #
 # ============================================================================
 
@@ -95,6 +95,8 @@ services:
       - EXTERNAL_WHISPER_MODEL=${EXTERNAL_WHISPER_MODEL:-large-v3}
       - EXTERNAL_API_KEY=${EXTERNAL_API_KEY}
       - EXTERNAL_DIARIZE_URL=${EXTERNAL_DIARIZE_URL}
+      - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
       - USE_PYANNOTE=${USE_PYANNOTE:-false}
       - HF_TOKEN=${HF_TOKEN}
     volumes:
@@ -175,6 +177,10 @@ services:
       - LANGUAGE_AGENT_URL=http://language:8002
       - FUSION_AGENT_URL=http://fusion:8007
       - JWT_SECRET=${JWT_SECRET:-nexus-dev-jwt-secret-2026}
+      - ZEPTOMAIL_TOKEN=${ZEPTOMAIL_TOKEN:-}
+      - FROM_EMAIL=${FROM_EMAIL:-noreply@yourdomain.com}
+      - FROM_NAME=${FROM_NAME:-NEXUS}
+      - APP_URL=${APP_URL:-http://localhost:3000}
     volumes:
       - ./services/api_gateway:/app
       - ./shared:/app/shared

@@ -30,7 +30,7 @@ interface AuthState {
     password: string,
     fullName: string,
     company?: string
-  ) => Promise<void>;
+  ) => Promise<{ requiresVerification?: boolean; message?: string }>;
   logout: () => void;
   updateUser: (user: User) => void;
 }
@@ -41,7 +41,7 @@ const AuthContext = createContext<AuthState>({
   isAuthenticated: false,
   isLoading: true,
   login: async () => {},
-  signup: async () => {},
+  signup: async () => ({}),
   logout: () => {},
   updateUser: () => {},
 });
@@ -200,15 +200,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     ) => {
       const data = await authRequest<{
         user: User;
-        access_token: string;
-        refresh_token: string;
+        access_token?: string;
+        refresh_token?: string;
+        requires_verification?: boolean;
+        message?: string;
       }>("/auth/signup", {
         email,
         password,
         full_name: fullName,
         company: company || undefined,
       });
-      handleAuthResponse(data);
+
+      if (data.requires_verification) {
+        return { requiresVerification: true, message: data.message };
+      }
+
+      // Auto-verified (no email service configured)
+      handleAuthResponse(
+        data as { user: User; access_token: string; refresh_token: string }
+      );
+      return {};
     },
     [handleAuthResponse]
   );

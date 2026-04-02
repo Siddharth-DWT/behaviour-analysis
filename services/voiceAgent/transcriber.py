@@ -42,6 +42,12 @@ EXTERNAL_WHISPER_MODEL = os.getenv("EXTERNAL_WHISPER_MODEL", "base")
 # External GPU Diarization API (pyannote on GPU)
 EXTERNAL_DIARIZE_URL = os.getenv("EXTERNAL_DIARIZE_URL", "")
 
+# Deepgram API (diarization fallback — Nova-3 model)
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+
+# AssemblyAI API (preferred — transcription + diarization in one call)
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
+
 
 class Transcriber:
     """
@@ -57,19 +63,36 @@ class Transcriber:
         self._diarization_pipeline = None
         self._external_client = None
         self._diarize_client = None
+        self._deepgram_client = None
+        self._assemblyai_client = None
         self._use_external = False
         self._use_external_diarize = False
+        self._use_deepgram_diarize = False
+        self._use_assemblyai = False
         self._num_speakers = None  # Speaker count hint (2-10), None = auto
         self._audio_data = None    # Pre-loaded (y, sr) tuple, avoids redundant disk reads
         self._last_diarization_backend = "uninitialized"
 
-        # Try to initialise external Whisper client
-        if EXTERNAL_WHISPER_URL:
-            self._init_external()
+        # Priority for transcription + diarization (NOT feature extraction):
+        #   1. AssemblyAI (transcribe+diarize in one call)
+        #   2. Deepgram Nova-3 (transcribe+diarize in one call)
+        #   3. External GPU Whisper + external diarize endpoint
+        #   4. Local faster-whisper + KMeans/pyannote
+        #
+        # Feature extraction always runs separately via librosa (voice agent pipeline).
+        if ASSEMBLYAI_API_KEY:
+            self._init_assemblyai()
 
-        # Try to initialise external GPU diarization client
-        if EXTERNAL_DIARIZE_URL:
-            self._init_external_diarize()
+        if not self._use_assemblyai and DEEPGRAM_API_KEY:
+            self._init_deepgram_diarize()
+
+        if not self._use_assemblyai and not self._use_deepgram_diarize:
+            # Fall back to separate Whisper + diarize
+            if EXTERNAL_WHISPER_URL:
+                self._init_external()
+
+            if EXTERNAL_DIARIZE_URL:
+                self._init_external_diarize()
 
     def _init_external(self):
         """Try to connect to the external Whisper API."""
@@ -104,6 +127,46 @@ class Transcriber:
                 f"Could not initialise external Whisper client: {e}. "
                 f"Falling back to local faster-whisper."
             )
+
+    def _init_assemblyai(self):
+        """Try to initialise AssemblyAI client (transcription + diarization)."""
+        try:
+            project_root = str(Path(__file__).parent.parent.parent)
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+
+            from shared.utils.external_apis import AssemblyAIClient
+
+            client = AssemblyAIClient(api_key=ASSEMBLYAI_API_KEY)
+
+            if client.is_healthy():
+                self._assemblyai_client = client
+                self._use_assemblyai = True
+                logger.info("Using ASSEMBLYAI Universal-3-Pro for transcription + diarization (preferred)")
+            else:
+                logger.warning("AssemblyAI API not reachable. Trying other backends.")
+        except Exception as e:
+            logger.warning(f"Could not initialise AssemblyAI client: {e}")
+
+    def _init_deepgram_diarize(self):
+        """Try to initialise Deepgram Nova-3 diarization client."""
+        try:
+            project_root = str(Path(__file__).parent.parent.parent)
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+
+            from shared.utils.external_apis import DeepgramDiarizeClient
+
+            client = DeepgramDiarizeClient(api_key=DEEPGRAM_API_KEY)
+
+            if client.is_healthy():
+                self._deepgram_client = client
+                self._use_deepgram_diarize = True
+                logger.info("Using DEEPGRAM Nova-3 for transcription + diarization (fallback)")
+            else:
+                logger.warning("Deepgram API not reachable. Trying other backends.")
+        except Exception as e:
+            logger.warning(f"Could not initialise Deepgram client: {e}")
 
     def _init_external_diarize(self):
         """Try to connect to the external GPU diarization API."""
@@ -189,7 +252,12 @@ class Transcriber:
         self._audio_data = audio_data
         self._meeting_type = meeting_type
         try:
-            if self._use_external:
+            # Priority: AssemblyAI > Deepgram > Whisper+diarize > local
+            if self._use_assemblyai:
+                return self._transcribe_assemblyai(audio_path)
+            elif self._use_deepgram_diarize:
+                return self._transcribe_deepgram(audio_path)
+            elif self._use_external:
                 return self._transcribe_external(audio_path)
             else:
                 return self._transcribe_local(audio_path)
@@ -198,6 +266,40 @@ class Transcriber:
             self._num_speakers = None
             self._audio_data = None
             self._meeting_type = None
+
+    def _transcribe_assemblyai(self, audio_path: str) -> dict:
+        """
+        Transcribe + diarize via AssemblyAI Universal-3-Pro (single API call).
+        Falls back through the chain on failure.
+        """
+        try:
+            result = self._assemblyai_client.transcribe_and_diarize(audio_path)
+            self._last_diarization_backend = "assemblyai"
+            return result
+        except Exception as e:
+            logger.error(f"AssemblyAI failed: {e}. Falling back.")
+            if self._use_deepgram_diarize:
+                return self._transcribe_deepgram(audio_path)
+            elif self._use_external:
+                return self._transcribe_external(audio_path)
+            else:
+                return self._transcribe_local(audio_path)
+
+    def _transcribe_deepgram(self, audio_path: str) -> dict:
+        """
+        Transcribe + diarize via Deepgram Nova-3 (single API call).
+        Falls back through the chain on failure.
+        """
+        try:
+            result = self._deepgram_client.transcribe_and_diarize(audio_path)
+            self._last_diarization_backend = "deepgram"
+            return result
+        except Exception as e:
+            logger.error(f"Deepgram failed: {e}. Falling back.")
+            if self._use_external:
+                return self._transcribe_external(audio_path)
+            else:
+                return self._transcribe_local(audio_path)
 
     # ═══════════════════════════════════════════════════════════
     # EXTERNAL BACKEND (GPU Whisper API)
@@ -238,11 +340,19 @@ class Transcriber:
                 config = self.SPEAKER_DEFAULTS.get(
                     meeting_type, {"default": 2, "min": 2, "max": 8}
                 )
+                # Deepgram handles MP4/MP3 natively — send original file
+                # for best quality. Only fall back to pre-loaded WAV for
+                # pyannote GPU which can't decode container formats.
+                use_audio_data = (
+                    None if self._use_deepgram_diarize
+                    else self._audio_data
+                )
                 return self._diarize_client.diarize(
                     audio_path,
                     min_speakers=config["min"],
                     max_speakers=config["max"],
                     num_speakers=self._num_speakers or 0,
+                    audio_data=use_audio_data,
                 )
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -389,6 +499,19 @@ class Transcriber:
         return segments
 
     @staticmethod
+    def _normalize_speaker_label(label: str) -> str:
+        """Normalize GPU diarization speaker labels to internal format.
+
+        The external pyannote API returns 'SPEAKER_00', 'SPEAKER_01', etc.
+        Internally NEXUS uses 'Speaker_0', 'Speaker_1', etc.
+        """
+        import re
+        m = re.match(r"SPEAKER_(\d+)", label)
+        if m:
+            return f"Speaker_{int(m.group(1))}"
+        return label
+
+    @staticmethod
     def _apply_diarize_timeline(
         segments: list[dict], timeline: list[dict]
     ) -> list[dict]:
@@ -406,7 +529,7 @@ class Transcriber:
 
                 if overlap > best_overlap:
                     best_overlap = overlap
-                    best_speaker = turn["speaker"]
+                    best_speaker = Transcriber._normalize_speaker_label(turn["speaker"])
 
             # If no overlap, use nearest turn
             if best_overlap == 0 and timeline:
@@ -415,7 +538,7 @@ class Transcriber:
                     timeline,
                     key=lambda t: abs((t["start"] + t["end"]) / 2 * 1000 - seg_mid),
                 )
-                best_speaker = nearest["speaker"]
+                best_speaker = Transcriber._normalize_speaker_label(nearest["speaker"])
 
             seg["speaker"] = best_speaker
 
@@ -575,7 +698,7 @@ class Transcriber:
             )
             return kept
 
-        return filtered
+        return segments
 
     # ═══════════════════════════════════════════════════════════
     # SPEAKER DIARIZATION
@@ -1092,6 +1215,7 @@ class Transcriber:
                 min_speakers=config["min"],
                 max_speakers=config["max"],
                 num_speakers=num_speakers,
+                audio_data=self._audio_data,
             )
 
             speaker_timeline = result.get("timeline", [])
@@ -1113,7 +1237,7 @@ class Transcriber:
 
                     if overlap > best_overlap:
                         best_overlap = overlap
-                        best_speaker = turn["speaker"]
+                        best_speaker = self._normalize_speaker_label(turn["speaker"])
 
                 # If no overlap, use nearest turn
                 if best_overlap == 0:
@@ -1122,7 +1246,7 @@ class Transcriber:
                         speaker_timeline,
                         key=lambda t: abs((t["start"] + t["end"]) / 2 * 1000 - seg_mid),
                     )
-                    best_speaker = nearest["speaker"]
+                    best_speaker = self._normalize_speaker_label(nearest["speaker"])
 
                 seg["speaker"] = best_speaker
 
@@ -1219,11 +1343,11 @@ class Transcriber:
             logger.info(f"Running pyannote diarization: {diarize_params}")
             diarization = self._diarization_pipeline(audio_input, **diarize_params)
 
-            # Create speaker timeline
+            # Create speaker timeline (normalize SPEAKER_00 → Speaker_0)
             speaker_timeline = []
             for turn, _, speaker in diarization.itertracks(yield_label=True):
                 speaker_timeline.append({
-                    "speaker": speaker,
+                    "speaker": self._normalize_speaker_label(speaker),
                     "start_ms": int(turn.start * 1000),
                     "end_ms": int(turn.end * 1000),
                 })

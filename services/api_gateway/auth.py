@@ -247,6 +247,11 @@ async def delete_refresh_token(refresh_token: str) -> None:
     )
 
 
+def generate_verification_token() -> str:
+    """Generate a secure URL-safe token for email verification."""
+    return secrets.token_urlsafe(48)
+
+
 async def cleanup_expired_tokens() -> int:
     """Delete expired refresh tokens. Returns count deleted."""
     from database import get_pool

@@ -1,7 +1,8 @@
 import { useState, FormEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { Activity, Eye, EyeOff, Loader2 } from "lucide-react";
+import { Activity, Eye, EyeOff, Loader2, RefreshCw } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
+import { resendVerification } from "../api/client";
 
 export default function Login() {
   const navigate = useNavigate();
@@ -12,16 +13,35 @@ export default function Login() {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [needsVerification, setNeedsVerification] = useState(false);
+  const [resendStatus, setResendStatus] = useState<string | null>(null);
+
+  const handleResendVerification = async () => {
+    setResendStatus(null);
+    try {
+      await resendVerification(email);
+      setResendStatus("Verification email sent! Check your inbox.");
+    } catch (err) {
+      setResendStatus((err as Error).message || "Failed to resend");
+    }
+  };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError(null);
+    setNeedsVerification(false);
+    setResendStatus(null);
     setLoading(true);
     try {
       await login(email, password);
       navigate("/sessions", { replace: true });
     } catch (err) {
-      setError((err as Error).message || "Login failed");
+      const msg = (err as Error).message || "Login failed";
+      if (msg.toLowerCase().includes("not verified")) {
+        setNeedsVerification(true);
+      } else {
+        setError(msg);
+      }
     } finally {
       setLoading(false);
     }
@@ -55,6 +75,27 @@ export default function Login() {
           {error && (
             <div className="mb-4 rounded border border-stress-high-30 bg-stress-high-10 px-3 py-2 text-xs text-nexus-stress-high">
               {error}
+            </div>
+          )}
+
+          {needsVerification && (
+            <div className="mb-4 rounded border border-yellow-500/30 bg-yellow-500/10 px-3 py-3">
+              <p className="mb-2 text-xs text-yellow-400">
+                Your email hasn't been verified yet.
+              </p>
+              {resendStatus && (
+                <p className="mb-2 text-xs text-nexus-text-secondary">
+                  {resendStatus}
+                </p>
+              )}
+              <button
+                type="button"
+                onClick={handleResendVerification}
+                className="flex items-center gap-1.5 text-xs font-medium text-yellow-400 hover:text-yellow-300"
+              >
+                <RefreshCw className="h-3 w-3" />
+                Resend verification email
+              </button>
             </div>
           )}
 

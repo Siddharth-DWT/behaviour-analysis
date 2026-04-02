@@ -45,13 +45,13 @@ try:
     from feature_extractor import VoiceFeatureExtractor
     from calibration import CalibrationModule
     from rules import VoiceRuleEngine
-    from transcriber import Transcriber
+    from transcriber import Transcriber, USE_PYANNOTE
 except ImportError:
     # Fallback for running from project root
     from services.voiceAgent.feature_extractor import VoiceFeatureExtractor
     from services.voiceAgent.calibration import CalibrationModule
     from services.voiceAgent.rules import VoiceRuleEngine
-    from services.voiceAgent.transcriber import Transcriber
+    from services.voiceAgent.transcriber import Transcriber, USE_PYANNOTE
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nexus.voice")
@@ -93,7 +93,20 @@ async def health():
         "status": "ok",
         "agent": "voice",
         "version": "0.2.0",
-        "transcriber_backend": transcriber.backend if transcriber else "not_loaded",
+        "transcriber_backend": (
+            "assemblyai" if (transcriber and transcriber._use_assemblyai)
+            else "deepgram_nova3" if (transcriber and transcriber._use_deepgram_diarize)
+            else transcriber.backend if transcriber
+            else "not_loaded"
+        ),
+        "diarization_backend": (
+            "assemblyai" if (transcriber and transcriber._use_assemblyai)
+            else "deepgram_nova3" if (transcriber and transcriber._use_deepgram_diarize)
+            else "external_gpu" if (transcriber and transcriber._use_external_diarize)
+            else "local_pyannote" if USE_PYANNOTE
+            else "local_kmeans"
+        ) if transcriber else "not_loaded",
+        "last_diarization_used": getattr(transcriber, "_last_diarization_backend", "uninitialized") if transcriber else "not_loaded",
         "models_loaded": {
             "feature_extractor": feature_extractor is not None,
             "transcriber": transcriber is not None,
@@ -189,28 +202,6 @@ async def analyse_audio(request: AnalysisRequest):
             detail=f"Audio file could not be decoded — it may be empty or corrupted. ({e})",
         )
 
-    # ── Step 1: Transcribe + diarise (Whisper uses file path; diarisation reuses loaded audio) ──
-    logger.info(f"[{session_id}] Step 1: Transcribing (num_speakers={request.num_speakers})...")
-    transcript = transcriber.transcribe(
-        str(file_path), num_speakers=request.num_speakers, preloaded_audio=(y, sr)
-    )
-
-    duration_sec = transcript["duration_seconds"]
-    speakers = list(set(seg["speaker"] for seg in transcript["segments"]))
-    logger.info(f"[{session_id}] Transcribed: {duration_sec:.1f}s, {len(speakers)} speakers, {len(transcript['segments'])} segments")
-
-    # ── Step 2: Extract acoustic features (reuses loaded audio, parallel per speaker) ──
-    logger.info(f"[{session_id}] Step 2: Extracting features...")
-    try:
-        features_by_speaker = feature_extractor.extract_all_from_array(
-            y, sr, transcript["segments"]
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Feature extraction failed. ({e})",
-        )
-    
     # ── Step 3: Build baselines ──
     # Compute true speaking time per speaker from transcript (not feature windows)
     # so calibration confidence isn't penalised by skipped short windows.

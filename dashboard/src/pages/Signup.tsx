@@ -1,7 +1,8 @@
-import { useState, FormEvent, useMemo } from "react";
+import { useState, useEffect, FormEvent, useMemo } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { Activity, Eye, EyeOff, Loader2 } from "lucide-react";
+import { Activity, Eye, EyeOff, Loader2, CheckCircle2, Mail, RefreshCw } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
+import { resendVerification } from "../api/client";
 
 type PasswordStrength = "weak" | "fair" | "strong";
 
@@ -49,9 +50,34 @@ export default function Signup() {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [verificationSent, setVerificationSent] = useState(false);
+  const [sentEmail, setSentEmail] = useState("");
+  const [resendCooldown, setResendCooldown] = useState(0);
+  const [resendStatus, setResendStatus] = useState<string | null>(null);
 
   const strength = useMemo(() => getPasswordStrength(password), [password]);
   const cfg = STRENGTH_CONFIG[strength];
+
+  // Cooldown timer for resend button
+  useEffect(() => {
+    if (resendCooldown <= 0) return;
+    const interval = setInterval(() => {
+      setResendCooldown((prev) => prev - 1);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [resendCooldown]);
+
+  const handleResend = async () => {
+    if (resendCooldown > 0) return;
+    setResendStatus(null);
+    try {
+      await resendVerification(sentEmail);
+      setResendStatus("Verification email sent!");
+      setResendCooldown(60);
+    } catch (err) {
+      setResendStatus((err as Error).message || "Failed to resend");
+    }
+  };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -70,14 +96,80 @@ export default function Signup() {
 
     setLoading(true);
     try {
-      await signup(email, password, fullName, company || undefined);
-      navigate("/sessions", { replace: true });
+      const result = await signup(email, password, fullName, company || undefined);
+      if (result.requiresVerification) {
+        setSentEmail(email);
+        setVerificationSent(true);
+      } else {
+        navigate("/sessions", { replace: true });
+      }
     } catch (err) {
       setError((err as Error).message || "Signup failed");
     } finally {
       setLoading(false);
     }
   };
+
+  if (verificationSent) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-nexus-bg px-4">
+        <div className="w-full max-w-sm">
+          {/* Logo */}
+          <div className="mb-8 text-center">
+            <div className="mb-3 flex items-center justify-center gap-2">
+              <Activity className="h-8 w-8 text-nexus-accent-blue" />
+              <span className="font-mono text-2xl font-bold tracking-wider text-nexus-text-primary">
+                NEXUS
+              </span>
+            </div>
+            <p className="text-xs text-nexus-text-muted">
+              Behavioural Analysis System
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-nexus-border bg-nexus-surface p-6 text-center">
+            <CheckCircle2 className="mx-auto mb-4 h-12 w-12 text-emerald-400" />
+            <h2 className="mb-2 text-sm font-semibold text-nexus-text-primary">
+              Check your email!
+            </h2>
+            <div className="mb-1 flex items-center justify-center gap-1.5 text-nexus-text-muted">
+              <Mail className="h-3.5 w-3.5" />
+              <span className="text-xs">{sentEmail}</span>
+            </div>
+            <p className="mb-6 text-xs text-nexus-text-secondary">
+              We've sent a verification link to your email. Click the link to
+              activate your account.
+            </p>
+
+            {resendStatus && (
+              <div className="mb-4 rounded border border-nexus-border bg-nexus-bg px-3 py-2 text-xs text-nexus-text-secondary">
+                {resendStatus}
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={handleResend}
+              disabled={resendCooldown > 0}
+              className="mb-4 flex w-full items-center justify-center gap-2 rounded border border-nexus-border bg-nexus-bg px-4 py-2 text-xs font-medium text-nexus-text-primary transition-colors hover:bg-nexus-border disabled:opacity-50"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              {resendCooldown > 0
+                ? `Resend in ${resendCooldown}s`
+                : "Resend verification email"}
+            </button>
+
+            <Link
+              to="/login"
+              className="text-xs text-nexus-accent-blue hover:underline"
+            >
+              Back to Login
+            </Link>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-nexus-bg px-4">
