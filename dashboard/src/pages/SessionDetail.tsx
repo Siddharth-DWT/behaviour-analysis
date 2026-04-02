@@ -476,6 +476,7 @@ export default function SessionDetail() {
               voice: "var(--agent-voice)",
               language: "var(--agent-language)",
               fusion: "var(--agent-fusion)",
+              conversation: "var(--accent-blue, #4F8BFF)",
             };
             return (
               <span
@@ -638,6 +639,45 @@ export default function SessionDetail() {
                         {speaker.objectionCount > 0 && (
                           <StatChip label="Objections" value={speaker.objectionCount} color={getCSSVar("--stress-high") || "#EF4444"} />
                         )}
+                        {/* Conversation agent: dominance & engagement per speaker */}
+                        {(() => {
+                          const domSig = signals.find(
+                            (s) => s.agent === "conversation" && s.signal_type === "dominance_score" && s.speaker_label === speaker.label
+                          );
+                          const engSig = signals.find(
+                            (s) => s.agent === "conversation" && s.signal_type === "conversation_engagement" && s.speaker_label === speaker.label
+                          );
+                          return (
+                            <>
+                              {domSig && (
+                                <StatChip
+                                  label="Dominance"
+                                  value={(domSig.value_text || "").replace(/_/g, " ")}
+                                  color={
+                                    domSig.value_text === "dominant"
+                                      ? (getCSSVar("--stress-high") || "#EF4444")
+                                      : domSig.value_text === "balanced"
+                                      ? (getCSSVar("--stress-low") || "#22C55E")
+                                      : (getCSSVar("--stress-med") || "#F59E0B")
+                                  }
+                                />
+                              )}
+                              {engSig && (
+                                <StatChip
+                                  label="Engagement"
+                                  value={(engSig.value_text || "").replace(/_/g, " ")}
+                                  color={
+                                    engSig.value_text === "highly_engaged" || engSig.value_text === "engaged"
+                                      ? (getCSSVar("--stress-low") || "#22C55E")
+                                      : engSig.value_text === "passive"
+                                      ? (getCSSVar("--stress-med") || "#F59E0B")
+                                      : (getCSSVar("--stress-high") || "#EF4444")
+                                  }
+                                />
+                              )}
+                            </>
+                          );
+                        })()}
                       </div>
 
                       {i < speakerStats.length - 1 && (
@@ -656,6 +696,56 @@ export default function SessionDetail() {
           <StressTimeline signals={signals} speakerRoles={speakerRoles} />
         </div>
       </div>
+
+      {/* 4b. CONVERSATION DYNAMICS SUMMARY */}
+      {(() => {
+        const convoSignals = signals.filter((s) => s.agent === "conversation");
+        if (convoSignals.length === 0) return null;
+        const turnTaking = convoSignals.find((s) => s.signal_type === "turn_taking_pattern");
+        const rapportSig = convoSignals.find((s) => s.signal_type === "rapport_indicator");
+        const balanceSig = convoSignals.find((s) => s.signal_type === "conversation_balance");
+        return (
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            {turnTaking && (
+              <div className="rounded-lg border border-nexus-border bg-nexus-surface p-4 text-center">
+                <div className="text-[11px] text-nexus-text-secondary mb-2">Turn Rate</div>
+                <div className="text-lg font-bold text-nexus-text-primary">
+                  {turnTaking.value != null ? `${turnTaking.value.toFixed(1)}/min` : "--"}
+                </div>
+                <div className="text-[10px] text-nexus-text-muted mt-0.5">
+                  {(turnTaking.value_text || "").replace(/_/g, " ")}
+                </div>
+              </div>
+            )}
+            {rapportSig && (
+              <div className="rounded-lg border border-nexus-border bg-nexus-surface p-4 text-center">
+                <div className="text-[11px] text-nexus-text-secondary mb-2">Rapport</div>
+                <div className="text-lg font-bold" style={{
+                  color: (rapportSig.value ?? 0) >= 0.65 ? "#22C55E" : (rapportSig.value ?? 0) >= 0.4 ? "#F59E0B" : "#EF4444"
+                }}>
+                  {rapportSig.value != null ? rapportSig.value.toFixed(2) : "--"}
+                </div>
+                <div className="text-[10px] text-nexus-text-muted mt-0.5">
+                  {(rapportSig.value_text || "").replace(/_/g, " ")}
+                </div>
+              </div>
+            )}
+            {balanceSig && (
+              <div className="rounded-lg border border-nexus-border bg-nexus-surface p-4 text-center">
+                <div className="text-[11px] text-nexus-text-secondary mb-2">Balance</div>
+                <div className="text-lg font-bold" style={{
+                  color: balanceSig.value_text === "well_balanced" ? "#22C55E" : balanceSig.value_text === "moderately_balanced" ? "#F59E0B" : "#EF4444"
+                }}>
+                  {(balanceSig.value_text || "").replace(/_/g, " ")}
+                </div>
+                <div className="text-[10px] text-nexus-text-muted mt-0.5">
+                  index: {balanceSig.value != null ? balanceSig.value.toFixed(2) : "--"}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* 5. ALERTS & FUSION INSIGHTS */}
       <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
@@ -869,6 +959,7 @@ export default function SessionDetail() {
                 <GraphInsightsCard
                   analytics={content.graph_analytics as Record<string, unknown>}
                   speakerRoles={speakerRoles}
+                  signals={signals}
                 />
               )}
 

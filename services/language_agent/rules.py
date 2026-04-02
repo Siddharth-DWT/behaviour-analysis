@@ -1,6 +1,6 @@
 """
 NEXUS Language Agent - Rule Engine
-Implements 5 core rules from the NEXUS Rule Engine specification.
+Implements 12 core rules from the NEXUS Rule Engine specification.
 
 Each rule takes linguistic features and produces Signal dicts.
 Thresholds are hardcoded defaults matching the Rule Engine document;
@@ -8,9 +8,16 @@ in production these load from the rule_config database table.
 
 Rules implemented:
   LANG-SENT-01: Per-sentence sentiment (DistilBERT)
+  LANG-SENT-02: Emotional intensity (positive/negative word density)
   LANG-BUY-01:  Buying signal detection (SPIN keyword patterns)
   LANG-OBJ-01:  Objection signal detection (hedges + resistance)
   LANG-PWR-01:  Power language score (Lakoff/O'Barr)
+  LANG-PERS-01: Persuasion technique detection (Cialdini 2006)
+  LANG-QUES-01: Question type classification (SPIN)
+  LANG-NEG-01:  Gottman Four Horsemen detection
+  LANG-EMP-01:  Empathy language detection
+  LANG-CLAR-01: Clarity score
+  LANG-TOPIC-01: Topic shift detection
   LANG-INTENT-01: Intent classification (Claude API batch)
 
 Research references:
@@ -19,9 +26,13 @@ Research references:
   - Rackham 1988 (SPIN Selling — 35,000 calls)
   - Lakoff 1975 (language & gender / powerless speech)
   - O'Barr & Atkins 1982 (powerless speech in courtrooms)
+  - Cialdini 2006 (influence: science and practice)
+  - Gottman 1994 (four horsemen of the apocalypse)
+  - Rogers 1957 (empathic understanding)
 """
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -100,6 +111,101 @@ class LanguageRuleEngine:
     # Content types where sales-specific rules (buying/objection) are active
     SALES_TYPES = {"sales_call"}
 
+    # ── Word sets for emotional intensity (LANG-SENT-02) ──
+    POSITIVE_EMOTION_WORDS = {
+        "happy", "great", "love", "wonderful", "fantastic", "amazing",
+        "excellent", "perfect", "beautiful", "awesome", "glad", "pleased",
+        "delighted", "thrilled", "grateful", "proud", "joy", "excited",
+        "brilliant", "superb",
+    }
+    NEGATIVE_EMOTION_WORDS = {
+        "angry", "hate", "terrible", "awful", "horrible", "disgusting",
+        "frustrated", "annoyed", "upset", "worried", "scared", "anxious",
+        "sad", "depressed", "miserable", "furious", "disappointed", "hurt",
+        "painful", "dreadful",
+    }
+
+    # ── Persuasion regex patterns (LANG-PERS-01, Cialdini 2006) ──
+    PERSUASION_PATTERNS = {
+        "scarcity": re.compile(
+            r"limited\s+time|only\s+\d+\s+left|offer\s+expires|last\s+chance|act\s+now|don'?t\s+miss",
+            re.IGNORECASE,
+        ),
+        "social_proof": re.compile(
+            r"other\s+compan(ies|y)|other\s+clients?|most\s+of\s+our|industry\s+standard|trusted\s+by",
+            re.IGNORECASE,
+        ),
+        "authority": re.compile(
+            r"research\s+shows|studies\s+indicate|experts?\s+recommend|certified|award[- ]winning",
+            re.IGNORECASE,
+        ),
+        "reciprocity": re.compile(
+            r"free.{0,20}send|let\s+me\s+share|as\s+a\s+thank\s+you|complimentary|no\s+obligation",
+            re.IGNORECASE,
+        ),
+        "commitment": re.compile(
+            r"you\s+mentioned\s+earlier|as\s+you\s+agreed|you\s+said\s+that|building\s+on\s+what\s+you",
+            re.IGNORECASE,
+        ),
+        "scarcity_manufactured": re.compile(
+            r"need\s+to\s+know\s+by|other\s+people\s+are\s+looking|can'?t\s+hold\s+this|decision\s+today",
+            re.IGNORECASE,
+        ),
+    }
+
+    # ── Gottman Four Horsemen patterns (LANG-NEG-01) ──
+    GOTTMAN_PATTERNS = {
+        "criticism": re.compile(
+            r"you\s+always|you\s+never|what'?s\s+wrong\s+with\s+you|why\s+can'?t\s+you",
+            re.IGNORECASE,
+        ),
+        "contempt": re.compile(
+            r"\bwhatever\b|that'?s\s+ridiculous|i\s+don'?t\s+care|yeah\s+right|good\s+luck\s+with\s+that",
+            re.IGNORECASE,
+        ),
+        "defensiveness": re.compile(
+            r"that'?s\s+not\s+my\s+fault|yes\s+but\s+you|if\s+you\s+had\s+just|that'?s\s+not\s+what\s+i\s+said",
+            re.IGNORECASE,
+        ),
+    }
+    # Stonewalling: very short responses (handled separately in the rule)
+    STONEWALLING_RESPONSES = {"fine", "whatever", "i don't know", "okay", "k"}
+
+    # ── Empathy patterns (LANG-EMP-01, Rogers 1957) ──
+    VALIDATION_PHRASES = [
+        "i understand", "that makes sense", "i can see why", "i hear you",
+        "you're right", "that must be", "i appreciate", "i can imagine",
+    ]
+    REFLECTION_PHRASES = [
+        "so what you're saying", "it sounds like",
+        "if i understand correctly", "in other words",
+    ]
+
+    # ── Stop words for topic shift (LANG-TOPIC-01) ──
+    STOP_WORDS = {
+        "i", "me", "my", "myself", "we", "our", "ours", "ourselves", "you",
+        "your", "yours", "yourself", "yourselves", "he", "him", "his",
+        "himself", "she", "her", "hers", "herself", "it", "its", "itself",
+        "they", "them", "their", "theirs", "themselves", "what", "which",
+        "who", "whom", "this", "that", "these", "those", "am", "is", "are",
+        "was", "were", "be", "been", "being", "have", "has", "had", "having",
+        "do", "does", "did", "doing", "a", "an", "the", "and", "but", "if",
+        "or", "because", "as", "until", "while", "of", "at", "by", "for",
+        "with", "about", "against", "between", "through", "during", "before",
+        "after", "above", "below", "to", "from", "up", "down", "in", "out",
+        "on", "off", "over", "under", "again", "further", "then", "once",
+        "here", "there", "when", "where", "why", "how", "all", "both",
+        "each", "few", "more", "most", "other", "some", "such", "no", "nor",
+        "not", "only", "own", "same", "so", "than", "too", "very", "s", "t",
+        "can", "will", "just", "don", "should", "now", "d", "ll", "m", "o",
+        "re", "ve", "y", "ain", "aren", "couldn", "didn", "doesn", "hadn",
+        "hasn", "haven", "isn", "ma", "mightn", "mustn", "needn", "shan",
+        "shouldn", "wasn", "weren", "won", "wouldn", "yeah", "yes", "no",
+        "okay", "ok", "um", "uh", "like", "know", "think", "right", "well",
+        "going", "got", "get", "would", "could", "really", "actually",
+        "thing", "things", "gonna", "want", "let", "say", "said",
+    }
+
     def __init__(self):
         # TODO: Load thresholds from rule_config DB table
         self._content_type = "sales_call"  # Default for backward compat
@@ -115,6 +221,8 @@ class LanguageRuleEngine:
         speaker_id: str,
         content_type: Optional[str] = None,
         speaker_role: Optional[str] = None,
+        all_features_list: Optional[list] = None,
+        current_index: int = 0,
     ) -> list[dict]:
         """
         Run all rules against a single segment's features.
@@ -125,6 +233,8 @@ class LanguageRuleEngine:
             content_type: Optional override for content type
             speaker_role: Optional speaker role (e.g. "Seller", "Prospect")
                           Buying signals are only valid from Prospect/Buyer.
+            all_features_list: Full list of features for all segments (for topic shift)
+            current_index: Index of current segment in all_features_list
 
         Returns:
             List of Signal dicts (one per fired rule)
@@ -147,6 +257,24 @@ class LanguageRuleEngine:
                 "text_preview": features.get("text", "")[:80],
             },
         ))
+
+        # ── LANG-SENT-02: Emotional Intensity (all content types) ──
+        emo = self._rule_sent_02(features)
+        if emo is not None:
+            signals.append(_make_signal(
+                speaker_id, "emotional_intensity",
+                emo["value"], emo["label"],
+                emo["confidence"],
+                start_ms, end_ms,
+                {
+                    "rule": "LANG-SENT-02",
+                    "density": emo["density"],
+                    "positive_count": emo["positive_count"],
+                    "negative_count": emo["negative_count"],
+                    "word_count": emo["word_count"],
+                    "text_preview": features.get("text", "")[:80],
+                },
+            ))
 
         # ── LANG-BUY-01: Buying Signal Detection (sales_call only) ──
         # Buying signals are only meaningful from the Prospect/Buyer, never the Seller.
@@ -203,6 +331,103 @@ class LanguageRuleEngine:
                     "text_preview": features.get("text", "")[:80],
                 },
             ))
+
+        # ── LANG-PERS-01: Persuasion Detection (all content types) ──
+        pers = self._rule_pers_01(features, active_type)
+        if pers is not None:
+            signals.append(_make_signal(
+                speaker_id, "persuasion_technique",
+                pers["value"], pers["value_text"],
+                pers["confidence"],
+                start_ms, end_ms,
+                {
+                    "rule": "LANG-PERS-01",
+                    "techniques_found": pers["techniques_found"],
+                    "detected_count": pers["detected_count"],
+                    "text_preview": features.get("text", "")[:80],
+                },
+            ))
+
+        # ── LANG-QUES-01: Question Type (all content types) ──
+        ques = self._rule_ques_01(features, active_type)
+        if ques is not None:
+            signals.append(_make_signal(
+                speaker_id, "question_type",
+                ques["value"], ques["label"],
+                ques["confidence"],
+                start_ms, end_ms,
+                {
+                    "rule": "LANG-QUES-01",
+                    "question_category": ques["category"],
+                    "spin_type": ques.get("spin_type"),
+                    "text_preview": features.get("text", "")[:80],
+                },
+            ))
+
+        # ── LANG-NEG-01: Gottman Four Horsemen (all content types) ──
+        neg = self._rule_neg_01(features, active_type)
+        if neg is not None:
+            signals.append(_make_signal(
+                speaker_id, "gottman_horsemen",
+                neg["value"], neg["label"],
+                neg["confidence"],
+                start_ms, end_ms,
+                {
+                    "rule": "LANG-NEG-01",
+                    "horseman": neg["horseman"],
+                    "matched_pattern": neg.get("matched_pattern", ""),
+                    "text_preview": features.get("text", "")[:80],
+                },
+            ))
+
+        # ── LANG-EMP-01: Empathy Language (all content types) ──
+        emp = self._rule_emp_01(features, active_type)
+        if emp is not None:
+            signals.append(_make_signal(
+                speaker_id, "empathy_language",
+                emp["value"], emp["label"],
+                emp["confidence"],
+                start_ms, end_ms,
+                {
+                    "rule": "LANG-EMP-01",
+                    "validation_count": emp["validation_count"],
+                    "reflection_count": emp["reflection_count"],
+                    "text_preview": features.get("text", "")[:80],
+                },
+            ))
+
+        # ── LANG-CLAR-01: Clarity Score (all content types) ──
+        clar = self._rule_clar_01(features, active_type)
+        if clar is not None:
+            signals.append(_make_signal(
+                speaker_id, "clarity_score",
+                clar["value"], clar["label"],
+                clar["confidence"],
+                start_ms, end_ms,
+                {
+                    "rule": "LANG-CLAR-01",
+                    "penalties": clar.get("penalties", []),
+                    "bonuses": clar.get("bonuses", []),
+                    "text_preview": features.get("text", "")[:80],
+                },
+            ))
+
+        # ── LANG-TOPIC-01: Topic Shift (requires full features list) ──
+        if all_features_list is not None:
+            topic = self._rule_topic_01(features, all_features_list, current_index)
+            if topic is not None:
+                signals.append(_make_signal(
+                    speaker_id, "topic_shift",
+                    topic["value"], topic["label"],
+                    topic["confidence"],
+                    start_ms, end_ms,
+                    {
+                        "rule": "LANG-TOPIC-01",
+                        "overlap_pct": topic["overlap_pct"],
+                        "current_keywords": topic.get("current_keywords", [])[:10],
+                        "text_preview": features.get("text", "")[:80],
+                    },
+                ))
 
         return signals
 
@@ -438,6 +663,364 @@ class LanguageRuleEngine:
             "powerless_count": powerless_count,
             "features_found": features_found,
             "word_count": word_count,
+        }
+
+    # ════════════════════════════════════════════════════════
+    # LANG-SENT-02: Emotional Intensity
+    # Research: Pennebaker 2015 (word-level affect)
+    # ════════════════════════════════════════════════════════
+
+    def _rule_sent_02(self, f: dict) -> Optional[dict]:
+        """
+        Measure emotional word density as a percentage of total words.
+        Fires when density is notably high, moderate, or suppressed.
+        Also detects negative emotional shifts.
+        """
+        text = f.get("text", "").strip().lower()
+        words = text.split()
+        word_count = len(words)
+        if word_count == 0:
+            return None
+
+        pos_count = sum(1 for w in words if w in self.POSITIVE_EMOTION_WORDS)
+        neg_count = sum(1 for w in words if w in self.NEGATIVE_EMOTION_WORDS)
+        total_emotion = pos_count + neg_count
+        density = total_emotion / word_count
+
+        label = None
+
+        # Check for negative emotional shift first
+        if neg_count > pos_count * 1.5 and neg_count >= 2:
+            label = "negative_emotional_shift"
+        elif density > 0.08:
+            label = "high"
+        elif density > 0.04:
+            label = "moderate"
+        elif density < 0.02 and word_count >= 15:
+            label = "suppressed"
+
+        if label is None:
+            return None  # Normal range — don't emit
+
+        return {
+            "value": round(density, 4),
+            "label": label,
+            "confidence": 0.60,
+            "density": round(density, 4),
+            "positive_count": pos_count,
+            "negative_count": neg_count,
+            "word_count": word_count,
+        }
+
+    # ════════════════════════════════════════════════════════
+    # LANG-PERS-01: Persuasion Detection (Cialdini 2006)
+    # ════════════════════════════════════════════════════════
+
+    def _rule_pers_01(self, f: dict, content_type: str) -> Optional[dict]:
+        """
+        Detect persuasion techniques based on Cialdini's 6 principles.
+        Uses regex patterns per category; emits on first match.
+        """
+        text = f.get("text", "").strip()
+        if not text:
+            return None
+
+        techniques_found = []
+        for technique, pattern in self.PERSUASION_PATTERNS.items():
+            if pattern.search(text):
+                techniques_found.append(technique)
+
+        if not techniques_found:
+            return None
+
+        detected_count = len(techniques_found)
+        value = min(detected_count / 7.0, 1.0)
+        primary_technique = techniques_found[0]
+
+        return {
+            "value": round(value, 4),
+            "value_text": primary_technique,
+            "confidence": 0.55,
+            "techniques_found": techniques_found,
+            "detected_count": detected_count,
+        }
+
+    # ════════════════════════════════════════════════════════
+    # LANG-QUES-01: Question Type Classification (SPIN)
+    # Research: Rackham 1988
+    # ════════════════════════════════════════════════════════
+
+    _QUESTION_STARTERS = re.compile(
+        r"^(how|what|why|when|where|who|do you|have you|can you|could you|would you|is it|are you|did you|will you|shall we)",
+        re.IGNORECASE,
+    )
+    _TAG_QUESTION = re.compile(
+        r"(right\s*\??|don'?t\s+you\s+think\s*\??|isn'?t\s+it\s*\??|aren'?t\s+you\s*\??|won'?t\s+you\s*\??)$",
+        re.IGNORECASE,
+    )
+
+    # SPIN sub-classification keywords (for sales_call)
+    _SPIN_SITUATION = re.compile(
+        r"(how\s+many|how\s+long|how\s+often|currently|right\s+now|at\s+the\s+moment|what\s+do\s+you\s+use|tell\s+me\s+about\s+your)",
+        re.IGNORECASE,
+    )
+    _SPIN_PROBLEM = re.compile(
+        r"(difficult|challenge|problem|issue|frustrat|struggle|dissatisfied|concern|worry|trouble|pain\s+point)",
+        re.IGNORECASE,
+    )
+    _SPIN_IMPLICATION = re.compile(
+        r"(what\s+happens\s+if|what\s+would|how\s+does\s+that\s+affect|impact|consequence|result\s+in|lead\s+to|cost\s+you)",
+        re.IGNORECASE,
+    )
+    _SPIN_NEED_PAYOFF = re.compile(
+        r"(would\s+it\s+help|how\s+would|what\s+if\s+you\s+could|imagine|benefit|value|useful|important\s+to\s+you|solve)",
+        re.IGNORECASE,
+    )
+
+    def _rule_ques_01(self, f: dict, content_type: str) -> Optional[dict]:
+        """
+        Detect and classify question types.
+        For sales_call: sub-classify into SPIN categories.
+        """
+        text = f.get("text", "").strip()
+        if not text:
+            return None
+
+        is_question = text.rstrip().endswith("?") or bool(self._QUESTION_STARTERS.match(text))
+        if not is_question:
+            return None
+
+        # Classify question type
+        if self._TAG_QUESTION.search(text):
+            category = "tag"
+        elif re.match(r"^(how|why|tell\s+me)", text, re.IGNORECASE):
+            category = "open"
+        else:
+            category = "closed"
+
+        result = {
+            "value": 1.0,
+            "label": category,
+            "confidence": 0.70,
+            "category": category,
+        }
+
+        # SPIN sub-classification for sales calls
+        if content_type in self.SALES_TYPES:
+            spin_type = None
+            if self._SPIN_NEED_PAYOFF.search(text):
+                spin_type = "need_payoff"
+            elif self._SPIN_IMPLICATION.search(text):
+                spin_type = "implication"
+            elif self._SPIN_PROBLEM.search(text):
+                spin_type = "problem"
+            elif self._SPIN_SITUATION.search(text):
+                spin_type = "situation"
+
+            if spin_type:
+                result["label"] = f"{category}_{spin_type}"
+                result["spin_type"] = spin_type
+
+        return result
+
+    # ════════════════════════════════════════════════════════
+    # LANG-NEG-01: Gottman Four Horsemen
+    # Research: Gottman 1994
+    # ════════════════════════════════════════════════════════
+
+    def _rule_neg_01(self, f: dict, content_type: str) -> Optional[dict]:
+        """
+        Detect the Four Horsemen of relationship breakdown:
+        criticism, contempt, defensiveness, stonewalling.
+        """
+        text = f.get("text", "").strip()
+        if not text:
+            return None
+
+        text_lower = text.lower().strip()
+
+        # Check stonewalling first: very short responses
+        if text_lower in self.STONEWALLING_RESPONSES:
+            return {
+                "value": 0.4,
+                "label": "stonewalling",
+                "confidence": 0.35,
+                "horseman": "stonewalling",
+                "matched_pattern": text_lower,
+            }
+
+        # Check the three regex-based horsemen
+        for horseman, pattern in self.GOTTMAN_PATTERNS.items():
+            match = pattern.search(text)
+            if match:
+                return {
+                    "value": 0.6,
+                    "label": horseman,
+                    "confidence": 0.50,
+                    "horseman": horseman,
+                    "matched_pattern": match.group(0),
+                }
+
+        return None
+
+    # ════════════════════════════════════════════════════════
+    # LANG-EMP-01: Empathy Language
+    # Research: Rogers 1957 (empathic understanding)
+    # ════════════════════════════════════════════════════════
+
+    def _rule_emp_01(self, f: dict, content_type: str) -> Optional[dict]:
+        """
+        Detect empathy language: validation and reflection phrases.
+        Score = validation*0.3 + reflection*0.4, capped at 1.0.
+        """
+        text = f.get("text", "").strip().lower()
+        if not text:
+            return None
+
+        validation_count = sum(1 for phrase in self.VALIDATION_PHRASES if phrase in text)
+        reflection_count = sum(1 for phrase in self.REFLECTION_PHRASES if phrase in text)
+
+        if validation_count == 0 and reflection_count == 0:
+            return None
+
+        score = min(validation_count * 0.3 + reflection_count * 0.4, 1.0)
+
+        if score >= 0.7:
+            label = "high_empathy"
+        elif score >= 0.3:
+            label = "moderate_empathy"
+        else:
+            label = "low_empathy"
+
+        return {
+            "value": round(score, 4),
+            "label": label,
+            "confidence": 0.55,
+            "validation_count": validation_count,
+            "reflection_count": reflection_count,
+        }
+
+    # ════════════════════════════════════════════════════════
+    # LANG-CLAR-01: Clarity Score
+    # ════════════════════════════════════════════════════════
+
+    _PASSIVE_INDICATORS = re.compile(
+        r"\b(was|were|is|are|been|being)\s+\w+ed\b", re.IGNORECASE,
+    )
+    _STRUCTURE_MARKERS = re.compile(
+        r"\b(first|second|third|finally|in\s+conclusion|to\s+summarize|next|lastly)\b",
+        re.IGNORECASE,
+    )
+    _NUMBERS = re.compile(r"\b\d+\.?\d*\b")
+
+    def _rule_clar_01(self, f: dict, content_type: str) -> Optional[dict]:
+        """
+        Score clarity of speech. Penalises long sentences and passive voice.
+        Bonuses for structure markers and specificity (numbers).
+        Only emits for notably high (>0.80) or low (<0.40) clarity.
+        """
+        text = f.get("text", "").strip()
+        words = text.split()
+        word_count = len(words)
+        if word_count < 10:
+            return None
+
+        score = 1.0
+        penalties = []
+        bonuses = []
+
+        # Penalty: average sentence length
+        sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+        if sentences:
+            avg_sentence_length = sum(len(s.split()) for s in sentences) / len(sentences)
+            if avg_sentence_length > 35:
+                score -= 0.30  # -0.15 for >25 and additional -0.15 for >35
+                penalties.append(f"very_long_sentences ({avg_sentence_length:.1f} avg)")
+            elif avg_sentence_length > 25:
+                score -= 0.15
+                penalties.append(f"long_sentences ({avg_sentence_length:.1f} avg)")
+
+        # Penalty: passive voice indicators
+        passive_matches = self._PASSIVE_INDICATORS.findall(text)
+        passive_pct = len(passive_matches) / word_count if word_count > 0 else 0
+        if passive_pct > 0.05:
+            score -= 0.10
+            penalties.append(f"passive_voice ({len(passive_matches)} instances)")
+
+        # Bonus: structure markers
+        if self._STRUCTURE_MARKERS.search(text):
+            score += 0.10
+            bonuses.append("structure_markers")
+
+        # Bonus: numbers/specificity (max 3 bonuses at 0.05 each)
+        number_count = min(len(self._NUMBERS.findall(text)), 3)
+        if number_count > 0:
+            score += number_count * 0.05
+            bonuses.append(f"specificity ({number_count} numbers)")
+
+        score = max(0.0, min(1.0, score))
+
+        # Only emit if notably high or low
+        if score > 0.80:
+            label = "high_clarity"
+        elif score < 0.40:
+            label = "low_clarity"
+        else:
+            return None  # Normal range — don't emit
+
+        return {
+            "value": round(score, 4),
+            "label": label,
+            "confidence": 0.50,
+            "penalties": penalties,
+            "bonuses": bonuses,
+        }
+
+    # ════════════════════════════════════════════════════════
+    # LANG-TOPIC-01: Topic Shift Detection
+    # ════════════════════════════════════════════════════════
+
+    def _rule_topic_01(
+        self, f: dict, all_features_list: list, current_index: int,
+    ) -> Optional[dict]:
+        """
+        Detect topic shifts by comparing content words of the current segment
+        against the last 3 segments. Overlap < 15% → topic_change_detected.
+        """
+        if current_index == 0:
+            return None  # First segment — nothing to compare against
+
+        def _content_words(text: str) -> set:
+            words = re.findall(r"[a-z]+", text.lower())
+            return {w for w in words if w not in self.STOP_WORDS and len(w) > 2}
+
+        current_words = _content_words(f.get("text", ""))
+        if len(current_words) < 3:
+            return None  # Too few content words to compare
+
+        # Gather content words from last 3 segments
+        lookback = max(0, current_index - 3)
+        previous_words = set()
+        for idx in range(lookback, current_index):
+            prev_text = all_features_list[idx].get("text", "")
+            previous_words.update(_content_words(prev_text))
+
+        if not previous_words:
+            return None
+
+        # Compute overlap
+        overlap = current_words & previous_words
+        overlap_pct = len(overlap) / len(current_words) if current_words else 1.0
+
+        if overlap_pct >= 0.15:
+            return None  # Enough continuity — no topic shift
+
+        return {
+            "value": round(1.0 - overlap_pct, 4),
+            "label": "topic_change_detected",
+            "confidence": 0.55,
+            "overlap_pct": round(overlap_pct, 4),
+            "current_keywords": list(current_words)[:10],
         }
 
     # ════════════════════════════════════════════════════════

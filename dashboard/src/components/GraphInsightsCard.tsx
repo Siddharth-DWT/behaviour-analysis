@@ -43,9 +43,23 @@ interface GraphAnalytics {
   resolution_paths?: ResolutionPath[];
 }
 
+interface ConversationDynamics {
+  turn_rate?: number;
+  dominance_index?: number;
+  rapport_score?: number;
+}
+
 interface GraphInsightsCardProps {
   analytics: GraphAnalytics;
   speakerRoles: Record<string, string>;
+  signals?: Array<{
+    agent: string;
+    signal_type: string;
+    value: number | null;
+    value_text: string;
+    confidence: number;
+    metadata: Record<string, unknown> | null;
+  }>;
 }
 
 function formatTime(ms: number): string {
@@ -74,7 +88,7 @@ const TRAJECTORY_ICONS: Record<string, string> = {
   volatile: "〰️",
 };
 
-export default function GraphInsightsCard({ analytics, speakerRoles }: GraphInsightsCardProps) {
+export default function GraphInsightsCard({ analytics, speakerRoles, signals = [] }: GraphInsightsCardProps) {
   if (!analytics || Object.keys(analytics).length === 0) return null;
 
   const clusters = analytics.tension_clusters || [];
@@ -83,8 +97,23 @@ export default function GraphInsightsCard({ analytics, speakerRoles }: GraphInsi
   const patterns = analytics.speaker_patterns || {};
   const resolutions = analytics.resolution_paths || [];
 
+  // Extract conversation dynamics from conversation agent signals
+  const convoSignals = signals.filter((s) => s.agent === "conversation");
+  const turnTakingSig = convoSignals.find((s) => s.signal_type === "turn_taking_pattern");
+  const balanceSig = convoSignals.find((s) => s.signal_type === "conversation_balance");
+  const rapportSig = convoSignals.find((s) => s.signal_type === "rapport_indicator");
+
+  const conversationDynamics: ConversationDynamics = {
+    turn_rate: turnTakingSig?.value ?? undefined,
+    dominance_index: balanceSig?.value ?? undefined,
+    rapport_score: rapportSig?.value ?? undefined,
+  };
+  const hasConvoDynamics = conversationDynamics.turn_rate != null ||
+    conversationDynamics.dominance_index != null ||
+    conversationDynamics.rapport_score != null;
+
   const hasContent = clusters.length > 0 || momentum?.turning_point_ms || topics.length > 0 ||
-    Object.keys(patterns).length > 0 || resolutions.length > 0;
+    Object.keys(patterns).length > 0 || resolutions.length > 0 || hasConvoDynamics;
 
   if (!hasContent) return null;
 
@@ -144,6 +173,60 @@ export default function GraphInsightsCard({ analytics, speakerRoles }: GraphInsi
               <span className="text-nexus-text-muted">
                 {" "}(shifted at <span className="font-mono">{formatTime(momentum.turning_point_ms)}</span>)
               </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Conversation Dynamics */}
+      {hasConvoDynamics && (
+        <div>
+          <div className="text-[11px] text-nexus-text-secondary font-medium mb-1.5">
+            💬 Conversation Dynamics
+          </div>
+          <div className="flex flex-wrap gap-3">
+            {conversationDynamics.turn_rate != null && (
+              <div className="text-xs text-nexus-text-primary">
+                <span className="text-nexus-text-muted">Turn rate: </span>
+                <span className="font-medium font-mono">
+                  {conversationDynamics.turn_rate.toFixed(1)}
+                </span>
+                <span className="text-nexus-text-muted text-[10px]"> /min</span>
+              </div>
+            )}
+            {conversationDynamics.dominance_index != null && (
+              <div className="text-xs text-nexus-text-primary">
+                <span className="text-nexus-text-muted">Dominance: </span>
+                <span
+                  className="font-medium font-mono"
+                  style={{
+                    color: conversationDynamics.dominance_index > 0.65
+                      ? "var(--stress-high, #EF4444)"
+                      : conversationDynamics.dominance_index > 0.45
+                      ? "var(--stress-med, #F59E0B)"
+                      : "var(--stress-low, #22C55E)",
+                  }}
+                >
+                  {conversationDynamics.dominance_index.toFixed(2)}
+                </span>
+              </div>
+            )}
+            {conversationDynamics.rapport_score != null && (
+              <div className="text-xs text-nexus-text-primary">
+                <span className="text-nexus-text-muted">Rapport: </span>
+                <span
+                  className="font-medium font-mono"
+                  style={{
+                    color: conversationDynamics.rapport_score >= 0.65
+                      ? "var(--stress-low, #22C55E)"
+                      : conversationDynamics.rapport_score >= 0.4
+                      ? "var(--stress-med, #F59E0B)"
+                      : "var(--stress-high, #EF4444)",
+                  }}
+                >
+                  {conversationDynamics.rapport_score.toFixed(2)}
+                </span>
+              </div>
             )}
           </div>
         </div>

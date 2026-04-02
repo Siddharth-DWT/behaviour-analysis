@@ -271,15 +271,25 @@ async def analyse_signals(request: AnalyseRequest):
     if request.language_summary:
         entities = request.language_summary.get("entities", {})
 
+    # Extract conversation summary if present (passed via voice_summary by API Gateway)
+    conversation_summary = {}
+    if request.voice_summary:
+        conversation_summary = request.voice_summary.get("conversation", {})
+
     # ── Step 4: Build signal graph + analytics ──
     graph_json = {}
     key_paths = []
     graph_insights = {}
     try:
         graph = SignalGraph()
+        # Include conversation signals in graph if available
+        conversation_signals_for_graph = []
+        if conversation_summary.get("signals"):
+            conversation_signals_for_graph = conversation_summary["signals"]
+
         graph.build_from_session(
             voice_signals=voice_dicts,
-            language_signals=language_dicts,
+            language_signals=language_dicts + conversation_signals_for_graph,
             fusion_signals=all_fusion_signals,
             transcript_segments=[],
             entities=entities,
@@ -333,6 +343,7 @@ async def analyse_signals(request: AnalyseRequest):
             meeting_type=report_type,
             entities=entities,
             graph_analytics=graph_insights,
+            conversation_summary=conversation_summary,
         )
 
     # ── Build summary ──

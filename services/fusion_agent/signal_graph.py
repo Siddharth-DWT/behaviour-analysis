@@ -503,6 +503,29 @@ class SignalGraph:
             "credibility_assessment": f"Credibility: {value_text}",
             "verbal_incongruence": f"Incongruence: {value_text}",
             "urgency_authenticity": f"Urgency: {value_text}",
+            # Voice Agent new rules
+            "monotone_flag": "Monotone detected",
+            "energy_level": f"Energy: {value_text}",
+            "pause_classification": f"Pause: {value_text}",
+            "interruption_event": f"Interruption ({value_text})",
+            "talk_time_ratio": f"Talk: {int((value or 0) * 100)}%",
+            # Language Agent new rules
+            "emotional_intensity": f"Emotion: {value_text}",
+            "persuasion_technique": f"Persuasion: {value_text}",
+            "question_type": f"Q: {value_text}",
+            "gottman_horsemen": f"Gottman: {value_text}",
+            "empathy_language": "Empathy detected",
+            "clarity_score": f"Clarity: {int((value or 0) * 100)}%",
+            "topic_shift": "Topic Change",
+            # Conversation Agent
+            "turn_taking_pattern": f"Turns: {value_text}",
+            "response_latency_pattern": f"Latency: {value_text}",
+            "dominance_score": f"Dominance: {value_text}",
+            "interruption_pattern": f"Interruptions: {value_text}",
+            "rapport_indicator": f"Rapport: {value_text}",
+            "conversation_engagement": f"Engagement: {value_text}",
+            "conversation_balance": f"Balance: {value_text}",
+            "conflict_score": f"Conflict: {value_text}",
         }
         return labels.get(sig_type, sig_type.replace("_", " ").title())
 

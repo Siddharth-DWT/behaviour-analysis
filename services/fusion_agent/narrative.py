@@ -53,6 +53,7 @@ def generate_session_narrative(
     meeting_type: str = "sales_call",
     entities: Optional[dict] = None,
     graph_analytics: Optional[dict] = None,
+    conversation_summary: Optional[dict] = None,
 ) -> Optional[dict]:
     """
     Generate a structured narrative report for the session using the LLM.
@@ -66,6 +67,9 @@ def generate_session_narrative(
         fusion_signals: All fusion signals produced during the session
         unified_states: Final unified speaker states
         meeting_type: Type of meeting (sales_call, client_meeting, internal)
+        entities: Extracted entities from language analysis
+        graph_analytics: Graph-derived analytics
+        conversation_summary: Summary from Conversation Agent (turn-taking, rapport, dominance)
 
     Returns:
         {
@@ -79,6 +83,7 @@ def generate_session_narrative(
     """
     entities = entities or {}
     graph_analytics = graph_analytics or {}
+    conversation_summary = conversation_summary or {}
     llm_complete = _get_llm_complete()
     if llm_complete is None:
         return _fallback_narrative(
@@ -89,7 +94,7 @@ def generate_session_narrative(
     context = _build_context(
         session_id, duration_seconds, speakers,
         voice_summary, language_summary, fusion_signals, unified_states,
-        entities, graph_analytics,
+        entities, graph_analytics, conversation_summary,
     )
 
     system_prompt, user_prompt = _build_prompt(context, meeting_type)
@@ -123,6 +128,7 @@ def _build_context(
     unified_states: list[dict],
     entities: Optional[dict] = None,
     graph_analytics: Optional[dict] = None,
+    conversation_summary: Optional[dict] = None,
 ) -> str:
     """Build a structured text context block for the LLM."""
     lines = []
@@ -193,6 +199,33 @@ def _build_context(
                 f"strength={m.get('strength', 0):.3f}, "
                 f"categories={m.get('categories', [])}"
             )
+
+    # Conversation dynamics
+    conversation_summary = conversation_summary or {}
+    if conversation_summary:
+        lines.append("\n=== CONVERSATION DYNAMICS ===")
+        turn_taking = conversation_summary.get("turn_taking", {})
+        if turn_taking:
+            lines.append(f"  Turn count: {turn_taking.get('total_turns', 0)}")
+            lines.append(f"  Avg turn duration: {turn_taking.get('avg_turn_duration_ms', 0):.0f} ms")
+            lines.append(f"  Turn rate: {turn_taking.get('turns_per_minute', 0):.1f} turns/min")
+        rapport = conversation_summary.get("rapport", {})
+        if rapport:
+            lines.append(f"  Rapport score: {rapport.get('score', 0):.2f}")
+            lines.append(f"  Rapport level: {rapport.get('level', 'unknown')}")
+        dominance = conversation_summary.get("dominance", {})
+        if dominance:
+            lines.append(f"  Dominance index: {dominance.get('index', 0):.2f}")
+            for sid, pct in dominance.get("per_speaker", {}).items():
+                lines.append(f"    {sid}: {pct:.1f}% talk time")
+        interruptions = conversation_summary.get("interruptions", {})
+        if interruptions:
+            lines.append(f"  Total interruptions: {interruptions.get('total', 0)}")
+            for sid, cnt in interruptions.get("per_speaker", {}).items():
+                lines.append(f"    {sid}: {cnt} interruptions")
+        response_latency = conversation_summary.get("response_latency", {})
+        if response_latency:
+            lines.append(f"  Avg response latency: {response_latency.get('avg_ms', 0):.0f} ms")
 
     # Fusion signals
     if fusion_signals:

@@ -95,6 +95,7 @@ logger = logging.getLogger("nexus.gateway")
 # ── Agent URLs (configurable via environment) ──
 VOICE_AGENT_URL = os.getenv("VOICE_AGENT_URL", "http://localhost:8001")
 LANGUAGE_AGENT_URL = os.getenv("LANGUAGE_AGENT_URL", "http://localhost:8002")
+CONVERSATION_AGENT_URL = os.getenv("CONVERSATION_AGENT_URL", "http://localhost:8006")
 FUSION_AGENT_URL = os.getenv("FUSION_AGENT_URL", "http://localhost:8007")
 
 # ── Upload directory ──
@@ -166,6 +167,7 @@ async def health():
         for name, url in [
             ("voice", VOICE_AGENT_URL),
             ("language", LANGUAGE_AGENT_URL),
+            ("conversation", CONVERSATION_AGENT_URL),
             ("fusion", FUSION_AGENT_URL),
         ]:
             try:
@@ -686,6 +688,7 @@ async def create_session_endpoint(
     agent_status = {
         "voice": "completed",
         "language": "skipped",
+        "conversation": "skipped",
         "fusion": "skipped",
     }
 
@@ -726,18 +729,51 @@ async def create_session_endpoint(
     else:
         logger.warning(f"[{session_id}] No transcript segments — skipping Language Agent")
 
+    # ── Step 4b: Conversation Agent ──
+    conversation_result = None
+    conversation_signals = []
+    conversation_summary = {}
+
+    if transcript_segments and len(set(seg.get("speaker") for seg in transcript_segments)) >= 2:
+        try:
+            conversation_result = await _call_conversation_agent(
+                session_id, transcript_segments, meeting_type,
+            )
+            conversation_signals = conversation_result.get("signals", [])
+            conversation_summary = conversation_result.get("summary", {})
+            agent_status["conversation"] = "completed"
+            logger.info(f"[{session_id}] Conversation Agent: {len(conversation_signals)} signals")
+        except Exception as e:
+            agent_status["conversation"] = "failed"
+            logger.warning(f"[{session_id}] Conversation Agent failed (continuing): {e}")
+
+        # Persist conversation signals
+        if conversation_signals:
+            try:
+                count = await insert_signals(session_id, conversation_signals, speaker_map)
+                logger.info(f"[{session_id}] Persisted {count} conversation signals")
+            except Exception as e:
+                logger.warning(f"[{session_id}] Conversation signal persist failed: {e}")
+    else:
+        logger.info(f"[{session_id}] < 2 speakers — skipping Conversation Agent")
+
     # ── Step 5: Fusion Agent ──
     fusion_result = None
     fusion_signals = []
     alerts = []
     report = None
 
+    # Enrich voice_summary with conversation dynamics for Fusion Agent
+    enriched_voice_summary = dict(voice_summary)
+    if conversation_summary:
+        enriched_voice_summary["conversation"] = conversation_summary
+
     try:
         fusion_result = await _call_fusion_agent(
             session_id=session_id,
             voice_signals=voice_signals,
             language_signals=language_signals,
-            voice_summary=voice_summary,
+            voice_summary=enriched_voice_summary,
             language_summary=language_summary,
             meeting_type=meeting_type,
         )
@@ -820,6 +856,7 @@ async def create_session_endpoint(
         speaker_count=speaker_count,
         voice_signal_count=len(voice_signals),
         language_signal_count=len(language_signals),
+        conversation_signal_count=len(conversation_signals),
         fusion_signal_count=len(fusion_signals),
         alert_count=len(alerts),
         report_generated=report_generated,
@@ -1098,6 +1135,27 @@ async def _call_language_agent(
                 "session_id": session_id,
                 "meeting_type": meeting_type,
                 "run_intent_classification": True,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _call_conversation_agent(
+    session_id: str,
+    segments: list[dict],
+    meeting_type: str,
+) -> dict:
+    """Call Conversation Agent POST /analyse with transcript segments."""
+    speakers = list(set(seg.get("speaker", "unknown") for seg in segments))
+    async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
+        resp = await client.post(
+            f"{CONVERSATION_AGENT_URL}/analyse",
+            json={
+                "segments": segments,
+                "speakers": speakers,
+                "content_type": meeting_type,
+                "session_id": session_id,
             },
         )
         resp.raise_for_status()

@@ -181,19 +181,28 @@ async def analyse_audio(request: AnalysisRequest):
             continue
         
         for features in features_list:
+            # All segments in this window (all speakers) for interruption detection
+            window_all_segments = [
+                s for s in transcript["segments"]
+                if s["end_ms"] > features["window_start_ms"]
+                and s["start_ms"] < features["window_end_ms"]
+            ]
             signals = rule_engine.evaluate(
                 features=features,
                 baseline=baseline,
                 speaker_id=speaker_id,
-                transcript_segments=[
-                    s for s in transcript["segments"]
-                    if s["speaker"] == speaker_id
-                    and s["end_ms"] > features["window_start_ms"]
-                    and s["start_ms"] < features["window_end_ms"]
-                ]
+                transcript_segments=window_all_segments,
             )
             all_signals.extend(signals)
     
+    # ── Step 4b: Talk time signals (session-level) ──
+    talk_time_signals = VoiceRuleEngine._emit_talk_time_signals(
+        features_by_speaker, duration_sec
+    )
+    all_signals.extend(talk_time_signals)
+    if talk_time_signals:
+        logger.info(f"[{session_id}] Talk time: {len(talk_time_signals)} imbalance signals")
+
     # ── Step 5: Build summary ──
     elapsed = time.time() - start_time
     logger.info(f"[{session_id}] Complete: {len(all_signals)} signals in {elapsed:.1f}s")

@@ -55,6 +55,27 @@ class LanguageAnalysisResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────
+# CONVERSATION AGENT  (port 8006)
+# ─────────────────────────────────────────────────────────
+
+class ConversationAnalysisRequest(BaseModel):
+    """POST /analyse — analyse transcript segments for conversation dynamics."""
+    segments: list[dict]
+    speakers: list[str] = []
+    content_type: Optional[str] = "sales_call"
+    session_id: Optional[str] = None
+    language_signals: Optional[list[dict]] = None  # Language Agent signals for cross-modal rules
+
+
+class ConversationAnalysisResponse(BaseModel):
+    """Response from Conversation Agent POST /analyse."""
+    session_id: str
+    speaker_count: int
+    signals: list[dict]                         # List of Signal.to_dict()
+    summary: dict                               # Per-speaker + session conversation stats
+
+
+# ─────────────────────────────────────────────────────────
 # FUSION AGENT  (port 8007)
 # ─────────────────────────────────────────────────────────
 
@@ -117,6 +138,7 @@ class SessionCreateResponse(BaseModel):
     speaker_count: Optional[int] = None
     voice_signal_count: int = 0
     language_signal_count: int = 0
+    conversation_signal_count: int = 0
     fusion_signal_count: int = 0
     alert_count: int = 0
     report_generated: bool = False

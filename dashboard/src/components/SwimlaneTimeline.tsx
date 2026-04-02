@@ -9,6 +9,7 @@
  */
 import { useRef, useState, useMemo, useCallback, useEffect } from "react";
 import * as d3 from "d3";
+import { Zap } from "lucide-react";
 import type { Signal, TranscriptSegment } from "../api/client";
 import {
   buildSwimlaneData,
@@ -164,6 +165,39 @@ export default function SwimlaneTimeline({
     () => d3.scaleLinear().domain(viewRange).range([0, timelineW]),
     [viewRange, timelineW]
   );
+
+  // Compute cross-speaker gaps and overlaps for latency coloring / interruption markers
+  const { gapMarkers, interruptionMarkers } = useMemo(() => {
+    // Collect all blocks with speaker info, sorted by start time
+    const allBlocks: { start_ms: number; end_ms: number; spkId: string; laneIdx: number }[] = [];
+    visibleSpeakers.forEach((spk, li) => {
+      for (const blk of spk.blocks) {
+        allBlocks.push({ start_ms: blk.start_ms, end_ms: blk.end_ms, spkId: spk.id, laneIdx: li });
+      }
+    });
+    allBlocks.sort((a, b) => a.start_ms - b.start_ms);
+
+    const gaps: { ms: number; gapMs: number; type: "fast" | "slow" }[] = [];
+    const interruptions: { ms: number; laneIdx: number }[] = [];
+
+    for (let i = 1; i < allBlocks.length; i++) {
+      const prev = allBlocks[i - 1];
+      const curr = allBlocks[i];
+      if (prev.spkId === curr.spkId) continue; // same speaker, skip
+
+      const gapMs = curr.start_ms - prev.end_ms;
+
+      if (gapMs < 0) {
+        // Overlap = interruption
+        interruptions.push({ ms: curr.start_ms, laneIdx: curr.laneIdx });
+      } else if (gapMs < 500) {
+        gaps.push({ ms: prev.end_ms, gapMs, type: "fast" });
+      } else if (gapMs > 2000) {
+        gaps.push({ ms: prev.end_ms, gapMs, type: "slow" });
+      }
+    }
+    return { gapMarkers: gaps, interruptionMarkers: interruptions };
+  }, [visibleSpeakers]);
 
   const bodyH = TOPIC_H + visibleSpeakers.length * (LANE_H + LANE_GAP) + FUSION_ROW_H;
   const totalH = HEADER_H + bodyH + 8;
@@ -487,6 +521,46 @@ export default function SwimlaneTimeline({
 
                 {/* Lane bottom border */}
                 <line x1={LABEL_W} x2={chartW - 8} y1={ly + LANE_H} y2={ly + LANE_H} stroke="#2D3348" strokeWidth={0.5} />
+              </g>
+            );
+          })}
+
+          {/* ── Response latency gap markers ── */}
+          {gapMarkers.map((g, i) => {
+            const gx = xScale(g.ms) + LABEL_W;
+            if (gx < LABEL_W || gx > chartW) return null;
+            const fillColor = g.type === "fast" ? "#10B981" : "#EF4444";
+            const lanesTop = HEADER_H + TOPIC_H;
+            const lanesBottom = fusionRowY;
+            return (
+              <rect
+                key={`gap-${i}`}
+                x={gx}
+                y={lanesTop}
+                width={Math.max(2, xScale(g.ms + g.gapMs) - xScale(g.ms))}
+                height={lanesBottom - lanesTop}
+                fill={fillColor}
+                opacity={0.12}
+                rx={1}
+                pointerEvents="none"
+              >
+                <title>{g.type === "fast" ? "Quick response" : "Long pause"} ({Math.round(g.gapMs)}ms)</title>
+              </rect>
+            );
+          })}
+
+          {/* ── Interruption markers ── */}
+          {interruptionMarkers.map((im, i) => {
+            const ix = xScale(im.ms) + LABEL_W;
+            if (ix < LABEL_W || ix > chartW) return null;
+            const iy = laneYs[im.laneIdx] ?? (HEADER_H + TOPIC_H);
+            return (
+              <g key={`int-${i}`} transform={`translate(${ix}, ${iy + 3})`}>
+                <rect x={-7} y={-1} width={14} height={14} rx={3} fill="#F59E0B" opacity={0.25} />
+                <text x={0} y={7} textAnchor="middle" dominantBaseline="central" fontSize={9} fill="#F59E0B">
+                  ⚡
+                </text>
+                <title>Interruption</title>
               </g>
             );
           })}
