@@ -304,30 +304,37 @@ async def analyse_signals(request: AnalyseRequest):
         graph_json = graph.to_json()
         key_paths = graph.get_key_paths(max_paths=5)
 
-            analytics = GraphAnalytics(graph)
-            _graph_insights = analytics.compute_all()
+        analytics = GraphAnalytics(graph)
+        graph_insights = analytics.compute_all()
 
-            _graph_signals = rule_engine.evaluate_graph_insights(
-                _graph_insights, speakers, all_fusion_signals
-            )
+        graph_signals = rule_engine.evaluate_graph_insights(
+            graph_insights, speakers, all_fusion_signals
+        )
+        all_fusion_signals.extend(graph_signals)
 
-            logger.info(
-                f"[{session_id}] Signal graph: "
-                f"{_graph_json['stats']['node_count']} nodes, "
-                f"{_graph_json['stats']['edge_count']} edges, "
-                f"{len(_key_paths)} key paths, "
-                f"{len(_graph_signals)} graph-based signals"
-            )
-        except Exception as e:
-            logger.warning(f"[{session_id}] Signal graph/analytics failed (non-fatal): {e}")
-        return _graph_json, _key_paths, _graph_insights, _graph_signals
+        logger.info(
+            f"[{session_id}] Signal graph: "
+            f"{graph_json['stats']['node_count']} nodes, "
+            f"{graph_json['stats']['edge_count']} edges, "
+            f"{len(key_paths)} key paths, "
+            f"{len(graph_signals)} graph-based signals"
+        )
+    except Exception as e:
+        logger.warning(f"[{session_id}] Signal graph/analytics failed (non-fatal): {e}")
 
-    async def _build_narrative():
-        """Generate narrative report (runs without graph analytics for speed)."""
-        if not request.generate_report:
-            return None
+    # ── Step 5: Generate narrative report ──
+    report = None
+    if request.generate_report:
         logger.info(f"[{session_id}] Generating narrative report...")
-        return await generate_session_narrative(
+
+        all_timestamps = [
+            _to_int(s.get("window_end_ms", 0))
+            for s in voice_dicts + language_dicts
+        ]
+        duration_seconds = (max(all_timestamps) - min(all_timestamps)) / 1000.0 if all_timestamps else 0
+        report_type = request.content_type or request.meeting_type or "sales_call"
+
+        report = generate_session_narrative(
             session_id=session_id,
             duration_seconds=duration_seconds,
             speakers=speakers,

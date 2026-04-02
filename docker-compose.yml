@@ -24,6 +24,14 @@
 #   6381  → Redis/Valkey (6379)
 #   8002  → Voice Agent (8001)
 #   8003  → Language Agent (8002)
+#   8004  → Fusion Agent (8007)
+#   8000  → API Gateway (8000)
+#   3006  → Dashboard (3000)
+# PORTS (host → container):
+#   5436  → PostgreSQL (5432)
+#   6381  → Redis/Valkey (6379)
+#   8002  → Voice Agent (8001)
+#   8003  → Language Agent (8002)
 #   8006  → Conversation Agent (8006)
 #   8004  → Fusion Agent (8007)
 #   8000  → API Gateway (8000)
@@ -97,6 +105,8 @@ services:
       - EXTERNAL_WHISPER_MODEL=${EXTERNAL_WHISPER_MODEL:-large-v3}
       - EXTERNAL_API_KEY=${EXTERNAL_API_KEY}
       - EXTERNAL_DIARIZE_URL=${EXTERNAL_DIARIZE_URL}
+      - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
       - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
       - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
       - PARAKEET_URL=${PARAKEET_URL}
@@ -211,6 +221,10 @@ services:
       - CONVERSATION_AGENT_URL=http://conversation:8006
       - FUSION_AGENT_URL=http://fusion:8007
       - JWT_SECRET=${JWT_SECRET:-nexus-dev-jwt-secret-2026}
+      - ZEPTOMAIL_TOKEN=${ZEPTOMAIL_TOKEN:-}
+      - FROM_EMAIL=${FROM_EMAIL:-noreply@yourdomain.com}
+      - FROM_NAME=${FROM_NAME:-NEXUS}
+      - APP_URL=${APP_URL:-http://localhost:3000}
       - JWT_ACCESS_TOKEN_EXPIRE_MINUTES=${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
       - JWT_REFRESH_TOKEN_EXPIRE_DAYS=${JWT_REFRESH_TOKEN_EXPIRE_DAYS:-30}
       - ZEPTOMAIL_TOKEN=${ZEPTOMAIL_TOKEN:-}

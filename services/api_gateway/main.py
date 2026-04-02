@@ -62,7 +62,9 @@ try:
         store_refresh_token, verify_and_consume_refresh_token,
         delete_refresh_token, cleanup_expired_tokens,
         generate_verification_token,
+        generate_verification_token,
     )
+    from email_service import is_email_configured, send_verification_email
 except ImportError:
     from services.api_gateway.database import (
         get_pool, close_pool,
@@ -225,6 +227,9 @@ class ChangePasswordRequest(BaseModel):
 class ResendVerificationRequest(BaseModel):
     email: str
 
+class ResendVerificationRequest(BaseModel):
+    email: str
+
 
 # ─────────────────────────────────────────────────────────
 # AUTH — Endpoints (public)
@@ -238,20 +243,66 @@ async def signup(body: SignupRequest):
 
     pool = await get_pool()
 
-    # Check duplicate email
+    # Check duplicate email — allow re-signup if previous user is unverified
     existing = await pool.fetchrow(
-        "SELECT id FROM users WHERE email = $1", email
+        "SELECT id, is_verified FROM users WHERE email = $1", email
     )
     if existing:
-        raise HTTPException(409, "Email already registered")
+        if existing["is_verified"]:
+            raise HTTPException(409, "Email already registered")
+        # Unverified orphan — delete so user can re-register cleanly
+        await pool.execute("DELETE FROM users WHERE id = $1", existing["id"])
+        logger.info(f"Removed unverified orphan user for {email}")
 
     password_hash = hash_password(body.password)
 
+    # If email service is configured, require email verification
+    if is_email_configured():
+        # Use a transaction — if email sending fails, rollback the user creation
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO users (org_id, email, name, full_name, password_hash, company, role)
+                    VALUES ($1, $2, $3, $3, $4, $5, 'member')
+                    RETURNING id, email, full_name, role, company
+                    """,
+                    DEV_ORG_ID, email, body.full_name, password_hash, body.company,
+                )
+
+                token = generate_verification_token()
+                await conn.execute(
+                    """
+                    INSERT INTO email_verifications (user_id, token, expires_at)
+                    VALUES ($1, $2, NOW() + INTERVAL '24 hours')
+                    """,
+                    row["id"],
+                    token,
+                )
+
+                email_sent = await send_verification_email(email, body.full_name, token)
+                if not email_sent:
+                    raise Exception("Verification email could not be sent")
+
+        return {
+            "user": {
+                "id": str(row["id"]),
+                "email": row["email"],
+                "full_name": row["full_name"],
+                "role": row["role"],
+                "company": row["company"],
+            },
+            "requires_verification": True,
+            "message": "Verification email sent. Please check your inbox to verify your email address.",
+        }
+
+    # No email configured — auto-verify and return tokens (dev mode)
+    logger.warning("Email verification disabled — auto-verifying user")
     row = await pool.fetchrow(
         """
-        INSERT INTO users (org_id, email, name, full_name, password_hash, company, role)
-        VALUES ($1, $2, $3, $3, $4, $5, 'member')
-        RETURNING id, email, full_name, role, company, avatar_url, org_id, created_at
+        INSERT INTO users (org_id, email, name, full_name, password_hash, company, role, is_verified)
+        VALUES ($1, $2, $3, $3, $4, $5, 'member', true)
+        RETURNING id, email, full_name, role, company
         """,
         DEV_ORG_ID, email, body.full_name, password_hash, body.company,
     )
@@ -314,6 +365,7 @@ async def login(body: LoginRequest):
     row = await pool.fetchrow(
         """
         SELECT id, email, full_name, role, company, avatar_url, org_id,
+               password_hash, is_active, is_verified, created_at, last_login_at
                password_hash, is_active, is_verified, created_at, last_login_at
         FROM users WHERE email = $1
         """,
@@ -475,6 +527,100 @@ async def refresh(body: RefreshRequest):
         "access_token": access_token,
         "refresh_token": new_refresh,
     }
+
+
+# ─────────────────────────────────────────────────────────
+# AUTH — Email verification endpoints (public)
+# ─────────────────────────────────────────────────────────
+
+@app.get("/auth/verify-email")
+async def verify_email(token: str = Query(...)):
+    """Verify a user's email address using the token from the verification email."""
+    pool = await get_pool()
+
+    row = await pool.fetchrow(
+        """
+        SELECT ev.id AS verification_id, ev.user_id, ev.expires_at, ev.used_at,
+               u.email, u.is_verified
+        FROM email_verifications ev
+        JOIN users u ON u.id = ev.user_id
+        WHERE ev.token = $1
+        """,
+        token,
+    )
+
+    if not row:
+        raise HTTPException(400, "Invalid verification token.")
+
+    if row["used_at"] is not None:
+        raise HTTPException(400, "This verification link has already been used.")
+
+    # Compare expiry — handle both naive and aware timestamps from DB
+    expires_at = row["expires_at"]
+    now = datetime.now(timezone.utc)
+    if expires_at.tzinfo is None:
+        now = now.replace(tzinfo=None)
+    if expires_at < now:
+        raise HTTPException(400, "This verification link has expired. Please request a new one.")
+
+    # Mark user as verified and consume the token
+    await pool.execute(
+        "UPDATE users SET is_verified = true WHERE id = $1", row["user_id"]
+    )
+    await pool.execute(
+        "UPDATE email_verifications SET used_at = NOW() WHERE id = $1",
+        row["verification_id"],
+    )
+
+    return {"success": True, "message": "Email verified successfully. You can now log in."}
+
+
+@app.post("/auth/resend-verification")
+async def resend_verification(body: ResendVerificationRequest):
+    """Resend the verification email for an unverified account."""
+    email = body.email.strip().lower()
+
+    pool = await get_pool()
+
+    user = await pool.fetchrow(
+        "SELECT id, email, full_name, is_verified FROM users WHERE email = $1",
+        email,
+    )
+
+    if not user:
+        # Don't reveal whether the email exists
+        return {"message": "If that email is registered and unverified, a verification email has been sent."}
+
+    if user["is_verified"]:
+        return {"message": "If that email is registered and unverified, a verification email has been sent."}
+
+    # Rate limit: max 3 verification emails per hour
+    recent_count = await pool.fetchval(
+        """
+        SELECT COUNT(*) FROM email_verifications
+        WHERE user_id = $1 AND created_at > NOW() - INTERVAL '1 hour'
+        """,
+        user["id"],
+    )
+    if recent_count >= 3:
+        raise HTTPException(
+            429, "Too many verification emails requested. Please try again later."
+        )
+
+    token = generate_verification_token()
+    await pool.execute(
+        """
+        INSERT INTO email_verifications (user_id, token, expires_at)
+        VALUES ($1, $2, NOW() + INTERVAL '24 hours')
+        """,
+        user["id"],
+        token,
+    )
+    email_sent = await send_verification_email(user["email"], user["full_name"], token)
+    if not email_sent:
+        raise HTTPException(502, "Failed to send verification email. Please try again later.")
+
+    return {"message": "Verification email resent."}
 
 
 # ─────────────────────────────────────────────────────────
@@ -652,8 +798,8 @@ async def create_session_endpoint(
         )
         logger.info(
             f"[{session_id}] Transcription: "
-            f"{transcript_result.get('duration_seconds', 0):.0f}s, "
-            f"{len(transcript_result.get('speakers', []))} speakers"
+            f"{voice_result.get('duration_seconds', 0):.0f}s, "
+            f"{len(voice_result.get('speakers', []))} speakers"
         )
     except Exception as e:
         logger.error(f"[{session_id}] Voice Agent transcription failed: {e}")
@@ -670,11 +816,6 @@ async def create_session_endpoint(
     voice_summary = voice_result.get("summary", {})
     speaker_count = len(voice_speakers)
 
-    language_signals = language_result.get("signals", []) if language_result else []
-    language_summary = language_result.get("summary", {}) if language_result else {}
-    if language_result:
-        logger.info(f"[{session_id}] Language Agent: {len(language_signals)} signals")
-
     # Persist speakers (blocking — required for foreign key on signals)
     speaker_map = {}
     try:
@@ -682,13 +823,12 @@ async def create_session_endpoint(
     except Exception as e:
         logger.warning(f"[{session_id}] Speaker upsert failed: {e}")
 
-    # Optimization 7: Persist voice signals, language signals, transcript in background
-    async def _bg_persist_voice():
-        try:
-            count = await insert_signals(session_id, voice_signals, speaker_map)
-            logger.info(f"[{session_id}] Persisted {count} voice signals")
-        except Exception as e:
-            logger.warning(f"[{session_id}] Voice signal persist failed: {e}")
+    # Persist voice signals
+    try:
+        count = await insert_signals(session_id, voice_signals, speaker_map)
+        logger.info(f"[{session_id}] Persisted {count} voice signals")
+    except Exception as e:
+        logger.warning(f"[{session_id}] Voice signal persist failed: {e}")
 
     # ── Track agent statuses ──
     agent_status = {

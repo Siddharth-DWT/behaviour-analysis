@@ -77,6 +77,7 @@ export default function App() {
           </PublicRoute>
         }
       />
+      <Route path="/verify-email" element={<VerifyEmail />} />
 
       {/* Email verification (accessible regardless of auth state) */}
       <Route path="/verify-email" element={<VerifyEmail />} />

@@ -1,3 +1,8 @@
+-- ============================================================================
+-- NEXUS Auth Schema - Migration 03
+-- Adds email verification table for signup flow
+-- ============================================================================
+
 CREATE TABLE IF NOT EXISTS email_verifications (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES users(id) ON DELETE CASCADE,

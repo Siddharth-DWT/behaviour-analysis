@@ -126,18 +126,22 @@ uvicorn main:app --port 8000 --app-dir services/api-gateway
 
 ### External GPU APIs (Optional)
 
-NEXUS can optionally use GPU-accelerated Whisper STT and Coqui TTS services
-running on a remote server with NVIDIA RTX 5090. Set these env vars to enable:
+NEXUS can optionally use GPU-accelerated Whisper STT, Coqui TTS, and pyannote
+diarization services running on a remote server with NVIDIA RTX 5090. Set these env vars to enable:
 
 ```bash
 export EXTERNAL_WHISPER_URL=http://110.227.200.12:8008   # GPU Whisper STT
 export EXTERNAL_TTS_URL=http://110.227.200.12:8009       # Coqui XTTS v2
+export EXTERNAL_DIARIZE_URL=http://110.227.200.12:8008   # GPU pyannote diarization
 export EXTERNAL_API_KEY=your-api-key-here
 export EXTERNAL_WHISPER_MODEL=base                        # or large-v3 for best accuracy
 ```
 
 - **Whisper STT**: Voice Agent auto-detects and uses the GPU API for transcription
   (falls back to local faster-whisper if unreachable)
+- **GPU Diarization**: Voice Agent uses the GPU pyannote API at `/diarize` for speaker
+  separation. When both Whisper and diarization are on GPU, they run in parallel via
+  ThreadPoolExecutor. Falls back to local KMeans/pyannote if unreachable.
 - **Coqui TTS**: Used by `test_pipeline.py --use-external-tts` for natural-sounding
   test audio with voice cloning (distinct speakers)
 - **WebSocket STT**: Available at `ws://server:8008/ws/transcribe` for Phase 4 real-time mode

@@ -284,8 +284,6 @@ export async function getHealth(): Promise<{
   return request("/health");
 }
 
-// ── Email Verification ──
-
 export async function verifyEmail(token: string): Promise<{ success: boolean; message: string }> {
   const res = await fetch(`${API_BASE}/auth/verify-email?token=${token}`);
   if (!res.ok) {

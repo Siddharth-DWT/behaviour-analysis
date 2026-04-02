@@ -4,8 +4,9 @@ Wraps the GPU-accelerated Whisper STT and Coqui TTS services
 running on the external GPU server.
 
 These are optional accelerators:
-  - Whisper STT: GPU-powered transcription (replaces local faster-whisper)
-  - Coqui TTS:  Neural TTS with voice cloning (replaces macOS `say`)
+  - Whisper STT:   GPU-powered transcription (replaces local faster-whisper)
+  - Coqui TTS:     Neural TTS with voice cloning (replaces macOS `say`)
+  - Diarization:   GPU-powered pyannote speaker diarization (replaces local CPU pyannote/KMeans)
 
 Environment variables:
   EXTERNAL_WHISPER_URL   e.g. http://your-gpu-server:8008
@@ -45,6 +46,16 @@ def is_whisper_available() -> bool:
 def is_tts_available() -> bool:
     """Check if external Coqui TTS API is configured."""
     return bool(TTS_URL)
+
+
+def is_assemblyai_available() -> bool:
+    """Check if AssemblyAI API is configured."""
+    return bool(ASSEMBLYAI_API_KEY)
+
+
+def is_deepgram_available() -> bool:
+    """Check if Deepgram API is configured."""
+    return bool(DEEPGRAM_API_KEY)
 
 
 def is_diarize_available() -> bool:
@@ -557,44 +568,72 @@ class DiarizeClient:
         min_speakers: int = 2,
         max_speakers: int = 8,
         num_speakers: int = 0,
+        audio_data: tuple = None,
     ) -> dict:
         """
         Diarize an audio file via the external GPU API.
 
+        The server expects WAV audio. If audio_data (numpy_array, sr) is
+        provided, it is exported as in-memory WAV and sent directly —
+        this avoids the server failing on container formats like MP4/WebM
+        that require FFmpeg/libtorchcodec to decode.
+
         Args:
-            audio_path: Path to audio file
+            audio_path: Path to audio file (used when audio_data is None)
             min_speakers: Minimum expected speakers
             max_speakers: Maximum expected speakers
             num_speakers: Exact count (0 = auto-detect using min/max)
+            audio_data: Optional (numpy_array, sample_rate) tuple — pre-loaded
+                        16 kHz mono audio. When provided, audio_path is only
+                        used for logging.
 
         Returns:
             {
                 "speakers": ["SPEAKER_00", ...],
-                "timeline": [{"speaker": str, "start": float, "end": float}, ...],
+                "timeline": [{"speaker": str, "start": float, "end": float, "duration": float}, ...],
                 "num_speakers": int,
                 "duration": float,
                 "processing_time": float,
+                "mode": str,               # "exclusive" or "overlap"
+                "params_used": dict,       # clustering/segmentation thresholds
             }
         """
         audio_file = Path(audio_path)
-        if not audio_file.exists():
-            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        file_label = audio_file.name
 
         logger.info(
-            f"Diarizing via external GPU API: {audio_file.name} "
+            f"Diarizing via external GPU API: {file_label} "
             f"(min={min_speakers}, max={max_speakers}, exact={num_speakers})"
         )
 
         start_time = time.time()
 
-        with open(audio_path, "rb") as f:
-            files = {"file": (audio_file.name, f, "audio/wav")}
-            data = {
-                "min_speakers": str(min_speakers),
-                "max_speakers": str(max_speakers),
-                "num_speakers": str(num_speakers),
-            }
+        data = {
+            "min_speakers": str(min_speakers),
+            "max_speakers": str(max_speakers),
+            "num_speakers": str(num_speakers),
+        }
 
+        if audio_data is not None:
+            # Export pre-loaded numpy audio to in-memory WAV bytes
+            import numpy as np
+            y, sr = audio_data
+            wav_buf = io.BytesIO()
+            y_int16 = np.clip(y * 32767, -32768, 32767).astype(np.int16)
+            with wave.open(wav_buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(sr)
+                wf.writeframes(y_int16.tobytes())
+            wav_buf.seek(0)
+            files = {"file": ("audio.wav", wav_buf, "audio/wav")}
+            logger.debug(f"Sending pre-loaded audio as WAV ({len(y_int16)} samples, {sr} Hz)")
+        else:
+            if not audio_file.exists():
+                raise FileNotFoundError(f"Audio file not found: {audio_path}")
+            files = {"file": (file_label, open(audio_path, "rb"), "audio/wav")}
+
+        try:
             with httpx.Client(timeout=self.timeout) as client:
                 resp = client.post(
                     f"{self.base_url}/diarize",
@@ -602,6 +641,10 @@ class DiarizeClient:
                     data=data,
                     headers=self._headers,
                 )
+        finally:
+            # Close the file handle if we opened one
+            if audio_data is None and "file" in files:
+                files["file"][1].close()
 
         elapsed = time.time() - start_time
 
@@ -620,6 +663,496 @@ class DiarizeClient:
         )
 
         return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# ASSEMBLYAI CLIENT (transcription + diarization in one call)
+# ═══════════════════════════════════════════════════════════════
+
+class AssemblyAIClient:
+    """
+    Transcription + speaker diarization via AssemblyAI Universal-3-Pro.
+
+    AssemblyAI provides both transcription and diarization in a single
+    async API call, replacing both Whisper and Deepgram/pyannote.
+
+    Flow: Upload audio → Submit job → Poll until complete → Return result.
+
+    Usage:
+        client = AssemblyAIClient(api_key="...")
+        result = client.transcribe_and_diarize("path/to/audio.mp4")
+        print(result["segments"])    # transcript segments with speaker labels
+        print(result["num_speakers"])
+    """
+
+    BASE_URL = "https://api.assemblyai.com/v2"
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        timeout: int = DEFAULT_TIMEOUT,
+        poll_interval: int = 5,
+    ):
+        self.api_key = api_key or ASSEMBLYAI_API_KEY
+        self.timeout = timeout
+        self.poll_interval = poll_interval
+
+        if not self.api_key:
+            raise ValueError(
+                "AssemblyAI API key not configured. Set ASSEMBLYAI_API_KEY env var."
+            )
+
+    @property
+    def _headers(self) -> dict:
+        return {"Authorization": self.api_key}
+
+    def is_healthy(self) -> bool:
+        """Check if AssemblyAI API is reachable."""
+        try:
+            resp = httpx.get(
+                f"{self.BASE_URL}/transcript",
+                headers=self._headers,
+                params={"limit": 1},
+                timeout=10,
+            )
+            healthy = resp.status_code in (200, 401, 403)
+            if healthy:
+                logger.info("AssemblyAI API reachable")
+            return healthy
+        except Exception as e:
+            logger.warning(f"AssemblyAI health check failed: {e}")
+        return False
+
+    def _upload(self, audio_path: str) -> str:
+        """Upload audio file and return the CDN URL."""
+        audio_file = Path(audio_path)
+        if not audio_file.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        logger.info(f"Uploading to AssemblyAI: {audio_file.name}")
+        start = time.time()
+
+        with open(audio_path, "rb") as f:
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.post(
+                    f"{self.BASE_URL}/upload",
+                    headers={**self._headers, "Content-Type": "application/octet-stream"},
+                    content=f,
+                )
+
+        if resp.status_code != 200:
+            raise RuntimeError(f"AssemblyAI upload error ({resp.status_code}): {resp.text[:500]}")
+
+        upload_url = resp.json()["upload_url"]
+        logger.info(f"Upload complete in {time.time() - start:.1f}s")
+        return upload_url
+
+    def _submit(self, audio_url: str) -> str:
+        """Submit a transcription job and return the transcript ID."""
+        payload = {
+            "audio_url": audio_url,
+            "speaker_labels": True,
+            "speech_models": ["universal-3-pro"],
+        }
+
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.post(
+                f"{self.BASE_URL}/transcript",
+                headers={**self._headers, "Content-Type": "application/json"},
+                json=payload,
+            )
+
+        if resp.status_code != 200:
+            raise RuntimeError(f"AssemblyAI submit error ({resp.status_code}): {resp.text[:500]}")
+
+        data = resp.json()
+        tid = data.get("id")
+        if not tid:
+            raise RuntimeError(f"AssemblyAI submit returned no ID: {data}")
+
+        logger.info(f"AssemblyAI job submitted: {tid}")
+        return tid
+
+    def _poll(self, transcript_id: str, max_wait: int = 600) -> dict:
+        """Poll until transcription is complete. Returns full response."""
+        url = f"{self.BASE_URL}/transcript/{transcript_id}"
+        elapsed = 0
+
+        while elapsed < max_wait:
+            time.sleep(self.poll_interval)
+            elapsed += self.poll_interval
+
+            with httpx.Client(timeout=30) as client:
+                resp = client.get(url, headers=self._headers)
+
+            if resp.status_code != 200:
+                raise RuntimeError(f"AssemblyAI poll error ({resp.status_code})")
+
+            data = resp.json()
+            status = data.get("status")
+
+            if status == "completed":
+                logger.info(f"AssemblyAI transcription completed in {elapsed}s")
+                return data
+            elif status == "error":
+                raise RuntimeError(f"AssemblyAI transcription failed: {data.get('error', 'unknown')}")
+
+        raise TimeoutError(f"AssemblyAI transcription timed out after {max_wait}s")
+
+    def transcribe_and_diarize(self, audio_path: str) -> dict:
+        """
+        Upload, transcribe, and diarize audio in one flow.
+
+        Returns a result dict compatible with the voice agent pipeline:
+            {
+                "duration_seconds": float,
+                "backend": "assemblyai",
+                "model": "universal-3-pro",
+                "segments": [
+                    {
+                        "speaker": "Speaker_0",
+                        "start_ms": int,
+                        "end_ms": int,
+                        "text": str,
+                        "words": [{"word": str, "start": float, "end": float, "probability": float}],
+                    }
+                ],
+                "num_speakers": int,
+                "speakers": ["Speaker_0", ...],
+            }
+        """
+        start_time = time.time()
+        file_label = Path(audio_path).name
+
+        logger.info(f"AssemblyAI transcribe+diarize: {file_label}")
+
+        # Upload → Submit → Poll
+        upload_url = self._upload(audio_path)
+        transcript_id = self._submit(upload_url)
+        result = self._poll(transcript_id)
+
+        total_time = time.time() - start_time
+
+        # Convert AssemblyAI response to NEXUS internal format
+        # Speaker labels: A→Speaker_0, B→Speaker_1, etc.
+        speaker_map = {}
+
+        segments = []
+        for utt in result.get("utterances", []):
+            raw_speaker = utt["speaker"]
+            if raw_speaker not in speaker_map:
+                speaker_map[raw_speaker] = f"Speaker_{len(speaker_map)}"
+            speaker_label = speaker_map[raw_speaker]
+
+            # Collect words for this utterance
+            words = []
+            for w in utt.get("words", []):
+                words.append({
+                    "word": w["text"],
+                    "start": w["start"] / 1000.0,
+                    "end": w["end"] / 1000.0,
+                    "probability": round(w.get("confidence", 0), 3),
+                })
+
+            segments.append({
+                "speaker": speaker_label,
+                "start_ms": utt["start"],
+                "end_ms": utt["end"],
+                "text": utt["text"],
+                "words": words,
+            })
+
+        duration = result.get("audio_duration", 0)
+        speakers = sorted(set(speaker_map.values()))
+
+        logger.info(
+            f"AssemblyAI complete: {duration}s audio, {len(segments)} segments, "
+            f"{len(speakers)} speakers, total={total_time:.1f}s"
+        )
+
+        return {
+            "duration_seconds": duration,
+            "backend": "assemblyai",
+            "model": "universal-3-pro",
+            "segments": segments,
+            "num_speakers": len(speakers),
+            "speakers": speakers,
+            "processing_time": total_time,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# DEEPGRAM DIARIZATION CLIENT
+# ═══════════════════════════════════════════════════════════════
+
+class DeepgramDiarizeClient:
+    """
+    Speaker diarization via Deepgram Nova-3 API.
+
+    Deepgram provides transcription + diarization in a single call.
+    We use it here only for the diarization timeline — the transcript
+    from Whisper large-v3 is kept as the primary source of truth.
+
+    Usage:
+        client = DeepgramDiarizeClient(api_key="...")
+        result = client.diarize("path/to/audio.wav")
+        print(result["num_speakers"])
+        print(result["timeline"])
+    """
+
+    BASE_URL = "https://api.deepgram.com/v1/listen"
+
+    # Map file extensions to MIME types Deepgram accepts
+    MIME_TYPES = {
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+        ".ogg": "audio/ogg",
+        ".flac": "audio/flac",
+        ".aac": "audio/aac",
+        ".opus": "audio/opus",
+    }
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        timeout: int = DIARIZE_TIMEOUT,
+    ):
+        self.api_key = api_key or DEEPGRAM_API_KEY
+        self.timeout = timeout
+
+        if not self.api_key:
+            raise ValueError(
+                "Deepgram API key not configured. Set DEEPGRAM_API_KEY env var."
+            )
+
+    def is_healthy(self) -> bool:
+        """Check if Deepgram API is reachable."""
+        try:
+            resp = httpx.get(
+                "https://api.deepgram.com/v1/projects",
+                headers={"Authorization": f"Token {self.api_key}"},
+                timeout=10,
+            )
+            healthy = resp.status_code in (200, 401, 403)
+            if healthy:
+                logger.info("Deepgram API reachable")
+            return healthy
+        except Exception as e:
+            logger.warning(f"Deepgram health check failed: {e}")
+        return False
+
+    def diarize(
+        self,
+        audio_path: str,
+        min_speakers: int = 2,
+        max_speakers: int = 8,
+        num_speakers: int = 0,
+        audio_data: tuple = None,
+    ) -> dict:
+        """
+        Diarize audio via Deepgram Nova-3.
+
+        Returns a result dict matching the same format as DiarizeClient
+        so it can be used as a drop-in replacement.
+
+        Returns:
+            {
+                "speakers": ["Speaker_0", ...],
+                "timeline": [{"speaker": str, "start": float, "end": float, "duration": float}, ...],
+                "num_speakers": int,
+                "duration": float,
+                "processing_time": float,
+            }
+        """
+        audio_file = Path(audio_path)
+        file_label = audio_file.name
+
+        logger.info(
+            f"Diarizing via Deepgram Nova-3: {file_label} "
+            f"(min={min_speakers}, max={max_speakers}, exact={num_speakers})"
+        )
+
+        start_time = time.time()
+
+        # Build query params
+        params = {
+            "diarize": "true",
+            "punctuate": "true",
+            "utterances": "true",
+            "model": "nova-3",
+            "language": "en",
+        }
+
+        headers = {"Authorization": f"Token {self.api_key}"}
+
+        if audio_data is not None:
+            # Export pre-loaded numpy audio to WAV bytes
+            import numpy as np
+            y, sr = audio_data
+            wav_buf = io.BytesIO()
+            y_int16 = np.clip(y * 32767, -32768, 32767).astype(np.int16)
+            with wave.open(wav_buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(y_int16.tobytes())
+            content = wav_buf.getvalue()
+            headers["Content-Type"] = "audio/wav"
+        else:
+            if not audio_file.exists():
+                raise FileNotFoundError(f"Audio file not found: {audio_path}")
+            suffix = audio_file.suffix.lower()
+            headers["Content-Type"] = self.MIME_TYPES.get(suffix, "audio/wav")
+            with open(audio_path, "rb") as f:
+                content = f.read()
+
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.post(
+                self.BASE_URL,
+                params=params,
+                headers=headers,
+                content=content,
+            )
+
+        elapsed = time.time() - start_time
+
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Deepgram API error ({resp.status_code}): {resp.text[:500]}"
+            )
+
+        data = resp.json()
+        results = data.get("results", {})
+        utterances = results.get("utterances", [])
+        metadata = data.get("metadata", {})
+        audio_duration = metadata.get("duration", 0)
+
+        # Convert Deepgram utterances to our standard timeline format
+        timeline = []
+        speakers_seen = set()
+        for utt in utterances:
+            spk = utt["speaker"]
+            speaker_label = f"Speaker_{spk}"
+            speakers_seen.add(speaker_label)
+            timeline.append({
+                "speaker": speaker_label,
+                "start": utt["start"],
+                "end": utt["end"],
+                "duration": round(utt["end"] - utt["start"], 3),
+            })
+
+        num_detected = len(speakers_seen)
+
+        logger.info(
+            f"Deepgram diarization complete: {num_detected} speakers, "
+            f"{len(timeline)} turns, "
+            f"API time={elapsed:.1f}s"
+        )
+
+        return {
+            "speakers": sorted(speakers_seen),
+            "timeline": timeline,
+            "num_speakers": num_detected,
+            "duration": audio_duration,
+            "processing_time": elapsed,
+        }
+
+    def transcribe_and_diarize(self, audio_path: str) -> dict:
+        """
+        Transcribe + diarize via Deepgram Nova-3 in a single API call.
+
+        Returns a result dict compatible with the voice agent pipeline
+        (same format as AssemblyAIClient.transcribe_and_diarize).
+        """
+        audio_file = Path(audio_path)
+        file_label = audio_file.name
+
+        logger.info(f"Deepgram transcribe+diarize: {file_label}")
+
+        start_time = time.time()
+
+        params = {
+            "diarize": "true",
+            "punctuate": "true",
+            "utterances": "true",
+            "model": "nova-3",
+            "language": "en",
+            "smart_format": "true",
+        }
+
+        headers = {"Authorization": f"Token {self.api_key}"}
+
+        if not audio_file.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        suffix = audio_file.suffix.lower()
+        headers["Content-Type"] = self.MIME_TYPES.get(suffix, "audio/wav")
+        with open(audio_path, "rb") as f:
+            content = f.read()
+
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.post(
+                self.BASE_URL,
+                params=params,
+                headers=headers,
+                content=content,
+            )
+
+        elapsed = time.time() - start_time
+
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Deepgram API error ({resp.status_code}): {resp.text[:500]}"
+            )
+
+        data = resp.json()
+        results = data.get("results", {})
+        utterances = results.get("utterances", [])
+        metadata = data.get("metadata", {})
+        audio_duration = metadata.get("duration", 0)
+
+        # Convert Deepgram utterances → NEXUS segment format
+        segments = []
+        speakers_seen = set()
+        for utt in utterances:
+            speaker_label = f"Speaker_{utt['speaker']}"
+            speakers_seen.add(speaker_label)
+
+            words = []
+            for w in utt.get("words", []):
+                words.append({
+                    "word": w.get("punctuated_word", w.get("word", "")),
+                    "start": w["start"],
+                    "end": w["end"],
+                    "probability": round(w.get("confidence", 0), 3),
+                })
+
+            segments.append({
+                "speaker": speaker_label,
+                "start_ms": int(utt["start"] * 1000),
+                "end_ms": int(utt["end"] * 1000),
+                "text": utt["transcript"],
+                "words": words,
+            })
+
+        speakers = sorted(speakers_seen)
+
+        logger.info(
+            f"Deepgram complete: {audio_duration}s audio, {len(segments)} segments, "
+            f"{len(speakers)} speakers, total={elapsed:.1f}s"
+        )
+
+        return {
+            "duration_seconds": audio_duration,
+            "backend": "deepgram",
+            "model": "nova-3",
+            "segments": segments,
+            "num_speakers": len(speakers),
+            "speakers": speakers,
+            "processing_time": elapsed,
+        }
 
 
 # ═══════════════════════════════════════════════════════════════
