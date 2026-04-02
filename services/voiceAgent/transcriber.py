@@ -146,17 +146,14 @@ class Transcriber:
         if backend in ("auto", "deepgram") and DEEPGRAM_API_KEY:
             self._init_deepgram()
 
-        # GPU server endpoints (only one can run at a time to avoid OOM):
-        # Uncomment the one you want to test, keep others commented.
-
-        # if backend in ("auto", "whisper-pyannote") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
-        #     self._init_whisper_pyannote()
+        if backend in ("auto", "whisper-pyannote") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
+            self._init_whisper_pyannote()
 
         if backend in ("auto", "parakeet") and PARAKEET_URL:
             self._init_parakeet()
 
-        # if backend in ("auto", "whisper") and EXTERNAL_WHISPER_URL:
-        #     self._init_external()
+        if backend in ("auto", "whisper") and EXTERNAL_WHISPER_URL:
+            self._init_external()
 
     def _init_whisper_pyannote(self):
         """Try to initialise Whisper+Pyannote combined endpoint (single call, GPU)."""

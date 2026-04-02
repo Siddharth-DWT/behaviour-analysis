@@ -99,6 +99,7 @@ FUSION_AGENT_URL = os.getenv("FUSION_AGENT_URL", "http://localhost:8007")
 
 # ── Upload directory ──
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/recordings"))
+RECORDING_RETENTION_DAYS = int(os.getenv("RECORDING_RETENTION_DAYS", "3"))
 
 # ── HTTP client timeout (Voice Agent with Whisper can be slow) ──
 AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "1800"))  # 30 minutes
@@ -120,10 +121,28 @@ app.add_middleware(
 )
 
 
+def _cleanup_old_recordings():
+    """Delete recording files older than RECORDING_RETENTION_DAYS."""
+    if not UPLOAD_DIR.exists():
+        return
+    cutoff = time.time() - (RECORDING_RETENTION_DAYS * 86400)
+    removed = 0
+    for f in UPLOAD_DIR.iterdir():
+        if f.is_file() and f.stat().st_mtime < cutoff:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        logger.info(f"Cleaned up {removed} recording(s) older than {RECORDING_RETENTION_DAYS} days")
+
+
 @app.on_event("startup")
 async def startup():
     logger.info("Starting NEXUS API Gateway...")
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    _cleanup_old_recordings()
 
     try:
         await get_pool()
@@ -587,12 +606,22 @@ async def create_session_endpoint(
     file_name = f"{session_id}{suffix}"
     file_path = UPLOAD_DIR / file_name
 
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    content = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(content)
+    MAX_FILE_SIZE = 300 * 1024 * 1024  # 300 MB
 
-    file_size_mb = len(content) / (1024 * 1024)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Stream to disk with size check — avoid reading entire file into memory
+    file_size = 0
+    with open(file_path, "wb") as f:
+        while chunk := await file.read(1024 * 1024):  # 1 MB chunks
+            file_size += len(chunk)
+            if file_size > MAX_FILE_SIZE:
+                f.close()
+                file_path.unlink(missing_ok=True)
+                raise HTTPException(413, f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)} MB.")
+            f.write(chunk)
+
+    file_size_mb = file_size / (1024 * 1024)
     logger.info(f"[{session_id}] Uploaded {filename} ({file_size_mb:.1f} MB)")
 
     if not title:
@@ -778,6 +807,9 @@ async def create_session_endpoint(
     )
 
     logger.info(f"[{session_id}] Pipeline complete (status={final_status}, agents={agent_status})")
+
+    # Cleanup old recordings in background
+    _cleanup_old_recordings()
 
     return SessionCreateResponse(
         session_id=session_id,
