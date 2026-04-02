@@ -27,9 +27,10 @@ class NexusConfig:
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
 
-    # External GPU APIs (optional — accelerates transcription & TTS)
+    # External GPU APIs (optional — accelerates transcription, TTS & diarization)
     external_whisper_url: str = os.getenv("EXTERNAL_WHISPER_URL", "")
     external_tts_url: str = os.getenv("EXTERNAL_TTS_URL", "")
+    external_diarize_url: str = os.getenv("EXTERNAL_DIARIZE_URL", "")
     external_api_key: str = os.getenv("EXTERNAL_API_KEY", "")
     external_whisper_model: str = os.getenv("EXTERNAL_WHISPER_MODEL", "base")
 
@@ -55,6 +56,11 @@ class NexusConfig:
     def has_external_tts(self) -> bool:
         """Check if external TTS API is configured."""
         return bool(self.external_tts_url and self.external_api_key)
+
+    @property
+    def has_external_diarize(self) -> bool:
+        """Check if external GPU diarization API is configured."""
+        return bool(self.external_diarize_url)
 
     @property
     def has_llm_configured(self) -> bool:
@@ -84,6 +90,8 @@ class NexusConfig:
             issues.append("EXTERNAL_WHISPER_URL set but EXTERNAL_API_KEY missing")
         if self.external_tts_url and not self.external_api_key:
             issues.append("EXTERNAL_TTS_URL set but EXTERNAL_API_KEY missing")
+        if self.external_diarize_url and not self.external_api_key:
+            issues.append("EXTERNAL_DIARIZE_URL set but EXTERNAL_API_KEY missing")
         return issues
 
 
