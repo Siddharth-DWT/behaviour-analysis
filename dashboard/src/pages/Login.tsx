@@ -13,6 +13,18 @@ export default function Login() {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [needsVerification, setNeedsVerification] = useState(false);
+  const [resendStatus, setResendStatus] = useState<string | null>(null);
+
+  const handleResendVerification = async () => {
+    setResendStatus(null);
+    try {
+      await resendVerification(email);
+      setResendStatus("Verification email sent! Check your inbox.");
+    } catch (err) {
+      setResendStatus((err as Error).message || "Failed to resend");
+    }
+  };
 
   // Email not verified state
   const [notVerified, setNotVerified] = useState(false);
@@ -62,19 +74,32 @@ export default function Login() {
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError(null);
+<<<<<<< HEAD
     setNotVerified(false);
     setResendMessage(null);
+=======
+    setNeedsVerification(false);
+    setResendStatus(null);
+>>>>>>> 6a3ef65253290b82d23c749daf2cc5b90f16c172
     setLoading(true);
     try {
       await login(email, password);
       navigate("/sessions", { replace: true });
     } catch (err) {
+<<<<<<< HEAD
       const message = (err as Error).message || "Login failed";
       // Detect 403 "not verified" error from the backend
       if (message.includes("403") && message.toLowerCase().includes("not verified")) {
         setNotVerified(true);
       } else {
         setError(message);
+=======
+      const msg = (err as Error).message || "Login failed";
+      if (msg.toLowerCase().includes("not verified")) {
+        setNeedsVerification(true);
+      } else {
+        setError(msg);
+>>>>>>> 6a3ef65253290b82d23c749daf2cc5b90f16c172
       }
     } finally {
       setLoading(false);
@@ -112,6 +137,7 @@ export default function Login() {
             </div>
           )}
 
+<<<<<<< HEAD
           {notVerified && (
             <div className="mb-4 rounded border border-yellow-500/30 bg-yellow-500/10 px-3 py-3 text-xs">
               <div className="mb-2 flex items-center gap-1.5 text-yellow-400">
@@ -134,6 +160,25 @@ export default function Login() {
                 {resendCooldown > 0
                   ? `Resend verification email (${resendCooldown}s)`
                   : "Resend verification email"}
+=======
+          {needsVerification && (
+            <div className="mb-4 rounded border border-yellow-500/30 bg-yellow-500/10 px-3 py-3">
+              <p className="mb-2 text-xs text-yellow-400">
+                Your email hasn't been verified yet.
+              </p>
+              {resendStatus && (
+                <p className="mb-2 text-xs text-nexus-text-secondary">
+                  {resendStatus}
+                </p>
+              )}
+              <button
+                type="button"
+                onClick={handleResendVerification}
+                className="flex items-center gap-1.5 text-xs font-medium text-yellow-400 hover:text-yellow-300"
+              >
+                <RefreshCw className="h-3 w-3" />
+                Resend verification email
+>>>>>>> 6a3ef65253290b82d23c749daf2cc5b90f16c172
               </button>
             </div>
           )}
