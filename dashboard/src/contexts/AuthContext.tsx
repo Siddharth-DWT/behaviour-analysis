@@ -154,8 +154,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [scheduleRefresh]
   );
 
-  // Restore session on mount
+  // Restore session on mount (guarded against React StrictMode double-fire)
+  const restoreAttempted = useRef(false);
   useEffect(() => {
+    if (restoreAttempted.current) return;
+    restoreAttempted.current = true;
+
     const storedRefresh = getStoredRefreshToken();
     if (!storedRefresh) {
       setIsLoading(false);
@@ -200,15 +204,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     ) => {
       const data = await authRequest<{
         user: User;
-        access_token: string;
-        refresh_token: string;
+        access_token?: string;
+        refresh_token?: string;
+        requires_verification?: boolean;
+        message?: string;
       }>("/auth/signup", {
         email,
         password,
         full_name: fullName,
         company: company || undefined,
       });
-      handleAuthResponse(data);
+
+      if (data.requires_verification) {
+        // Don't auto-login — throw a special error the Signup page will catch
+        throw Object.assign(new Error(data.message || "Please verify your email"), {
+          requiresVerification: true,
+          email,
+        });
+      }
+
+      // Normal flow (email not configured — auto-verified)
+      handleAuthResponse(data as { user: User; access_token: string; refresh_token: string });
     },
     [handleAuthResponse]
   );

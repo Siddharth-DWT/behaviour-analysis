@@ -26,9 +26,13 @@ def load_audio(path: str, sr: int = 16000) -> tuple[np.ndarray, int]:
     import librosa
 
     # Fast path: librosa handles WAV, FLAC, OGG natively via soundfile
+    import warnings
     try:
-        y, out_sr = librosa.load(path, sr=sr, mono=True)
-        return y, out_sr
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="PySoundFile failed")
+            warnings.filterwarnings("ignore", message="librosa.core.audio.__audioread_load")
+            y, out_sr = librosa.load(path, sr=sr, mono=True)
+            return y, out_sr
     except Exception:
         pass
 

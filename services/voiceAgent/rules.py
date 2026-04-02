@@ -1,6 +1,6 @@
 """
 NEXUS Voice Agent - Rule Engine
-Implements 5 core rules from the NEXUS Rule Engine specification.
+Implements 14 core rules from the NEXUS Rule Engine specification.
 
 Each rule takes raw features + speaker baseline and produces Signal objects.
 Thresholds are loaded from the rule_config database table (configurable).
@@ -11,9 +11,18 @@ Rules implemented:
   VOICE-FILLER-01: Filler word detection & classification
   VOICE-FILLER-02: Filler credibility threshold
   VOICE-PITCH-01: Pitch elevation flag
+  VOICE-PITCH-02: Monotone detection
   VOICE-RATE-01: Speech rate anomaly detection
   VOICE-TONE-03: Nervous/Anxious tone classification
   VOICE-TONE-04: Confident/Authoritative tone classification
+  VOICE-TONE-05: Warm/Friendly tone classification
+  VOICE-TONE-06: Cold/Distant tone classification
+  VOICE-TONE-07: Aggressive tone classification
+  VOICE-TONE-08: Excited tone classification
+  VOICE-ENERGY-01: Energy level classification
+  VOICE-PAUSE-01: Pause classification
+  VOICE-INT-01: Interruption detection
+  VOICE-TALK-01: Talk time ratio (session level)
 """
 import logging
 import sys
@@ -31,15 +40,34 @@ except ImportError:
 logger = logging.getLogger("nexus.voice.rules")
 
 
+def _make_signal(
+    speaker_id: str, signal_type: str, value: float, value_text: str,
+    confidence: float, window_start_ms: int, window_end_ms: int,
+    metadata: dict = None,
+) -> dict:
+    """Create a validated signal dict via the Signal model."""
+    return Signal(
+        agent="voice",
+        speaker_id=speaker_id,
+        signal_type=signal_type,
+        value=round(value, 4),
+        value_text=value_text,
+        confidence=round(min(confidence, 0.85), 4),  # Enforce 0.85 cap
+        window_start_ms=window_start_ms,
+        window_end_ms=window_end_ms,
+        metadata=metadata,
+    ).to_dict()
+
+
 class VoiceRuleEngine:
     """
     Evaluates acoustic features against per-speaker baselines
     using research-derived detection rules.
-    
+
     All thresholds are expressed as deviations from baseline
     unless marked as absolute.
     """
-    
+
     def __init__(self):
         self.cal = CalibrationModule()
         # TODO: Load thresholds from rule_config DB table
@@ -50,17 +78,19 @@ class VoiceRuleEngine:
         features: dict,
         baseline: SpeakerBaseline,
         speaker_id: str,
-        transcript_segments: list[dict] = None
+        transcript_segments: list[dict] = None,
+        conversation_features: dict = None,
     ) -> list[dict]:
         """
         Run all rules against a single feature window.
-        
+
         Args:
             features: Feature dict from VoiceFeatureExtractor
             baseline: SpeakerBaseline from CalibrationModule
             speaker_id: Speaker identifier
             transcript_segments: Transcript segments in this window
-            
+            conversation_features: Reserved for future conversation-level features
+
         Returns:
             List of Signal dicts (one per fired rule)
         """
@@ -68,100 +98,153 @@ class VoiceRuleEngine:
         window_start = features.get("window_start_ms", 0)
         window_end = features.get("window_end_ms", 0)
         cal_conf = baseline.calibration_confidence
-        
+
         # Skip if calibration is too low
         if cal_conf < 0.1:
             return signals
-        
+
         # ── VOICE-STRESS-01: Composite Vocal Stress Score ──
         stress = self._rule_stress_01(features, baseline)
         if stress is not None:
-            signals.append({
-                "agent": "voice",
-                "speaker_id": speaker_id,
-                "signal_type": "vocal_stress_score",
-                "value": round(stress["score"], 4),
-                "value_text": stress["level"],
-                "confidence": round(stress["score"] * cal_conf, 4),  # Self-calibrating
-                "window_start_ms": window_start,
-                "window_end_ms": window_end,
-                "metadata": stress["components"],
-            })
-        
+            signals.append(_make_signal(
+                speaker_id, "vocal_stress_score",
+                stress["score"], stress["level"],
+                stress["score"] * cal_conf,
+                window_start, window_end,
+                stress["components"],
+            ))
+
         # ── VOICE-FILLER-01: Filler Detection ──
         filler = self._rule_filler_01(features, baseline)
         if filler is not None:
-            signals.append({
-                "agent": "voice",
-                "speaker_id": speaker_id,
-                "signal_type": "filler_detection",
-                "value": filler["filler_rate_pct"],
-                "value_text": filler["status"],
-                "confidence": round(0.90 * cal_conf, 4),  # Filler detection is near-perfect
-                "window_start_ms": window_start,
-                "window_end_ms": window_end,
-                "metadata": {
+            signals.append(_make_signal(
+                speaker_id, "filler_detection",
+                filler["filler_rate_pct"], filler["status"],
+                0.90 * cal_conf,
+                window_start, window_end,
+                {
                     "filler_count": filler["filler_count"],
                     "um_count": filler["um_count"],
                     "uh_count": filler["uh_count"],
                     "delta_from_baseline": filler.get("delta", 0),
                     "credibility_impact": filler.get("credibility_impact", "none"),
                 },
-            })
-        
+            ))
+
         # ── VOICE-PITCH-01: Pitch Elevation Flag ──
         pitch = self._rule_pitch_01(features, baseline)
         if pitch is not None:
-            signals.append({
-                "agent": "voice",
-                "speaker_id": speaker_id,
-                "signal_type": "pitch_elevation_flag",
-                "value": pitch["delta_pct"],
-                "value_text": pitch["level"],
-                "confidence": round(0.50 * cal_conf, 4),
-                "window_start_ms": window_start,
-                "window_end_ms": window_end,
-                "metadata": {
+            signals.append(_make_signal(
+                speaker_id, "pitch_elevation_flag",
+                pitch["delta_pct"], pitch["level"],
+                0.50 * cal_conf,
+                window_start, window_end,
+                {
                     "f0_current": pitch["f0_current"],
                     "f0_baseline": pitch["f0_baseline"],
                     "delta_pct": pitch["delta_pct"],
                 },
-            })
-        
+            ))
+
+        # ── VOICE-PITCH-02: Monotone Detection ──
+        monotone = self._rule_pitch_02(features, baseline)
+        if monotone is not None:
+            signals.append(_make_signal(
+                speaker_id, "monotone_flag",
+                monotone["value"], monotone["value_text"],
+                monotone["confidence_raw"] * cal_conf,
+                window_start, window_end,
+                monotone.get("evidence", {}),
+            ))
+
         # ── VOICE-RATE-01: Speech Rate Anomaly ──
         rate = self._rule_rate_01(features, baseline)
         if rate is not None:
-            signals.append({
-                "agent": "voice",
-                "speaker_id": speaker_id,
-                "signal_type": "speech_rate_anomaly",
-                "value": rate["delta_pct"],
-                "value_text": rate["classification"],
-                "confidence": round(0.40 * cal_conf, 4),
-                "window_start_ms": window_start,
-                "window_end_ms": window_end,
-                "metadata": {
+            signals.append(_make_signal(
+                speaker_id, "speech_rate_anomaly",
+                rate["delta_pct"], rate["classification"],
+                0.40 * cal_conf,
+                window_start, window_end,
+                {
                     "wpm_current": rate["wpm_current"],
                     "wpm_baseline": rate["wpm_baseline"],
                     "sub_classification": rate.get("sub_classification", ""),
                 },
-            })
-        
-        # ── VOICE-TONE-03/04: Tone Classification ──
+            ))
+
+        # ── VOICE-TONE-03/04: Tone Classification (nervous/confident) ──
+        # If existing tone returns None or "neutral", try the 4 new tones
         tone = self._rule_tone(features, baseline)
-        if tone is not None:
-            signals.append({
-                "agent": "voice",
-                "speaker_id": speaker_id,
-                "signal_type": "tone_classification",
-                "value": tone["confidence_raw"],
-                "value_text": tone["tone"],
-                "confidence": round(tone["confidence_raw"] * cal_conf, 4),
-                "window_start_ms": window_start,
-                "window_end_ms": window_end,
-                "metadata": tone.get("evidence", {}),
-            })
-        
+        if tone is not None and tone["tone"] not in ("neutral",):
+            signals.append(_make_signal(
+                speaker_id, "tone_classification",
+                tone["confidence_raw"], tone["tone"],
+                tone["confidence_raw"] * cal_conf,
+                window_start, window_end,
+                tone.get("evidence", {}),
+            ))
+        else:
+            # Try new tone rules in priority order: warm → excited → aggressive → cold
+            new_tone = (
+                self._rule_tone_warm(features, baseline)
+                or self._rule_tone_excited(features, baseline)
+                or self._rule_tone_aggressive(features, baseline)
+                or self._rule_tone_cold(features, baseline)
+            )
+            if new_tone is not None:
+                signals.append(_make_signal(
+                    speaker_id, "tone_classification",
+                    new_tone["confidence_raw"], new_tone["value_text"],
+                    new_tone["confidence_raw"] * cal_conf,
+                    window_start, window_end,
+                    new_tone.get("evidence", {}),
+                ))
+            elif tone is not None:
+                # Emit the original neutral tone if no new tone matched
+                signals.append(_make_signal(
+                    speaker_id, "tone_classification",
+                    tone["confidence_raw"], tone["tone"],
+                    tone["confidence_raw"] * cal_conf,
+                    window_start, window_end,
+                    tone.get("evidence", {}),
+                ))
+
+        # ── VOICE-ENERGY-01: Energy Level Classification ──
+        energy = self._rule_energy_01(features, baseline)
+        if energy is not None:
+            signals.append(_make_signal(
+                speaker_id, "energy_level",
+                energy["value"], energy["value_text"],
+                energy["confidence_raw"] * cal_conf,
+                window_start, window_end,
+                energy.get("evidence", {}),
+            ))
+
+        # ── VOICE-PAUSE-01: Pause Classification ──
+        pause_signals = self._rule_pause_01(features, baseline)
+        for ps in pause_signals:
+            signals.append(_make_signal(
+                speaker_id, "pause_classification",
+                ps["value"], ps["value_text"],
+                ps["confidence_raw"] * cal_conf,
+                window_start, window_end,
+                ps.get("evidence", {}),
+            ))
+
+        # ── VOICE-INT-01: Interruption Detection ──
+        if transcript_segments:
+            int_signals = self._rule_int_01(features, baseline, transcript_segments)
+            if int_signals:
+                for isig in int_signals:
+                    signals.append(_make_signal(
+                        speaker_id, "interruption_event",
+                        isig["value"], isig["value_text"],
+                        isig["confidence_raw"] * cal_conf,
+                        isig.get("window_start_ms", window_start),
+                        isig.get("window_end_ms", window_end),
+                        isig.get("evidence", {}),
+                    ))
+
         return signals
     
     # ════════════════════════════════════════════════════════
@@ -253,9 +336,13 @@ class VoiceRuleEngine:
         delta = 0.0
         if b.filler_rate_pct > 0:
             delta = self.cal.compute_delta(filler_rate, b.filler_rate_pct)
-        
+        elif filler_rate > 0:
+            # Zero-baseline speaker: any fillers are a spike.
+            # Use absolute rate as the delta proxy (1% = 1.0 delta).
+            delta = filler_rate / 1.0  # 1% filler rate = 100% delta
+
         # Status based on delta
-        if delta > 0.50:  # 50% more fillers than baseline
+        if delta > 0.50:  # 50% more fillers than baseline (or >0.5% absolute for zero-baseline)
             status = "filler_spike"
         elif delta > 0.25:
             status = "filler_elevated"
@@ -480,3 +567,550 @@ class VoiceRuleEngine:
                     "note": "Neither pattern dominant (difference < 0.15)"
                 },
             }
+
+    # ════════════════════════════════════════════════════════
+    # VOICE-TONE-05: Warm/Friendly Tone Classification
+    # Research: Juslin & Laukka 2003 — warmth associated with
+    # stable pitch near baseline, lower variance, controlled rate
+    # ════════════════════════════════════════════════════════
+
+    def _rule_tone_warm(self, f: dict, b: SpeakerBaseline) -> Optional[dict]:
+        """
+        Detect warm/friendly tone.
+
+        Profile:
+          - F0 within -10% to +5% of baseline (relaxed, not stressed)
+          - F0 variance lower than baseline (smooth prosody)
+          - Not faster than baseline (unhurried delivery)
+          - Jitter < 1.5% (clean phonation, no tension)
+        """
+        if b.f0_mean == 0:
+            return None
+
+        f0_delta = self.cal.compute_delta(f.get("f0_mean", 0), b.f0_mean)
+        f0_var_delta = self.cal.compute_delta(f.get("f0_variance", 0), b.f0_variance) if b.f0_variance > 0 else 0
+        rate_delta = self.cal.compute_delta(f.get("speech_rate_wpm", 0), b.speech_rate_wpm) if b.speech_rate_wpm > 0 else 0
+        jitter = f.get("jitter_local_pct", 0)
+
+        score = 0.0
+        evidence = {}
+
+        # F0 within -10% to +5% of baseline
+        if -0.10 <= f0_delta <= 0.05:
+            score += 0.30
+            evidence["pitch_near_baseline"] = round(f0_delta * 100, 1)
+
+        # F0 variance lower (smooth prosody)
+        if f0_var_delta < -0.10:
+            score += 0.25
+            evidence["pitch_variance_lower"] = round(f0_var_delta * 100, 1)
+
+        # Not faster than baseline (unhurried)
+        if rate_delta <= 0.05:
+            score += 0.25
+            evidence["rate_unhurried"] = round(rate_delta * 100, 1)
+
+        # Clean phonation (low jitter)
+        if jitter < 1.5:
+            score += 0.20
+            evidence["jitter_low"] = round(jitter, 2)
+
+        if score < 0.50:
+            return None
+
+        return {
+            "value_text": "warm",
+            "confidence_raw": min(score, 0.60),
+            "evidence": evidence,
+        }
+
+    # ════════════════════════════════════════════════════════
+    # VOICE-TONE-06: Cold/Distant Tone Classification
+    # Research: Juslin & Laukka 2003 — cold/distant voice marked
+    # by low prosodic variation, reduced energy range
+    # ════════════════════════════════════════════════════════
+
+    def _rule_tone_cold(self, f: dict, b: SpeakerBaseline) -> Optional[dict]:
+        """
+        Detect cold/distant tone.
+
+        Profile:
+          - F0 variance 30%+ below baseline (flat, unexpressive)
+          - Energy dynamic range 25%+ below baseline (narrow dynamics)
+          - Slightly slower than baseline
+        """
+        if b.f0_mean == 0:
+            return None
+
+        f0_var_delta = self.cal.compute_delta(f.get("f0_variance", 0), b.f0_variance) if b.f0_variance > 0 else 0
+        energy_range_current = f.get("energy_dynamic_range_db", 0)
+        # Use energy_rms_db as proxy for energy range baseline if no explicit baseline
+        energy_range_baseline = b.energy_rms_db  # Approximate: compare dynamic range to mean energy
+        energy_range_delta = self.cal.compute_delta(energy_range_current, energy_range_baseline) if energy_range_baseline != 0 else 0
+        rate_delta = self.cal.compute_delta(f.get("speech_rate_wpm", 0), b.speech_rate_wpm) if b.speech_rate_wpm > 0 else 0
+
+        score = 0.0
+        evidence = {}
+
+        # F0 variance 30%+ below baseline
+        if f0_var_delta <= -0.30:
+            score += 0.35
+            evidence["pitch_variance_flat"] = round(f0_var_delta * 100, 1)
+
+        # Energy range 25%+ below baseline
+        if energy_range_delta <= -0.25:
+            score += 0.35
+            evidence["energy_range_narrow"] = round(energy_range_delta * 100, 1)
+
+        # Slightly slower
+        if rate_delta < -0.05:
+            score += 0.30
+            evidence["rate_slower"] = round(rate_delta * 100, 1)
+
+        if score < 0.50:
+            return None
+
+        return {
+            "value_text": "cold",
+            "confidence_raw": min(score, 0.55),
+            "evidence": evidence,
+        }
+
+    # ════════════════════════════════════════════════════════
+    # VOICE-TONE-07: Aggressive Tone Classification
+    # Research: Banse & Scherer 1996 — anger/aggression marked by
+    # high F0, high variance, high energy, fast rate
+    # ════════════════════════════════════════════════════════
+
+    def _rule_tone_aggressive(self, f: dict, b: SpeakerBaseline) -> Optional[dict]:
+        """
+        Detect aggressive tone.
+
+        Profile:
+          - F0 20%+ above baseline
+          - F0 variance 25%+ above baseline
+          - Energy 15%+ above baseline
+          - Rate 15%+ above baseline
+        """
+        if b.f0_mean == 0:
+            return None
+
+        f0_delta = self.cal.compute_delta(f.get("f0_mean", 0), b.f0_mean)
+        f0_var_delta = self.cal.compute_delta(f.get("f0_variance", 0), b.f0_variance) if b.f0_variance > 0 else 0
+        energy_delta = self.cal.compute_delta(f.get("energy_rms_db", 0), b.energy_rms_db) if b.energy_rms_db != 0 else 0
+        rate_delta = self.cal.compute_delta(f.get("speech_rate_wpm", 0), b.speech_rate_wpm) if b.speech_rate_wpm > 0 else 0
+
+        score = 0.0
+        evidence = {}
+
+        # F0 20%+ above baseline
+        if f0_delta >= 0.20:
+            score += 0.25
+            evidence["pitch_elevated"] = round(f0_delta * 100, 1)
+
+        # F0 variance 25%+ above (wide, forceful)
+        if f0_var_delta >= 0.25:
+            score += 0.25
+            evidence["pitch_variance_wide"] = round(f0_var_delta * 100, 1)
+
+        # Energy 15%+ above baseline
+        if energy_delta >= 0.15:
+            score += 0.25
+            evidence["energy_elevated"] = round(energy_delta * 100, 1)
+
+        # Rate 15%+ above baseline
+        if rate_delta >= 0.15:
+            score += 0.25
+            evidence["rate_fast"] = round(rate_delta * 100, 1)
+
+        if score < 0.50:
+            return None
+
+        return {
+            "value_text": "aggressive",
+            "confidence_raw": min(score, 0.55),
+            "evidence": evidence,
+        }
+
+    # ════════════════════════════════════════════════════════
+    # VOICE-TONE-08: Excited Tone Classification
+    # Research: Juslin & Laukka 2003 — excitement has elevated F0,
+    # wide variance, high energy, fast rate, but GOOD voice quality
+    # (key discriminator from nervous: HNR maintained, low jitter)
+    # ════════════════════════════════════════════════════════
+
+    def _rule_tone_excited(self, f: dict, b: SpeakerBaseline) -> Optional[dict]:
+        """
+        Detect excited tone.
+
+        Profile:
+          - F0 10%+ above baseline
+          - F0 variance 20%+ above baseline (wide, not narrow like nervous)
+          - Energy 10%+ above baseline
+          - Rate 10%+ above baseline
+          - HNR maintained (not degraded — key discriminator from nervous)
+          - Jitter < 2.0% (voice quality intact)
+        """
+        if b.f0_mean == 0:
+            return None
+
+        f0_delta = self.cal.compute_delta(f.get("f0_mean", 0), b.f0_mean)
+        f0_var_delta = self.cal.compute_delta(f.get("f0_variance", 0), b.f0_variance) if b.f0_variance > 0 else 0
+        energy_delta = self.cal.compute_delta(f.get("energy_rms_db", 0), b.energy_rms_db) if b.energy_rms_db != 0 else 0
+        rate_delta = self.cal.compute_delta(f.get("speech_rate_wpm", 0), b.speech_rate_wpm) if b.speech_rate_wpm > 0 else 0
+        hnr_delta = self.cal.compute_delta(f.get("hnr_db", 0), b.hnr_db) if b.hnr_db != 0 else 0
+        jitter = f.get("jitter_local_pct", 0)
+
+        score = 0.0
+        evidence = {}
+
+        # F0 10%+ above baseline
+        if f0_delta >= 0.10:
+            score += 0.20
+            evidence["pitch_elevated"] = round(f0_delta * 100, 1)
+
+        # F0 variance 20%+ above (wide, expressive — not narrow like nervous)
+        if f0_var_delta >= 0.20:
+            score += 0.20
+            evidence["pitch_variance_wide"] = round(f0_var_delta * 100, 1)
+
+        # Energy 10%+ above
+        if energy_delta >= 0.10:
+            score += 0.15
+            evidence["energy_elevated"] = round(energy_delta * 100, 1)
+
+        # Rate 10%+ above
+        if rate_delta >= 0.10:
+            score += 0.15
+            evidence["rate_fast"] = round(rate_delta * 100, 1)
+
+        # HNR maintained (not degraded) — key discriminator from nervous
+        if hnr_delta >= -0.05:
+            score += 0.15
+            evidence["hnr_maintained"] = round(hnr_delta * 100, 1)
+
+        # Jitter < 2.0% (voice quality intact)
+        if jitter < 2.0:
+            score += 0.15
+            evidence["jitter_controlled"] = round(jitter, 2)
+
+        if score < 0.50:
+            return None
+
+        return {
+            "value_text": "excited",
+            "confidence_raw": min(score, 0.55),
+            "evidence": evidence,
+        }
+
+    # ════════════════════════════════════════════════════════
+    # VOICE-PITCH-02: Monotone Detection
+    # Research: Apple et al. 1979 — monotone delivery reduces
+    # persuasiveness and perceived engagement
+    # ════════════════════════════════════════════════════════
+
+    def _rule_pitch_02(self, f: dict, b: SpeakerBaseline) -> Optional[dict]:
+        """
+        Detect monotone speech: flat prosody indicating disengagement
+        or deliberate emotional suppression.
+
+        Thresholds:
+          - F0 variance 40%+ below baseline
+          - F0 range < 30 Hz (absolute)
+          - If energy also drops 15%+, increase confidence
+        """
+        if b.f0_mean == 0 or b.f0_variance == 0:
+            return None
+
+        f0_var_delta = self.cal.compute_delta(f.get("f0_variance", 0), b.f0_variance)
+        f0_range = f.get("f0_range", 0)
+
+        # Must meet both: variance 40%+ below AND range < 30 Hz
+        if f0_var_delta > -0.40 or f0_range >= 30.0:
+            return None
+
+        delta = abs(f0_var_delta)
+        cal_conf = b.calibration_confidence
+        confidence = delta * cal_conf
+
+        evidence = {
+            "f0_variance_delta_pct": round(f0_var_delta * 100, 1),
+            "f0_range_hz": round(f0_range, 1),
+        }
+
+        # Energy drop boosts confidence
+        energy_delta = self.cal.compute_delta(f.get("energy_rms_db", 0), b.energy_rms_db) if b.energy_rms_db != 0 else 0
+        if energy_delta <= -0.15:
+            confidence += 0.10
+            evidence["energy_also_depressed"] = round(energy_delta * 100, 1)
+
+        confidence = min(confidence, 0.65)
+
+        return {
+            "value": round(delta, 4),
+            "value_text": "monotone_detected",
+            "confidence_raw": confidence,
+            "evidence": evidence,
+        }
+
+    # ════════════════════════════════════════════════════════
+    # VOICE-ENERGY-01: Energy Level Classification
+    # Research: Scherer 2003 — vocal energy correlates with arousal
+    # ════════════════════════════════════════════════════════
+
+    def _rule_energy_01(self, f: dict, b: SpeakerBaseline) -> Optional[dict]:
+        """
+        Classify energy level relative to baseline.
+
+        Only emits a signal when energy is outside the ±6 dB normal range.
+          > +6 dB → "elevated" (arousal or emphasis)
+          < -6 dB → "depressed" (disengagement or fatigue)
+        """
+        if b.energy_rms_db == 0:
+            return None
+
+        energy_current = f.get("energy_rms_db", 0)
+        if energy_current == 0:
+            return None
+
+        energy_delta_db = energy_current - b.energy_rms_db
+
+        # Only emit if outside ±6 dB (normal range produces no signal)
+        if abs(energy_delta_db) < 6.0:
+            return None
+
+        evidence = {
+            "energy_current_db": round(energy_current, 1),
+            "energy_baseline_db": round(b.energy_rms_db, 1),
+            "delta_db": round(energy_delta_db, 1),
+        }
+
+        if energy_delta_db > 6.0:
+            value_text = "elevated"
+            # Sub-classify: arousal vs emphasis based on F0
+            f0_delta = self.cal.compute_delta(f.get("f0_mean", 0), b.f0_mean) if b.f0_mean > 0 else 0
+            if f0_delta > 0.10:
+                evidence["sub_classification"] = "arousal"
+            else:
+                evidence["sub_classification"] = "emphasis"
+        else:
+            value_text = "depressed"
+
+        # Confidence scales with how far outside the ±6 dB range
+        confidence = min(abs(energy_delta_db) / 20.0, 0.70)
+
+        return {
+            "value": round(energy_delta_db, 4),
+            "value_text": value_text,
+            "confidence_raw": confidence,
+            "evidence": evidence,
+        }
+
+    # ════════════════════════════════════════════════════════
+    # VOICE-PAUSE-01: Pause Classification
+    # Research: Goldman-Eisler 1968, Campione & Véronis 2002
+    # Returns a LIST (can emit multiple signals per window)
+    # ════════════════════════════════════════════════════════
+
+    def _rule_pause_01(self, f: dict, b: SpeakerBaseline) -> list[dict]:
+        """
+        Classify pause patterns in the current window.
+
+        Can emit multiple signals:
+          - pause_ratio > 0.55 → "excessive_pausing"
+          - pause_ratio < 0.20 when baseline > 0.30 → "reduced_pausing"
+          - max_pause > 2000 ms → "extended_hesitation"
+        """
+        results = []
+        pause_ratio = f.get("pause_ratio", 0)
+        max_pause_ms = f.get("max_pause_ms", 0)
+
+        # Excessive pausing
+        if pause_ratio > 0.55:
+            confidence = min(pause_ratio, 0.70)
+            results.append({
+                "value": round(pause_ratio, 4),
+                "value_text": "excessive_pausing",
+                "confidence_raw": confidence,
+                "evidence": {
+                    "pause_ratio": round(pause_ratio, 3),
+                    "pause_count": f.get("pause_count", 0),
+                    "total_pause_ms": f.get("total_pause_ms", 0),
+                },
+            })
+
+        # Reduced pausing (only meaningful if baseline has significant pauses)
+        if pause_ratio < 0.20 and b.pause_ratio_pct > 0.30:
+            delta = b.pause_ratio_pct - pause_ratio
+            confidence = min(delta, 0.60)
+            results.append({
+                "value": round(pause_ratio, 4),
+                "value_text": "reduced_pausing",
+                "confidence_raw": confidence,
+                "evidence": {
+                    "pause_ratio": round(pause_ratio, 3),
+                    "baseline_pause_ratio": round(b.pause_ratio_pct, 3),
+                    "note": "Speaker normally pauses more — reduced pausing may indicate rushing or rehearsal",
+                },
+            })
+
+        # Extended hesitation
+        if max_pause_ms > 2000:
+            confidence = min(max_pause_ms / 5000.0, 0.65)
+            results.append({
+                "value": round(max_pause_ms / 1000.0, 4),
+                "value_text": "extended_hesitation",
+                "confidence_raw": confidence,
+                "evidence": {
+                    "max_pause_ms": max_pause_ms,
+                    "avg_pause_ms": f.get("avg_pause_ms", 0),
+                },
+            })
+
+        return results
+
+    # ════════════════════════════════════════════════════════
+    # VOICE-INT-01: Interruption Detection
+    # Research: Schegloff 2000 — competitive vs cooperative overlaps
+    # Takes transcript_segments for overlap analysis
+    # ════════════════════════════════════════════════════════
+
+    def _rule_int_01(
+        self, f: dict, b: SpeakerBaseline, transcript_segments: list[dict]
+    ) -> Optional[list[dict]]:
+        """
+        Detect interruptions from transcript segment overlaps.
+
+        Checks consecutive segments: if seg_b starts before seg_a ends
+        AND they are different speakers AND overlap > 200 ms, that's
+        an interruption. If the interrupting segment has <= 2 words,
+        it's a backchannel (skip).
+
+        Returns:
+            List of signal dicts, or None if no interruptions found.
+        """
+        if not transcript_segments or len(transcript_segments) < 2:
+            return None
+
+        # Sort all segments by start time
+        sorted_segs = sorted(transcript_segments, key=lambda s: s["start_ms"])
+        results = []
+
+        for i in range(len(sorted_segs) - 1):
+            seg_a = sorted_segs[i]
+            seg_b = sorted_segs[i + 1]
+
+            # Must be different speakers
+            if seg_a.get("speaker") == seg_b.get("speaker"):
+                continue
+
+            # Check overlap: seg_b starts before seg_a ends
+            if seg_b["start_ms"] >= seg_a["end_ms"]:
+                continue
+
+            overlap_ms = seg_a["end_ms"] - seg_b["start_ms"]
+            if overlap_ms <= 200:
+                continue  # Too short to be a real interruption
+
+            # Backchannel filter: if interrupting segment has <= 2 words, skip
+            interrupter_words = len(seg_b.get("text", "").split())
+            if interrupter_words <= 2:
+                continue
+
+            overlap_seconds = round(overlap_ms / 1000.0, 3)
+            confidence = min(overlap_seconds / 2.0, 0.65)
+
+            results.append({
+                "value": overlap_seconds,
+                "value_text": "competitive_interruption",
+                "confidence_raw": confidence,
+                "window_start_ms": seg_b["start_ms"],
+                "window_end_ms": seg_a["end_ms"],
+                "evidence": {
+                    "overlap_ms": overlap_ms,
+                    "interrupter": seg_b.get("speaker", "unknown"),
+                    "interrupted": seg_a.get("speaker", "unknown"),
+                    "interrupter_words": interrupter_words,
+                    "interrupter_text": seg_b.get("text", "")[:100],
+                },
+            })
+
+        return results if results else None
+
+    # ════════════════════════════════════════════════════════
+    # VOICE-TALK-01: Talk Time Ratio (Session Level)
+    # Research: Mast 2002 — dominance correlates with talk time
+    # This is a session-level method, not per-window
+    # ════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _emit_talk_time_signals(
+        features_by_speaker: dict[str, list[dict]],
+        duration_sec: float,
+    ) -> list[dict]:
+        """
+        Compute per-speaker talk time ratios and flag imbalances.
+
+        Args:
+            features_by_speaker: {speaker_id: [feature_dicts]}
+            duration_sec: Total session duration in seconds
+
+        Returns:
+            List of Signal dicts for talk time imbalances.
+        """
+        if not features_by_speaker or duration_sec <= 0:
+            return []
+
+        # Compute total speaking time per speaker
+        speaker_times = {}
+        for speaker_id, features_list in features_by_speaker.items():
+            total_sec = sum(f.get("speaking_time_sec", 0) for f in features_list)
+            speaker_times[speaker_id] = total_sec
+
+        total_talk_time = sum(speaker_times.values())
+        if total_talk_time <= 0:
+            return []
+
+        n_speakers = len(speaker_times)
+        expected_pct = 1.0 / n_speakers if n_speakers > 0 else 1.0
+        signals = []
+
+        for speaker_id, talk_sec in speaker_times.items():
+            talk_pct = talk_sec / total_talk_time
+
+            value_text = None
+            confidence = 0.0
+
+            if n_speakers == 2 and talk_pct > 0.70:
+                # 2-speaker case: significant imbalance
+                value_text = "talk_imbalance_significant"
+                confidence = min((talk_pct - 0.70) / 0.20 * 0.50 + 0.40, 0.65)
+            elif n_speakers > 2:
+                if talk_pct > 2.0 * expected_pct:
+                    # Dominant talker (more than 2x expected share)
+                    value_text = "dominant_talker"
+                    confidence = min((talk_pct / expected_pct - 2.0) / 2.0 * 0.50 + 0.40, 0.65)
+                elif talk_pct < 0.3 * expected_pct:
+                    # Silent participant (less than 30% of expected share)
+                    value_text = "silent_participant"
+                    confidence = min((0.3 * expected_pct - talk_pct) / (0.3 * expected_pct) * 0.50 + 0.40, 0.65)
+
+            if value_text is not None:
+                signals.append(_make_signal(
+                    speaker_id=speaker_id,
+                    signal_type="talk_time_ratio",
+                    value=round(talk_pct, 4),
+                    value_text=value_text,
+                    confidence=confidence,
+                    window_start_ms=0,
+                    window_end_ms=int(duration_sec * 1000),
+                    metadata={
+                        "talk_seconds": round(talk_sec, 1),
+                        "talk_pct": round(talk_pct * 100, 1),
+                        "total_talk_time_sec": round(total_talk_time, 1),
+                        "n_speakers": n_speakers,
+                        "expected_pct": round(expected_pct * 100, 1),
+                    },
+                ))
+
+        return signals

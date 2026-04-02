@@ -28,7 +28,7 @@ import json
 import asyncio
 import logging
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends
@@ -61,6 +61,7 @@ try:
         get_current_user, require_role,
         store_refresh_token, verify_and_consume_refresh_token,
         delete_refresh_token, cleanup_expired_tokens,
+        generate_verification_token,
     )
 except ImportError:
     from services.api_gateway.database import (
@@ -80,7 +81,13 @@ except ImportError:
         get_current_user, require_role,
         store_refresh_token, verify_and_consume_refresh_token,
         delete_refresh_token, cleanup_expired_tokens,
+        generate_verification_token,
     )
+
+try:
+    from email_service import is_email_configured, send_verification_email
+except ImportError:
+    from services.api_gateway.email_service import is_email_configured, send_verification_email
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nexus.gateway")
@@ -88,13 +95,18 @@ logger = logging.getLogger("nexus.gateway")
 # ── Agent URLs (configurable via environment) ──
 VOICE_AGENT_URL = os.getenv("VOICE_AGENT_URL", "http://localhost:8002")
 LANGUAGE_AGENT_URL = os.getenv("LANGUAGE_AGENT_URL", "http://localhost:8003")
+CONVERSATION_AGENT_URL = os.getenv("CONVERSATION_AGENT_URL", "http://localhost:8011")
 FUSION_AGENT_URL = os.getenv("FUSION_AGENT_URL", "http://localhost:8004")
 
 # ── Upload directory ──
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/recordings"))
+RECORDING_RETENTION_DAYS = int(os.getenv("RECORDING_RETENTION_DAYS", "3"))
 
 # ── HTTP client timeout (Voice Agent with Whisper can be slow) ──
 AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "1800"))  # 30 minutes
+
+# ── CORS origins (comma-separated list) ──
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:3006,http://localhost:5173").split(",")
 
 app = FastAPI(
     title="NEXUS API Gateway",
@@ -104,16 +116,34 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _cleanup_old_recordings():
+    """Delete recording files older than RECORDING_RETENTION_DAYS."""
+    if not UPLOAD_DIR.exists():
+        return
+    cutoff = time.time() - (RECORDING_RETENTION_DAYS * 86400)
+    removed = 0
+    for f in UPLOAD_DIR.iterdir():
+        if f.is_file() and f.stat().st_mtime < cutoff:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        logger.info(f"Cleaned up {removed} recording(s) older than {RECORDING_RETENTION_DAYS} days")
 
 
 @app.on_event("startup")
 async def startup():
     logger.info("Starting NEXUS API Gateway...")
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    _cleanup_old_recordings()
 
     try:
         await get_pool()
@@ -137,6 +167,7 @@ async def health():
         for name, url in [
             ("voice", VOICE_AGENT_URL),
             ("language", LANGUAGE_AGENT_URL),
+            ("conversation", CONVERSATION_AGENT_URL),
             ("fusion", FUSION_AGENT_URL),
         ]:
             try:
@@ -191,6 +222,9 @@ class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
 
+class ResendVerificationRequest(BaseModel):
+    email: str
+
 
 # ─────────────────────────────────────────────────────────
 # AUTH — Endpoints (public)
@@ -223,21 +257,52 @@ async def signup(body: SignupRequest):
     )
 
     user_id = str(row["id"])
-    access_token = create_access_token(user_id, email, row["role"])
-    refresh_token, expires_at = create_refresh_token_value()
-    await store_refresh_token(user_id, refresh_token, expires_at)
 
-    return {
-        "user": {
-            "id": user_id,
-            "email": row["email"],
-            "full_name": row["full_name"],
-            "role": row["role"],
-            "company": row["company"],
-        },
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-    }
+    # Email verification flow
+    if is_email_configured():
+        token = generate_verification_token()
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        await pool.execute(
+            """
+            INSERT INTO email_verifications (user_id, token, expires_at)
+            VALUES ($1, $2, $3)
+            """,
+            row["id"], token, expires_at,
+        )
+        await send_verification_email(email, body.full_name, token)
+
+        return {
+            "user": {
+                "id": user_id,
+                "email": row["email"],
+                "full_name": row["full_name"],
+                "role": row["role"],
+                "company": row["company"],
+            },
+            "requires_verification": True,
+            "message": "Verification email sent. Please check your inbox.",
+        }
+    else:
+        # No email provider — auto-verify and issue tokens immediately
+        logger.warning("Email not configured — auto-verifying new user")
+        await pool.execute(
+            "UPDATE users SET is_verified = true WHERE id = $1", row["id"],
+        )
+        access_token = create_access_token(user_id, email, row["role"])
+        refresh_token, expires_at = create_refresh_token_value()
+        await store_refresh_token(user_id, refresh_token, expires_at)
+
+        return {
+            "user": {
+                "id": user_id,
+                "email": row["email"],
+                "full_name": row["full_name"],
+                "role": row["role"],
+                "company": row["company"],
+            },
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+        }
 
 
 @app.post("/auth/login")
@@ -249,7 +314,7 @@ async def login(body: LoginRequest):
     row = await pool.fetchrow(
         """
         SELECT id, email, full_name, role, company, avatar_url, org_id,
-               password_hash, is_active, created_at, last_login_at
+               password_hash, is_active, is_verified, created_at, last_login_at
         FROM users WHERE email = $1
         """,
         email,
@@ -263,6 +328,12 @@ async def login(body: LoginRequest):
 
     if not verify_password(body.password, row["password_hash"]):
         raise HTTPException(401, "Invalid email or password")
+
+    if not row["is_verified"]:
+        raise HTTPException(
+            403,
+            "Email not verified. Please check your inbox for the verification link.",
+        )
 
     user_id = str(row["id"])
 
@@ -288,6 +359,97 @@ async def login(body: LoginRequest):
         "access_token": access_token,
         "refresh_token": refresh_token,
     }
+
+
+@app.get("/auth/verify-email")
+async def verify_email(token: str = Query(...)):
+    """Verify a user's email address using the token from the verification email."""
+    pool = await get_pool()
+
+    row = await pool.fetchrow(
+        """
+        SELECT ev.id AS verification_id, ev.user_id, ev.expires_at, ev.used_at,
+               u.email, u.full_name, u.is_verified
+        FROM email_verifications ev
+        JOIN users u ON u.id = ev.user_id
+        WHERE ev.token = $1
+        """,
+        token,
+    )
+
+    if not row:
+        raise HTTPException(400, "Invalid verification token.")
+
+    if row["used_at"] is not None:
+        raise HTTPException(400, "This verification link has already been used.")
+
+    if row["expires_at"] < datetime.now(timezone.utc):
+        raise HTTPException(400, "Verification link has expired. Please request a new one.")
+
+    # Mark user as verified and consume the token
+    await pool.execute(
+        "UPDATE users SET is_verified = true WHERE id = $1",
+        row["user_id"],
+    )
+    await pool.execute(
+        "UPDATE email_verifications SET used_at = $1 WHERE id = $2",
+        datetime.now(timezone.utc), row["verification_id"],
+    )
+
+    return {"success": True, "message": "Email verified successfully. You can now log in."}
+
+
+@app.post("/auth/resend-verification")
+async def resend_verification(body: ResendVerificationRequest):
+    """Resend the verification email for an unverified account."""
+    email = body.email.strip().lower()
+    pool = await get_pool()
+
+    row = await pool.fetchrow(
+        "SELECT id, full_name, is_verified FROM users WHERE email = $1",
+        email,
+    )
+
+    if not row:
+        # Don't reveal whether the email exists
+        return {"message": "If that email is registered, a verification email has been sent."}
+
+    if row["is_verified"]:
+        return {"message": "If that email is registered, a verification email has been sent."}
+
+    # Rate limit: max 3 verification emails in the last hour
+    recent_count = await pool.fetchval(
+        """
+        SELECT COUNT(*) FROM email_verifications
+        WHERE user_id = $1 AND created_at > NOW() - INTERVAL '1 hour'
+        """,
+        row["id"],
+    )
+    if recent_count >= 3:
+        raise HTTPException(
+            429,
+            "Too many verification emails requested. Please try again later.",
+        )
+
+    if not is_email_configured():
+        logger.warning("Email not configured — cannot resend verification email")
+        raise HTTPException(
+            503,
+            "Email service is not configured. Please contact support.",
+        )
+
+    token = generate_verification_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+    await pool.execute(
+        """
+        INSERT INTO email_verifications (user_id, token, expires_at)
+        VALUES ($1, $2, $3)
+        """,
+        row["id"], token, expires_at,
+    )
+    await send_verification_email(email, row["full_name"], token)
+
+    return {"message": "Verification email resent."}
 
 
 @app.post("/auth/refresh")
@@ -446,12 +608,22 @@ async def create_session_endpoint(
     file_name = f"{session_id}{suffix}"
     file_path = UPLOAD_DIR / file_name
 
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    content = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(content)
+    MAX_FILE_SIZE = 300 * 1024 * 1024  # 300 MB
 
-    file_size_mb = len(content) / (1024 * 1024)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Stream to disk with size check — avoid reading entire file into memory
+    file_size = 0
+    with open(file_path, "wb") as f:
+        while chunk := await file.read(1024 * 1024):  # 1 MB chunks
+            file_size += len(chunk)
+            if file_size > MAX_FILE_SIZE:
+                f.close()
+                file_path.unlink(missing_ok=True)
+                raise HTTPException(413, f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)} MB.")
+            f.write(chunk)
+
+    file_size_mb = file_size / (1024 * 1024)
     logger.info(f"[{session_id}] Uploaded {filename} ({file_size_mb:.1f} MB)")
 
     if not title:
@@ -472,16 +644,12 @@ async def create_session_endpoint(
     except Exception as e:
         logger.warning(f"[{session_id}] DB create failed (continuing without DB): {e}")
 
-    # ── Step 3: Get transcript fast, then run Voice features + Language in parallel ──
-    # Optimization 1: Language Agent only needs transcript, not voice features/rules.
-    # So we get transcript first, then run full Voice analysis and Language in parallel.
-
-    resolved_path = str(file_path.resolve())
-
-    # Step 3a: Get transcript (fast path via /transcribe)
-    transcript_result = None
+    # ── Step 3: Voice Agent (with retry — this is the critical agent) ──
+    voice_result = None
     try:
-        voice_result = await _call_voice_agent(session_id, str(file_path.resolve()), num_speakers=num_speakers, meeting_type=meeting_type)
+        voice_result = await _call_with_retry(
+            lambda: _call_voice_agent(session_id, str(file_path.resolve()), num_speakers=num_speakers, meeting_type=meeting_type)
+        )
         logger.info(
             f"[{session_id}] Transcription: "
             f"{transcript_result.get('duration_seconds', 0):.0f}s, "
@@ -492,35 +660,9 @@ async def create_session_endpoint(
         await _try_update_status(session_id, "failed")
         raise HTTPException(502, f"Voice Agent failed: {e}")
 
-    transcript_segments = transcript_result.get("segments", [])
-
-    # Step 3b: Run full Voice analysis + Language Agent IN PARALLEL
-    async def _voice_task():
-        return await _call_voice_agent(session_id, resolved_path, num_speakers=num_speakers)
-
-    async def _language_task():
-        if not transcript_segments:
-            return None
-        return await _call_language_agent(session_id, transcript_segments, meeting_type)
-
-    results = await asyncio.gather(
-        _voice_task(), _language_task(), return_exceptions=True
-    )
-    voice_result_or_exc, language_result_or_exc = results
-
-    # Voice failure is fatal
-    if isinstance(voice_result_or_exc, Exception):
-        logger.error(f"[{session_id}] Voice Agent failed: {voice_result_or_exc}")
-        await _try_update_status(session_id, "failed")
-        raise HTTPException(502, f"Voice Agent failed: {voice_result_or_exc}")
-    voice_result = voice_result_or_exc
-
-    # Language failure is non-fatal
-    if isinstance(language_result_or_exc, Exception):
-        logger.warning(f"[{session_id}] Language Agent failed (continuing): {language_result_or_exc}")
-        language_result = None
-    else:
-        language_result = language_result_or_exc
+    if not isinstance(voice_result, dict):
+        logger.error(f"[{session_id}] Voice Agent returned unexpected type: {type(voice_result)}")
+        voice_result = {}
 
     duration_seconds = voice_result.get("duration_seconds", 0)
     voice_signals = voice_result.get("signals", [])
@@ -548,6 +690,14 @@ async def create_session_endpoint(
         except Exception as e:
             logger.warning(f"[{session_id}] Voice signal persist failed: {e}")
 
+    # ── Track agent statuses ──
+    agent_status = {
+        "voice": "completed",
+        "language": "skipped",
+        "conversation": "skipped",
+        "fusion": "skipped",
+    }
+
     # ── Step 4: Language Agent ──
     language_result = None
     language_signals = []
@@ -569,8 +719,10 @@ async def create_session_endpoint(
             )
             language_signals = language_result.get("signals", [])
             language_summary = language_result.get("summary", {})
+            agent_status["language"] = "completed"
             logger.info(f"[{session_id}] Language Agent: {len(language_signals)} signals")
         except Exception as e:
+            agent_status["language"] = "failed"
             logger.warning(f"[{session_id}] Language Agent failed (continuing): {e}")
 
         # Persist language signals
@@ -583,29 +735,64 @@ async def create_session_endpoint(
     else:
         logger.warning(f"[{session_id}] No transcript segments — skipping Language Agent")
 
+    # ── Step 4b: Conversation Agent ──
+    conversation_result = None
+    conversation_signals = []
+    conversation_summary = {}
+
+    if transcript_segments and len(set(seg.get("speaker") for seg in transcript_segments)) >= 2:
+        try:
+            conversation_result = await _call_conversation_agent(
+                session_id, transcript_segments, meeting_type,
+            )
+            conversation_signals = conversation_result.get("signals", [])
+            conversation_summary = conversation_result.get("summary", {})
+            agent_status["conversation"] = "completed"
+            logger.info(f"[{session_id}] Conversation Agent: {len(conversation_signals)} signals")
+        except Exception as e:
+            agent_status["conversation"] = "failed"
+            logger.warning(f"[{session_id}] Conversation Agent failed (continuing): {e}")
+
+        # Persist conversation signals
+        if conversation_signals:
+            try:
+                count = await insert_signals(session_id, conversation_signals, speaker_map)
+                logger.info(f"[{session_id}] Persisted {count} conversation signals")
+            except Exception as e:
+                logger.warning(f"[{session_id}] Conversation signal persist failed: {e}")
+    else:
+        logger.info(f"[{session_id}] < 2 speakers — skipping Conversation Agent")
+
     # ── Step 5: Fusion Agent ──
     fusion_result = None
     fusion_signals = []
     alerts = []
     report = None
 
+    # Enrich voice_summary with conversation dynamics for Fusion Agent
+    enriched_voice_summary = dict(voice_summary)
+    if conversation_summary:
+        enriched_voice_summary["conversation"] = conversation_summary
+
     try:
         fusion_result = await _call_fusion_agent(
             session_id=session_id,
             voice_signals=voice_signals,
             language_signals=language_signals,
-            voice_summary=voice_summary,
+            voice_summary=enriched_voice_summary,
             language_summary=language_summary,
             meeting_type=meeting_type,
         )
         fusion_signals = fusion_result.get("fusion_signals", [])
         alerts = fusion_result.get("alerts", [])
         report = fusion_result.get("report")
+        agent_status["fusion"] = "completed"
         logger.info(
             f"[{session_id}] Fusion Agent: "
             f"{len(fusion_signals)} signals, {len(alerts)} alerts"
         )
     except Exception as e:
+        agent_status["fusion"] = "failed"
         logger.warning(f"[{session_id}] Fusion Agent failed (continuing): {e}")
 
     # Persist fusion signals
@@ -651,27 +838,35 @@ async def create_session_endpoint(
         except Exception as e:
             logger.warning(f"[{session_id}] Report persist failed: {e}")
 
-    # ── Step 6: Mark session complete ──
+    # ── Step 6: Mark session complete (or partial if agents failed) ──
+    any_failed = any(v == "failed" for v in agent_status.values())
+    final_status = "partial" if any_failed else "completed"
+
     await _try_update_status(
-        session_id, "completed",
+        session_id, final_status,
         duration_ms=int(duration_seconds * 1000),
         speaker_count=speaker_count,
     )
 
-    logger.info(f"[{session_id}] Pipeline complete")
+    logger.info(f"[{session_id}] Pipeline complete (status={final_status}, agents={agent_status})")
+
+    # Cleanup old recordings in background
+    _cleanup_old_recordings()
 
     return SessionCreateResponse(
         session_id=session_id,
-        status="completed",
+        status=final_status,
         title=title,
         meeting_type=meeting_type,
         duration_seconds=duration_seconds,
         speaker_count=speaker_count,
         voice_signal_count=len(voice_signals),
         language_signal_count=len(language_signals),
+        conversation_signal_count=len(conversation_signals),
         fusion_signal_count=len(fusion_signals),
         alert_count=len(alerts),
         report_generated=report_generated,
+        agent_status=agent_status,
     )
 
 
@@ -899,6 +1094,21 @@ async def get_session_transcript(session_id: str, current_user: dict = Depends(g
 # Agent call helpers
 # ─────────────────────────────────────────────────────────
 
+async def _call_with_retry(coro_fn, max_retries=2, backoff=2.0):
+    """Call an async function with retry and exponential backoff."""
+    last_error: Exception = Exception("no attempts made")
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro_fn()
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                wait = backoff * (2 ** attempt)
+                logger.warning(f"Retry {attempt+1}/{max_retries} after {wait}s: {e}")
+                await asyncio.sleep(wait)
+    raise last_error
+
+
 async def _call_voice_agent(session_id: str, file_path: str, num_speakers: Optional[int] = None, meeting_type: str = "sales_call") -> dict:
     """Call Voice Agent POST /analyse with file path."""
     payload = {
@@ -931,6 +1141,27 @@ async def _call_language_agent(
                 "session_id": session_id,
                 "meeting_type": meeting_type,
                 "run_intent_classification": True,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _call_conversation_agent(
+    session_id: str,
+    segments: list[dict],
+    meeting_type: str,
+) -> dict:
+    """Call Conversation Agent POST /analyse with transcript segments."""
+    speakers = list(set(seg.get("speaker", "unknown") for seg in segments))
+    async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
+        resp = await client.post(
+            f"{CONVERSATION_AGENT_URL}/analyse",
+            json={
+                "segments": segments,
+                "speakers": speakers,
+                "content_type": meeting_type,
+                "session_id": session_id,
             },
         )
         resp.raise_for_status()
@@ -1009,9 +1240,11 @@ def _extract_transcript_segments(voice_result: dict) -> list[dict]:
             continue
 
         start_ms = s.get("window_start_ms", 0)
-        if start_ms in seen_starts:
+        speaker = s.get("speaker_id", "unknown")
+        dedup_key = (start_ms, speaker)
+        if dedup_key in seen_starts:
             continue
-        seen_starts.add(start_ms)
+        seen_starts.add(dedup_key)
 
         reconstructed.append({
             "speaker": s.get("speaker_id", "unknown"),

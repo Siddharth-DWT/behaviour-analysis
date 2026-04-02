@@ -16,6 +16,11 @@ import bcrypt
 
 logger = logging.getLogger("nexus.gateway.auth")
 
+
+def generate_verification_token() -> str:
+    return secrets.token_urlsafe(48)
+
+
 # ── JWT Configuration ──
 
 JWT_SECRET = os.getenv("JWT_SECRET", "")

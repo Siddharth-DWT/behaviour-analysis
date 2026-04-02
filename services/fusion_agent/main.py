@@ -278,37 +278,31 @@ async def analyse_signals(request: AnalyseRequest):
     if request.language_summary:
         entities = request.language_summary.get("entities", {})
 
-    # ── Step 4+5: Build graph + generate narrative IN PARALLEL ──
+    # Extract conversation summary if present (passed via voice_summary by API Gateway)
+    conversation_summary = {}
+    if request.voice_summary:
+        conversation_summary = request.voice_summary.get("conversation", {})
+
+    # ── Step 4: Build signal graph + analytics ──
     graph_json = {}
     key_paths = []
     graph_insights = {}
-    report = None
+    try:
+        graph = SignalGraph()
+        # Include conversation signals in graph if available
+        conversation_signals_for_graph = []
+        if conversation_summary.get("signals"):
+            conversation_signals_for_graph = conversation_summary["signals"]
 
-    # Compute duration from signal timestamps (needed by narrative)
-    all_timestamps = [
-        _to_int(s.get("window_end_ms", 0))
-        for s in voice_dicts + language_dicts
-    ]
-    duration_seconds = (max(all_timestamps) - min(all_timestamps)) / 1000.0 if all_timestamps else 0
-    report_type = request.content_type or request.meeting_type or "sales_call"
-
-    async def _build_graph():
-        """Build signal graph + analytics."""
-        _graph_json = {}
-        _key_paths = []
-        _graph_insights = {}
-        _graph_signals = []
-        try:
-            graph = SignalGraph()
-            graph.build_from_session(
-                voice_signals=voice_dicts,
-                language_signals=language_dicts,
-                fusion_signals=all_fusion_signals,
-                transcript_segments=[],
-                entities=entities,
-            )
-            _graph_json = graph.to_json()
-            _key_paths = graph.get_key_paths(max_paths=5)
+        graph.build_from_session(
+            voice_signals=voice_dicts,
+            language_signals=language_dicts + conversation_signals_for_graph,
+            fusion_signals=all_fusion_signals,
+            transcript_segments=[],
+            entities=entities,
+        )
+        graph_json = graph.to_json()
+        key_paths = graph.get_key_paths(max_paths=5)
 
             analytics = GraphAnalytics(graph)
             _graph_insights = analytics.compute_all()
@@ -343,20 +337,9 @@ async def analyse_signals(request: AnalyseRequest):
             unified_states=all_unified_states,
             meeting_type=report_type,
             entities=entities,
-            graph_analytics={},  # Graph runs in parallel; narrative proceeds without it
+            graph_analytics=graph_insights,
+            conversation_summary=conversation_summary,
         )
-
-    (graph_json, key_paths, graph_insights, graph_signals), report = await asyncio.gather(
-        _build_graph(), _build_narrative()
-    )
-    all_fusion_signals.extend(graph_signals)
-
-    # Enrich report with graph analytics summary after both complete
-    if report and graph_insights:
-        report["graph_analytics_summary"] = {
-            "tension_clusters": len(graph_insights.get("tension_clusters", [])),
-            "trajectory": graph_insights.get("momentum", {}).get("overall_trajectory"),
-        }
 
     # ── Build summary ──
     elapsed = time.time() - start_time

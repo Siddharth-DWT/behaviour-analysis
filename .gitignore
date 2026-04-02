@@ -52,3 +52,4 @@ services/voice-agent/
 services/language-agent/
 services/fusion-agent/
 services/api-gateway/
+pretrained_models/

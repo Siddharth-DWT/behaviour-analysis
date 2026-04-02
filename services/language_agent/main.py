@@ -205,10 +205,11 @@ async def analyse_transcript(request: AnalysisRequest):
     logger.info(f"[{session_id}] Step 4: Running rule engine (content_type={content_type})...")
     all_signals = []
 
-    for features in features_list:
+    for i, features in enumerate(features_list):
         speaker_id = features.get("speaker_id", "unknown")
         signals = rule_engine.evaluate(
             features=features, speaker_id=speaker_id, content_type=content_type,
+            all_features_list=features_list, current_index=i,
         )
         all_signals.extend(signals)
 

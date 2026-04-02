@@ -11,10 +11,7 @@ class NexusConfig:
     """Central configuration loaded from environment variables."""
 
     # Database
-    database_url: str = os.getenv(
-        "DATABASE_URL",
-        "postgresql://nexus:nexus_dev_2026@localhost:5432/nexus"
-    )
+    database_url: str = os.getenv("DATABASE_URL", "")
 
     # Redis / Valkey
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -37,6 +34,9 @@ class NexusConfig:
     fusion_cycle_seconds: float = 10.0      # How often FUSION runs per speaker
     calibration_min_seconds: int = 60       # Minimum speech for initial baseline
     calibration_reliable_seconds: int = 180 # Speech duration for reliable baseline
+
+    # Diarization
+    diarization_mode: str = os.getenv("DIARIZATION_MODE", "auto")  # auto|pyannote|kmeans
 
     # Redis Streams
     stream_prefix: str = "nexus:stream"
@@ -67,6 +67,8 @@ class NexusConfig:
     def validate(self) -> list[str]:
         """Check for missing required configuration. Returns list of issues."""
         issues = []
+        if not self.database_url:
+            issues.append("DATABASE_URL not set")
         if self.llm_provider == "anthropic":
             if not self.anthropic_api_key or self.anthropic_api_key.startswith("sk-ant-your"):
                 issues.append("LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY not set")

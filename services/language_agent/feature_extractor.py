@@ -577,8 +577,10 @@ class LanguageFeatureExtractor:
             return output
 
         # ── 3. DistilBERT fallback (wide neutral zone) ──
+        # Note: _sentiment_backend may have been set to "vader" by the LLM
+        # failure path, even if DistilBERT is loaded. Check the pipe directly.
         pipe = _get_sentiment_pipeline()
-        if pipe is not None and _sentiment_backend == "distilbert":
+        if pipe is not None:
             try:
                 results = pipe(valid_texts, batch_size=32)
                 output = [neutral.copy() for _ in texts]
@@ -774,10 +776,11 @@ class LanguageFeatureExtractor:
 
         features_found = []
 
-        # Count hedges
+        # Count hedges (word-boundary matching to avoid "mankind of" → "kind of")
+        import re
         for hedge in POWERLESS_HEDGES:
-            # Use word boundary matching for multi-word hedges
-            count = text_lower.count(hedge)
+            pattern = r'\b' + re.escape(hedge) + r'\b'
+            count = len(re.findall(pattern, text_lower))
             if count > 0:
                 features_found.extend([f"hedge:{hedge}"] * count)
 
@@ -795,9 +798,10 @@ class LanguageFeatureExtractor:
         if intensifier_count >= 2 or (intensifier_count >= 1 and word_count < 8):
             features_found.extend([f"intensifier"] * intensifier_count)
 
-        # Count hesitation forms
+        # Count hesitation forms (word-boundary matching)
         for hesitation in POWERLESS_HESITATIONS:
-            if hesitation in text_lower:
+            pattern = r'\b' + re.escape(hesitation) + r'\b'
+            if re.search(pattern, text_lower):
                 features_found.append(f"hesitation:{hesitation}")
 
         # Count polite forms

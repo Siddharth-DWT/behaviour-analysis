@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Zap } from "lucide-react";
 import type { Signal } from "../api/client";
 
 interface SpeakerInfo {
@@ -215,6 +216,29 @@ export default function SpeakerGraph({
                     {count} exchange{count !== 1 ? "s" : ""}
                   </text>
                 )}
+                {/* Rapport score on connection line */}
+                {(() => {
+                  const rapportSig = signals.find(
+                    (s) => s.agent === "conversation" && s.signal_type === "rapport_indicator"
+                  );
+                  // Only show once (on the first pair)
+                  if (!rapportSig || i !== 0 || j !== 1) return null;
+                  const rVal = rapportSig.value ?? 0;
+                  const rColor = rVal >= 0.65 ? "#22C55E" : rVal >= 0.4 ? "#F59E0B" : "#EF4444";
+                  return (
+                    <text
+                      x={mx + offsetX}
+                      y={my + offsetY + 11}
+                      textAnchor="middle"
+                      dominantBaseline="central"
+                      fontSize={8}
+                      fill={rColor}
+                      fontWeight={600}
+                    >
+                      rapport {rVal.toFixed(2)}
+                    </text>
+                  );
+                })()}
               </g>
             );
           })
@@ -309,16 +333,95 @@ export default function SpeakerGraph({
                 Stress {Math.round(speaker.avgStress * 100)}%
               </text>
 
-              {/* Talk time badge — small number inside circle at bottom */}
-              <text
-                x={cx}
-                y={cy + (displayRole ? 22 : 14)}
-                textAnchor="middle"
-                fontSize={8}
-                fill="var(--text-muted, #999)"
-              >
-                {Math.round(speaker.talkTimePct)}%
-              </text>
+              {/* Talk time badge — prefer conversation agent data when available */}
+              {(() => {
+                const balSig = signals.find(
+                  (s) => s.agent === "conversation" && s.signal_type === "conversation_balance" && s.speaker_label === speaker.label
+                );
+                const talkPct = balSig?.metadata
+                  ? (balSig.metadata as Record<string, unknown>).talk_time_pct as number | undefined
+                  : undefined;
+                return (
+                  <text
+                    x={cx}
+                    y={cy + (displayRole ? 22 : 14)}
+                    textAnchor="middle"
+                    fontSize={8}
+                    fill="var(--text-muted, #999)"
+                  >
+                    {Math.round(talkPct ?? speaker.talkTimePct)}%
+                  </text>
+                );
+              })()}
+              {/* Dominance indicator from conversation agent */}
+              {(() => {
+                const domSig = signals.find(
+                  (s) => s.agent === "conversation" && s.signal_type === "dominance_score" && s.speaker_label === speaker.label
+                );
+                if (!domSig) return null;
+                const domColor = domSig.value_text === "dominant" ? "#EF4444"
+                  : domSig.value_text === "balanced" ? "#22C55E"
+                  : "#F59E0B";
+                return (
+                  <text
+                    x={cx}
+                    y={cy + r + 25}
+                    textAnchor="middle"
+                    fontSize={8}
+                    fill={domColor}
+                    fontWeight={600}
+                  >
+                    {(domSig.value_text || "").replace(/_/g, " ")}
+                  </text>
+                );
+              })()}
+
+              {/* Engagement score below dominance label */}
+              {(() => {
+                const engSig = signals.find(
+                  (s) => s.agent === "conversation" && s.signal_type === "engagement_score" && s.speaker_label === speaker.label
+                );
+                if (!engSig || engSig.value == null) return null;
+                const engColor = engSig.value >= 0.65 ? "#22C55E"
+                  : engSig.value >= 0.4 ? "#F59E0B"
+                  : "#EF4444";
+                return (
+                  <text
+                    x={cx}
+                    y={cy + r + 36}
+                    textAnchor="middle"
+                    fontSize={7}
+                    fill={engColor}
+                  >
+                    engage {Math.round(engSig.value * 100)}%
+                  </text>
+                );
+              })()}
+
+              {/* Interruption badge — amber Zap icon for interrupters */}
+              {(() => {
+                const intSig = signals.find(
+                  (s) =>
+                    s.agent === "conversation" &&
+                    s.signal_type === "interruption_pattern" &&
+                    s.speaker_label === speaker.label &&
+                    (s.value_text || "").includes("interrupter")
+                );
+                if (!intSig) return null;
+                return (
+                  <g transform={`translate(${cx + r - 2}, ${cy - r - 2})`}>
+                    <circle r={8} fill="#F59E0B" opacity={0.2} />
+                    <text
+                      textAnchor="middle"
+                      dominantBaseline="central"
+                      fontSize={10}
+                      fill="#F59E0B"
+                    >
+                      ⚡
+                    </text>
+                  </g>
+                );
+              })()}
             </g>
           );
         })}

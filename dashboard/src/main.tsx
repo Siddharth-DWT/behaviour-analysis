@@ -5,6 +5,7 @@ import { BrowserRouter } from "react-router-dom";
 import { ThemeProvider } from "./contexts/ThemeContext";
 import { AuthProvider } from "./contexts/AuthContext";
 import App from "./App";
+import ErrorBoundary from "./components/ErrorBoundary";
 import "./index.css";
 
 const queryClient = new QueryClient({
@@ -22,7 +23,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
       <BrowserRouter>
         <ThemeProvider>
           <AuthProvider>
-            <App />
+            <ErrorBoundary>
+              <App />
+            </ErrorBoundary>
           </AuthProvider>
         </ThemeProvider>
       </BrowserRouter>

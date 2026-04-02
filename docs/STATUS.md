@@ -136,7 +136,7 @@
 | FastAPI application | ✅ Done | `services/voice-agent/main.py` |
 | Feature extractor (25+ features) | ✅ Done | `services/voice-agent/feature_extractor.py` |
 | Calibration module (VOICE-CAL-01) | ✅ Done | `services/voice-agent/calibration.py` |
-| Rule engine (5 core rules) | ✅ Done | `services/voice-agent/rules.py` |
+| Rule engine (14 rules) | ✅ Done | `services/voice-agent/rules.py` |
 | Transcriber (Whisper + diarisation) | ✅ Done | `services/voice-agent/transcriber.py` |
 | Multi-speaker diarization (2-10) | ✅ Done | Simple heuristic + pyannote support |
 | Dual transcription backend | ✅ Done | Local CPU + External GPU API |
@@ -149,7 +149,7 @@
 |-----------|--------|------|
 | FastAPI application | ✅ Done | `services/language-agent/main.py` |
 | Feature extractor | ✅ Done | `services/language-agent/feature_extractor.py` |
-| Rule engine (5 rules, content-adaptive) | ✅ Done | `services/language-agent/rules.py` |
+| Rule engine (12 rules, content-adaptive) | ✅ Done | `services/language-agent/rules.py` |
 | Content-type gating | ✅ Done | Buying/objection rules only for sales_call |
 | Dual LLM support | ✅ Done | OpenAI + Anthropic for intent classification |
 | Dockerfile | ✅ Done | `services/language-agent/Dockerfile` |
@@ -180,7 +180,25 @@
 | Signal models | ✅ Done | `shared/models/signals.py` |
 | Config | ✅ Done | `shared/config/settings.py` |
 
-### Conversation Agent (Agent 6) — 🔲 NOT STARTED
+### Conversation Agent (Agent 6) — ✅ COMPLETE (v0.1)
+
+| Component | Status | File |
+|-----------|--------|------|
+| FastAPI application | ✅ Done | `services/conversation_agent/main.py` |
+| Feature extractor (per-speaker, per-pair, session) | ✅ Done | `services/conversation_agent/feature_extractor.py` |
+| Rule engine (7 rules) | ✅ Done | `services/conversation_agent/rules.py` |
+| CONVO-TURN-01: Turn-taking pattern | ✅ Done | Turn rate classification |
+| CONVO-LAT-01: Response latency | ✅ Done | Per-pair latency analysis |
+| CONVO-DOM-01: Dominance mapping | ✅ Done | Per-speaker dominance score |
+| CONVO-INT-01: Interruption pattern | ✅ Done | Rate-based detection |
+| CONVO-RAP-01: Rapport indicator | ✅ Done | 4-component weighted score |
+| CONVO-ENG-01: Conversation engagement | ✅ Done | 5-component weighted score |
+| CONVO-BAL-01: Conversation balance | ✅ Done | Gini-based dominance index |
+| Dockerfile | ✅ Done | `services/conversation_agent/Dockerfile` |
+| Requirements | ✅ Done | No ML deps, pure computation |
+| Dashboard: Conversation Dynamics panel | ✅ Done | `InsightPanel.tsx` |
+| Dashboard: Speaker dominance/engagement chips | ✅ Done | `SessionDetail.tsx` |
+| Dashboard: Rapport on speaker graph | ✅ Done | `SpeakerGraph.tsx` |
 ### Facial Agent (Agent 3) — 🔲 Phase 2
 ### Body Agent (Agent 4) — 🔲 Phase 2
 ### Gaze Agent (Agent 5) — 🔲 Phase 2
@@ -231,7 +249,7 @@
 9. Tune rule_config thresholds from real data
 
 ### Next Week
-10. Build Conversation Agent
+10. ~~Build Conversation Agent~~ ✅
 11. Add Speaker Cards to Session Detail
 12. Integrate media ingestion into API Gateway (accept URLs via POST)
 
