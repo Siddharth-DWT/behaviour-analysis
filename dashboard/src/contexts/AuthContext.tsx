@@ -208,10 +208,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         refresh_token?: string;
         requires_verification?: boolean;
         message?: string;
-        access_token?: string;
-        refresh_token?: string;
-        requires_verification?: boolean;
-        message?: string;
       }>("/auth/signup", {
         email,
         password,

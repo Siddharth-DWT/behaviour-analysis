@@ -815,7 +815,6 @@ class Transcriber:
                     max_speakers=config["max"],
                     num_speakers=self._num_speakers or 0,
                     audio_data=use_audio_data,
-                    audio_data=use_audio_data,
                 )
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -2400,9 +2399,8 @@ class Transcriber:
         """
         import re
 
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
         openai_key = os.environ.get("OPENAI_API_KEY", "")
-        if not (anthropic_key or openai_key) or len(segments) < 2:
+        if not openai_key or len(segments) < 2:
             return segments
 
         # Skip if no LOW-confidence segments
@@ -2462,35 +2460,18 @@ class Transcriber:
                 + "\n\nOutput the corrected segment list. No explanations."
             )
 
-            # Call LLM
-            llm_provider = os.environ.get("LLM_PROVIDER", "anthropic" if anthropic_key else "openai")
-            if llm_provider == "openai" and openai_key:
-                response = httpx.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
-                    json={"model": "gpt-4o", "temperature": 0, "max_tokens": 2048,
-                          "messages": [{"role": "user", "content": prompt}]},
-                    timeout=20,
-                )
-                if response.status_code != 200:
-                    logger.warning(f"LLM API error: {response.status_code}")
-                    return segments
-                completion = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-            else:
-                response = httpx.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={"x-api-key": anthropic_key, "content-type": "application/json",
-                             "anthropic-version": "2023-06-01"},
-                    json={"model": "claude-sonnet-4-20250514", "max_tokens": 2048, "temperature": 0,
-                          "messages": [{"role": "user", "content": prompt}]},
-                    timeout=20,
-                )
-                if response.status_code != 200:
-                    logger.warning(f"LLM API error: {response.status_code}")
-                    return segments
-                completion = "".join(
-                    b.get("text", "") for b in response.json().get("content", []) if b.get("type") == "text"
-                )
+            # Call LLM (OpenAI)
+            response = httpx.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
+                json={"model": "gpt-4o", "temperature": 0, "max_tokens": 2048,
+                      "messages": [{"role": "user", "content": prompt}]},
+                timeout=20,
+            )
+            if response.status_code != 200:
+                logger.warning(f"LLM API error: {response.status_code}")
+                return segments
+            completion = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
 
             if not completion.strip():
                 return segments
@@ -2981,7 +2962,6 @@ class Transcriber:
                 max_speakers=config["max"],
                 num_speakers=num_speakers,
                 audio_data=self._audio_data,
-                audio_data=self._audio_data,
             )
 
             speaker_timeline = result.get("timeline", [])
@@ -3112,11 +3092,9 @@ class Transcriber:
             diarization = self._diarization_pipeline(audio_input, **diarize_params)
 
             # Create speaker timeline (normalize SPEAKER_00 → Speaker_0)
-            # Create speaker timeline (normalize SPEAKER_00 → Speaker_0)
             speaker_timeline = []
             for turn, _, speaker in diarization.itertracks(yield_label=True):
                 speaker_timeline.append({
-                    "speaker": self._normalize_speaker_label(speaker),
                     "speaker": self._normalize_speaker_label(speaker),
                     "start_ms": int(turn.start * 1000),
                     "end_ms": int(turn.end * 1000),
