@@ -95,7 +95,7 @@ logger = logging.getLogger("nexus.gateway")
 # ── Agent URLs (configurable via environment) ──
 VOICE_AGENT_URL = os.getenv("VOICE_AGENT_URL", "http://localhost:8002")
 LANGUAGE_AGENT_URL = os.getenv("LANGUAGE_AGENT_URL", "http://localhost:8003")
-CONVERSATION_AGENT_URL = os.getenv("CONVERSATION_AGENT_URL", "http://localhost:8006")
+CONVERSATION_AGENT_URL = os.getenv("CONVERSATION_AGENT_URL", "http://localhost:8011")
 FUSION_AGENT_URL = os.getenv("FUSION_AGENT_URL", "http://localhost:8004")
 
 # ── Upload directory ──

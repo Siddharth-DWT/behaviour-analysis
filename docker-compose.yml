@@ -151,7 +151,7 @@ services:
     container_name: nexus-conversation-agent
     restart: unless-stopped
     ports:
-      - "8006:8006"
+      - "8011:8006"
     environment:
       - PYTHONPATH=/app
       - DATABASE_URL=postgresql://nexus:${POSTGRES_PASSWORD:-nexus_dev_2026}@postgres:5432/nexus
