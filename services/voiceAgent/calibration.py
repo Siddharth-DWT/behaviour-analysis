@@ -66,15 +66,19 @@ class CalibrationModule:
         # Use first max_windows features for calibration
         cal_features = features_list[:max_windows]
         
-        if len(cal_features) < CALIBRATION_MIN_WINDOWS:
-            logger.warning(
-                f"Insufficient data for {speaker_id}: "
-                f"{len(cal_features)} windows (need {CALIBRATION_MIN_WINDOWS})"
-            )
-            # Return a minimal baseline with low confidence
+        if len(cal_features) == 0:
+            logger.warning(f"No calibration data for {speaker_id}")
             baseline = SpeakerBaseline(speaker_id=speaker_id, session_id=session_id)
             baseline.calibration_confidence = 0.1
             return baseline
+
+        if len(cal_features) < CALIBRATION_MIN_WINDOWS:
+            logger.warning(
+                f"Limited data for {speaker_id}: "
+                f"{len(cal_features)} windows (ideal {CALIBRATION_MIN_WINDOWS}) — "
+                f"using available data with reduced confidence"
+            )
+            # Continue below — use whatever data is available, confidence will be low
         
         baseline = SpeakerBaseline(speaker_id=speaker_id, session_id=session_id)
         

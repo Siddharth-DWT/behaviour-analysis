@@ -102,6 +102,7 @@ services:
       - CLUSTERING_METHOD=${CLUSTERING_METHOD:-spectral}
       - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
       - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+      - PARAKEET_URL=${PARAKEET_URL}
       - TRANSCRIPTION_BACKEND=${TRANSCRIPTION_BACKEND:-auto}
     volumes:
       - ./services/voiceAgent:/app

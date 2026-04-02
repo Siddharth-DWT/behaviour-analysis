@@ -44,14 +44,17 @@ EXTERNAL_WHISPER_MODEL = os.getenv("EXTERNAL_WHISPER_MODEL", "base")
 DIARIZE_CLUSTERING_THRESHOLD = float(os.getenv("DIARIZE_CLUSTERING_THRESHOLD", "0.5"))
 
 # Transcription backend selection:
-#   auto | assemblyai | deepgram | whisper-pyannote | whisper | local
-# auto = AssemblyAI > Deepgram > Whisper+Pyannote combined > Whisper+separate diarize > Local
+#   auto | assemblyai | deepgram | whisper-pyannote | parakeet | whisper | local
+# auto = AssemblyAI > Deepgram > Whisper+Pyannote combined > Parakeet+diarize > Whisper+separate diarize > Local
 TRANSCRIPTION_BACKEND = os.getenv("TRANSCRIPTION_BACKEND", "auto")
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 
 # Whisper+Pyannote combined endpoint (single call, no mapping needed)
 EXTERNAL_TRANSCRIBE_DIARIZE_URL = os.getenv("EXTERNAL_DIARIZE_URL", "")
+
+# Parakeet TDT (fast transcription with word timestamps, needs separate diarizer)
+PARAKEET_URL = os.getenv("PARAKEET_URL", "")
 
 # ── Pyannote Community-1 Pipeline (global singleton — loaded once) ──
 _pyannote_community_pipeline = None
@@ -117,22 +120,25 @@ class Transcriber:
         self._external_client = None
         self._deepgram_client = None
         self._assemblyai_client = None
+        self._parakeet_client = None
         self._use_external = False
         self._use_deepgram = False
         self._use_assemblyai = False
         self._use_whisper_pyannote = False
+        self._use_parakeet = False
         self._num_speakers = None  # Speaker count hint (2-10), None = auto
         self._audio_data = None    # Pre-loaded (y, sr) tuple, avoids redundant disk reads
         self._last_diarization_backend = "uninitialized"
 
         backend = TRANSCRIPTION_BACKEND.lower()
 
-        # Fallback chain (each does its own transcription + diarization):
+        # Fallback chain:
         #   1. AssemblyAI (one call, Universal-3 Pro)
         #   2. Deepgram (one call, Nova-3)
         #   3. Whisper+Pyannote combined (one GPU call, no mapping)
-        #   4. Whisper transcribe + pyannote separate diarize (two calls, mapping)
-        #   5. Local faster-whisper + local diarize cascade
+        #   4. Parakeet transcribe + diarize cascade (fast transcription, separate diarize)
+        #   5. Whisper transcribe + diarize cascade (two calls, mapping)
+        #   6. Local faster-whisper + local diarize cascade
 
         if backend in ("auto", "assemblyai") and ASSEMBLYAI_API_KEY:
             self._init_assemblyai()
@@ -140,11 +146,17 @@ class Transcriber:
         if backend in ("auto", "deepgram") and DEEPGRAM_API_KEY:
             self._init_deepgram()
 
-        if backend in ("auto", "whisper-pyannote") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
-            self._init_whisper_pyannote()
+        # GPU server endpoints (only one can run at a time to avoid OOM):
+        # Uncomment the one you want to test, keep others commented.
 
-        if backend in ("auto", "whisper") and EXTERNAL_WHISPER_URL:
-            self._init_external()
+        # if backend in ("auto", "whisper-pyannote") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
+        #     self._init_whisper_pyannote()
+
+        if backend in ("auto", "parakeet") and PARAKEET_URL:
+            self._init_parakeet()
+
+        # if backend in ("auto", "whisper") and EXTERNAL_WHISPER_URL:
+        #     self._init_external()
 
     def _init_whisper_pyannote(self):
         """Try to initialise Whisper+Pyannote combined endpoint (single call, GPU)."""
@@ -164,6 +176,25 @@ class Transcriber:
                 logger.warning(f"Whisper+Pyannote endpoint not healthy ({resp.status_code})")
         except Exception as e:
             logger.warning(f"Could not connect to Whisper+Pyannote endpoint: {e}")
+
+    def _init_parakeet(self):
+        """Try to initialise Parakeet TDT client (fast transcription with word timestamps)."""
+        try:
+            project_root = str(Path(__file__).parent.parent.parent)
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+
+            from shared.utils.parakeet_client import create_parakeet_client
+
+            client = create_parakeet_client()
+            if client is not None:
+                self._parakeet_client = client
+                self._use_parakeet = True
+                logger.info("Using Parakeet backend (TDT 0.6B v2, transcription + separate diarize)")
+            else:
+                logger.warning("Parakeet URL set but client creation failed.")
+        except Exception as e:
+            logger.warning(f"Could not initialise Parakeet client: {e}")
 
     def _init_assemblyai(self):
         """Try to initialise AssemblyAI client (transcription + diarization in one call)."""
@@ -296,14 +327,17 @@ class Transcriber:
             #   1. AssemblyAI (one call, Universal-3 Pro)
             #   2. Deepgram (one call, Nova-3)
             #   3. Whisper+Pyannote combined (one GPU call, no mapping)
-            #   4. Whisper + pyannote separate (two calls, mapping)
-            #   5. Local faster-whisper + local diarize cascade
+            #   4. Parakeet + diarize cascade (fast transcription, separate diarize)
+            #   5. Whisper + diarize cascade (two calls, mapping)
+            #   6. Local faster-whisper + local diarize cascade
             if self._use_assemblyai:
                 return self._transcribe_assemblyai(audio_path)
             elif self._use_deepgram:
                 return self._transcribe_deepgram(audio_path)
             elif self._use_whisper_pyannote:
                 return self._transcribe_whisper_pyannote(audio_path)
+            elif self._use_parakeet:
+                return self._transcribe_parakeet(audio_path)
             elif self._use_external:
                 return self._transcribe_external(audio_path)
             else:
@@ -313,6 +347,57 @@ class Transcriber:
             self._num_speakers = None
             self._audio_data = None
             self._meeting_type = None
+
+    # ═══════════════════════════════════════════════════════════
+    # PARAKEET BACKEND (fast transcription + separate diarize cascade)
+    # ═══════════════════════════════════════════════════════════
+
+    def _transcribe_parakeet(self, audio_path: str) -> dict:
+        """
+        Transcribe via Parakeet TDT 0.6B v2 (174x realtime), then run
+        diarize cascade for speaker labels.
+
+        Fallback: Whisper separate -> Local
+        """
+        logger.info(f"Transcribing via Parakeet: {audio_path}")
+
+        try:
+            result = self._parakeet_client.transcribe(audio_path)
+        except Exception as e:
+            logger.error(f"Parakeet failed: {e}. Falling back.")
+            self._use_parakeet = False
+            if self._use_external:
+                return self._transcribe_external(audio_path)
+            return self._transcribe_local(audio_path)
+
+        segments = result.get("segments", [])
+        segments = self._strip_hallucinations(segments)
+
+        # Parakeet returns very coarse segments (e.g., 2 segments for 20s audio).
+        # Split them into per-sentence segments using word timestamps so the
+        # diarizer has enough granularity to assign different speakers.
+        segments = self._split_coarse_segments(segments)
+
+        duration = result["duration_seconds"]
+        proc_time = result["processing_time"]
+
+        logger.info(
+            f"Parakeet transcription complete: {duration:.1f}s audio, "
+            f"{len(segments)} segments (after split), time={proc_time:.1f}s"
+        )
+
+        # Apply speaker diarization (same cascade as Whisper separate path)
+        segments = self._diarize_simple(segments, self._num_speakers, audio_path)
+
+        return {
+            "duration_seconds": duration,
+            "backend": "parakeet",
+            "model": result.get("model", "parakeet-tdt-0.6b-v2"),
+            "processing_time": proc_time,
+            "segments": segments,
+            "diarization_backend": self._last_diarization_backend,
+            "diarization_confidence": self._compute_diarization_confidence(segments),
+        }
 
     # ═══════════════════════════════════════════════════════════
     # WHISPER+PYANNOTE COMBINED (single GPU call, no mapping)
@@ -395,7 +480,9 @@ class Transcriber:
         except Exception as e:
             logger.error(f"Whisper+Pyannote combined failed: {e}. Falling back.")
             self._use_whisper_pyannote = False
-            if self._use_external:
+            if self._use_parakeet:
+                return self._transcribe_parakeet(audio_path)
+            elif self._use_external:
                 return self._transcribe_external(audio_path)
             return self._transcribe_local(audio_path)
         finally:
@@ -491,6 +578,8 @@ class Transcriber:
                 return self._transcribe_deepgram(audio_path)
             elif self._use_whisper_pyannote:
                 return self._transcribe_whisper_pyannote(audio_path)
+            elif self._use_parakeet:
+                return self._transcribe_parakeet(audio_path)
             elif self._use_external:
                 return self._transcribe_external(audio_path)
             return self._transcribe_local(audio_path)
@@ -535,6 +624,8 @@ class Transcriber:
             self._use_deepgram = False
             if self._use_whisper_pyannote:
                 return self._transcribe_whisper_pyannote(audio_path)
+            elif self._use_parakeet:
+                return self._transcribe_parakeet(audio_path)
             elif self._use_external:
                 return self._transcribe_external(audio_path)
             return self._transcribe_local(audio_path)
@@ -699,6 +790,75 @@ class Transcriber:
     # ═══════════════════════════════════════════════════════════
     # HALLUCINATION FILTER
     # ═══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _split_coarse_segments(segments: list[dict], max_seg_duration_ms: int = 5000) -> list[dict]:
+        """
+        Split coarse segments (e.g., from Parakeet) into finer per-sentence
+        segments using word timestamps. This gives the diarizer enough
+        granularity to assign different speakers within a long segment.
+
+        A segment longer than max_seg_duration_ms is split at sentence
+        boundaries (period, question mark, exclamation) using word timestamps.
+        If no sentence boundaries exist, splits at natural pauses (gaps > 300ms).
+        """
+        result = []
+        for seg in segments:
+            duration_ms = seg.get("end_ms", 0) - seg.get("start_ms", 0)
+            words = seg.get("words", [])
+
+            # Short segment or no words — keep as-is
+            if duration_ms <= max_seg_duration_ms or len(words) < 2:
+                result.append(seg)
+                continue
+
+            # Find split points at sentence boundaries
+            splits = []
+            current_words = []
+            for w in words:
+                current_words.append(w)
+                word_text = w.get("word", "")
+                # Split at sentence-ending punctuation
+                if word_text.rstrip().endswith((".", "?", "!")):
+                    splits.append(current_words)
+                    current_words = []
+
+            # Remaining words
+            if current_words:
+                if splits:
+                    splits.append(current_words)
+                else:
+                    # No sentence boundaries — split at pauses > 300ms
+                    pause_splits = []
+                    chunk = [words[0]]
+                    for i in range(1, len(words)):
+                        gap = (words[i].get("start", 0) - words[i - 1].get("end", 0)) * 1000
+                        if gap > 300 and len(chunk) >= 2:
+                            pause_splits.append(chunk)
+                            chunk = []
+                        chunk.append(words[i])
+                    if chunk:
+                        pause_splits.append(chunk)
+                    splits = pause_splits if len(pause_splits) > 1 else [words]
+
+            # Build new segments from splits
+            for word_group in splits:
+                if not word_group:
+                    continue
+                text = " ".join(w.get("word", "").strip() for w in word_group).strip()
+                if not text:
+                    continue
+                result.append({
+                    "start_ms": int(word_group[0].get("start", 0) * 1000),
+                    "end_ms": int(word_group[-1].get("end", 0) * 1000),
+                    "text": text,
+                    "words": word_group,
+                })
+
+        if len(result) != len(segments):
+            logger.info(f"Split {len(segments)} coarse segments into {len(result)} fine segments")
+
+        return result
 
     @staticmethod
     def _strip_hallucinations(segments: list[dict], max_repeat: int = 5) -> list[dict]:

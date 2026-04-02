@@ -31,15 +31,34 @@ except ImportError:
 logger = logging.getLogger("nexus.voice.rules")
 
 
+def _make_signal(
+    speaker_id: str, signal_type: str, value: float, value_text: str,
+    confidence: float, window_start_ms: int, window_end_ms: int,
+    metadata: dict = None,
+) -> dict:
+    """Create a validated signal dict via the Signal model."""
+    return Signal(
+        agent="voice",
+        speaker_id=speaker_id,
+        signal_type=signal_type,
+        value=round(value, 4),
+        value_text=value_text,
+        confidence=round(min(confidence, 0.85), 4),  # Enforce 0.85 cap
+        window_start_ms=window_start_ms,
+        window_end_ms=window_end_ms,
+        metadata=metadata,
+    ).to_dict()
+
+
 class VoiceRuleEngine:
     """
     Evaluates acoustic features against per-speaker baselines
     using research-derived detection rules.
-    
+
     All thresholds are expressed as deviations from baseline
     unless marked as absolute.
     """
-    
+
     def __init__(self):
         self.cal = CalibrationModule()
         # TODO: Load thresholds from rule_config DB table
@@ -76,91 +95,71 @@ class VoiceRuleEngine:
         # ── VOICE-STRESS-01: Composite Vocal Stress Score ──
         stress = self._rule_stress_01(features, baseline)
         if stress is not None:
-            signals.append({
-                "agent": "voice",
-                "speaker_id": speaker_id,
-                "signal_type": "vocal_stress_score",
-                "value": round(stress["score"], 4),
-                "value_text": stress["level"],
-                "confidence": round(stress["score"] * cal_conf, 4),  # Self-calibrating
-                "window_start_ms": window_start,
-                "window_end_ms": window_end,
-                "metadata": stress["components"],
-            })
-        
+            signals.append(_make_signal(
+                speaker_id, "vocal_stress_score",
+                stress["score"], stress["level"],
+                stress["score"] * cal_conf,
+                window_start, window_end,
+                stress["components"],
+            ))
+
         # ── VOICE-FILLER-01: Filler Detection ──
         filler = self._rule_filler_01(features, baseline)
         if filler is not None:
-            signals.append({
-                "agent": "voice",
-                "speaker_id": speaker_id,
-                "signal_type": "filler_detection",
-                "value": filler["filler_rate_pct"],
-                "value_text": filler["status"],
-                "confidence": round(0.90 * cal_conf, 4),  # Filler detection is near-perfect
-                "window_start_ms": window_start,
-                "window_end_ms": window_end,
-                "metadata": {
+            signals.append(_make_signal(
+                speaker_id, "filler_detection",
+                filler["filler_rate_pct"], filler["status"],
+                0.90 * cal_conf,
+                window_start, window_end,
+                {
                     "filler_count": filler["filler_count"],
                     "um_count": filler["um_count"],
                     "uh_count": filler["uh_count"],
                     "delta_from_baseline": filler.get("delta", 0),
                     "credibility_impact": filler.get("credibility_impact", "none"),
                 },
-            })
-        
+            ))
+
         # ── VOICE-PITCH-01: Pitch Elevation Flag ──
         pitch = self._rule_pitch_01(features, baseline)
         if pitch is not None:
-            signals.append({
-                "agent": "voice",
-                "speaker_id": speaker_id,
-                "signal_type": "pitch_elevation_flag",
-                "value": pitch["delta_pct"],
-                "value_text": pitch["level"],
-                "confidence": round(0.50 * cal_conf, 4),
-                "window_start_ms": window_start,
-                "window_end_ms": window_end,
-                "metadata": {
+            signals.append(_make_signal(
+                speaker_id, "pitch_elevation_flag",
+                pitch["delta_pct"], pitch["level"],
+                0.50 * cal_conf,
+                window_start, window_end,
+                {
                     "f0_current": pitch["f0_current"],
                     "f0_baseline": pitch["f0_baseline"],
                     "delta_pct": pitch["delta_pct"],
                 },
-            })
-        
+            ))
+
         # ── VOICE-RATE-01: Speech Rate Anomaly ──
         rate = self._rule_rate_01(features, baseline)
         if rate is not None:
-            signals.append({
-                "agent": "voice",
-                "speaker_id": speaker_id,
-                "signal_type": "speech_rate_anomaly",
-                "value": rate["delta_pct"],
-                "value_text": rate["classification"],
-                "confidence": round(0.40 * cal_conf, 4),
-                "window_start_ms": window_start,
-                "window_end_ms": window_end,
-                "metadata": {
+            signals.append(_make_signal(
+                speaker_id, "speech_rate_anomaly",
+                rate["delta_pct"], rate["classification"],
+                0.40 * cal_conf,
+                window_start, window_end,
+                {
                     "wpm_current": rate["wpm_current"],
                     "wpm_baseline": rate["wpm_baseline"],
                     "sub_classification": rate.get("sub_classification", ""),
                 },
-            })
+            ))
         
         # ── VOICE-TONE-03/04: Tone Classification ──
         tone = self._rule_tone(features, baseline)
         if tone is not None:
-            signals.append({
-                "agent": "voice",
-                "speaker_id": speaker_id,
-                "signal_type": "tone_classification",
-                "value": tone["confidence_raw"],
-                "value_text": tone["tone"],
-                "confidence": round(tone["confidence_raw"] * cal_conf, 4),
-                "window_start_ms": window_start,
-                "window_end_ms": window_end,
-                "metadata": tone.get("evidence", {}),
-            })
+            signals.append(_make_signal(
+                speaker_id, "tone_classification",
+                tone["confidence_raw"], tone["tone"],
+                tone["confidence_raw"] * cal_conf,
+                window_start, window_end,
+                tone.get("evidence", {}),
+            ))
         
         return signals
     
@@ -253,9 +252,13 @@ class VoiceRuleEngine:
         delta = 0.0
         if b.filler_rate_pct > 0:
             delta = self.cal.compute_delta(filler_rate, b.filler_rate_pct)
-        
+        elif filler_rate > 0:
+            # Zero-baseline speaker: any fillers are a spike.
+            # Use absolute rate as the delta proxy (1% = 1.0 delta).
+            delta = filler_rate / 1.0  # 1% filler rate = 100% delta
+
         # Status based on delta
-        if delta > 0.50:  # 50% more fillers than baseline
+        if delta > 0.50:  # 50% more fillers than baseline (or >0.5% absolute for zero-baseline)
             status = "filler_spike"
         elif delta > 0.25:
             status = "filler_elevated"

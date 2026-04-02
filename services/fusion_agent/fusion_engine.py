@@ -229,33 +229,70 @@ def compute_unified_state(
     if confidence_inputs:
         state.confidence_level = round(sum(confidence_inputs) / len(confidence_inputs), 3)
 
-    # ── Sentiment: average of recent values ──
+    # ── Sentiment: recency-weighted average with confidence factoring ──
     sentiment_signals = [
         s for s in language_signals
         if s.get("signal_type") == "sentiment_score"
     ]
     if sentiment_signals:
-        recent_sent = [_to_float(s.get("value", 0)) for s in sentiment_signals[-10:]]
-        state.sentiment_score = round(sum(recent_sent) / len(recent_sent), 3)
+        # Sort by time, take last 10
+        sorted_sent = sorted(
+            sentiment_signals, key=lambda s: _to_int(s.get("window_start_ms", 0))
+        )[-10:]
+        # Recency weight: recent signals count more (1.0, 1.1, 1.2, ..., 1.9)
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for i, s in enumerate(sorted_sent):
+            value = _to_float(s.get("value", 0))
+            conf = max(_to_float(s.get("confidence", 0.5)), 0.1)
+            recency = 1.0 + (i / max(len(sorted_sent) - 1, 1)) * 0.9
+            w = recency * conf
+            weighted_sum += value * w
+            weight_total += w
+        if weight_total > 0:
+            state.sentiment_score = round(weighted_sum / weight_total, 3)
 
-    # ── Engagement: composite of activity indicators ──
+    # ── Engagement: composite of real activity indicators ──
     engagement_factors = []
 
-    # Speech rate activity (any signal = they're talking = engaged)
-    if voice_signals:
-        engagement_factors.append(0.60)
-    if language_signals:
-        engagement_factors.append(0.60)
+    # Voice activity: speech rate variation indicates active participation
+    rate_signals = [s for s in voice_signals if s.get("signal_type") == "speech_rate_anomaly"]
+    if rate_signals:
+        # Fast speech = more engaged, slow = less
+        avg_rate = sum(_to_float(s.get("value", 0)) for s in rate_signals[-5:]) / len(rate_signals[-5:])
+        if avg_rate > 10:   # Speaking faster than baseline
+            engagement_factors.append(0.75)
+        elif avg_rate < -10:  # Speaking slower
+            engagement_factors.append(0.40)
+        else:
+            engagement_factors.append(0.55)
+
+    # Filler rate: high fillers = cognitive engagement (thinking out loud)
+    filler_signals = [s for s in voice_signals if s.get("signal_type") == "filler_detection"]
+    if filler_signals:
+        avg_filler = sum(_to_float(s.get("value", 0)) for s in filler_signals[-5:]) / len(filler_signals[-5:])
+        if avg_filler > 3.0:  # High filler rate = processing
+            engagement_factors.append(0.60)
+        else:
+            engagement_factors.append(0.50)
+
+    # Sentiment intensity: strong sentiment (positive or negative) = engaged
+    if sentiment_signals:
+        avg_abs_sent = sum(abs(_to_float(s.get("value", 0))) for s in sentiment_signals[-5:]) / len(sentiment_signals[-5:])
+        engagement_factors.append(min(0.40 + avg_abs_sent * 0.5, 0.85))
+
+    # Power language: high power = actively leading/asserting
+    power_signals = [s for s in language_signals if s.get("signal_type") == "power_language_score"]
+    if power_signals:
+        avg_power = sum(_to_float(s.get("value", 0.5)) for s in power_signals[-5:]) / len(power_signals[-5:])
+        engagement_factors.append(min(0.35 + avg_power * 0.5, 0.85))
 
     # Buying signals boost engagement
-    buy_signals = [
-        s for s in language_signals
-        if s.get("signal_type") == "buying_signal"
-    ]
+    buy_signals = [s for s in language_signals if s.get("signal_type") == "buying_signal"]
     if buy_signals:
         engagement_factors.append(0.80)
 
-    # High stress slightly reduces engagement score
+    # High stress reduces engagement
     if state.stress_level > 0.60:
         engagement_factors.append(0.30)
 

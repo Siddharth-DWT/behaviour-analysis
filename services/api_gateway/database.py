@@ -19,10 +19,9 @@ logger = logging.getLogger("nexus.gateway.db")
 # Default dev org — matches seed data in 01-schema.sql
 DEV_ORG_ID = "00000000-0000-0000-0000-000000000001"
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://nexus:nexus_dev_2026@localhost:5436/nexus",
-)
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+if not DATABASE_URL:
+    logger.error("DATABASE_URL not set! Database operations will fail.")
 
 _pool: Optional[asyncpg.Pool] = None
 
@@ -30,6 +29,8 @@ _pool: Optional[asyncpg.Pool] = None
 async def get_pool() -> asyncpg.Pool:
     """Get or create the connection pool."""
     global _pool
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL environment variable is not set")
     if _pool is None:
         _pool = await asyncpg.create_pool(
             DATABASE_URL,
@@ -262,10 +263,13 @@ async def insert_signals(session_id: str, signals: list[dict], speaker_map: dict
     pool = await get_pool()
     speaker_map = speaker_map or {}
 
+    unmapped_speakers = set()
     records = []
     for s in signals:
         speaker_label = s.get("speaker_id", "unknown")
         speaker_uuid = speaker_map.get(speaker_label)
+        if speaker_uuid is None and speaker_label not in ("unknown", "all", "multiple", ""):
+            unmapped_speakers.add(speaker_label)
 
         metadata = s.get("metadata")
         if isinstance(metadata, dict):
@@ -285,6 +289,9 @@ async def insert_signals(session_id: str, signals: list[dict], speaker_map: dict
             _safe_int(s.get("window_end_ms", 0)),
             metadata,
         ))
+
+    if unmapped_speakers:
+        logger.warning(f"Signals reference {len(unmapped_speakers)} unmapped speakers: {unmapped_speakers}")
 
     await pool.executemany(
         """

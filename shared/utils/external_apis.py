@@ -1,15 +1,15 @@
 """
 NEXUS Shared — External API Clients
 Wraps the GPU-accelerated Whisper STT and Coqui TTS services
-running on the external server (110.227.200.12).
+running on the external GPU server.
 
 These are optional accelerators:
   - Whisper STT: GPU-powered transcription (replaces local faster-whisper)
   - Coqui TTS:  Neural TTS with voice cloning (replaces macOS `say`)
 
 Environment variables:
-  EXTERNAL_WHISPER_URL   e.g. http://110.227.200.12:8008
-  EXTERNAL_TTS_URL       e.g. http://110.227.200.12:8009
+  EXTERNAL_WHISPER_URL   e.g. http://your-gpu-server:8008
+  EXTERNAL_TTS_URL       e.g. http://your-gpu-server:8009
   EXTERNAL_API_KEY       API key for both services
 """
 import io

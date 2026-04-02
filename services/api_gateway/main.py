@@ -25,6 +25,7 @@ import sys
 import uuid
 import time
 import json
+import asyncio
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -102,6 +103,9 @@ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/recordings"))
 # ── HTTP client timeout (Voice Agent with Whisper can be slow) ──
 AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "1800"))  # 30 minutes
 
+# ── CORS origins (comma-separated list) ──
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:3006,http://localhost:5173").split(",")
+
 app = FastAPI(
     title="NEXUS API Gateway",
     description="Central API for the NEXUS multi-agent behavioural analysis system",
@@ -110,7 +114,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -609,10 +613,12 @@ async def create_session_endpoint(
     except Exception as e:
         logger.warning(f"[{session_id}] DB create failed (continuing without DB): {e}")
 
-    # ── Step 3: Voice Agent ──
+    # ── Step 3: Voice Agent (with retry — this is the critical agent) ──
     voice_result = None
     try:
-        voice_result = await _call_voice_agent(session_id, str(file_path.resolve()), num_speakers=num_speakers, meeting_type=meeting_type)
+        voice_result = await _call_with_retry(
+            lambda: _call_voice_agent(session_id, str(file_path.resolve()), num_speakers=num_speakers, meeting_type=meeting_type)
+        )
         logger.info(
             f"[{session_id}] Voice Agent: "
             f"{voice_result.get('duration_seconds', 0):.0f}s, "
@@ -622,6 +628,10 @@ async def create_session_endpoint(
         logger.error(f"[{session_id}] Voice Agent failed: {e}")
         await _try_update_status(session_id, "failed")
         raise HTTPException(502, f"Voice Agent failed: {e}")
+
+    if not isinstance(voice_result, dict):
+        logger.error(f"[{session_id}] Voice Agent returned unexpected type: {type(voice_result)}")
+        voice_result = {}
 
     duration_seconds = voice_result.get("duration_seconds", 0)
     voice_signals = voice_result.get("signals", [])
@@ -642,6 +652,13 @@ async def create_session_endpoint(
         logger.info(f"[{session_id}] Persisted {count} voice signals")
     except Exception as e:
         logger.warning(f"[{session_id}] Voice signal persist failed: {e}")
+
+    # ── Track agent statuses ──
+    agent_status = {
+        "voice": "completed",
+        "language": "skipped",
+        "fusion": "skipped",
+    }
 
     # ── Step 4: Language Agent ──
     language_result = None
@@ -664,8 +681,10 @@ async def create_session_endpoint(
             )
             language_signals = language_result.get("signals", [])
             language_summary = language_result.get("summary", {})
+            agent_status["language"] = "completed"
             logger.info(f"[{session_id}] Language Agent: {len(language_signals)} signals")
         except Exception as e:
+            agent_status["language"] = "failed"
             logger.warning(f"[{session_id}] Language Agent failed (continuing): {e}")
 
         # Persist language signals
@@ -696,11 +715,13 @@ async def create_session_endpoint(
         fusion_signals = fusion_result.get("fusion_signals", [])
         alerts = fusion_result.get("alerts", [])
         report = fusion_result.get("report")
+        agent_status["fusion"] = "completed"
         logger.info(
             f"[{session_id}] Fusion Agent: "
             f"{len(fusion_signals)} signals, {len(alerts)} alerts"
         )
     except Exception as e:
+        agent_status["fusion"] = "failed"
         logger.warning(f"[{session_id}] Fusion Agent failed (continuing): {e}")
 
     # Persist fusion signals
@@ -746,18 +767,21 @@ async def create_session_endpoint(
         except Exception as e:
             logger.warning(f"[{session_id}] Report persist failed: {e}")
 
-    # ── Step 6: Mark session complete ──
+    # ── Step 6: Mark session complete (or partial if agents failed) ──
+    any_failed = any(v == "failed" for v in agent_status.values())
+    final_status = "partial" if any_failed else "completed"
+
     await _try_update_status(
-        session_id, "completed",
+        session_id, final_status,
         duration_ms=int(duration_seconds * 1000),
         speaker_count=speaker_count,
     )
 
-    logger.info(f"[{session_id}] Pipeline complete")
+    logger.info(f"[{session_id}] Pipeline complete (status={final_status}, agents={agent_status})")
 
     return SessionCreateResponse(
         session_id=session_id,
-        status="completed",
+        status=final_status,
         title=title,
         meeting_type=meeting_type,
         duration_seconds=duration_seconds,
@@ -767,6 +791,7 @@ async def create_session_endpoint(
         fusion_signal_count=len(fusion_signals),
         alert_count=len(alerts),
         report_generated=report_generated,
+        agent_status=agent_status,
     )
 
 
@@ -994,6 +1019,21 @@ async def get_session_transcript(session_id: str, current_user: dict = Depends(g
 # Agent call helpers
 # ─────────────────────────────────────────────────────────
 
+async def _call_with_retry(coro_fn, max_retries=2, backoff=2.0):
+    """Call an async function with retry and exponential backoff."""
+    last_error: Exception = Exception("no attempts made")
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro_fn()
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                wait = backoff * (2 ** attempt)
+                logger.warning(f"Retry {attempt+1}/{max_retries} after {wait}s: {e}")
+                await asyncio.sleep(wait)
+    raise last_error
+
+
 async def _call_voice_agent(session_id: str, file_path: str, num_speakers: Optional[int] = None, meeting_type: str = "sales_call") -> dict:
     """Call Voice Agent POST /analyse with file path."""
     payload = {
@@ -1104,9 +1144,11 @@ def _extract_transcript_segments(voice_result: dict) -> list[dict]:
             continue
 
         start_ms = s.get("window_start_ms", 0)
-        if start_ms in seen_starts:
+        speaker = s.get("speaker_id", "unknown")
+        dedup_key = (start_ms, speaker)
+        if dedup_key in seen_starts:
             continue
-        seen_starts.add(start_ms)
+        seen_starts.add(dedup_key)
 
         reconstructed.append({
             "speaker": s.get("speaker_id", "unknown"),

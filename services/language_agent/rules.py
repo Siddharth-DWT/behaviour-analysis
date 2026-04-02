@@ -34,6 +34,25 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     from shared.models.signals import Signal
 
+def _make_signal(
+    speaker_id: str, signal_type: str, value: float, value_text: str,
+    confidence: float, window_start_ms: int, window_end_ms: int,
+    metadata: dict = None,
+) -> dict:
+    """Create a validated signal dict via the Signal model."""
+    return Signal(
+        agent="language",
+        speaker_id=speaker_id,
+        signal_type=signal_type,
+        value=round(value, 4),
+        value_text=value_text,
+        confidence=round(min(confidence, 0.85), 4),  # Enforce 0.85 cap
+        window_start_ms=window_start_ms,
+        window_end_ms=window_end_ms,
+        metadata=metadata,
+    ).to_dict()
+
+
 # ── LLM client (supports Anthropic + OpenAI via LLM_PROVIDER env var) ──
 try:
     from shared.utils.llm_client import is_configured, get_provider_info, complete as llm_complete
@@ -117,21 +136,17 @@ class LanguageRuleEngine:
 
         # ── LANG-SENT-01: Per-Sentence Sentiment (all content types) ──
         sent = self._rule_sentiment_01(features)
-        signals.append({
-            "agent": "language",
-            "speaker_id": speaker_id,
-            "signal_type": "sentiment_score",
-            "value": round(sent["value"], 4),
-            "value_text": sent["label"],
-            "confidence": round(sent["confidence"], 4),
-            "window_start_ms": start_ms,
-            "window_end_ms": end_ms,
-            "metadata": {
+        signals.append(_make_signal(
+            speaker_id, "sentiment_score",
+            sent["value"], sent["label"],
+            sent["confidence"],
+            start_ms, end_ms,
+            {
                 "raw_label": sent["raw_label"],
                 "raw_score": sent["raw_score"],
                 "text_preview": features.get("text", "")[:80],
             },
-        })
+        ))
 
         # ── LANG-BUY-01: Buying Signal Detection (sales_call only) ──
         # Buying signals are only meaningful from the Prospect/Buyer, never the Seller.
@@ -149,58 +164,45 @@ class LanguageRuleEngine:
                 }
                 if not speaker_role:
                     meta["needs_role_validation"] = True
-                signals.append({
-                    "agent": "language",
-                    "speaker_id": speaker_id,
-                    "signal_type": "buying_signal",
-                    "value": round(buy["strength"], 4),
-                    "value_text": buy["level"],
-                    "confidence": round(buy["confidence"], 4),
-                    "window_start_ms": start_ms,
-                    "window_end_ms": end_ms,
-                    "metadata": meta,
-                })
+                signals.append(_make_signal(
+                    speaker_id, "buying_signal",
+                    buy["strength"], buy["level"],
+                    buy["confidence"],
+                    start_ms, end_ms, meta,
+                ))
 
         # ── LANG-OBJ-01: Objection Signal Detection (sales_call only) ──
         if active_type in self.SALES_TYPES:
             obj = self._rule_objection_01(features)
             if obj is not None:
-                signals.append({
-                    "agent": "language",
-                    "speaker_id": speaker_id,
-                    "signal_type": "objection_signal",
-                    "value": round(obj["strength"], 4),
-                    "value_text": obj["level"],
-                    "confidence": round(obj["confidence"], 4),
-                    "window_start_ms": start_ms,
-                    "window_end_ms": end_ms,
-                    "metadata": {
+                signals.append(_make_signal(
+                    speaker_id, "objection_signal",
+                    obj["strength"], obj["level"],
+                    obj["confidence"],
+                    start_ms, end_ms,
+                    {
                         "categories": obj["categories"],
                         "hedge_count": obj.get("hedge_count", 0),
                         "matches": obj["matches"][:5],
                         "text_preview": features.get("text", "")[:80],
                     },
-                })
+                ))
 
         # ── LANG-PWR-01: Power Language Score (all content types) ──
         pwr = self._rule_power_01(features)
         if pwr is not None:
-            signals.append({
-                "agent": "language",
-                "speaker_id": speaker_id,
-                "signal_type": "power_language_score",
-                "value": round(pwr["score"], 4),
-                "value_text": pwr["level"],
-                "confidence": round(pwr["confidence"], 4),
-                "window_start_ms": start_ms,
-                "window_end_ms": end_ms,
-                "metadata": {
+            signals.append(_make_signal(
+                speaker_id, "power_language_score",
+                pwr["score"], pwr["level"],
+                pwr["confidence"],
+                start_ms, end_ms,
+                {
                     "powerless_feature_count": pwr["powerless_count"],
                     "features_found": pwr["features_found"],
                     "word_count": pwr["word_count"],
                     "text_preview": features.get("text", "")[:80],
                 },
-            })
+            ))
 
         return signals
 
@@ -451,13 +453,16 @@ class LanguageRuleEngine:
         Uses the shared llm_client (supports Anthropic Claude or OpenAI).
         Returns Signal dicts for each classified utterance.
         """
-        # Build numbered utterance list for the prompt
+        # Build numbered utterance list for the prompt.
+        # Track which batch indices have valid text so LLM IDs map back correctly.
         utterance_lines = []
+        valid_batch_indices = []  # Maps prompt ID (1-based) → batch index
         for i, f in enumerate(batch):
             speaker = f.get("speaker_id", "unknown")
             text = f.get("text", "").strip()
             if text:
-                utterance_lines.append(f"{i+1}. [{speaker}]: {text}")
+                valid_batch_indices.append(i)
+                utterance_lines.append(f"{len(utterance_lines)+1}. [{speaker}]: {text}")
 
         if not utterance_lines:
             return []
@@ -497,46 +502,49 @@ Utterances:
                 max_tokens=1024,
             )
 
-            # Handle potential markdown wrapping
-            if response_text.startswith("```"):
-                response_text = response_text.split("\n", 1)[1]
-                response_text = response_text.rsplit("```", 1)[0].strip()
-
-            classifications = json.loads(response_text)
-
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse LLM intent response: {e}")
-            return []
+            # Robust JSON extraction — handles markdown, extra text, etc.
+            import re
+            # Try direct parse first
+            try:
+                classifications = json.loads(response_text)
+            except json.JSONDecodeError:
+                # Try extracting JSON array from markdown or surrounding text
+                json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+                if json_match:
+                    classifications = json.loads(json_match.group())
+                else:
+                    logger.warning(f"No JSON array found in LLM response: {response_text[:200]}")
+                    return []
         except Exception as e:
             logger.warning(f"LLM API call failed for intent classification: {e}")
             return []
 
-        # Convert to signals
+        # Convert to signals — map LLM IDs back via valid_batch_indices
         signals = []
         for cls in classifications:
-            idx = cls.get("id", 0) - 1  # Convert 1-based to 0-based
-            if idx < 0 or idx >= len(batch):
+            prompt_id = cls.get("id", 0) - 1  # Convert 1-based to 0-based
+            if prompt_id < 0 or prompt_id >= len(valid_batch_indices):
                 continue
 
-            f = batch[idx]
+            batch_idx = valid_batch_indices[prompt_id]
+            f = batch[batch_idx]
             raw_confidence = min(float(cls.get("confidence", 0.5)), 0.85)
 
             if raw_confidence < 0.40:
                 continue
 
-            signals.append({
-                "agent": "language",
-                "speaker_id": f.get("speaker_id", "unknown"),
-                "signal_type": "intent_classification",
-                "value": 1.0,  # Intent is categorical: 1.0 = detected
-                "value_text": cls.get("intent", "UNKNOWN"),
-                "confidence": round(raw_confidence, 4),
-                "window_start_ms": f.get("start_ms", 0),
-                "window_end_ms": f.get("end_ms", 0),
-                "metadata": {
+            signals.append(_make_signal(
+                f.get("speaker_id", "unknown"),
+                "intent_classification",
+                1.0,  # Intent is categorical: 1.0 = detected
+                cls.get("intent", "UNKNOWN"),
+                raw_confidence,
+                f.get("start_ms", 0),
+                f.get("end_ms", 0),
+                {
                     "intent": cls.get("intent", "UNKNOWN"),
                     "text_preview": f.get("text", "")[:80],
                 },
-            })
+            ))
 
         return signals

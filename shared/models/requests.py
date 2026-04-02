@@ -120,6 +120,7 @@ class SessionCreateResponse(BaseModel):
     fusion_signal_count: int = 0
     alert_count: int = 0
     report_generated: bool = False
+    agent_status: Optional[dict[str, str]] = None
 
 
 class SessionListResponse(BaseModel):

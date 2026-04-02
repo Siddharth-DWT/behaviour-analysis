@@ -3,6 +3,7 @@
 NEXUS Health Check - Verify all infrastructure services are running.
 Run: python scripts/health_check.py
 """
+import os
 import sys
 import json
 
@@ -10,10 +11,11 @@ def check_postgres():
     """Check PostgreSQL + pgvector connection."""
     try:
         import psycopg2
-        conn = psycopg2.connect(
-            host="localhost", port=5432,
-            dbname="nexus", user="nexus", password="nexus_dev_2026"
-        )
+        database_url = os.getenv("DATABASE_URL", "")
+        if not database_url:
+            print("  [FAIL] DATABASE_URL environment variable not set")
+            return False
+        conn = psycopg2.connect(database_url)
         cur = conn.cursor()
         
         # Check pgvector extension
