@@ -334,7 +334,7 @@ async def analyse_signals(request: AnalyseRequest):
         duration_seconds = (max(all_timestamps) - min(all_timestamps)) / 1000.0 if all_timestamps else 0
         report_type = request.content_type or request.meeting_type or "sales_call"
 
-        report = generate_session_narrative(
+        report = await generate_session_narrative(
             session_id=session_id,
             duration_seconds=duration_seconds,
             speakers=speakers,

@@ -123,9 +123,11 @@ class Transcriber:
         self._parakeet_client = None
         self._use_external = False
         self._use_deepgram = False
+        self._use_deepgram_diarize = False
         self._use_assemblyai = False
         self._use_whisper_pyannote = False
         self._use_parakeet = False
+        self._use_external_diarize = False
         self._num_speakers = None  # Speaker count hint (2-10), None = auto
         self._audio_data = None    # Pre-loaded (y, sr) tuple, avoids redundant disk reads
         self._last_diarization_backend = "uninitialized"
