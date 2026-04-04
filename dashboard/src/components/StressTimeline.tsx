@@ -14,6 +14,7 @@ import type { Signal } from "../api/client";
 interface Props {
   signals: Signal[];
   speakerRoles?: Record<string, string>;
+  speakerNames?: Record<string, string>;
 }
 
 interface DataPoint {
@@ -33,7 +34,7 @@ function formatTime(ms: number): string {
   return `${min}:${String(sec).padStart(2, "0")}`;
 }
 
-export default function StressTimeline({ signals, speakerRoles }: Props) {
+export default function StressTimeline({ signals, speakerRoles, speakerNames }: Props) {
   const [themeColors, setThemeColors] = useState({
     speakerColors: ["#4F8BFF", "#8B5CF6", "#F59E0B", "#10B981", "#EC4899"],
     border: "#2D3348",
@@ -85,11 +86,15 @@ export default function StressTimeline({ signals, speakerRoles }: Props) {
     new Set(stressSignals.map((s) => s.speaker_label || s.speaker_id || "Unknown"))
   );
 
-  // Build display names with roles
+  // Build display names with real names + roles
   const speakerDisplayNames: Record<string, string> = {};
   for (const label of speakerLabels) {
+    const name = speakerNames?.[label];
     const role = speakerRoles?.[label];
-    speakerDisplayNames[label] = role ? `${label} (${role})` : label;
+    if (name && role) speakerDisplayNames[label] = `${name} (${role})`;
+    else if (name) speakerDisplayNames[label] = name;
+    else if (role) speakerDisplayNames[label] = `${label} (${role})`;
+    else speakerDisplayNames[label] = label;
   }
 
   // Build time-series data points

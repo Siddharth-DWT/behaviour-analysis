@@ -95,6 +95,7 @@ def _check_llm_ready() -> bool:
 
 
 INTENT_BATCH_SIZE = 15  # 10-20 utterances per LLM call
+SHORT_UTTERANCE_WORDS = 5  # ≤5 words need surrounding context for classification
 
 
 class LanguageRuleEngine:
@@ -451,7 +452,9 @@ class LanguageRuleEngine:
         # Process in batches of INTENT_BATCH_SIZE
         for batch_start in range(0, len(features_list), INTENT_BATCH_SIZE):
             batch = features_list[batch_start:batch_start + INTENT_BATCH_SIZE]
-            batch_signals = await self._classify_intent_batch(batch)
+            batch_signals = await self._classify_intent_batch(
+                batch, all_features=features_list, batch_offset=batch_start,
+            )
             signals.extend(batch_signals)
 
         return signals
@@ -1030,12 +1033,14 @@ class LanguageRuleEngine:
     # ════════════════════════════════════════════════════════
 
     async def _classify_intent_batch(
-        self, batch: list[dict]
+        self, batch: list[dict],
+        all_features: list[dict] | None = None,
+        batch_offset: int = 0,
     ) -> list[dict]:
         """
         Send a batch of utterances to the LLM for intent classification.
-        Uses the shared llm_client (supports Anthropic Claude or OpenAI).
-        Returns Signal dicts for each classified utterance.
+        Short utterances (≤5 words) are enriched with surrounding context
+        so the LLM can classify them accurately.
         """
         # Build numbered utterance list for the prompt.
         # Track which batch indices have valid text so LLM IDs map back correctly.
@@ -1044,8 +1049,35 @@ class LanguageRuleEngine:
         for i, f in enumerate(batch):
             speaker = f.get("speaker_id", "unknown")
             text = f.get("text", "").strip()
-            if text:
-                valid_batch_indices.append(i)
+            if not text:
+                continue
+
+            valid_batch_indices.append(i)
+            words = text.split()
+
+            # Short utterance: enrich with surrounding context
+            if len(words) <= SHORT_UTTERANCE_WORDS and all_features is not None:
+                global_idx = batch_offset + i
+                parts = []
+                # Previous 2 segments
+                for prev_off in [2, 1]:
+                    prev_idx = global_idx - prev_off
+                    if 0 <= prev_idx < len(all_features):
+                        prev_f = all_features[prev_idx]
+                        prev_text = prev_f.get("text", "").strip()
+                        if prev_text:
+                            parts.append(f"{prev_f.get('speaker_id', '?')}: {prev_text}")
+                # Current (marked)
+                parts.append(f">>> {speaker}: {text} <<<")
+                # Next 1 segment
+                next_idx = global_idx + 1
+                if next_idx < len(all_features):
+                    nxt_f = all_features[next_idx]
+                    nxt_text = nxt_f.get("text", "").strip()
+                    if nxt_text:
+                        parts.append(f"{nxt_f.get('speaker_id', '?')}: {nxt_text}")
+                utterance_lines.append(f"{len(utterance_lines)+1}. " + " | ".join(parts))
+            else:
                 utterance_lines.append(f"{len(utterance_lines)+1}. [{speaker}]: {text}")
 
         if not utterance_lines:
@@ -1066,12 +1098,20 @@ class LanguageRuleEngine:
 - PROPOSE: Suggesting an idea, plan, or solution
 - AGREE: Expressing agreement or acceptance
 - DISAGREE: Expressing disagreement or pushback
+- ACKNOWLEDGE: Confirming receipt, accepting a point ("Fine.", "Okay.", "Right.", "Sure.")
 - NEGOTIATE: Bargaining, counter-offering, or discussing terms
 - COMMIT: Making a promise, commitment, or decision
 - DEFLECT: Avoiding, redirecting, or evading a topic
 - RAPPORT: Small talk, relationship building, empathy
 - CLOSE: Attempting to close a deal or reach a decision
 - OBJECTION: Raising a concern or barrier
+
+IMPORTANT for context-enriched utterances (marked with >>> and <<<):
+- Classify ONLY the marked segment. Surrounding text is context.
+- Short responses after questions: "Fine.", "Okay.", "Sure." = ACKNOWLEDGE or AGREE
+- "No.", "Nope." after a yes/no question = DISAGREE or INFORM
+- "Yes.", "Yeah." = AGREE
+- When in doubt for short utterances, prefer ACKNOWLEDGE over REQUEST.
 
 Respond with a JSON array of objects: [{{"id": 1, "intent": "CATEGORY", "confidence": 0.0-1.0}}]
 Only include utterances where you have confidence > 0.4. Return ONLY the JSON array, no other text.

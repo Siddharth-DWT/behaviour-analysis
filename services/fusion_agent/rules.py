@@ -53,6 +53,9 @@ class FusionRuleEngine:
     from different agents within temporal windows.
     """
 
+    # Content types where persuasion/urgency detection is relevant
+    URGENCY_RELEVANT_TYPES = {"sales_call", "presentation", "pitch", "debate"}
+
     def evaluate(
         self,
         speaker_id: str,
@@ -60,6 +63,7 @@ class FusionRuleEngine:
         language_signals: list[dict],
         window_start_ms: int = 0,
         window_end_ms: int = 0,
+        content_type: str = "sales_call",
     ) -> list[dict]:
         """
         Run all fusion rules for a speaker given their recent signals.
@@ -70,6 +74,7 @@ class FusionRuleEngine:
             language_signals: Recent language agent signals for this speaker
             window_start_ms: Fusion window start
             window_end_ms: Fusion window end
+            content_type: Meeting type for content-aware gating
 
         Returns:
             List of fusion signal dicts
@@ -92,7 +97,7 @@ class FusionRuleEngine:
             })
 
         # ── FUSION-07: Hedge × Positive Sentiment → Incongruence ──
-        incong = self._rule_fusion_07(language_signals, voice_signals)
+        incong = self._rule_fusion_07(language_signals, voice_signals, content_type)
         if incong is not None:
             signals.append({
                 "agent": "fusion",
@@ -107,7 +112,7 @@ class FusionRuleEngine:
             })
 
         # ── FUSION-13: Persuasion × Pace → Urgency Authenticity ──
-        urg = self._rule_fusion_13(voice_signals, language_signals)
+        urg = self._rule_fusion_13(voice_signals, language_signals, content_type)
         if urg is not None:
             signals.append({
                 "agent": "fusion",
@@ -239,6 +244,7 @@ class FusionRuleEngine:
         self,
         language_signals: list[dict],
         voice_signals: list[dict] = None,
+        content_type: str = "sales_call",
     ) -> Optional[dict]:
         """
         Audio-only adaptation of FUSION-07 (Head Shake × Affirmative Language).
@@ -337,10 +343,13 @@ class FusionRuleEngine:
 
         if not has_voice_stress:
             # Downgrade: polite hedging, not true incongruence
+            hedged_conf = min(0.35, score * 0.50)
+            if hedged_conf < 0.10:
+                return None  # Below noise floor
             return {
                 "score": min(score, 0.30),
                 "level": "hedged_agreement",
-                "confidence": min(0.35, score * 0.50),
+                "confidence": hedged_conf,
                 "evidence": evidence,
             }
 
@@ -357,6 +366,11 @@ class FusionRuleEngine:
         # (d) Minimum confidence threshold
         if raw_confidence < 0.45:
             return None
+
+        # For internal meetings, require higher confidence (more natural variance)
+        if content_type in ("internal", "meeting", "interview"):
+            if raw_confidence < 0.35:
+                return None
 
         return {
             "score": score,
@@ -375,6 +389,7 @@ class FusionRuleEngine:
         self,
         voice_signals: list[dict],
         language_signals: list[dict],
+        content_type: str = "sales_call",
     ) -> Optional[dict]:
         """
         Urgency authenticity check:
@@ -399,6 +414,10 @@ class FusionRuleEngine:
         genuinely enthusiastic about their product from one artificially
         creating time pressure.
         """
+        # GATE: Only fire on content types where persuasion/urgency detection makes sense
+        if content_type not in self.URGENCY_RELEVANT_TYPES:
+            return None
+
         # Need rate anomaly signal (elevated = speaking faster than baseline)
         rate_signals = [
             s for s in voice_signals
@@ -560,6 +579,7 @@ class FusionRuleEngine:
         graph_insights: dict,
         speakers: list[str],
         existing_fusion_signals: list[dict],
+        content_type: str = "sales_call",
     ) -> list[dict]:
         """Generate fusion signals from graph analytics."""
         signals = []

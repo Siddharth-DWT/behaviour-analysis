@@ -570,7 +570,8 @@ class DiarizeClient:
         min_speakers: int = 2,
         max_speakers: int = 8,
         num_speakers: int = 0,
-        audio_data: tuple = None,
+        audio_data: Optional[tuple] = None,
+        clustering_threshold: float = 0.0,
     ) -> dict:
         """
         Diarize an audio file via the external GPU API.
@@ -621,10 +622,12 @@ class DiarizeClient:
         start_time = time.time()
 
         data = {
-            "min_speakers": str(min_speakers),
-            "max_speakers": str(max_speakers),
-            "num_speakers": str(num_speakers),
+            "min_speakers": str(min_speakers or 1),
+            "max_speakers": str(max_speakers or 20),
+            "num_speakers": str(num_speakers or 0),
         }
+        if clustering_threshold and clustering_threshold > 0:
+            data["clustering_threshold"] = str(clustering_threshold)
 
         if audio_data is not None:
             # Export pre-loaded numpy audio to in-memory WAV bytes
@@ -1203,7 +1206,7 @@ def create_diarize_client(**kwargs) -> Optional[DiarizeClient]:
         return None
     try:
         client = DiarizeClient(**kwargs)
-        if client.health_check():
+        if client.is_healthy():
             return client
         logger.warning(f"External diarize API at {DIARIZE_URL} is not healthy")
         return None

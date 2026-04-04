@@ -146,6 +146,7 @@ services:
       - ./services/language_agent:/app
       - ./shared:/app/shared
       - ./data:/app/data
+      - ./models:/app/models
     depends_on:
       postgres:
         condition: service_healthy
@@ -220,6 +221,12 @@ services:
       - LANGUAGE_AGENT_URL=http://language:8002
       - CONVERSATION_AGENT_URL=http://conversation:8006
       - FUSION_AGENT_URL=http://fusion:8007
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - OLLAMA_URL=${OLLAMA_URL:-}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1:8b}
+      - OLLAMA_EMBED_MODEL=${OLLAMA_EMBED_MODEL:-nomic-embed-text}
       - JWT_SECRET=${JWT_SECRET:-nexus-dev-jwt-secret-2026}
       - ZEPTOMAIL_TOKEN=${ZEPTOMAIL_TOKEN:-}
       - FROM_EMAIL=${FROM_EMAIL:-noreply@yourdomain.com}

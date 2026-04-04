@@ -19,8 +19,16 @@ Models auto-download on first use (~1.5GB for medium model).
 """
 import os
 import sys
+import warnings
 import logging
+import tempfile
 import numpy as np
+import soundfile as sf
+
+# Suppress torchcodec/libtorchcodec warnings from pyannote — we pre-convert to WAV
+warnings.filterwarnings("ignore", message=".*torchcodec.*")
+warnings.filterwarnings("ignore", message=".*libtorchcodec.*")
+
 import torchaudio as _ta
 import torch
 from typing import Optional
@@ -153,6 +161,12 @@ class Transcriber:
 
         if backend in ("auto", "parakeet") and PARAKEET_URL:
             self._init_parakeet()
+
+        # Parakeet and Whisper both need a separate diarization backend.
+        # Init external GPU diarize if available (used by parakeet, whisper, and auto).
+        if backend in ("auto", "parakeet", "whisper") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
+            if not self._use_external_diarize:
+                self._init_external_diarize()
 
         if backend in ("auto", "whisper") and EXTERNAL_WHISPER_URL:
             self._init_external()
@@ -357,17 +371,17 @@ class Transcriber:
             from shared.utils.external_apis import DiarizeClient
 
             client = DiarizeClient(
-                base_url=EXTERNAL_DIARIZE_URL,
+                base_url=EXTERNAL_TRANSCRIBE_DIARIZE_URL,
                 api_key=EXTERNAL_API_KEY,
             )
 
             if client.is_healthy():
                 self._diarize_client = client
                 self._use_external_diarize = True
-                logger.info(f"Using EXTERNAL GPU diarization: {EXTERNAL_DIARIZE_URL}")
+                logger.info(f"Using EXTERNAL GPU diarization: {EXTERNAL_TRANSCRIBE_DIARIZE_URL}")
             else:
                 logger.warning(
-                    f"External diarize API at {EXTERNAL_DIARIZE_URL} is not healthy. "
+                    f"External diarize API at {EXTERNAL_TRANSCRIBE_DIARIZE_URL} is not healthy. "
                     f"Falling back to local diarization."
                 )
         except Exception as e:
@@ -430,7 +444,13 @@ class Transcriber:
         self._num_speakers = num_speakers
         self._audio_data = audio_data
         self._meeting_type = meeting_type
+        self._tmp_wav = None  # Track temp WAV for cleanup
+
         try:
+            # Convert to 16kHz mono WAV upfront if input is a video/non-WAV container.
+            # This ensures ALL backends get clean audio regardless of input format.
+            effective_path = self._ensure_wav(audio_path)
+
             # Fallback chain:
             #   1. AssemblyAI (one call, Universal-3 Pro)
             #   2. Deepgram (one call, Nova-3)
@@ -439,22 +459,77 @@ class Transcriber:
             #   5. Whisper + diarize cascade (two calls, mapping)
             #   6. Local faster-whisper + local diarize cascade
             if self._use_assemblyai:
-                return self._transcribe_assemblyai(audio_path)
+                return self._transcribe_assemblyai(effective_path)
             elif self._use_deepgram:
-                return self._transcribe_deepgram(audio_path)
+                return self._transcribe_deepgram(effective_path)
             elif self._use_whisper_pyannote:
-                return self._transcribe_whisper_pyannote(audio_path)
+                return self._transcribe_whisper_pyannote(effective_path)
             elif self._use_parakeet:
-                return self._transcribe_parakeet(audio_path)
+                return self._transcribe_parakeet(effective_path)
             elif self._use_external:
-                return self._transcribe_external(audio_path)
+                return self._transcribe_external(effective_path)
             else:
-                return self._transcribe_local(audio_path)
+                return self._transcribe_local(effective_path)
         finally:
+            # Cleanup temp WAV if we created one
+            if self._tmp_wav is not None:
+                try:
+                    os.unlink(self._tmp_wav)
+                except OSError:
+                    pass
+                self._tmp_wav = None
             # Clear per-request state to prevent leaking into next request
             self._num_speakers = None
             self._audio_data = None
             self._meeting_type = None
+
+    def _ensure_wav(self, audio_path: str) -> str:
+        """
+        Convert input file to 16kHz mono WAV if it's not already WAV.
+        Uses pre-loaded audio_data if available, otherwise loads from file.
+        Returns path to the WAV file (original if already WAV, temp file otherwise).
+        """
+        # If it's already a .wav, use as-is
+        if audio_path.lower().endswith(".wav") and self._audio_data is None:
+            return audio_path
+
+        # If we have pre-loaded audio data, write it to a temp WAV
+        if self._audio_data is not None:
+            y, sr = self._audio_data
+            if y.ndim > 1:
+                y = np.mean(y, axis=0) if y.shape[0] < y.shape[1] else np.mean(y, axis=1)
+            if sr != 16000:
+                try:
+                    import torchaudio.functional as _ta_fn
+                    import torch
+                    waveform = torch.from_numpy(y).float().unsqueeze(0)
+                    waveform = _ta_fn.resample(waveform, sr, 16000)
+                    y = waveform.squeeze(0).numpy()
+                except ImportError:
+                    import librosa
+                    y = librosa.resample(y, orig_sr=sr, target_sr=16000)
+                sr = 16000
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            sf.write(tmp.name, y, sr)
+            self._tmp_wav = tmp.name
+            logger.info(f"Converted pre-loaded audio to 16kHz WAV: {tmp.name}")
+            return tmp.name
+
+        # Non-WAV file on disk (mp4, mp3, m4a, webm, ogg, flac) — load and convert
+        if not audio_path.lower().endswith(".wav"):
+            try:
+                from shared.utils.audio_loader import load_audio
+                y, sr = load_audio(audio_path, sr=16000)
+            except ImportError:
+                import librosa
+                y, sr = librosa.load(audio_path, sr=16000, mono=True)
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            sf.write(tmp.name, y, sr)
+            self._tmp_wav = tmp.name
+            logger.info(f"Converted {Path(audio_path).suffix} to 16kHz mono WAV: {tmp.name}")
+            return tmp.name
+
+        return audio_path
 
     # ═══════════════════════════════════════════════════════════
     # PARAKEET BACKEND (fast transcription + separate diarize cascade)
@@ -519,42 +594,14 @@ class Transcriber:
 
         Fallback: AssemblyAI -> Deepgram -> Whisper separate -> Local
         """
-        import tempfile
-        import soundfile as sf
-
         url = EXTERNAL_TRANSCRIBE_DIARIZE_URL.rstrip("/")
         if not url.endswith("/transcribe-diarize"):
             url = f"{url}/transcribe-diarize"
 
         logger.info(f"Transcribing via Whisper+Pyannote combined: {audio_path}")
 
-        # Convert to WAV if needed (pyannote can't read MP4)
+        # audio_path is already 16kHz mono WAV (converted by _ensure_wav)
         wav_path = audio_path
-        tmp_wav = None
-        if self._audio_data is not None:
-            y, sr = self._audio_data
-            if y.ndim > 1:
-                y = np.mean(y, axis=0) if y.shape[0] < y.shape[1] else np.mean(y, axis=1)
-            if sr != 16000:
-                waveform = torch.from_numpy(y).float()
-                if waveform.ndim == 1:
-                    waveform = waveform.unsqueeze(0)
-                waveform = _ta.functional.resample(waveform, sr, 16000)
-                y = waveform.squeeze(0).numpy()
-                sr = 16000
-            tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            sf.write(tmp_wav.name, y, sr)
-            wav_path = tmp_wav.name
-        elif audio_path.lower().endswith((".mp4", ".m4a", ".webm", ".ogg", ".flac", ".mp3")):
-            try:
-                from shared.utils.audio_loader import load_audio
-                y, sr = load_audio(audio_path, sr=16000)
-            except ImportError:
-                import librosa
-                y, sr = librosa.load(audio_path, sr=16000, mono=True)
-            tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            sf.write(tmp_wav.name, y, sr)
-            wav_path = tmp_wav.name
 
         headers = {"X-API-Key": EXTERNAL_API_KEY} if EXTERNAL_API_KEY else {}
 
@@ -593,12 +640,6 @@ class Transcriber:
             elif self._use_external:
                 return self._transcribe_external(audio_path)
             return self._transcribe_local(audio_path)
-        finally:
-            if tmp_wav is not None:
-                try:
-                    os.unlink(tmp_wav.name)
-                except OSError:
-                    pass
 
         # Convert response to NEXUS format
         # Response has: segments[{speaker, start, end, text, words}], speakers, duration
@@ -804,19 +845,13 @@ class Transcriber:
                     None if self._use_deepgram_diarize
                     else self._audio_data
                 )
-                # Deepgram handles MP4/MP3 natively — send original file
-                # for best quality. Only fall back to pre-loaded WAV for
-                # pyannote GPU which can't decode container formats.
-                use_audio_data = (
-                    None if self._use_deepgram_diarize
-                    else self._audio_data
-                )
                 return self._diarize_client.diarize(
                     audio_path,
                     min_speakers=config["min"],
                     max_speakers=config["max"],
                     num_speakers=self._num_speakers or 0,
                     audio_data=use_audio_data,
+                    clustering_threshold=DIARIZE_CLUSTERING_THRESHOLD,
                 )
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:

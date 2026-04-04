@@ -32,6 +32,7 @@ import SignalChainCards from "../components/SignalChainCards";
 import SpeakerGraph from "../components/SpeakerGraph";
 import InsightPanel from "../components/InsightPanel";
 import ConversationGraph from "../components/ConversationGraph";
+import SessionChat from "../components/SessionChat";
 import SwimlaneTimeline from "../components/SwimlaneTimeline";
 import TranscriptView from "../components/TranscriptView";
 import GraphInsightsCard from "../components/GraphInsightsCard";
@@ -346,7 +347,7 @@ const FUSION_VALUE_LABELS: Record<string, string> = {
 
 // ── Main Component ──
 
-type TabKey = "transcript" | "insights" | "report";
+type TabKey = "transcript" | "insights" | "report" | "chat";
 
 export default function SessionDetail() {
   const { id } = useParams<{ id: string }>();
@@ -407,6 +408,30 @@ export default function SessionDetail() {
 
   // Infer speaker roles (uses transcript to detect who introduces themselves)
   const speakerRoles = inferSpeakerRoles(speakerStats, session.meeting_type, segments);
+
+  // Build speaker name map from entity extraction (Speaker_0 → "Rita")
+  const speakerNames: Record<string, string> = (() => {
+    const names: Record<string, string> = {};
+    const people = (content?.entities as any)?.people as Array<{ name: string; role: string; speaker_label: string }> | undefined;
+    if (!people) return names;
+    const byLabel: Record<string, Array<{ name: string; role: string }>> = {};
+    for (const p of people) {
+      if (p.speaker_label) {
+        (byLabel[p.speaker_label] ||= []).push(p);
+      }
+    }
+    for (const [label, candidates] of Object.entries(byLabel)) {
+      const best = candidates.find((c) => c.role && c.role.toLowerCase() !== "participant") || candidates[0];
+      if (best) names[label] = best.name;
+    }
+    return names;
+  })();
+
+  // Helper: get display name for a speaker label
+  const displayName = (label: string | null | undefined): string => {
+    if (!label) return "Unknown";
+    return speakerNames[label] || label;
+  };
 
   // Extract fusion signals
   const fusionSignals = signals.filter((s) => s.agent === "fusion");
@@ -503,6 +528,7 @@ export default function SessionDetail() {
           { key: "transcript" as TabKey, label: "Transcript", icon: "📝" },
           { key: "insights" as TabKey, label: "Insights", icon: "💡" },
           { key: "report" as TabKey, label: "Report", icon: "📊" },
+          { key: "chat" as TabKey, label: "Chat", icon: "💬" },
         ]).map((tab) => (
           <button
             key={tab.key}
@@ -618,10 +644,10 @@ export default function SessionDetail() {
                           style={{ background: color }}
                         />
                         <span className="text-sm font-semibold text-nexus-text-primary">
-                          {role ? `${role}` : speaker.label}
+                          {displayName(speaker.label)}
                         </span>
                         <span className="text-xs text-nexus-text-muted">
-                          ({speaker.label})
+                          ({speaker.label}{role ? ` · ${role}` : ""})
                         </span>
                       </div>
 
@@ -693,7 +719,7 @@ export default function SessionDetail() {
 
         {/* RIGHT: Stress Timeline */}
         <div className="lg:col-span-2">
-          <StressTimeline signals={signals} speakerRoles={speakerRoles} />
+          <StressTimeline signals={signals} speakerRoles={speakerRoles} speakerNames={speakerNames} />
         </div>
       </div>
 
@@ -775,7 +801,7 @@ export default function SessionDetail() {
                 icon: "🟠",
               };
               const valueDesc = FUSION_VALUE_LABELS[fs.value_text] || fs.value_text.replace(/_/g, " ");
-              const speaker = fs.speaker_label || "Unknown";
+              const speaker = displayName(fs.speaker_label);
               const role = speakerRoles[speaker];
               const speakerDisplay = role ? `${role} (${speaker})` : speaker;
 
@@ -862,6 +888,7 @@ export default function SessionDetail() {
                 segment={segment}
                 signals={matchSignalsToSegment(segment, signals)}
                 speakerRole={segment.speaker_label ? speakerRoles[segment.speaker_label] : undefined}
+                speakerName={segment.speaker_label ? speakerNames[segment.speaker_label] : undefined}
               />
             ))}
           </div>
@@ -870,6 +897,7 @@ export default function SessionDetail() {
             segments={segments}
             signals={signals}
             speakerRoles={speakerRoles}
+            speakerNames={speakerNames}
             durationMs={session.duration_ms || 0}
           />
         )}
@@ -969,7 +997,7 @@ export default function SessionDetail() {
                   onClick={() => setShowConvoGraph(true)}
                   className="w-full rounded-lg border border-dashed border-nexus-border bg-nexus-surface px-4 py-3 text-sm text-nexus-text-secondary hover:bg-nexus-surface-hover hover:text-nexus-text-primary transition-colors"
                 >
-                  🔗 Open Advanced Signal Node Graph
+                  Open Advanced Signal Node Graph
                 </button>
               ) : (
                 <ConversationGraph
@@ -1091,6 +1119,13 @@ export default function SessionDetail() {
               No report available for this session.
             </div>
           )}
+        </div>
+      )}
+
+      {/* ═══ CHAT TAB ═══ */}
+      {activeTab === "chat" && (
+        <div className="rounded-lg border border-nexus-border bg-nexus-surface" style={{ height: "calc(100vh - 260px)", minHeight: 400 }}>
+          <SessionChat sessionId={session.id} meetingType={session.meeting_type} />
         </div>
       )}
     </div>
