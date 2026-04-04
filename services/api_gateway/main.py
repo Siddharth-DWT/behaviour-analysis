@@ -31,7 +31,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
@@ -41,7 +41,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # isort: split
-from shared.models.requests import SessionCreateResponse, SessionListResponse
+from shared.models.requests import SessionListResponse
 
 try:
     from database import (
@@ -591,8 +591,9 @@ async def change_password(body: ChangePasswordRequest, current_user: dict = Depe
 
 
 
-@app.post("/sessions", response_model=SessionCreateResponse)
+@app.post("/sessions")
 async def create_session_endpoint(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     title: str = Form(default=""),
     meeting_type: str = Form(default="sales_call"),
@@ -600,13 +601,9 @@ async def create_session_endpoint(
     current_user: dict = Depends(require_role("member")),
 ):
     """
-    Upload an audio file and run the full analysis pipeline:
-    1. Save file to disk
-    2. Create session in PostgreSQL
-    3. Call Voice Agent → get signals + transcript
-    4. Call Language Agent → get language signals
-    5. Call Fusion Agent → get fusion signals, unified states, alerts, report
-    6. Persist everything to PostgreSQL
+    Upload an audio file and start the analysis pipeline in the background.
+    Returns immediately with session_id + status: "processing".
+    The dashboard polls GET /sessions/{id} to check progress.
     """
     # Validate file type
     filename = file.filename or "upload.wav"
@@ -627,10 +624,9 @@ async def create_session_endpoint(
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Stream to disk with size check — avoid reading entire file into memory
     file_size = 0
     with open(file_path, "wb") as f:
-        while chunk := await file.read(1024 * 1024):  # 1 MB chunks
+        while chunk := await file.read(1024 * 1024):
             file_size += len(chunk)
             if file_size > MAX_FILE_SIZE:
                 f.close()
@@ -658,6 +654,38 @@ async def create_session_endpoint(
         logger.info(f"[{session_id}] Session created in DB")
     except Exception as e:
         logger.warning(f"[{session_id}] DB create failed (continuing without DB): {e}")
+
+    # ── Step 3: Launch pipeline in background ──
+    background_tasks.add_task(
+        _run_pipeline,
+        session_id=session_id,
+        file_path=file_path,
+        title=title,
+        meeting_type=meeting_type,
+        num_speakers=num_speakers,
+    )
+
+    return {
+        "session_id": session_id,
+        "status": "processing",
+        "title": title,
+        "meeting_type": meeting_type,
+    }
+
+
+async def _run_pipeline(
+    session_id: str,
+    file_path: Path,
+    title: str,
+    meeting_type: str,
+    num_speakers: Optional[int] = None,
+):
+    """
+    Run the full analysis pipeline in the background.
+    Voice → Language → Conversation → Fusion → Persist → Knowledge Store.
+    Updates session status in DB as it progresses.
+    """
+    logger.info(f"[{session_id}] Pipeline starting (background)")
 
     # ── Step 3: Voice Agent (with retry — this is the critical agent) ──
     voice_result = None
@@ -877,20 +905,11 @@ async def create_session_endpoint(
     # Cleanup old recordings in background
     _cleanup_old_recordings()
 
-    return SessionCreateResponse(
-        session_id=session_id,
-        status=final_status,
-        title=title,
-        meeting_type=meeting_type,
-        duration_seconds=duration_seconds,
-        speaker_count=speaker_count,
-        voice_signal_count=len(voice_signals),
-        language_signal_count=len(language_signals),
-        conversation_signal_count=len(conversation_signals),
-        fusion_signal_count=len(fusion_signals),
-        alert_count=len(alerts),
-        report_generated=report_generated,
-        agent_status=agent_status,
+    logger.info(
+        f"[{session_id}] Pipeline finished: status={final_status}, "
+        f"voice={len(voice_signals)}, lang={len(language_signals)}, "
+        f"convo={len(conversation_signals)}, fusion={len(fusion_signals)}, "
+        f"alerts={len(alerts)}, report={'yes' if report_generated else 'no'}"
     )
 
 

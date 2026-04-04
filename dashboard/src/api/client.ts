@@ -263,10 +263,8 @@ export async function uploadSession(
 ): Promise<{
   session_id: string;
   status: string;
-  voice_signal_count: number;
-  language_signal_count: number;
-  fusion_signal_count: number;
-  alert_count: number;
+  title: string;
+  meeting_type: string;
 }> {
   const form = new FormData();
   form.append("file", file);

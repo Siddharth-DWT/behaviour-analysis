@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Upload, Loader2 } from "lucide-react";
 import { listSessions, uploadSession } from "../api/client";
@@ -10,11 +10,36 @@ export default function SessionList() {
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [meetingType, setMeetingType] = useState("sales_call");
+  const [processingIds, setProcessingIds] = useState<Set<string>>(new Set());
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["sessions"],
     queryFn: () => listSessions({ limit: 50 }),
+    refetchInterval: (query) => {
+      if (processingIds.size > 0) return 3000;
+      const sessions = (query.state.data as any)?.sessions ?? [];
+      if (sessions.some((s: any) => s.status === "processing" || s.status === "analysing")) return 3000;
+      return false;
+    },
   });
+
+  // Track when processing sessions complete — clear from tracking set
+  useEffect(() => {
+    if (!data?.sessions || processingIds.size === 0) return;
+    const completed = new Set<string>();
+    for (const s of data.sessions) {
+      if (processingIds.has(s.id) && s.status !== "processing" && s.status !== "analysing") {
+        completed.add(s.id);
+      }
+    }
+    if (completed.size > 0) {
+      setProcessingIds((prev) => {
+        const next = new Set(prev);
+        for (const id of completed) next.delete(id);
+        return next;
+      });
+    }
+  }, [data, processingIds]);
 
   const uploadMutation = useMutation({
     mutationFn: async (file: File) => {
@@ -23,7 +48,11 @@ export default function SessionList() {
       const title = file.name.replace(/\.[^.]+$/, "");
       return uploadSession(file, title, meetingType);
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
+      // Upload returned immediately — track this session for polling
+      if (result?.session_id) {
+        setProcessingIds((prev) => new Set(prev).add(result.session_id));
+      }
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
       setUploading(false);
     },
@@ -74,7 +103,7 @@ export default function SessionList() {
             ) : (
               <Upload className="h-3.5 w-3.5" />
             )}
-            {uploading ? "Analysing..." : "Upload"}
+            {uploading ? "Uploading..." : "Upload"}
           </button>
           <input
             ref={fileInputRef}
@@ -85,14 +114,6 @@ export default function SessionList() {
           />
         </div>
       </div>
-
-      {/* Upload status */}
-      {uploading && (
-        <div className="mb-4 flex items-center gap-2 rounded-lg border border-accent-blue-30 bg-accent-blue-10 p-3 text-xs text-nexus-accent-blue">
-          <Loader2 className="h-4 w-4 animate-spin" />
-          Running full pipeline: Voice → Language → Fusion. This may take a few minutes...
-        </div>
-      )}
 
       {uploadError && (
         <div className="mb-4 rounded-lg border border-stress-high-30 bg-stress-high-10 p-3 text-xs text-nexus-stress-high">
