@@ -2,6 +2,9 @@
 .env
 *.env.local
 
+# ONNX model files (generated, don't commit)
+/models/
+
 # Python
 __pycache__/
 *.py[cod]

@@ -859,6 +859,21 @@ async def create_session_endpoint(
 
     logger.info(f"[{session_id}] Pipeline complete (status={final_status}, agents={agent_status})")
 
+    # Store knowledge chunks for RAG chat (non-blocking, non-fatal)
+    try:
+        from knowledge_store import store_session_knowledge
+        _pool = await get_pool()
+        await store_session_knowledge(_pool, session_id, {
+            "transcript_segments": transcript_segments,
+            "signals": voice_signals + language_signals + conversation_signals + fusion_signals,
+            "entities": entities,
+            "report": report_content or {},
+            "graph_analytics": graph_analytics or {},
+            "conversation_summary": conversation_summary or {},
+        })
+    except Exception as e:
+        logger.warning(f"[{session_id}] Knowledge store failed (non-fatal): {e}")
+
     # Cleanup old recordings in background
     _cleanup_old_recordings()
 
@@ -1398,3 +1413,178 @@ def _serialise_signals(signals: list[dict]) -> list[dict]:
                 entry[k] = v
         clean.append(entry)
     return clean
+
+
+# ═══════════════════════════════════════════════════════════════
+# SESSION CHAT (RAG)
+# ═══════════════════════════════════════════════════════════════
+
+
+class ChatRequest(BaseModel):
+    question: str
+    history: list[dict] = []
+
+
+@app.post("/sessions/{session_id}/chat")
+async def chat_with_session(
+    session_id: str,
+    body: ChatRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Ask a question about a session's analysis using RAG.
+    Embeds the question, searches pgvector for relevant chunks,
+    feeds context to LLM, returns the answer with sources.
+    """
+    pool = await get_pool()
+
+    # Ownership check
+    session = await get_session(session_id, current_user.get("org_id"))
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if current_user["role"] != "admin" and str(session["user_id"]) != current_user["id"]:
+        raise HTTPException(403, "Access denied")
+
+    question = body.question.strip()
+    if not question:
+        raise HTTPException(400, "Question cannot be empty")
+
+    # Step 1: Embed the question
+    from shared.utils.llm_client import get_embedding
+    question_embedding = await get_embedding(question)
+    if not question_embedding:
+        raise HTTPException(500, "Embedding generation failed — check LLM configuration")
+
+    # Step 2: Search pgvector for relevant chunks
+    rows = await pool.fetch(
+        """
+        SELECT text, chunk_type, metadata,
+               1 - (embedding <=> $1::vector) AS similarity
+        FROM knowledge_chunks
+        WHERE session_id = $2
+        ORDER BY embedding <=> $1::vector
+        LIMIT 12
+        """,
+        "[" + ",".join(str(v) for v in question_embedding) + "]",
+        session_id,
+    )
+
+    if not rows:
+        return {
+            "answer": "No analysis data found for this session. Ensure the session has been fully processed.",
+            "sources": [],
+            "chunks_searched": 0,
+        }
+
+    # Step 3: Build context from top relevant chunks
+    context_parts = []
+    sources = []
+    for row in rows:
+        sim = float(row["similarity"])
+        if sim < 0.25:
+            continue
+        context_parts.append(f"[{row['chunk_type']}] {row['text']}")
+        sources.append({
+            "type": row["chunk_type"],
+            "text": row["text"][:200],
+            "similarity": round(sim, 3),
+        })
+
+    if not context_parts:
+        return {
+            "answer": "I couldn't find relevant analysis data for that question. Try rephrasing or ask about specific speakers, signals, or moments.",
+            "sources": [],
+            "chunks_searched": len(rows),
+        }
+
+    context = "\n".join(context_parts[:8])
+
+    # Step 4: Generate answer with LLM
+    from shared.utils.llm_client import acomplete
+
+    system_prompt = (
+        "You are NEXUS, a behavioural analysis assistant. Answer questions about "
+        "meeting/call analysis using ONLY the provided context.\n\n"
+        "Rules:\n"
+        "- Only answer based on the provided context. If the context doesn't contain the answer, say so.\n"
+        "- Reference specific timestamps, speaker names, and signal values when available.\n"
+        "- Be concise but thorough.\n"
+        "- Frame behavioural observations as 'indicators suggest' not 'they were definitely'.\n"
+        "- Never claim to detect deception — only note incongruence between modalities."
+    )
+
+    user_prompt = f"Context from session analysis:\n{context}\n\nQuestion: {question}"
+
+    # Include last few history messages for multi-turn context
+    if body.history:
+        history_text = "\n".join(
+            f"{m.get('role', 'user').title()}: {m.get('content', '')}"
+            for m in body.history[-4:]
+        )
+        user_prompt = f"Previous conversation:\n{history_text}\n\n{user_prompt}"
+
+    try:
+        answer = await acomplete(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=600,
+        )
+    except Exception as e:
+        logger.error(f"Chat LLM call failed: {e}")
+        raise HTTPException(502, f"LLM generation failed: {e}")
+
+    # Persist both messages to DB
+    user_id = current_user["id"]
+    top_sources = sources[:5]
+    try:
+        await pool.execute(
+            "INSERT INTO chat_messages (session_id, user_id, role, content) VALUES ($1, $2, 'user', $3)",
+            session_id, user_id, question,
+        )
+        await pool.execute(
+            "INSERT INTO chat_messages (session_id, user_id, role, content, sources) VALUES ($1, $2, 'assistant', $3, $4::jsonb)",
+            session_id, user_id, answer, json.dumps(top_sources),
+        )
+    except Exception as e:
+        logger.warning(f"Failed to persist chat messages: {e}")
+
+    return {
+        "answer": answer,
+        "sources": top_sources,
+        "chunks_searched": len(rows),
+    }
+
+
+@app.get("/sessions/{session_id}/chat")
+async def get_chat_history(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Get persisted chat history for a session."""
+    pool = await get_pool()
+
+    session = await get_session(session_id, current_user.get("org_id", ""))
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if current_user["role"] != "admin" and str(session["user_id"]) != current_user["id"]:
+        raise HTTPException(403, "Access denied")
+
+    rows = await pool.fetch(
+        """
+        SELECT role, content, sources, created_at
+        FROM chat_messages
+        WHERE session_id = $1 AND user_id = $2
+        ORDER BY created_at ASC
+        """,
+        session_id, current_user["id"],
+    )
+
+    messages = []
+    for row in rows:
+        msg = {"role": row["role"], "content": row["content"]}
+        if row["sources"]:
+            src = row["sources"]
+            msg["sources"] = json.loads(src) if isinstance(src, str) else src
+        messages.append(msg)
+
+    return {"messages": messages}

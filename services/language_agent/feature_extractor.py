@@ -10,14 +10,16 @@ Produces per-utterance feature vectors containing:
   - Lexical statistics: word count, sentence length, question detection
 """
 import re
+import time
 import logging
 from typing import Optional
 
 logger = logging.getLogger("nexus.language.features")
 
 # ── Lazy-loaded sentiment model (loaded once on first call) ──
-_sentiment_pipeline = None
-_sentiment_backend = "none"  # "distilbert" | "vader" | "none"
+_sentiment_model = None
+_sentiment_tokenizer = None
+_sentiment_backend = "none"  # "onnx_int8" | "onnx_fp32" | "pytorch" | "vader" | "none"
 
 # ── VADER fallback ──
 _vader_analyzer = None
@@ -36,44 +38,119 @@ def _get_vader_analyzer():
     return _vader_analyzer
 
 
-def _get_sentiment_pipeline():
+def _load_sentiment_model():
     """
-    Lazy-load DistilBERT sentiment pipeline, with VADER fallback.
-    Set SENTIMENT_BACKEND=vader to skip DistilBERT entirely.
+    Lazy-load sentiment model with cascading fallback:
+    1. DistilBERT ONNX INT8 (fastest, ~1-3ms/sample)
+    2. DistilBERT ONNX FP32 (fast, ~3-5ms/sample)
+    3. DistilBERT PyTorch (slow, ~15ms/sample)
+    4. VADER (rule-based, no model needed)
+    Set SENTIMENT_BACKEND=vader to skip all models.
     """
     import os
-    global _sentiment_pipeline, _sentiment_backend
-    if _sentiment_pipeline is not None:
-        return _sentiment_pipeline
-    if _sentiment_backend == "vader":
-        return None  # Already using VADER
+    global _sentiment_model, _sentiment_tokenizer, _sentiment_backend
 
-    # Check if we should skip DistilBERT (env var or PyTorch issues)
+    if _sentiment_backend != "none":
+        return  # Already loaded or explicitly set
+
     force_vader = os.environ.get("SENTIMENT_BACKEND", "auto").lower() == "vader"
     if force_vader:
         logger.info("SENTIMENT_BACKEND=vader — skipping DistilBERT.")
         _sentiment_backend = "vader"
-        return None
+        return
 
-    # Try DistilBERT
+    # Try ONNX models first (INT8 then FP32)
+    model_paths = [
+        ("models/distilbert-onnx-int8", "onnx_int8"),
+        ("models/distilbert-onnx", "onnx_fp32"),
+    ]
+    # Also check under /app/models inside Docker
+    for prefix in ["", "/app/"]:
+        for model_dir, backend_name in model_paths:
+            full_path = prefix + model_dir
+            onnx_file = os.path.join(full_path, "model.onnx")
+            if os.path.exists(onnx_file):
+                try:
+                    from optimum.onnxruntime import ORTModelForSequenceClassification
+                    from transformers import AutoTokenizer
+
+                    _sentiment_tokenizer = AutoTokenizer.from_pretrained(full_path)
+                    _sentiment_model = ORTModelForSequenceClassification.from_pretrained(
+                        full_path, provider="CPUExecutionProvider",
+                    )
+                    _sentiment_backend = backend_name
+                    logger.info(f"Loaded sentiment model: {backend_name} from {full_path}")
+                    # Warmup
+                    inputs = _sentiment_tokenizer(
+                        "test", return_tensors="np", padding=True, truncation=True, max_length=128
+                    )
+                    _sentiment_model(**inputs)
+                    return
+                except Exception as e:
+                    logger.warning(f"Failed to load {backend_name} from {full_path}: {e}")
+
+    # Fallback to PyTorch DistilBERT
     try:
         from transformers import pipeline as tf_pipeline
-        logger.info("Loading DistilBERT sentiment model...")
-        _sentiment_pipeline = tf_pipeline(
+        logger.info("Loading DistilBERT sentiment model (PyTorch fallback)...")
+        _sentiment_model = tf_pipeline(
             "sentiment-analysis",
             model="distilbert-base-uncased-finetuned-sst-2-english",
-            device=-1,  # CPU; use 0 for GPU
+            device=-1,
             truncation=True,
             max_length=512,
         )
-        _sentiment_backend = "distilbert"
-        logger.info("Sentiment model loaded (DistilBERT).")
-        return _sentiment_pipeline
+        _sentiment_backend = "pytorch"
+        logger.warning(
+            "Using PyTorch DistilBERT (slow). "
+            "Run scripts/convert_model_to_onnx.py for 4-6x speedup."
+        )
+        return
     except Exception as e:
-        logger.warning(f"DistilBERT failed ({e}), falling back to VADER...")
-        _sentiment_pipeline = None
-        _sentiment_backend = "vader"
-        return None
+        logger.warning(f"PyTorch DistilBERT failed ({e}), falling back to VADER...")
+
+    _sentiment_backend = "vader"
+
+
+def _predict_sentiment_local(texts: list[str]) -> list[dict | None]:
+    """
+    Run local sentiment model on a batch of texts.
+    Returns list of {"label": "POSITIVE"/"NEGATIVE", "score": float} or None.
+    """
+    _load_sentiment_model()
+
+    if _sentiment_backend == "vader" or _sentiment_backend == "none":
+        return [None] * len(texts)
+
+    if _sentiment_backend.startswith("onnx"):
+        import numpy as np
+        results = []
+        BATCH_SIZE = 32
+        for i in range(0, len(texts), BATCH_SIZE):
+            batch = texts[i:i + BATCH_SIZE]
+            inputs = _sentiment_tokenizer(
+                batch, return_tensors="np", padding=True, truncation=True, max_length=128,
+            )
+            outputs = _sentiment_model(**inputs)
+            logits = outputs.logits
+            exp_logits = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+            probs = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+            for j in range(len(batch)):
+                pred_idx = int(np.argmax(probs[j]))
+                pred_score = float(probs[j][pred_idx])
+                label = "POSITIVE" if pred_idx == 1 else "NEGATIVE"
+                results.append({"label": label, "score": pred_score})
+        return results
+
+    if _sentiment_backend == "pytorch":
+        try:
+            pipe_results = _sentiment_model(texts, batch_size=16, truncation=True, max_length=128)
+            return [{"label": r["label"], "score": r["score"]} for r in pipe_results]
+        except Exception as e:
+            logger.error(f"PyTorch sentiment failed: {e}")
+            return [None] * len(texts)
+
+    return [None] * len(texts)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -281,7 +358,7 @@ class LanguageFeatureExtractor:
     def warm_up(self):
         """Pre-load the sentiment model so first analysis isn't slow."""
         try:
-            _get_sentiment_pipeline()
+            _load_sentiment_model()
         except Exception:
             pass  # VADER fallback is automatic
         # Also ensure VADER is ready as fallback
@@ -462,26 +539,31 @@ class LanguageFeatureExtractor:
                     output[idx] = {"label": "NEUTRAL", "score": 0.0}
             return output
 
-        pipe = _get_sentiment_pipeline()
-        if pipe is not None and _sentiment_backend == "distilbert":
-            try:
-                valid_texts = [texts[i] for i in valid_indices]
-                results = pipe(valid_texts, batch_size=32)
-                output = [neutral.copy() for _ in texts]
-                for idx, result in zip(valid_indices, results):
-                    label = result["label"]
-                    raw = result["score"]
-                    signed = raw if label == "POSITIVE" else -raw
-                    if abs(signed) < 0.4:
-                        output[idx] = {"label": "NEUTRAL", "score": 0.0}
-                    else:
-                        output[idx] = {
-                            "label": "POSITIVE" if signed > 0 else "NEGATIVE",
-                            "score": round(signed, 4),
-                        }
-                return output
-            except Exception as e:
-                logger.warning(f"DistilBERT batch failed: {e}")
+        # DistilBERT / ONNX fallback
+        valid_texts = [texts[i] for i in valid_indices]
+        start_t = time.time()
+        model_results = _predict_sentiment_local(valid_texts)
+        elapsed = time.time() - start_t
+        if model_results and model_results[0] is not None:
+            logger.info(
+                f"Local sentiment: {len(valid_texts)} texts in {elapsed:.2f}s "
+                f"({elapsed / max(len(valid_texts), 1) * 1000:.1f} ms/text, backend={_sentiment_backend})"
+            )
+            output = [neutral.copy() for _ in texts]
+            for idx, result in zip(valid_indices, model_results):
+                if result is None:
+                    continue
+                label = result["label"]
+                raw = result["score"]
+                signed = raw if label == "POSITIVE" else -raw
+                if abs(signed) < 0.4:
+                    output[idx] = {"label": "NEUTRAL", "score": 0.0}
+                else:
+                    output[idx] = {
+                        "label": "POSITIVE" if signed > 0 else "NEGATIVE",
+                        "score": round(signed, 4),
+                    }
+            return output
 
         return [neutral.copy() for _ in texts]
 
@@ -576,30 +658,30 @@ class LanguageFeatureExtractor:
                     output[idx] = {"label": "NEUTRAL", "score": 0.0}
             return output
 
-        # ── 3. DistilBERT fallback (wide neutral zone) ──
-        # Note: _sentiment_backend may have been set to "vader" by the LLM
-        # failure path, even if DistilBERT is loaded. Check the pipe directly.
-        pipe = _get_sentiment_pipeline()
-        if pipe is not None:
-            try:
-                results = pipe(valid_texts, batch_size=32)
-                output = [neutral.copy() for _ in texts]
-                for idx, result in zip(valid_indices, results):
-                    label = result["label"]
-                    raw = result["score"]
-                    # Convert to signed: NEGATIVE → negative, POSITIVE → positive
-                    signed = raw if label == "POSITIVE" else -raw
-                    # Wide neutral zone: only flag if |score| > 0.4
-                    if abs(signed) < 0.4:
-                        output[idx] = {"label": "NEUTRAL", "score": 0.0}
-                    else:
-                        output[idx] = {
-                            "label": "POSITIVE" if signed > 0 else "NEGATIVE",
-                            "score": round(signed, 4),
-                        }
-                return output
-            except Exception as e:
-                logger.warning(f"DistilBERT batch failed: {e}")
+        # ── 3. DistilBERT / ONNX fallback (wide neutral zone) ──
+        start_t = time.time()
+        model_results = _predict_sentiment_local(valid_texts)
+        elapsed = time.time() - start_t
+        if model_results and model_results[0] is not None:
+            logger.info(
+                f"Local sentiment (LLM path fallback): {len(valid_texts)} texts in {elapsed:.2f}s "
+                f"({elapsed / max(len(valid_texts), 1) * 1000:.1f} ms/text, backend={_sentiment_backend})"
+            )
+            output = [neutral.copy() for _ in texts]
+            for idx, result in zip(valid_indices, model_results):
+                if result is None:
+                    continue
+                label = result["label"]
+                raw = result["score"]
+                signed = raw if label == "POSITIVE" else -raw
+                if abs(signed) < 0.4:
+                    output[idx] = {"label": "NEUTRAL", "score": 0.0}
+                else:
+                    output[idx] = {
+                        "label": "POSITIVE" if signed > 0 else "NEGATIVE",
+                        "score": round(signed, 4),
+                    }
+            return output
 
         logger.warning("No sentiment backend available — returning neutral")
         return [neutral.copy() for _ in texts]

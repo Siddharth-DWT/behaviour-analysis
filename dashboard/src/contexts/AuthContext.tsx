@@ -30,7 +30,7 @@ interface AuthState {
     password: string,
     fullName: string,
     company?: string
-  ) => Promise<{ requiresVerification?: boolean; message?: string }>;
+  ) => Promise<void>;
   logout: () => void;
   updateUser: (user: User) => void;
 }
@@ -41,7 +41,7 @@ const AuthContext = createContext<AuthState>({
   isAuthenticated: false,
   isLoading: true,
   login: async () => {},
-  signup: async () => ({}),
+  signup: async () => {},
   logout: () => {},
   updateUser: () => {},
 });

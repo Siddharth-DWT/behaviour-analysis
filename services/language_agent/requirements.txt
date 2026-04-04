@@ -7,6 +7,10 @@ python-multipart==0.0.20
 transformers==4.47.1
 # torch installed separately in Dockerfile (CPU-only build)
 
+# ONNX Runtime for fast DistilBERT inference (4-6x faster than PyTorch)
+onnxruntime>=1.17.0
+optimum[onnxruntime]>=1.17.0
+
 # LLM APIs for intent classification + sentiment + complex NLP
 anthropic==0.40.0
 openai>=1.0.0

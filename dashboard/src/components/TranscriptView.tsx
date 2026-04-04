@@ -95,6 +95,7 @@ interface Props {
   segments: TranscriptSegment[];
   signals: Signal[];
   speakerRoles?: Record<string, string>;
+  speakerNames?: Record<string, string>;
   durationMs: number;
 }
 
@@ -102,7 +103,7 @@ interface Props {
 /* Component                                                           */
 /* ------------------------------------------------------------------ */
 
-export default function TranscriptView({ segments, signals, speakerRoles, durationMs }: Props) {
+export default function TranscriptView({ segments, signals, speakerRoles, speakerNames, durationMs }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const minimapRef = useRef<HTMLDivElement>(null);
   const [search, setSearch] = useState("");
@@ -300,7 +301,7 @@ export default function TranscriptView({ segments, signals, speakerRoles, durati
                   {/* Header: speaker + time */}
                   <div className={`flex items-center gap-2 mb-0.5 ${isLeft ? "" : "justify-end"}`}>
                     <span className="text-[10px] font-semibold" style={{ color: style.text }}>
-                      {spk}
+                      {speakerNames?.[spk] || spk}
                       {role && <span className="font-normal opacity-70"> ({role})</span>}
                     </span>
                     <span className="text-[9px] text-nexus-text-muted">{fmtMs(seg.start_ms)}</span>
@@ -347,7 +348,7 @@ export default function TranscriptView({ segments, signals, speakerRoles, durati
         {selectedIdx !== null && segmentSignals[selectedIdx]?.length > 0 ? (
           <div>
             <div className="mb-1 text-[10px] text-nexus-text-muted">
-              Signals for {segments[selectedIdx].speaker_label || "Unknown"} at{" "}
+              Signals for {speakerNames?.[segments[selectedIdx].speaker_label || ""] || segments[selectedIdx].speaker_label || "Unknown"} at{" "}
               {fmtMs(segments[selectedIdx].start_ms)} - {fmtMs(segments[selectedIdx].end_ms)}
             </div>
             <div className="flex flex-wrap gap-1.5">

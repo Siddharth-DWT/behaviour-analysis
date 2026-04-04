@@ -142,6 +142,7 @@ async def analyse_signals(request: AnalyseRequest):
     6. Publish fusion signals to Redis Streams
     """
     session_id = request.session_id or str(uuid.uuid4())
+    content_type = request.content_type or request.meeting_type or "sales_call"
     start_time = time.time()
 
     voice_dicts = [s.model_dump() for s in request.voice_signals]
@@ -200,6 +201,7 @@ async def analyse_signals(request: AnalyseRequest):
             language_signals=speaker_language,
             window_start_ms=window_start,
             window_end_ms=window_end,
+            content_type=content_type,
         )
 
         state = compute_unified_state(
@@ -212,7 +214,7 @@ async def analyse_signals(request: AnalyseRequest):
         speaker_alerts = []
         for fs in fusion_signals:
             if fs.get("confidence", 0) >= 0.50:
-                alert = _create_alert(session_id, speaker_id, fs)
+                alert = _create_alert(session_id, speaker_id, fs, content_type)
                 if alert:
                     speaker_alerts.append(alert)
 
@@ -305,10 +307,10 @@ async def analyse_signals(request: AnalyseRequest):
         key_paths = graph.get_key_paths(max_paths=5)
 
         analytics = GraphAnalytics(graph)
-        graph_insights = analytics.compute_all()
+        graph_insights = analytics.compute_all(content_type=content_type)
 
         graph_signals = rule_engine.evaluate_graph_insights(
-            graph_insights, speakers, all_fusion_signals
+            graph_insights, speakers, all_fusion_signals, content_type=content_type
         )
         all_fusion_signals.extend(graph_signals)
 
@@ -499,11 +501,25 @@ def _normalise_redis_signal(s: dict) -> dict:
     }
 
 
-def _create_alert(session_id: str, speaker_id: str, fusion_signal: dict) -> Optional[dict]:
+def _create_alert(session_id: str, speaker_id: str, fusion_signal: dict, content_type: str = "sales_call") -> Optional[dict]:
     """Create an alert from a significant fusion signal."""
     sig_type = fusion_signal.get("signal_type", "")
     value_text = fusion_signal.get("value_text", "")
     confidence = fusion_signal.get("confidence", 0)
+
+    # Content-type gating: some alerts only make sense for certain content types
+    SALES_ONLY_ALERTS = {
+        ("urgency_authenticity", "manufactured_urgency"),
+        ("urgency_authenticity", "ambiguous_urgency"),
+        ("credibility_assessment", "credibility_concern"),
+    }
+    if (sig_type, value_text) in SALES_ONLY_ALERTS and content_type not in ("sales_call", "pitch", "presentation"):
+        return None
+
+    # For internal meetings, raise confidence threshold
+    if content_type in ("internal", "meeting"):
+        if confidence < 0.60:
+            return None
 
     alert_map = {
         "credibility_assessment": {

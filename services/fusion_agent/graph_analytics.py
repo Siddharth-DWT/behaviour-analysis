@@ -21,9 +21,9 @@ class GraphAnalytics:
         self.nodes = graph.nodes
         self.edges = graph.edges
 
-    def compute_all(self) -> dict:
+    def compute_all(self, content_type: str = "sales_call") -> dict:
         return {
-            "tension_clusters": self.find_tension_clusters(),
+            "tension_clusters": self.find_tension_clusters(content_type),
             "speaker_patterns": self.compute_speaker_patterns(),
             "topic_signal_density": self.compute_topic_signal_density(),
             "momentum": self.compute_momentum(),
@@ -35,21 +35,39 @@ class GraphAnalytics:
     # Tension Clusters
     # ──────────────────────────────────────────
 
-    def find_tension_clusters(self) -> list[dict]:
+    def find_tension_clusters(self, content_type: str = "sales_call") -> list[dict]:
         """Group negative signals into 10s buckets; 3+ signals = tension cluster."""
         negative_types = {
             "vocal_stress_score", "objection_signal", "filler_detection",
             "credibility_assessment", "verbal_incongruence",
         }
+        is_meeting = content_type in ("internal", "meeting")
         negative_nodes = []
         for n in self.nodes.values():
             if n["type"] not in ("voice_signal", "lang_signal", "fusion_signal"):
                 continue
             sig = n.get("signal_type", "")
-            if sig in negative_types:
-                negative_nodes.append(n)
-            elif sig == "sentiment_score" and (n.get("value") or 0) < -0.3:
-                negative_nodes.append(n)
+            val = n.get("value") or 0
+
+            # For internal meetings, only count genuinely negative signals
+            # (rapid exchanges + energy spikes are engagement, not tension)
+            if is_meeting:
+                if sig == "vocal_stress_score" and val > 0.5:
+                    negative_nodes.append(n)
+                elif sig == "objection_signal":
+                    negative_nodes.append(n)
+                elif sig == "sentiment_score" and val < -0.3:
+                    negative_nodes.append(n)
+                elif sig == "filler_detection" and n.get("value_text") == "filler_spike":
+                    negative_nodes.append(n)
+                elif sig in ("credibility_assessment", "verbal_incongruence"):
+                    negative_nodes.append(n)
+                # Skip low stress, energy, buying signals etc. for meetings
+            else:
+                if sig in negative_types:
+                    negative_nodes.append(n)
+                elif sig == "sentiment_score" and val < -0.3:
+                    negative_nodes.append(n)
 
         if not negative_nodes:
             return []
@@ -352,14 +370,28 @@ class GraphAnalytics:
             if sid:
                 contradicts_by_speaker.setdefault(sid, []).append(src["timestamp_ms"])
 
+        # Adaptive threshold: longer sessions with more speakers need more evidence
+        # Base: 3 windows for 2-speaker 5-minute call
+        # Scale: +1 per 5 additional minutes, +1 per additional speaker beyond 2
+        all_timestamps = [n["timestamp_ms"] for n in self.nodes.values() if n.get("timestamp_ms")]
+        if all_timestamps:
+            session_duration_min = max(1, (max(all_timestamps) - min(all_timestamps)) / 60000)
+        else:
+            session_duration_min = 1
+        speaker_count = len(set(
+            n.get("speaker_id") for n in self.nodes.values()
+            if n.get("speaker_id") and n.get("speaker_id") != "all"
+        ))
+        persistent_threshold = 3 + int(session_duration_min / 5) + max(0, speaker_count - 2)
+
         results = {}
         for sid, timestamps in contradicts_by_speaker.items():
             count = len(timestamps)
             # Group into 10s windows to determine persistence
             windows = set(ts // BUCKET_MS for ts in timestamps)
-            if len(windows) >= 3:
+            if len(windows) >= persistent_threshold:
                 consistency = "persistent"
-            elif len(windows) == 2:
+            elif len(windows) >= max(2, persistent_threshold // 2):
                 consistency = "occasional"
             else:
                 consistency = "isolated"
@@ -370,6 +402,7 @@ class GraphAnalytics:
                 "total_contradicts_edges": count,
                 "distinct_time_windows": len(windows),
                 "consistency": consistency,
+                "persistent_threshold": persistent_threshold,
                 "worst_incongruence_ms": worst_ms,
             }
 

@@ -57,10 +57,11 @@ interface Props {
   segment: TranscriptSegment;
   signals: Signal[];
   speakerRole?: string;
+  speakerName?: string;
 }
 
-export default function TranscriptBlock({ segment, signals, speakerRole }: Props) {
-  const speaker = segment.speaker_label || "Speaker";
+export default function TranscriptBlock({ segment, signals, speakerRole, speakerName }: Props) {
+  const speaker = speakerName || segment.speaker_label || "Speaker";
   const badges = filterSmartBadges(signals, 3);
   const borderColor = getBorderColor(signals);
 
