@@ -572,43 +572,30 @@ class DiarizeClient:
         num_speakers: int = 0,
         audio_data: Optional[tuple] = None,
         clustering_threshold: float = 0.0,
+        **kwargs,
     ) -> dict:
         """
         Diarize an audio file via the external GPU API.
 
         The server expects WAV audio. If audio_data (numpy_array, sr) is
-        provided, it is exported as in-memory WAV and sent directly —
-        this avoids the server failing on container formats like MP4/WebM
-        that require FFmpeg/libtorchcodec to decode.
-
-        The server expects WAV audio. If audio_data (numpy_array, sr) is
-        provided, it is exported as in-memory WAV and sent directly —
-        this avoids the server failing on container formats like MP4/WebM
-        that require FFmpeg/libtorchcodec to decode.
+        provided, it is exported as in-memory WAV and sent directly.
 
         Args:
-            audio_path: Path to audio file (used when audio_data is None)
             audio_path: Path to audio file (used when audio_data is None)
             min_speakers: Minimum expected speakers
             max_speakers: Maximum expected speakers
             num_speakers: Exact count (0 = auto-detect using min/max)
-            audio_data: Optional (numpy_array, sample_rate) tuple — pre-loaded
-                        16 kHz mono audio. When provided, audio_path is only
-                        used for logging.
-            audio_data: Optional (numpy_array, sample_rate) tuple — pre-loaded
-                        16 kHz mono audio. When provided, audio_path is only
-                        used for logging.
+            audio_data: Optional (numpy_array, sample_rate) tuple
+            clustering_threshold: NeMo/pyannote clustering threshold (0 = server default)
+            **kwargs: Extra params forwarded to API (e.g. backend, segmentation_threshold)
 
         Returns:
             {
                 "speakers": ["SPEAKER_00", ...],
-                "timeline": [{"speaker": str, "start": float, "end": float, "duration": float}, ...],
-                "timeline": [{"speaker": str, "start": float, "end": float, "duration": float}, ...],
+                "timeline": [{"speaker": ..., "start": ..., "end": ..., "duration": ...}],
                 "num_speakers": int,
                 "duration": float,
                 "processing_time": float,
-                "mode": str,               # "exclusive" or "overlap"
-                "params_used": dict,       # clustering/segmentation thresholds
             }
         """
         audio_file = Path(audio_path)
@@ -625,9 +612,14 @@ class DiarizeClient:
             "min_speakers": str(min_speakers or 1),
             "max_speakers": str(max_speakers or 20),
             "num_speakers": str(num_speakers or 0),
+            "backend": "nemo",
         }
         if clustering_threshold and clustering_threshold > 0:
             data["clustering_threshold"] = str(clustering_threshold)
+        # Forward any extra kwargs (e.g. backend="nemo", segmentation_threshold=0.5)
+        for k, v in kwargs.items():
+            if v is not None:
+                data[k] = str(v)
 
         if audio_data is not None:
             # Export pre-loaded numpy audio to in-memory WAV bytes
@@ -965,13 +957,17 @@ class DeepgramDiarizeClient:
         min_speakers: int = 2,
         max_speakers: int = 8,
         num_speakers: int = 0,
-        audio_data: tuple = None,
+        audio_data: Optional[tuple] = None,
+        clustering_threshold: float = 0.0,
+        **kwargs,
     ) -> dict:
         """
         Diarize audio via Deepgram Nova-3.
 
         Returns a result dict matching the same format as DiarizeClient
         so it can be used as a drop-in replacement.
+        Note: clustering_threshold and kwargs are accepted for signature
+        compatibility but not used by Deepgram API.
 
         Returns:
             {

@@ -143,30 +143,30 @@ class Transcriber:
         backend = TRANSCRIPTION_BACKEND.lower()
 
         # Fallback chain:
-        #   1. AssemblyAI (one call, Universal-3 Pro)
-        #   2. Deepgram (one call, Nova-3)
-        #   3. Whisper+Pyannote combined (one GPU call, no mapping)
-        #   4. Parakeet transcribe + diarize cascade (fast transcription, separate diarize)
+        #   1. Whisper+NeMo combined (/transcribe-diarize — one GPU call, best quality)
+        #   2. Parakeet + NeMo (Parakeet /transcribe + /diarize — fast transcription, separate diarize)
+        #   3. AssemblyAI (one call, Universal-3 Pro)
+        #   4. Deepgram (one call, Nova-3)
         #   5. Whisper transcribe + diarize cascade (two calls, mapping)
-        #   6. Local faster-whisper + local diarize cascade
+        #   6. Local faster-whisper + local diarize cascade (CPU)
+
+        if backend in ("auto", "whisper-pyannote", "whisper-nemo") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
+            self._init_whisper_pyannote()
+
+        if backend in ("auto", "parakeet") and PARAKEET_URL:
+            self._init_parakeet()
+
+        # Parakeet needs a separate diarization backend (/diarize endpoint).
+        # Also used by whisper separate mode.
+        if backend in ("auto", "parakeet", "whisper") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
+            if not self._use_external_diarize:
+                self._init_external_diarize()
 
         if backend in ("auto", "assemblyai") and ASSEMBLYAI_API_KEY:
             self._init_assemblyai()
 
         if backend in ("auto", "deepgram") and DEEPGRAM_API_KEY:
             self._init_deepgram()
-
-        if backend in ("auto", "whisper-pyannote") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
-            self._init_whisper_pyannote()
-
-        if backend in ("auto", "parakeet") and PARAKEET_URL:
-            self._init_parakeet()
-
-        # Parakeet and Whisper both need a separate diarization backend.
-        # Init external GPU diarize if available (used by parakeet, whisper, and auto).
-        if backend in ("auto", "parakeet", "whisper") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
-            if not self._use_external_diarize:
-                self._init_external_diarize()
 
         if backend in ("auto", "whisper") and EXTERNAL_WHISPER_URL:
             self._init_external()
@@ -452,20 +452,20 @@ class Transcriber:
             effective_path = self._ensure_wav(audio_path)
 
             # Fallback chain:
-            #   1. AssemblyAI (one call, Universal-3 Pro)
-            #   2. Deepgram (one call, Nova-3)
-            #   3. Whisper+Pyannote combined (one GPU call, no mapping)
-            #   4. Parakeet + diarize cascade (fast transcription, separate diarize)
-            #   5. Whisper + diarize cascade (two calls, mapping)
-            #   6. Local faster-whisper + local diarize cascade
-            if self._use_assemblyai:
-                return self._transcribe_assemblyai(effective_path)
-            elif self._use_deepgram:
-                return self._transcribe_deepgram(effective_path)
-            elif self._use_whisper_pyannote:
+            #   1. Whisper+NeMo combined (/transcribe-diarize — best quality)
+            #   2. Parakeet + NeMo (/transcribe + /diarize — fast)
+            #   3. AssemblyAI (one call, Universal-3 Pro)
+            #   4. Deepgram (one call, Nova-3)
+            #   5. Whisper + separate diarize cascade
+            #   6. Local faster-whisper + local diarize (CPU)
+            if self._use_whisper_pyannote:
                 return self._transcribe_whisper_pyannote(effective_path)
             elif self._use_parakeet:
                 return self._transcribe_parakeet(effective_path)
+            elif self._use_assemblyai:
+                return self._transcribe_assemblyai(effective_path)
+            elif self._use_deepgram:
+                return self._transcribe_deepgram(effective_path)
             elif self._use_external:
                 return self._transcribe_external(effective_path)
             else:
@@ -547,9 +547,13 @@ class Transcriber:
         try:
             result = self._parakeet_client.transcribe(audio_path)
         except Exception as e:
-            logger.error(f"Parakeet failed: {e}. Falling back.")
+            logger.error(f"Parakeet failed: {e}. Falling back to next backend.")
             self._use_parakeet = False
-            if self._use_external:
+            if self._use_assemblyai:
+                return self._transcribe_assemblyai(audio_path)
+            elif self._use_deepgram:
+                return self._transcribe_deepgram(audio_path)
+            elif self._use_external:
                 return self._transcribe_external(audio_path)
             return self._transcribe_local(audio_path)
 
@@ -612,10 +616,8 @@ class Transcriber:
             "model": EXTERNAL_WHISPER_MODEL,
             "min_speakers": str(config["min"]),
             "max_speakers": str(config["max"]),
+            "backend": "nemo",
         }
-        hf_token = os.getenv("HF_TOKEN", "")
-        if hf_token:
-            data["hf_token"] = hf_token
         if self._num_speakers:
             data["num_speakers"] = str(self._num_speakers)
 
@@ -633,10 +635,14 @@ class Transcriber:
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
             result = resp.json()
         except Exception as e:
-            logger.error(f"Whisper+Pyannote combined failed: {e}. Falling back.")
+            logger.error(f"Whisper+NeMo combined failed: {e}. Falling back to next backend.")
             self._use_whisper_pyannote = False
             if self._use_parakeet:
                 return self._transcribe_parakeet(audio_path)
+            elif self._use_assemblyai:
+                return self._transcribe_assemblyai(audio_path)
+            elif self._use_deepgram:
+                return self._transcribe_deepgram(audio_path)
             elif self._use_external:
                 return self._transcribe_external(audio_path)
             return self._transcribe_local(audio_path)
@@ -721,14 +727,10 @@ class Transcriber:
                 speakers_expected=self._num_speakers,
             )
         except Exception as e:
-            logger.error(f"AssemblyAI failed: {e}. Falling back.")
+            logger.error(f"AssemblyAI failed: {e}. Falling back to next backend.")
             self._use_assemblyai = False
             if self._use_deepgram:
                 return self._transcribe_deepgram(audio_path)
-            elif self._use_whisper_pyannote:
-                return self._transcribe_whisper_pyannote(audio_path)
-            elif self._use_parakeet:
-                return self._transcribe_parakeet(audio_path)
             elif self._use_external:
                 return self._transcribe_external(audio_path)
             return self._transcribe_local(audio_path)
@@ -769,13 +771,9 @@ class Transcriber:
         try:
             result = self._deepgram_client.transcribe(audio_path)
         except Exception as e:
-            logger.error(f"Deepgram failed: {e}. Falling back.")
+            logger.error(f"Deepgram failed: {e}. Falling back to next backend.")
             self._use_deepgram = False
-            if self._use_whisper_pyannote:
-                return self._transcribe_whisper_pyannote(audio_path)
-            elif self._use_parakeet:
-                return self._transcribe_parakeet(audio_path)
-            elif self._use_external:
+            if self._use_external:
                 return self._transcribe_external(audio_path)
             return self._transcribe_local(audio_path)
 
@@ -1038,7 +1036,6 @@ class Transcriber:
                 if overlap > best_overlap:
                     best_overlap = overlap
                     best_speaker = Transcriber._normalize_speaker_label(turn["speaker"])
-                    best_speaker = Transcriber._normalize_speaker_label(turn["speaker"])
 
             # If no overlap, use nearest turn
             if best_overlap == 0 and timeline:
@@ -1047,7 +1044,6 @@ class Transcriber:
                     timeline,
                     key=lambda t: abs((t["start"] + t["end"]) / 2 * 1000 - seg_mid),
                 )
-                best_speaker = Transcriber._normalize_speaker_label(nearest["speaker"])
                 best_speaker = Transcriber._normalize_speaker_label(nearest["speaker"])
 
             seg["speaker"] = best_speaker
@@ -1278,7 +1274,7 @@ class Transcriber:
     # ═══════════════════════════════════════════════════════════
 
     # Diarization mode from environment
-    DIARIZATION_MODE = os.getenv("DIARIZATION_MODE", "auto")  # auto|pyannote|embedding|kmeans
+    DIARIZATION_MODE = os.getenv("DIARIZATION_MODE", "auto")  # auto|pyannote|kmeans
 
     # Speaker count defaults and ranges per meeting type
     # turn_gap_ms: gap threshold for that conversation style
@@ -1491,21 +1487,14 @@ class Transcriber:
         audio_path: str,
     ) -> Optional[list[dict]]:
         """
-        Send audio to external GPU server for pyannote diarization.
-        Converts to WAV first since pyannote can't read MP4 directly.
+        Send audio to external GPU server for diarization (NeMo/pyannote).
+        Audio is already 16kHz mono WAV (converted by _ensure_wav upfront).
 
         Uses word-level timestamps (when available) for fine-grained speaker
-        mapping instead of whole-segment overlap, which fixes misassignment
-        at speaker turn boundaries.
-
-        Passes clustering_threshold=0.35 by default for better same-gender /
-        similar-voice separation (API default 0.5 over-splits).
+        mapping instead of whole-segment overlap.
 
         Returns labeled segments or None if unavailable.
         """
-        import tempfile
-        import soundfile as sf
-
         try:
             from shared.utils.external_apis import create_diarize_client
         except ImportError:
@@ -1517,75 +1506,27 @@ class Transcriber:
             logger.warning("External GPU diarization: client creation failed (health check?)")
             return None
 
-        logger.info("External GPU diarization: client ready, sending audio...")
-
         mt = self._meeting_type or "meeting"
-        config = self.SPEAKER_DEFAULTS.get(
-            mt,
-            {"default": 3, "min": 2, "max": 8},
-        )
+        config = self.SPEAKER_DEFAULTS.get(mt, {"default": 3, "min": 2, "max": 8})
         min_spk = config["min"]
-        # Use the estimated max_speakers from the cascade,
-        # NOT the meeting type max.
-        # Only fall back to config max if max_speakers is unreasonably low.
         max_spk = max(max_speakers, min_spk)
-        num_spk = self._num_speakers  # explicit user hint, or None
-
-        # Configurable via DIARIZE_CLUSTERING_THRESHOLD env var (default 0.5).
-        # Lower (0.3-0.4) = merges similar voices more aggressively (fewer speakers).
-        # Higher (0.5-0.7) = separates more aggressively (more speakers).
+        num_spk = self._num_speakers or 0
         clustering_threshold = DIARIZE_CLUSTERING_THRESHOLD
 
-        # Convert to WAV if we have pre-loaded audio (pyannote can't read MP4)
-        wav_path = audio_path
-        tmp_wav = None
-        if self._audio_data is not None:
-            y, sr = self._audio_data
-            # Ensure mono
-            if y.ndim > 1:
-                y = np.mean(y, axis=0) if y.shape[0] < y.shape[1] else np.mean(y, axis=1)
-            # Resample to 16 kHz if needed
-            if sr != 16000:
-                import torchaudio as _ta
-                import torch
-                waveform = torch.from_numpy(y).float()
-                if waveform.ndim == 1:
-                    waveform = waveform.unsqueeze(0)
-                waveform = _ta.functional.resample(waveform, sr, 16000)
-                y = waveform.squeeze(0).numpy()
-                sr = 16000
-            tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            sf.write(tmp_wav.name, y, sr)
-            wav_path = tmp_wav.name
-            logger.info(f"Converted audio to mono 16kHz WAV for GPU diarization: {wav_path}")
-        elif audio_path.lower().endswith((".mp4", ".m4a", ".webm", ".ogg", ".flac", ".mp3")):
-            # Load and convert non-WAV formats
-            try:
-                from shared.utils.audio_loader import load_audio
-                y, sr = load_audio(audio_path, sr=16000)
-            except ImportError:
-                import librosa
-                y, sr = librosa.load(audio_path, sr=16000, mono=True)
-            tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            sf.write(tmp_wav.name, y, sr)
-            wav_path = tmp_wav.name
-            logger.info(f"Converted {audio_path} to WAV for GPU diarization")
+        logger.info(
+            f"External GPU diarization: sending {Path(audio_path).name}, "
+            f"speakers={min_spk}-{max_spk} (hint={num_spk or 'auto'}), "
+            f"threshold={clustering_threshold}"
+        )
 
-        try:
-            result = client.diarize(
-                wav_path,
-                min_speakers=min_spk,
-                max_speakers=max_spk,
-                num_speakers=num_spk,
-                clustering_threshold=clustering_threshold,
-            )
-        finally:
-            # Clean up temp WAV file
-            if tmp_wav is not None:
-                try:
-                    os.unlink(tmp_wav.name)
-                except OSError:
-                    pass
+        # audio_path is already WAV from _ensure_wav() — no conversion needed
+        result = client.diarize(
+            audio_path,
+            min_speakers=min_spk,
+            max_speakers=max_spk,
+            num_speakers=num_spk,
+            clustering_threshold=clustering_threshold,
+        )
 
         if result is None:
             return None
@@ -2999,6 +2940,7 @@ class Transcriber:
                 max_speakers=config["max"],
                 num_speakers=num_speakers,
                 audio_data=self._audio_data,
+                clustering_threshold=DIARIZE_CLUSTERING_THRESHOLD,
             )
 
             speaker_timeline = result.get("timeline", [])
@@ -3021,7 +2963,6 @@ class Transcriber:
                     if overlap > best_overlap:
                         best_overlap = overlap
                         best_speaker = self._normalize_speaker_label(turn["speaker"])
-                        best_speaker = self._normalize_speaker_label(turn["speaker"])
 
                 # If no overlap, use nearest turn
                 if best_overlap == 0:
@@ -3030,7 +2971,6 @@ class Transcriber:
                         speaker_timeline,
                         key=lambda t: abs((t["start"] + t["end"]) / 2 * 1000 - seg_mid),
                     )
-                    best_speaker = self._normalize_speaker_label(nearest["speaker"])
                     best_speaker = self._normalize_speaker_label(nearest["speaker"])
 
                 seg["speaker"] = best_speaker
