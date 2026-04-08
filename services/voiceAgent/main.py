@@ -179,8 +179,16 @@ async def analyse_audio(request: AnalysisRequest):
         import librosa as _lr
         audio_data = _lr.load(str(file_path), sr=16000, mono=True)
 
-    # ── Step 1: Transcribe + diarise ──
+    # ── Create content-type profile ──
     meeting_type = request.meeting_type or "sales_call"
+    _profile = None
+    try:
+        from shared.config.content_type_profile import ContentTypeProfile
+        _profile = ContentTypeProfile(meeting_type)
+    except ImportError:
+        pass
+
+    # ── Step 1: Transcribe + diarise ──
     logger.info(f"[{session_id}] Step 1: Transcribing (num_speakers={request.num_speakers}, meeting_type={meeting_type})...")
     transcript = transcriber.transcribe(str(file_path), num_speakers=request.num_speakers, audio_data=audio_data, meeting_type=meeting_type)
     
@@ -246,6 +254,7 @@ async def analyse_audio(request: AnalysisRequest):
                 baseline=baseline,
                 speaker_id=speaker_id,
                 transcript_segments=window_all_segments,
+                profile=_profile,
             )
             all_signals.extend(signals)
     

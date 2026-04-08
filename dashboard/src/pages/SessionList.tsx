@@ -91,6 +91,8 @@ export default function SessionList() {
             <option value="client_meeting">Client Meeting</option>
             <option value="internal">Internal</option>
             <option value="interview">Interview</option>
+            <option value="podcast">Podcast</option>
+            <option value="debate">Debate</option>
           </select>
 
           <button

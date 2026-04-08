@@ -37,6 +37,11 @@ except ImportError:
     from shared.models.signals import Signal, SpeakerBaseline
     from services.voiceAgent.calibration import CalibrationModule
 
+try:
+    from shared.config.content_type_profile import ContentTypeProfile
+except ImportError:
+    ContentTypeProfile = None
+
 logger = logging.getLogger("nexus.voice.rules")
 
 
@@ -80,6 +85,7 @@ class VoiceRuleEngine:
         speaker_id: str,
         transcript_segments: list[dict] = None,
         conversation_features: dict = None,
+        profile: "ContentTypeProfile | None" = None,
     ) -> list[dict]:
         """
         Run all rules against a single feature window.
@@ -90,6 +96,7 @@ class VoiceRuleEngine:
             speaker_id: Speaker identifier
             transcript_segments: Transcript segments in this window
             conversation_features: Reserved for future conversation-level features
+            profile: ContentTypeProfile for content-aware thresholds/gating/renaming
 
         Returns:
             List of Signal dicts (one per fired rule)
@@ -103,88 +110,82 @@ class VoiceRuleEngine:
         if cal_conf < 0.1:
             return signals
 
+        def _add(rule_id: str, signal_type: str, value, value_text: str,
+                 confidence: float, metadata: dict = None):
+            """Helper: apply profile gating, confidence multiplier, and renaming."""
+            if profile and profile.is_gated(rule_id):
+                return
+            conf = confidence
+            if profile:
+                conf = profile.apply_confidence(rule_id, conf)
+            renamed = profile.rename_signal(value_text) if profile else value_text
+            signals.append(_make_signal(
+                speaker_id, signal_type, value, renamed, conf,
+                window_start, window_end, metadata or {},
+            ))
+
         # ── VOICE-STRESS-01: Composite Vocal Stress Score ──
         stress = self._rule_stress_01(features, baseline)
         if stress is not None:
-            signals.append(_make_signal(
-                speaker_id, "vocal_stress_score",
-                stress["score"], stress["level"],
-                stress["score"] * cal_conf,
-                window_start, window_end,
-                stress["components"],
-            ))
+            stress_offset = profile.get_threshold("VOICE-STRESS-01", "stress_offset", 0.0) if profile else 0.0
+            adjusted_score = max(0, stress["score"] - stress_offset)
+            _add("VOICE-STRESS-01", "vocal_stress_score",
+                 adjusted_score, stress["level"],
+                 adjusted_score * cal_conf, stress["components"])
 
         # ── VOICE-FILLER-01: Filler Detection ──
         filler = self._rule_filler_01(features, baseline)
         if filler is not None:
-            signals.append(_make_signal(
-                speaker_id, "filler_detection",
-                filler["filler_rate_pct"], filler["status"],
-                0.90 * cal_conf,
-                window_start, window_end,
-                {
-                    "filler_count": filler["filler_count"],
-                    "um_count": filler["um_count"],
-                    "uh_count": filler["uh_count"],
-                    "delta_from_baseline": filler.get("delta", 0),
-                    "credibility_impact": filler.get("credibility_impact", "none"),
-                },
-            ))
+            _add("VOICE-FILLER-01", "filler_detection",
+                 filler["filler_rate_pct"], filler["status"],
+                 0.90 * cal_conf, {
+                     "filler_count": filler["filler_count"],
+                     "um_count": filler["um_count"],
+                     "uh_count": filler["uh_count"],
+                     "delta_from_baseline": filler.get("delta", 0),
+                     "credibility_impact": filler.get("credibility_impact", "none"),
+                 })
 
         # ── VOICE-PITCH-01: Pitch Elevation Flag ──
         pitch = self._rule_pitch_01(features, baseline)
         if pitch is not None:
-            signals.append(_make_signal(
-                speaker_id, "pitch_elevation_flag",
-                pitch["delta_pct"], pitch["level"],
-                0.50 * cal_conf,
-                window_start, window_end,
-                {
-                    "f0_current": pitch["f0_current"],
-                    "f0_baseline": pitch["f0_baseline"],
-                    "delta_pct": pitch["delta_pct"],
-                },
-            ))
+            _add("VOICE-PITCH-01", "pitch_elevation_flag",
+                 pitch["delta_pct"], pitch["level"],
+                 0.50 * cal_conf, {
+                     "f0_current": pitch["f0_current"],
+                     "f0_baseline": pitch["f0_baseline"],
+                     "delta_pct": pitch["delta_pct"],
+                 })
 
         # ── VOICE-PITCH-02: Monotone Detection ──
         monotone = self._rule_pitch_02(features, baseline)
         if monotone is not None:
-            signals.append(_make_signal(
-                speaker_id, "monotone_flag",
-                monotone["value"], monotone["value_text"],
-                monotone["confidence_raw"] * cal_conf,
-                window_start, window_end,
-                monotone.get("evidence", {}),
-            ))
+            _add("VOICE-PITCH-02", "monotone_flag",
+                 monotone["value"], monotone["value_text"],
+                 monotone["confidence_raw"] * cal_conf,
+                 monotone.get("evidence", {}))
 
         # ── VOICE-RATE-01: Speech Rate Anomaly ──
         rate = self._rule_rate_01(features, baseline)
         if rate is not None:
-            signals.append(_make_signal(
-                speaker_id, "speech_rate_anomaly",
-                rate["delta_pct"], rate["classification"],
-                0.40 * cal_conf,
-                window_start, window_end,
-                {
-                    "wpm_current": rate["wpm_current"],
-                    "wpm_baseline": rate["wpm_baseline"],
-                    "sub_classification": rate.get("sub_classification", ""),
-                },
-            ))
+            _add("VOICE-RATE-01", "speech_rate_anomaly",
+                 rate["delta_pct"], rate["classification"],
+                 0.40 * cal_conf, {
+                     "wpm_current": rate["wpm_current"],
+                     "wpm_baseline": rate["wpm_baseline"],
+                     "sub_classification": rate.get("sub_classification", ""),
+                 })
 
         # ── VOICE-TONE-03/04: Tone Classification (nervous/confident) ──
-        # If existing tone returns None or "neutral", try the 4 new tones
         tone = self._rule_tone(features, baseline)
+        tone_rule_id = "VOICE-TONE-03"  # nervous/confident
         if tone is not None and tone["tone"] not in ("neutral",):
-            signals.append(_make_signal(
-                speaker_id, "tone_classification",
-                tone["confidence_raw"], tone["tone"],
-                tone["confidence_raw"] * cal_conf,
-                window_start, window_end,
-                tone.get("evidence", {}),
-            ))
+            tone_rule_id = "VOICE-TONE-04" if tone["tone"] == "confident" else "VOICE-TONE-03"
+            _add(tone_rule_id, "tone_classification",
+                 tone["confidence_raw"], tone["tone"],
+                 tone["confidence_raw"] * cal_conf,
+                 tone.get("evidence", {}))
         else:
-            # Try new tone rules in priority order: warm → excited → aggressive → cold
             new_tone = (
                 self._rule_tone_warm(features, baseline)
                 or self._rule_tone_excited(features, baseline)
@@ -192,58 +193,44 @@ class VoiceRuleEngine:
                 or self._rule_tone_cold(features, baseline)
             )
             if new_tone is not None:
-                signals.append(_make_signal(
-                    speaker_id, "tone_classification",
-                    new_tone["confidence_raw"], new_tone["value_text"],
-                    new_tone["confidence_raw"] * cal_conf,
-                    window_start, window_end,
-                    new_tone.get("evidence", {}),
-                ))
+                tone_label = new_tone["value_text"]
+                tone_ids = {"warm": "VOICE-TONE-01", "excited": "VOICE-TONE-06",
+                            "aggressive": "VOICE-TONE-05", "cold": "VOICE-TONE-02"}
+                _add(tone_ids.get(tone_label, "VOICE-TONE-01"), "tone_classification",
+                     new_tone["confidence_raw"], tone_label,
+                     new_tone["confidence_raw"] * cal_conf,
+                     new_tone.get("evidence", {}))
             elif tone is not None:
-                # Emit the original neutral tone if no new tone matched
-                signals.append(_make_signal(
-                    speaker_id, "tone_classification",
-                    tone["confidence_raw"], tone["tone"],
-                    tone["confidence_raw"] * cal_conf,
-                    window_start, window_end,
-                    tone.get("evidence", {}),
-                ))
+                _add("VOICE-TONE-03", "tone_classification",
+                     tone["confidence_raw"], tone["tone"],
+                     tone["confidence_raw"] * cal_conf,
+                     tone.get("evidence", {}))
 
         # ── VOICE-ENERGY-01: Energy Level Classification ──
         energy = self._rule_energy_01(features, baseline)
         if energy is not None:
-            signals.append(_make_signal(
-                speaker_id, "energy_level",
-                energy["value"], energy["value_text"],
-                energy["confidence_raw"] * cal_conf,
-                window_start, window_end,
-                energy.get("evidence", {}),
-            ))
+            _add("VOICE-ENERGY-01", "energy_level",
+                 energy["value"], energy["value_text"],
+                 energy["confidence_raw"] * cal_conf,
+                 energy.get("evidence", {}))
 
         # ── VOICE-PAUSE-01: Pause Classification ──
         pause_signals = self._rule_pause_01(features, baseline)
         for ps in pause_signals:
-            signals.append(_make_signal(
-                speaker_id, "pause_classification",
-                ps["value"], ps["value_text"],
-                ps["confidence_raw"] * cal_conf,
-                window_start, window_end,
-                ps.get("evidence", {}),
-            ))
+            _add("VOICE-PAUSE-01", "pause_classification",
+                 ps["value"], ps["value_text"],
+                 ps["confidence_raw"] * cal_conf,
+                 ps.get("evidence", {}))
 
         # ── VOICE-INT-01: Interruption Detection ──
         if transcript_segments:
             int_signals = self._rule_int_01(features, baseline, transcript_segments)
             if int_signals:
                 for isig in int_signals:
-                    signals.append(_make_signal(
-                        speaker_id, "interruption_event",
-                        isig["value"], isig["value_text"],
-                        isig["confidence_raw"] * cal_conf,
-                        isig.get("window_start_ms", window_start),
-                        isig.get("window_end_ms", window_end),
-                        isig.get("evidence", {}),
-                    ))
+                    _add("VOICE-INT-01", "interruption_event",
+                         isig["value"], isig["value_text"],
+                         isig["confidence_raw"] * cal_conf,
+                         isig.get("evidence", {}))
 
         return signals
     

@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Layer 1: PyTorch CPU (cached unless torch version changes)
-RUN pip install --no-cache-dir torch==2.4.1+cpu torchaudio==2.4.1+cpu \
+RUN pip install --no-cache-dir torch torchaudio \
     --index-url https://download.pytorch.org/whl/cpu
 
 # Layer 2: Heavy ML deps (cached separately so network failures don't restart torch)

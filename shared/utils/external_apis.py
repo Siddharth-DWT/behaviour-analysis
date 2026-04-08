@@ -662,9 +662,13 @@ class DiarizeClient:
 
         result = resp.json()
 
+        # Normalize: server returns "timeline", callers expect "segments"
+        if "timeline" in result and "segments" not in result:
+            result["segments"] = result["timeline"]
+
         logger.info(
             f"GPU diarization complete: {result.get('num_speakers', '?')} speakers, "
-            f"{len(result.get('timeline', []))} turns, "
+            f"{len(result.get('segments', []))} segments, "
             f"API time={result.get('processing_time', 0):.1f}s, "
             f"total={elapsed:.1f}s"
         )

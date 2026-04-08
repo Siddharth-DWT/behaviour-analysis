@@ -150,6 +150,13 @@ async def analyse(request: AnalysisRequest):
     speakers = request.speakers or []
     content_type = request.content_type or "sales_call"
 
+    _profile = None
+    try:
+        from shared.config.content_type_profile import ContentTypeProfile
+        _profile = ContentTypeProfile(content_type)
+    except ImportError:
+        pass
+
     if not segments:
         raise HTTPException(400, "No segments provided")
 
@@ -178,7 +185,7 @@ async def analyse(request: AnalysisRequest):
 
     # ── Step 2: Rule Engine ──
     language_signals = getattr(request, "language_signals", None) or None
-    signals = rule_engine.evaluate(features, content_type, language_signals=language_signals)
+    signals = rule_engine.evaluate(features, content_type, language_signals=language_signals, profile=_profile)
     logger.info(f"[{session_id}] Rule engine produced {len(signals)} signals")
 
     # ── Step 3: Build Summary ──

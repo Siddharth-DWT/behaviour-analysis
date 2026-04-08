@@ -184,11 +184,11 @@ class Transcriber:
             resp = httpx.get(f"{base}/health", headers=headers, timeout=30)
             if resp.status_code == 200:
                 self._use_whisper_pyannote = True
-                logger.info(f"Using Whisper+Pyannote combined endpoint: {url}")
+                logger.info(f"Using Whisper+NEMO combined endpoint: {url}")
             else:
-                logger.warning(f"Whisper+Pyannote endpoint not healthy ({resp.status_code})")
+                logger.warning(f"Whisper+NEMO endpoint not healthy ({resp.status_code})")
         except Exception as e:
-            logger.warning(f"Could not connect to Whisper+Pyannote endpoint: {e}")
+            logger.warning(f"Could not connect to Whisper+NEMO endpoint: {e}")
 
     def _init_parakeet(self):
         """Try to initialise Parakeet TDT client (fast transcription with word timestamps)."""
@@ -722,10 +722,15 @@ class Transcriber:
         logger.info(f"Transcribing via AssemblyAI: {audio_path}")
 
         try:
-            result = self._assemblyai_client.transcribe(
-                audio_path,
-                speakers_expected=self._num_speakers,
-            )
+            # AssemblyAIClient may come from assemblyai_client.py (.transcribe)
+            # or external_apis.py (.transcribe_and_diarize) — try both
+            if hasattr(self._assemblyai_client, 'transcribe'):
+                result = self._assemblyai_client.transcribe(
+                    audio_path,
+                    speakers_expected=self._num_speakers,
+                )
+            else:
+                result = self._assemblyai_client.transcribe_and_diarize(audio_path)
         except Exception as e:
             logger.error(f"AssemblyAI failed: {e}. Falling back to next backend.")
             self._use_assemblyai = False

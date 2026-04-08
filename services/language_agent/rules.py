@@ -225,6 +225,7 @@ class LanguageRuleEngine:
         speaker_role: Optional[str] = None,
         all_features_list: Optional[list] = None,
         current_index: int = 0,
+        profile=None,
     ) -> list[dict]:
         """
         Run all rules against a single segment's features.
@@ -234,9 +235,9 @@ class LanguageRuleEngine:
             speaker_id: Speaker identifier
             content_type: Optional override for content type
             speaker_role: Optional speaker role (e.g. "Seller", "Prospect")
-                          Buying signals are only valid from Prospect/Buyer.
             all_features_list: Full list of features for all segments (for topic shift)
             current_index: Index of current segment in all_features_list
+            profile: ContentTypeProfile for content-aware gating/renaming
 
         Returns:
             List of Signal dicts (one per fired rule)
@@ -246,44 +247,44 @@ class LanguageRuleEngine:
         end_ms = features.get("end_ms", 0)
         active_type = content_type or self._content_type
 
+        def _add(rule_id: str, signal_type: str, value, value_text: str,
+                 confidence: float, metadata: dict):
+            if profile and profile.is_gated(rule_id):
+                return
+            conf = confidence
+            if profile:
+                conf = profile.apply_confidence(rule_id, conf)
+            renamed_type = profile.rename_signal(signal_type) if profile else signal_type
+            renamed_text = profile.rename_signal(value_text) if profile else value_text
+            signals.append(_make_signal(
+                speaker_id, renamed_type, value, renamed_text, conf,
+                start_ms, end_ms, metadata,
+            ))
+
         # ── LANG-SENT-01: Per-Sentence Sentiment (all content types) ──
         sent = self._rule_sentiment_01(features)
-        signals.append(_make_signal(
-            speaker_id, "sentiment_score",
-            sent["value"], sent["label"],
-            sent["confidence"],
-            start_ms, end_ms,
-            {
-                "raw_label": sent["raw_label"],
-                "raw_score": sent["raw_score"],
-                "text_preview": features.get("text", "")[:80],
-            },
-        ))
+        _add("LANG-SENT-01", "sentiment_score",
+             sent["value"], sent["label"], sent["confidence"],
+             {"raw_label": sent["raw_label"], "raw_score": sent["raw_score"],
+              "text_preview": features.get("text", "")[:80]})
 
         # ── LANG-SENT-02: Emotional Intensity (all content types) ──
         emo = self._rule_sent_02(features)
         if emo is not None:
-            signals.append(_make_signal(
-                speaker_id, "emotional_intensity",
-                emo["value"], emo["label"],
-                emo["confidence"],
-                start_ms, end_ms,
-                {
-                    "rule": "LANG-SENT-02",
-                    "density": emo["density"],
-                    "positive_count": emo["positive_count"],
-                    "negative_count": emo["negative_count"],
-                    "word_count": emo["word_count"],
-                    "text_preview": features.get("text", "")[:80],
-                },
-            ))
+            _add("LANG-SENT-02", "emotional_intensity",
+                 emo["value"], emo["label"], emo["confidence"],
+                 {"rule": "LANG-SENT-02", "density": emo["density"],
+                  "positive_count": emo["positive_count"],
+                  "negative_count": emo["negative_count"],
+                  "word_count": emo["word_count"],
+                  "text_preview": features.get("text", "")[:80]})
 
-        # ── LANG-BUY-01: Buying Signal Detection (sales_call only) ──
-        # Buying signals are only meaningful from the Prospect/Buyer, never the Seller.
+        # ── LANG-BUY-01: Buying Signal Detection ──
+        # Profile handles gating (internal/podcast suppressed) and renaming
         role_lower = (speaker_role or "").lower()
         is_seller = role_lower in ("seller", "agent", "rep", "salesperson")
 
-        if active_type in self.SALES_TYPES and not is_seller:
+        if not is_seller:
             buy = self._rule_buying_01(features)
             if buy is not None:
                 meta = {
@@ -294,142 +295,85 @@ class LanguageRuleEngine:
                 }
                 if not speaker_role:
                     meta["needs_role_validation"] = True
-                signals.append(_make_signal(
-                    speaker_id, "buying_signal",
-                    buy["strength"], buy["level"],
-                    buy["confidence"],
-                    start_ms, end_ms, meta,
-                ))
+                _add("LANG-BUY-01", "buying_signal",
+                     buy["strength"], buy["level"],
+                     buy["confidence"], meta)
 
-        # ── LANG-OBJ-01: Objection Signal Detection (sales_call only) ──
-        if active_type in self.SALES_TYPES:
-            obj = self._rule_objection_01(features)
-            if obj is not None:
-                signals.append(_make_signal(
-                    speaker_id, "objection_signal",
-                    obj["strength"], obj["level"],
-                    obj["confidence"],
-                    start_ms, end_ms,
-                    {
-                        "categories": obj["categories"],
-                        "hedge_count": obj.get("hedge_count", 0),
-                        "matches": obj["matches"][:5],
-                        "text_preview": features.get("text", "")[:80],
-                    },
-                ))
+        # ── LANG-OBJ-01: Objection Signal Detection ──
+        # Profile handles gating (podcast suppressed) and renaming
+        obj = self._rule_objection_01(features)
+        if obj is not None:
+            _add("LANG-OBJ-01", "objection_signal",
+                 obj["strength"], obj["level"], obj["confidence"],
+                 {"categories": obj["categories"],
+                  "hedge_count": obj.get("hedge_count", 0),
+                  "matches": obj["matches"][:5],
+                  "text_preview": features.get("text", "")[:80]})
 
         # ── LANG-PWR-01: Power Language Score (all content types) ──
         pwr = self._rule_power_01(features)
         if pwr is not None:
-            signals.append(_make_signal(
-                speaker_id, "power_language_score",
-                pwr["score"], pwr["level"],
-                pwr["confidence"],
-                start_ms, end_ms,
-                {
-                    "powerless_feature_count": pwr["powerless_count"],
-                    "features_found": pwr["features_found"],
-                    "word_count": pwr["word_count"],
-                    "text_preview": features.get("text", "")[:80],
-                },
-            ))
+            _add("LANG-PWR-01", "power_language_score",
+                 pwr["score"], pwr["level"], pwr["confidence"],
+                 {"powerless_feature_count": pwr["powerless_count"],
+                  "features_found": pwr["features_found"],
+                  "word_count": pwr["word_count"],
+                  "text_preview": features.get("text", "")[:80]})
 
-        # ── LANG-PERS-01: Persuasion Detection (all content types) ──
+        # ── LANG-PERS-01: Persuasion Detection ──
         pers = self._rule_pers_01(features, active_type)
         if pers is not None:
-            signals.append(_make_signal(
-                speaker_id, "persuasion_technique",
-                pers["value"], pers["value_text"],
-                pers["confidence"],
-                start_ms, end_ms,
-                {
-                    "rule": "LANG-PERS-01",
-                    "techniques_found": pers["techniques_found"],
-                    "detected_count": pers["detected_count"],
-                    "text_preview": features.get("text", "")[:80],
-                },
-            ))
+            _add("LANG-PERS-01", "persuasion_technique",
+                 pers["value"], pers["value_text"], pers["confidence"],
+                 {"rule": "LANG-PERS-01", "techniques_found": pers["techniques_found"],
+                  "detected_count": pers["detected_count"],
+                  "text_preview": features.get("text", "")[:80]})
 
-        # ── LANG-QUES-01: Question Type (all content types) ──
+        # ── LANG-QUES-01: Question Type ──
         ques = self._rule_ques_01(features, active_type)
         if ques is not None:
-            signals.append(_make_signal(
-                speaker_id, "question_type",
-                ques["value"], ques["label"],
-                ques["confidence"],
-                start_ms, end_ms,
-                {
-                    "rule": "LANG-QUES-01",
-                    "question_category": ques["category"],
-                    "spin_type": ques.get("spin_type"),
-                    "text_preview": features.get("text", "")[:80],
-                },
-            ))
+            _add("LANG-QUES-01", "question_type",
+                 ques["value"], ques["label"], ques["confidence"],
+                 {"rule": "LANG-QUES-01", "question_category": ques["category"],
+                  "spin_type": ques.get("spin_type"),
+                  "text_preview": features.get("text", "")[:80]})
 
-        # ── LANG-NEG-01: Gottman Four Horsemen (all content types) ──
+        # ── LANG-NEG-01: Gottman Four Horsemen ──
         neg = self._rule_neg_01(features, active_type)
         if neg is not None:
-            signals.append(_make_signal(
-                speaker_id, "gottman_horsemen",
-                neg["value"], neg["label"],
-                neg["confidence"],
-                start_ms, end_ms,
-                {
-                    "rule": "LANG-NEG-01",
-                    "horseman": neg["horseman"],
-                    "matched_pattern": neg.get("matched_pattern", ""),
-                    "text_preview": features.get("text", "")[:80],
-                },
-            ))
+            _add("LANG-NEG-01", "gottman_horsemen",
+                 neg["value"], neg["label"], neg["confidence"],
+                 {"rule": "LANG-NEG-01", "horseman": neg["horseman"],
+                  "matched_pattern": neg.get("matched_pattern", ""),
+                  "text_preview": features.get("text", "")[:80]})
 
-        # ── LANG-EMP-01: Empathy Language (all content types) ──
+        # ── LANG-EMP-01: Empathy Language ──
         emp = self._rule_emp_01(features, active_type)
         if emp is not None:
-            signals.append(_make_signal(
-                speaker_id, "empathy_language",
-                emp["value"], emp["label"],
-                emp["confidence"],
-                start_ms, end_ms,
-                {
-                    "rule": "LANG-EMP-01",
-                    "validation_count": emp["validation_count"],
-                    "reflection_count": emp["reflection_count"],
-                    "text_preview": features.get("text", "")[:80],
-                },
-            ))
+            _add("LANG-EMP-01", "empathy_language",
+                 emp["value"], emp["label"], emp["confidence"],
+                 {"rule": "LANG-EMP-01", "validation_count": emp["validation_count"],
+                  "reflection_count": emp["reflection_count"],
+                  "text_preview": features.get("text", "")[:80]})
 
-        # ── LANG-CLAR-01: Clarity Score (all content types) ──
+        # ── LANG-CLAR-01: Clarity Score ──
         clar = self._rule_clar_01(features, active_type)
         if clar is not None:
-            signals.append(_make_signal(
-                speaker_id, "clarity_score",
-                clar["value"], clar["label"],
-                clar["confidence"],
-                start_ms, end_ms,
-                {
-                    "rule": "LANG-CLAR-01",
-                    "penalties": clar.get("penalties", []),
-                    "bonuses": clar.get("bonuses", []),
-                    "text_preview": features.get("text", "")[:80],
-                },
-            ))
+            _add("LANG-CLAR-01", "clarity_score",
+                 clar["value"], clar["label"], clar["confidence"],
+                 {"rule": "LANG-CLAR-01", "penalties": clar.get("penalties", []),
+                  "bonuses": clar.get("bonuses", []),
+                  "text_preview": features.get("text", "")[:80]})
 
         # ── LANG-TOPIC-01: Topic Shift (requires full features list) ──
         if all_features_list is not None:
             topic = self._rule_topic_01(features, all_features_list, current_index)
             if topic is not None:
-                signals.append(_make_signal(
-                    speaker_id, "topic_shift",
-                    topic["value"], topic["label"],
-                    topic["confidence"],
-                    start_ms, end_ms,
-                    {
-                        "rule": "LANG-TOPIC-01",
-                        "overlap_pct": topic["overlap_pct"],
-                        "current_keywords": topic.get("current_keywords", [])[:10],
-                        "text_preview": features.get("text", "")[:80],
-                    },
-                ))
+                _add("LANG-TOPIC-01", "topic_shift",
+                     topic["value"], topic["label"], topic["confidence"],
+                     {"rule": "LANG-TOPIC-01", "overlap_pct": topic["overlap_pct"],
+                      "current_keywords": topic.get("current_keywords", [])[:10],
+                      "text_preview": features.get("text", "")[:80]})
 
         return signals
 

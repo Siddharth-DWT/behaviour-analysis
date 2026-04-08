@@ -701,7 +701,7 @@ async def _run_pipeline(
     except Exception as e:
         logger.error(f"[{session_id}] Voice Agent transcription failed: {e}")
         await _try_update_status(session_id, "failed")
-        raise HTTPException(502, f"Voice Agent failed: {e}")
+        return  # Background task — cannot raise HTTPException
 
     if not isinstance(voice_result, dict):
         logger.error(f"[{session_id}] Voice Agent returned unexpected type: {type(voice_result)}")

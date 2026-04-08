@@ -37,6 +37,11 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     from shared.models.signals import Signal
 
+try:
+    from shared.config.content_type_profile import ContentTypeProfile
+except ImportError:
+    ContentTypeProfile = None
+
 
 def _make_signal(
     speaker_id: str, signal_type: str, value: float, value_text: str,
@@ -73,6 +78,7 @@ class ConversationRuleEngine:
         features: dict,
         content_type: str = "sales_call",
         language_signals: Optional[list] = None,
+        profile=None,
     ) -> list[dict]:
         """
         Run all conversation rules against extracted features.
@@ -80,13 +86,29 @@ class ConversationRuleEngine:
         Args:
             features: Output from ConversationFeatureExtractor.extract_all()
             content_type: Type of meeting (sales_call, interview, presentation, etc.)
-            language_signals: Optional list of Language Agent signals (used for
-                              cross-modal rules like CONVO-CONF-01).
+            language_signals: Optional list of Language Agent signals
+            profile: ContentTypeProfile for content-aware gating/renaming
 
         Returns:
             List of Signal dicts.
         """
+        if profile is None and ContentTypeProfile is not None:
+            profile = ContentTypeProfile(content_type)
+
         signals = []
+
+        def _apply_profile(rule_id: str, raw_signals: list[dict]) -> list[dict]:
+            """Filter, rename, and adjust confidence for a batch of signals."""
+            if not profile:
+                return raw_signals
+            if profile.is_gated(rule_id):
+                return []
+            result = []
+            for s in raw_signals:
+                s["confidence"] = profile.apply_confidence(rule_id, s.get("confidence", 0.5))
+                s["value_text"] = profile.rename_signal(s.get("value_text", ""))
+                result.append(s)
+            return result
 
         per_speaker = features.get("per_speaker", {})
         per_pair = features.get("per_pair", {})
@@ -98,45 +120,47 @@ class ConversationRuleEngine:
         duration_minutes = window_end_ms / 60000.0 if window_end_ms > 0 else 0
 
         # CONVO-TURN-01: Turn-taking pattern (session-level)
-        signals.extend(self._rule_turn_taking(session, window_start_ms, window_end_ms))
+        signals.extend(_apply_profile("CONVO-TURN-01",
+            self._rule_turn_taking(session, window_start_ms, window_end_ms)))
 
         # CONVO-LAT-01: Response latency pattern (per pair)
-        signals.extend(self._rule_response_latency(per_pair, window_start_ms, window_end_ms))
+        signals.extend(_apply_profile("CONVO-LAT-01",
+            self._rule_response_latency(per_pair, window_start_ms, window_end_ms)))
 
         # CONVO-DOM-01: Dominance score (per speaker)
-        signals.extend(self._rule_dominance(
+        signals.extend(_apply_profile("CONVO-DOM-01", self._rule_dominance(
             per_speaker, session, speakers, duration_minutes,
             window_start_ms, window_end_ms,
-        ))
+        )))
 
         # CONVO-INT-01: Interruption pattern (per speaker)
-        signals.extend(self._rule_interruption(
+        signals.extend(_apply_profile("CONVO-INT-01", self._rule_interruption(
             per_speaker, speakers, duration_minutes,
             window_start_ms, window_end_ms,
-        ))
+        )))
 
         # CONVO-RAP-01: Rapport indicator (per pair)
-        signals.extend(self._rule_rapport(
+        signals.extend(_apply_profile("CONVO-RAP-01", self._rule_rapport(
             per_speaker, per_pair, session, speakers, duration_minutes,
             window_start_ms, window_end_ms,
-        ))
+        )))
 
         # CONVO-ENG-01: Conversation engagement (per speaker)
-        signals.extend(self._rule_engagement(
+        signals.extend(_apply_profile("CONVO-ENG-01", self._rule_engagement(
             per_speaker, per_pair, session, speakers, duration_minutes,
             window_start_ms, window_end_ms,
-        ))
+        )))
 
         # CONVO-BAL-01: Conversation balance (session-level)
-        signals.extend(self._rule_balance(
+        signals.extend(_apply_profile("CONVO-BAL-01", self._rule_balance(
             session, content_type, window_start_ms, window_end_ms,
-        ))
+        )))
 
         # CONVO-CONF-01: Conflict detection (cross-modal with Language Agent)
-        signals.extend(self._rule_convo_conf_01(
+        signals.extend(_apply_profile("CONVO-CONF-01", self._rule_convo_conf_01(
             per_speaker, session, speakers, duration_minutes,
             language_signals, window_start_ms, window_end_ms,
-        ))
+        )))
 
         logger.info(f"ConversationRuleEngine produced {len(signals)} signals")
         return signals
