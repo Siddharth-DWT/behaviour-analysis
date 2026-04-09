@@ -1420,15 +1420,16 @@ class Transcriber:
         if not segments:
             return segments
 
-        if num_speakers is None:
-            estimated = self._estimate_speaker_count(segments)
-            logger.info("No speaker-count hint provided; estimated %s speaker(s)", estimated)
-            max_speakers = estimated
-        else:
+        meeting_type = getattr(self, "_meeting_type", "sales_call") or "sales_call"
+        config = self.SPEAKER_DEFAULTS.get(meeting_type, {"default": 3, "min": 2, "max": 10})
+
+        if num_speakers is not None:
             max_speakers = min(max(1, num_speakers), 10)
+        else:
+            max_speakers = config["max"]  # Let GPU backends auto-detect within full range
 
         # Single speaker — assign all segments and skip clustering
-        if max_speakers < 2:
+        if num_speakers == 1:
             for seg in segments:
                 seg["speaker"] = "Speaker_0"
             self._last_diarization_backend = "single_speaker"
@@ -1467,11 +1468,21 @@ class Transcriber:
             except Exception as e:
                 logger.warning(f"Pyannote 3.1 failed: {e}")
 
+        # ── Local fallbacks need estimated speaker count ──
+        # GPU backends above use full max_speakers range and auto-detect.
+        # Local KMeans/gap need an explicit count to cluster.
+        if num_speakers is None:
+            estimated = self._estimate_speaker_count(segments)
+            logger.info("Local fallback: estimated %s speaker(s) for clustering", estimated)
+            local_max = estimated
+        else:
+            local_max = max_speakers
+
         # ── Tier 3: Acoustic KMeans (enhanced with MFCCs) ──
-        if mode in ("kmeans", "auto") and audio_path and max_speakers >= 2:
+        if mode in ("kmeans", "auto") and audio_path and local_max >= 2:
             try:
                 clustered = self._diarize_acoustic_kmeans(
-                    segments, max_speakers, audio_path
+                    segments, local_max, audio_path
                 )
                 if clustered is not None:
                     return clustered
@@ -1479,9 +1490,9 @@ class Transcriber:
                 logger.warning(f"Acoustic KMeans diarization failed: {e}")
 
         # ── Tier 4/5: Gap+pitch or heuristic ──
-        if max_speakers == 2:
+        if local_max == 2:
             return self._diarize_gap_two_speaker(segments, audio_path)
-        return self._diarize_simple_multi_speaker(segments, max_speakers)
+        return self._diarize_simple_multi_speaker(segments, local_max)
 
     # ── External GPU Diarization (Tier 0) ──
 
