@@ -1512,7 +1512,8 @@ class Transcriber:
         if result is None:
             return None
 
-        gpu_segments = result.get("segments", [])
+        # GPU /diarize returns turns under "timeline"; older builds used "segments".
+        gpu_segments = result.get("timeline") or result.get("segments", [])
         if not gpu_segments:
             logger.warning("GPU diarization returned 0 segments")
             return None
