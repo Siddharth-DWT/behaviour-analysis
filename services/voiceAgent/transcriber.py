@@ -279,26 +279,6 @@ class Transcriber:
                 f"Falling back to local faster-whisper."
             )
 
-    def _init_assemblyai(self):
-        """Try to initialise AssemblyAI client (transcription + diarization)."""
-        try:
-            project_root = str(Path(__file__).parent.parent.parent)
-            if project_root not in sys.path:
-                sys.path.insert(0, project_root)
-
-            from shared.utils.external_apis import AssemblyAIClient
-
-            client = AssemblyAIClient(api_key=ASSEMBLYAI_API_KEY)
-
-            if client.is_healthy():
-                self._assemblyai_client = client
-                self._use_assemblyai = True
-                logger.info("Using ASSEMBLYAI Universal-3-Pro for transcription + diarization (preferred)")
-            else:
-                logger.warning("AssemblyAI API not reachable. Trying other backends.")
-        except Exception as e:
-            logger.warning(f"Could not initialise AssemblyAI client: {e}")
-
     def _init_deepgram_diarize(self):
         """Try to initialise Deepgram Nova-3 diarization client."""
         try:
@@ -318,26 +298,6 @@ class Transcriber:
                 logger.warning("Deepgram API not reachable. Trying other backends.")
         except Exception as e:
             logger.warning(f"Could not initialise Deepgram client: {e}")
-
-    def _init_assemblyai(self):
-        """Try to initialise AssemblyAI client (transcription + diarization)."""
-        try:
-            project_root = str(Path(__file__).parent.parent.parent)
-            if project_root not in sys.path:
-                sys.path.insert(0, project_root)
-
-            from shared.utils.external_apis import AssemblyAIClient
-
-            client = AssemblyAIClient(api_key=ASSEMBLYAI_API_KEY)
-
-            if client.is_healthy():
-                self._assemblyai_client = client
-                self._use_assemblyai = True
-                logger.info("Using ASSEMBLYAI Universal-3-Pro for transcription + diarization (preferred)")
-            else:
-                logger.warning("AssemblyAI API not reachable. Trying other backends.")
-        except Exception as e:
-            logger.warning(f"Could not initialise AssemblyAI client: {e}")
 
     def _init_deepgram_diarize(self):
         """Try to initialise Deepgram Nova-3 diarization client."""

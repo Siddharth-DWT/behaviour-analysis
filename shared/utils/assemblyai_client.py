@@ -23,6 +23,7 @@ BASE_URL = "https://api.assemblyai.com/v2"
 POLL_INTERVAL = 5  # seconds
 UPLOAD_TIMEOUT = 300  # 5 min for large file uploads
 POLL_TIMEOUT = 30
+MAX_POLL_WAIT = 1200  # 20 min cap for transcription job to terminate
 
 
 def is_available() -> bool:
@@ -127,8 +128,14 @@ class AssemblyAIClient:
         return resp.json()["upload_url"]
 
     def _poll(self, transcript_id: str) -> dict:
-        """Poll until transcript is completed or errored."""
+        """Poll until transcript is completed or errored. Caps at MAX_POLL_WAIT."""
+        deadline = time.time() + MAX_POLL_WAIT
         while True:
+            if time.time() > deadline:
+                raise TimeoutError(
+                    f"AssemblyAI transcript {transcript_id} did not finish within {MAX_POLL_WAIT}s"
+                )
+
             with httpx.Client(timeout=POLL_TIMEOUT) as client:
                 resp = client.get(
                     f"{BASE_URL}/transcript/{transcript_id}",
