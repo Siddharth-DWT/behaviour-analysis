@@ -59,7 +59,7 @@ ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 
 # Whisper+Pyannote combined endpoint (single call, no mapping needed)
-EXTERNAL_TRANSCRIBE_DIARIZE_URL = os.getenv("EXTERNAL_DIARIZE_URL", "")
+EXTERNAL_TRANSCRIBE_DIARIZE_URL = os.getenv("EXTERNAL_WHISPER_URL", "")
 
 # Parakeet TDT (fast transcription with word timestamps, needs separate diarizer)
 PARAKEET_URL = os.getenv("PARAKEET_URL", "")
@@ -142,30 +142,28 @@ class Transcriber:
 
         backend = TRANSCRIPTION_BACKEND.lower()
 
-        # Fallback chain:
-        #   1. Whisper+NeMo combined (/transcribe-diarize — one GPU call, best quality)
-        #   2. Parakeet + NeMo (Parakeet /transcribe + /diarize — fast transcription, separate diarize)
-        #   3. AssemblyAI (one call, Universal-3 Pro)
-        #   4. Deepgram (one call, Nova-3)
-        #   5. Whisper transcribe + diarize cascade (two calls, mapping)
-        #   6. Local faster-whisper + local diarize cascade (CPU)
+        # Fallback chains by backend mode:
+        #   auto:       AssemblyAI → Parakeet+NeMo → Whisper+NeMo → Deepgram → Local
+        #   assemblyai: AssemblyAI → Parakeet+NeMo → Local
+        #   parakeet:   Parakeet+NeMo → AssemblyAI → Whisper+NeMo → Deepgram → Local
+        #   whisper-nemo: Whisper+NeMo → Parakeet+NeMo → AssemblyAI → Deepgram → Local
 
-        if backend in ("auto", "whisper-pyannote", "whisper-nemo") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
-            self._init_whisper_pyannote()
+        # Init all backends that this mode can use
+        if backend in ("auto", "assemblyai", "parakeet") and ASSEMBLYAI_API_KEY:
+            self._init_assemblyai()
 
-        if backend in ("auto", "parakeet") and PARAKEET_URL:
+        if backend in ("auto", "parakeet", "whisper-nemo", "whisper-pyannote") and PARAKEET_URL:
             self._init_parakeet()
 
-        # Parakeet needs a separate diarization backend (/diarize endpoint).
-        # Also used by whisper separate mode.
+        if backend in ("auto", "whisper-nemo", "whisper-pyannote", "parakeet") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
+            self._init_whisper_pyannote()
+
+        # Parakeet needs a separate diarization backend (/diarize endpoint)
         if backend in ("auto", "parakeet", "whisper") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
             if not self._use_external_diarize:
                 self._init_external_diarize()
 
-        if backend in ("auto", "assemblyai") and ASSEMBLYAI_API_KEY:
-            self._init_assemblyai()
-
-        if backend in ("auto", "deepgram") and DEEPGRAM_API_KEY:
+        if backend in ("auto", "parakeet", "whisper-nemo") and DEEPGRAM_API_KEY:
             self._init_deepgram()
 
         if backend in ("auto", "whisper") and EXTERNAL_WHISPER_URL:
@@ -451,23 +449,32 @@ class Transcriber:
             # This ensures ALL backends get clean audio regardless of input format.
             effective_path = self._ensure_wav(audio_path)
 
-            # Fallback chain:
-            #   1. Whisper+NeMo combined (/transcribe-diarize — best quality)
-            #   2. Parakeet + NeMo (/transcribe + /diarize — fast)
-            #   3. AssemblyAI (one call, Universal-3 Pro)
-            #   4. Deepgram (one call, Nova-3)
-            #   5. Whisper + separate diarize cascade
-            #   6. Local faster-whisper + local diarize (CPU)
-            if self._use_whisper_pyannote:
-                return self._transcribe_whisper_pyannote(effective_path)
-            elif self._use_parakeet:
-                return self._transcribe_parakeet(effective_path)
-            elif self._use_assemblyai:
+            # Dispatch by backend mode:
+            #   auto:       AssemblyAI -> Parakeet+NeMo -> Whisper+NeMo -> Deepgram -> Local
+            #   assemblyai: AssemblyAI -> Parakeet+NeMo -> Local
+            #   parakeet:   Parakeet+NeMo -> AssemblyAI -> Whisper+NeMo -> Deepgram -> Local
+            #   whisper-nemo: Whisper+NeMo -> Parakeet+NeMo -> AssemblyAI -> Deepgram -> Local
+            backend = TRANSCRIPTION_BACKEND.lower()
+
+            if backend == "assemblyai" and self._use_assemblyai:
                 return self._transcribe_assemblyai(effective_path)
-            elif self._use_deepgram:
-                return self._transcribe_deepgram(effective_path)
-            elif self._use_external:
-                return self._transcribe_external(effective_path)
+            elif backend == "parakeet" and self._use_parakeet:
+                return self._transcribe_parakeet(effective_path)
+            elif backend in ("whisper-nemo", "whisper-pyannote") and self._use_whisper_pyannote:
+                return self._transcribe_whisper_pyannote(effective_path)
+            elif backend == "auto":
+                if self._use_assemblyai:
+                    return self._transcribe_assemblyai(effective_path)
+                elif self._use_parakeet:
+                    return self._transcribe_parakeet(effective_path)
+                elif self._use_whisper_pyannote:
+                    return self._transcribe_whisper_pyannote(effective_path)
+                elif self._use_deepgram:
+                    return self._transcribe_deepgram(effective_path)
+                elif self._use_external:
+                    return self._transcribe_external(effective_path)
+                else:
+                    return self._transcribe_local(effective_path)
             else:
                 return self._transcribe_local(effective_path)
         finally:
@@ -551,10 +558,10 @@ class Transcriber:
             self._use_parakeet = False
             if self._use_assemblyai:
                 return self._transcribe_assemblyai(audio_path)
+            elif self._use_whisper_pyannote:
+                return self._transcribe_whisper_pyannote(audio_path)
             elif self._use_deepgram:
                 return self._transcribe_deepgram(audio_path)
-            elif self._use_external:
-                return self._transcribe_external(audio_path)
             return self._transcribe_local(audio_path)
 
         segments = result.get("segments", [])
@@ -729,10 +736,12 @@ class Transcriber:
         except Exception as e:
             logger.error(f"AssemblyAI failed: {e}. Falling back to next backend.")
             self._use_assemblyai = False
-            if self._use_deepgram:
+            if self._use_parakeet:
+                return self._transcribe_parakeet(audio_path)
+            elif self._use_whisper_pyannote:
+                return self._transcribe_whisper_pyannote(audio_path)
+            elif self._use_deepgram:
                 return self._transcribe_deepgram(audio_path)
-            elif self._use_external:
-                return self._transcribe_external(audio_path)
             return self._transcribe_local(audio_path)
 
         segments = result.get("segments", [])
@@ -1415,15 +1424,17 @@ class Transcriber:
         if not segments:
             return segments
 
-        if num_speakers is None:
-            estimated = self._estimate_speaker_count(segments)
-            logger.info("No speaker-count hint provided; estimated %s speaker(s)", estimated)
-            max_speakers = estimated
-        else:
+        meeting_type = getattr(self, "_meeting_type", "sales_call") or "sales_call"
+        config = self.SPEAKER_DEFAULTS.get(meeting_type, {"default": 3, "min": 2, "max": 10})
+
+        if num_speakers is not None:
             max_speakers = min(max(1, num_speakers), 10)
+        else:
+            # GPU backends auto-detect within full range — don't limit them
+            max_speakers = config["max"]
 
         # Single speaker — assign all segments and skip clustering
-        if max_speakers < 2:
+        if num_speakers == 1:
             for seg in segments:
                 seg["speaker"] = "Speaker_0"
             self._last_diarization_backend = "single_speaker"
@@ -1433,7 +1444,7 @@ class Transcriber:
         mode = self.DIARIZATION_MODE
         logger.info(f"Diarization cascade: mode={mode}, audio_path={'yes' if audio_path else 'no'}, max_speakers={max_speakers}")
 
-        # ── Tier 0: External GPU pyannote Diarization ──
+        # ── Tier 0: External GPU pyannote/NeMo Diarization ──
         if mode in ("auto", "pyannote") and audio_path:
             try:
                 result = self._diarize_external_gpu(segments, max_speakers, audio_path)
@@ -1462,11 +1473,21 @@ class Transcriber:
             except Exception as e:
                 logger.warning(f"Pyannote 3.1 failed: {e}")
 
+        # ── Local fallbacks need estimated speaker count ──
+        # GPU backends above auto-detect within min/max range.
+        # Local KMeans/gap need an explicit count to cluster.
+        if num_speakers is None:
+            estimated = self._estimate_speaker_count(segments)
+            logger.info("Local fallback: estimated %s speaker(s) for clustering", estimated)
+            local_max = estimated
+        else:
+            local_max = max_speakers
+
         # ── Tier 3: Acoustic KMeans (enhanced with MFCCs) ──
-        if mode in ("kmeans", "auto") and audio_path and max_speakers >= 2:
+        if mode in ("kmeans", "auto") and audio_path and local_max >= 2:
             try:
                 clustered = self._diarize_acoustic_kmeans(
-                    segments, max_speakers, audio_path
+                    segments, local_max, audio_path
                 )
                 if clustered is not None:
                     return clustered
@@ -1474,9 +1495,9 @@ class Transcriber:
                 logger.warning(f"Acoustic KMeans diarization failed: {e}")
 
         # ── Tier 4/5: Gap+pitch or heuristic ──
-        if max_speakers == 2:
+        if local_max == 2:
             return self._diarize_gap_two_speaker(segments, audio_path)
-        return self._diarize_simple_multi_speaker(segments, max_speakers)
+        return self._diarize_simple_multi_speaker(segments, local_max)
 
     # ── External GPU Diarization (Tier 0) ──
 

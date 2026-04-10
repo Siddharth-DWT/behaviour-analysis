@@ -29,7 +29,7 @@ logger = logging.getLogger("nexus.external_apis")
 # ── Configuration ──────────────────────────────────────────────
 WHISPER_URL = os.getenv("EXTERNAL_WHISPER_URL", "")
 TTS_URL = os.getenv("EXTERNAL_TTS_URL", "")
-DIARIZE_URL = os.getenv("EXTERNAL_DIARIZE_URL", "")
+DIARIZE_URL = os.getenv("EXTERNAL_WHISPER_URL", "")
 API_KEY = os.getenv("EXTERNAL_API_KEY", "")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
