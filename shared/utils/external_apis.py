@@ -138,6 +138,8 @@ class WhisperClient:
         word_timestamps: bool = True,
         vad_filter: bool = True,
         stream: bool = False,
+        initial_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
     ) -> dict:
         """
         Transcribe an audio file via the external Whisper API.
@@ -195,6 +197,10 @@ class WhisperClient:
                 "vad_filter": str(vad_filter).lower(),
                 "stream": str(stream).lower(),
             }
+            if initial_prompt:
+                data["initial_prompt"] = initial_prompt
+            if temperature is not None:
+                data["temperature"] = str(max(0.0, min(1.0, temperature)))
 
             if stream:
                 return self._transcribe_stream(files, data)
@@ -963,6 +969,12 @@ class DeepgramDiarizeClient:
         num_speakers: int = 0,
         audio_data: Optional[tuple] = None,
         clustering_threshold: float = 0.0,
+        language: Optional[str] = None,
+        auto_punctuation: bool = True,
+        keep_filler_words: bool = False,
+        text_formatting: bool = False,
+        multichannel: bool = False,
+        keywords: Optional[list] = None,
         **kwargs,
     ) -> dict:
         """
@@ -995,11 +1007,19 @@ class DeepgramDiarizeClient:
         # Build query params
         params = {
             "diarize": "true",
-            "punctuate": "true",
+            "punctuate": str(auto_punctuation).lower(),
             "utterances": "true",
             "model": "nova-3",
-            "language": "en",
+            "language": language or "en",
         }
+        if keep_filler_words:
+            params["filler_words"] = "true"
+        if text_formatting:
+            params["smart_format"] = "true"
+        if multichannel:
+            params["multichannel"] = "true"
+        if keywords:
+            params["keywords"] = ":".join(keywords)
 
         headers = {"Authorization": f"Token {self.api_key}"}
 

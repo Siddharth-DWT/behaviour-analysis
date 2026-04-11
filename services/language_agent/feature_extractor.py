@@ -495,10 +495,31 @@ class LanguageFeatureExtractor:
                 text = raw.strip()
                 if text.startswith("```"):
                     text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-                scores = json.loads(text)
+
+                # Tolerant JSON extraction: direct parse → bracketed substring
+                # → numbered-line fallback ("1. 0.5\n2. -0.3"). Ollama llama3.1
+                # occasionally returns the latter instead of a clean array.
+                scores = None
+                try:
+                    scores = json.loads(text)
+                except json.JSONDecodeError:
+                    lb, rb = text.find("["), text.rfind("]")
+                    if lb >= 0 and rb > lb:
+                        try:
+                            scores = json.loads(text[lb:rb + 1])
+                        except json.JSONDecodeError:
+                            pass
+                if scores is None:
+                    import re
+                    floats = re.findall(r"-?\d*\.?\d+", text)
+                    if floats:
+                        try:
+                            scores = [float(f) for f in floats[:len(batch)]]
+                        except ValueError:
+                            scores = None
 
                 if not isinstance(scores, list):
-                    logger.warning(f"LLM returned non-array: {text[:100]}")
+                    logger.warning(f"LLM returned non-array sentiment: {text[:100]}")
                     continue
 
                 for j, idx in enumerate(batch_indices):
@@ -751,10 +772,31 @@ class LanguageFeatureExtractor:
                 text = raw.strip()
                 if text.startswith("```"):
                     text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-                scores = json.loads(text)
+
+                # Tolerant JSON extraction: direct parse → bracketed substring
+                # → numbered-line fallback ("1. 0.5\n2. -0.3"). Ollama llama3.1
+                # occasionally returns the latter instead of a clean array.
+                scores = None
+                try:
+                    scores = json.loads(text)
+                except json.JSONDecodeError:
+                    lb, rb = text.find("["), text.rfind("]")
+                    if lb >= 0 and rb > lb:
+                        try:
+                            scores = json.loads(text[lb:rb + 1])
+                        except json.JSONDecodeError:
+                            pass
+                if scores is None:
+                    import re
+                    floats = re.findall(r"-?\d*\.?\d+", text)
+                    if floats:
+                        try:
+                            scores = [float(f) for f in floats[:len(batch)]]
+                        except ValueError:
+                            scores = None
 
                 if not isinstance(scores, list):
-                    logger.warning(f"LLM returned non-array: {text[:100]}")
+                    logger.warning(f"LLM returned non-array sentiment: {text[:100]}")
                     continue
 
                 for j, idx in enumerate(batch_indices):

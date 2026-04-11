@@ -119,18 +119,26 @@ class ConversationRuleEngine:
         speakers = list(per_speaker.keys())
         duration_minutes = window_end_ms / 60000.0 if window_end_ms > 0 else 0
 
+        # Read content-type thresholds once; pass to rule methods below
+        mono_per_min   = profile.get_threshold("CONVO-TURN-01", "monologue_per_min", 2.0) if profile else 2.0
+        delayed_ms     = profile.get_threshold("CONVO-LAT-01",  "delayed_ms",        1500.0) if profile else 1500.0
+        dom_pct        = profile.get_threshold("CONVO-DOM-01",  "expected_dominant_pct", 65.0) if profile else 65.0
+        gini_low       = profile.get_threshold("CONVO-BAL-01",  "expected_gini_low",  0.0) if profile else 0.0
+        gini_high      = profile.get_threshold("CONVO-BAL-01",  "expected_gini_high", 0.0) if profile else 0.0
+        min_indicators = int(profile.get_threshold("CONVO-CONF-01", "min_indicators", 2.0)) if profile else 2
+
         # CONVO-TURN-01: Turn-taking pattern (session-level)
         signals.extend(_apply_profile("CONVO-TURN-01",
-            self._rule_turn_taking(session, window_start_ms, window_end_ms)))
+            self._rule_turn_taking(session, window_start_ms, window_end_ms, mono_per_min)))
 
         # CONVO-LAT-01: Response latency pattern (per pair)
         signals.extend(_apply_profile("CONVO-LAT-01",
-            self._rule_response_latency(per_pair, window_start_ms, window_end_ms)))
+            self._rule_response_latency(per_pair, window_start_ms, window_end_ms, delayed_ms)))
 
         # CONVO-DOM-01: Dominance score (per speaker)
         signals.extend(_apply_profile("CONVO-DOM-01", self._rule_dominance(
             per_speaker, session, speakers, duration_minutes,
-            window_start_ms, window_end_ms,
+            window_start_ms, window_end_ms, dom_pct / 100.0,
         )))
 
         # CONVO-INT-01: Interruption pattern (per speaker)
@@ -153,13 +161,13 @@ class ConversationRuleEngine:
 
         # CONVO-BAL-01: Conversation balance (session-level)
         signals.extend(_apply_profile("CONVO-BAL-01", self._rule_balance(
-            session, content_type, window_start_ms, window_end_ms,
+            session, content_type, window_start_ms, window_end_ms, gini_low, gini_high,
         )))
 
         # CONVO-CONF-01: Conflict detection (cross-modal with Language Agent)
         signals.extend(_apply_profile("CONVO-CONF-01", self._rule_convo_conf_01(
             per_speaker, session, speakers, duration_minutes,
-            language_signals, window_start_ms, window_end_ms,
+            language_signals, window_start_ms, window_end_ms, min_indicators,
         )))
 
         logger.info(f"ConversationRuleEngine produced {len(signals)} signals")
@@ -171,19 +179,20 @@ class ConversationRuleEngine:
 
     def _rule_turn_taking(
         self, session: dict, window_start_ms: int, window_end_ms: int,
+        mono_per_min: float = 2.0,
     ) -> list[dict]:
         """
         Classify turn-taking pattern based on turn rate per minute.
-        > 8/min → rapid_exchange, < 2/min → monologue_dominated, else → normal_conversation
+        > 10/min → rapid_exchange (Stivers 2009), < 2/min → monologue_dominated, else → normal_conversation
         """
         turn_rate = session.get("turn_rate_per_minute", 0)
 
-        if turn_rate > 8:
+        if turn_rate > 10:
             label = "rapid_exchange"
-            confidence = min(0.55 + (turn_rate - 8) * 0.03, 0.80)
-        elif turn_rate < 2:
+            confidence = min(0.55 + (turn_rate - 10) * 0.03, 0.80)
+        elif turn_rate < mono_per_min:
             label = "monologue_dominated"
-            confidence = min(0.55 + (2 - turn_rate) * 0.10, 0.80)
+            confidence = min(0.55 + (mono_per_min - turn_rate) * 0.10, 0.80)
         else:
             label = "normal_conversation"
             confidence = 0.65
@@ -209,6 +218,7 @@ class ConversationRuleEngine:
 
     def _rule_response_latency(
         self, per_pair: dict, window_start_ms: int, window_end_ms: int,
+        delayed_ms: float = 1500.0,
     ) -> list[dict]:
         """
         Classify response latency pattern per speaker pair.
@@ -231,12 +241,12 @@ class ConversationRuleEngine:
             elif avg_latency < 600:
                 label = "highly_engaged"
                 confidence = 0.65
-            elif avg_latency <= 1500:
+            elif avg_latency <= delayed_ms:
                 label = "normal"
                 confidence = 0.60
             else:
                 label = "delayed_responses"
-                confidence = min(0.55 + (avg_latency - 1500) / 5000, 0.75)
+                confidence = min(0.55 + (avg_latency - delayed_ms) / 5000, 0.75)
 
             signals.append(_make_signal(
                 speaker_id=pair_key,
@@ -268,10 +278,12 @@ class ConversationRuleEngine:
         duration_minutes: float,
         window_start_ms: int,
         window_end_ms: int,
+        dom_threshold: float = 0.65,
     ) -> list[dict]:
         """
         Compute dominance score per speaker.
-        dominance = 0.5*talk_time_pct + 0.2*interruption_ratio + 0.2*monologue_ratio + 0.1*(1-question_ratio)
+        dominance = 0.5*talk_time_pct + 0.15*interruption_ratio + 0.25*monologue_ratio + 0.1*(1-question_ratio)
+        Weights: monologue (0.25) > interruption (0.15) per Dunbar 1996 (speaking time > interruptions as dominance).
         > 0.65 → dominant, 0.35-0.65 → balanced, < 0.35 → passive
         """
         signals = []
@@ -311,19 +323,20 @@ class ConversationRuleEngine:
             )
 
             dominance = (
-                0.5 * talk_pct_norm +
-                0.2 * interruption_ratio +
-                0.2 * monologue_ratio +
-                0.1 * (1.0 - question_ratio)
+                0.5  * talk_pct_norm +
+                0.15 * interruption_ratio +
+                0.25 * monologue_ratio +
+                0.1  * (1.0 - question_ratio)
             )
             dominance = max(0.0, min(1.0, dominance))
 
-            if dominance > 0.65:
+            passive_threshold = 1.0 - dom_threshold
+            if dominance > dom_threshold:
                 label = "dominant"
-                confidence = min(0.55 + (dominance - 0.65) * 0.5, 0.80)
-            elif dominance < 0.35:
+                confidence = min(0.55 + (dominance - dom_threshold) * 0.5, 0.80)
+            elif dominance < passive_threshold:
                 label = "passive"
-                confidence = min(0.55 + (0.35 - dominance) * 0.5, 0.75)
+                confidence = min(0.55 + (passive_threshold - dominance) * 0.5, 0.75)
             else:
                 label = "balanced"
                 confidence = 0.60
@@ -652,6 +665,8 @@ class ConversationRuleEngine:
         content_type: str,
         window_start_ms: int,
         window_end_ms: int,
+        expected_gini_low: float = 0.0,
+        expected_gini_high: float = 0.0,
     ) -> list[dict]:
         """
         Session-level conversation balance based on dominance index (Gini).
@@ -665,6 +680,18 @@ class ConversationRuleEngine:
         if content_type and content_type.lower() in skip_types:
             label = "expected_imbalance"
             confidence = 0.50
+        elif expected_gini_low > 0 and expected_gini_high > 0:
+            # Interview / podcast: compare to expected distribution, not symmetry.
+            # e.g. interview expects Gini 0.20-0.40 (candidate talks more).
+            if dominance_index < expected_gini_low:
+                label = "more_balanced_than_expected"
+                confidence = min(0.55 + (expected_gini_low - dominance_index) * 2.0, 0.75)
+            elif dominance_index > expected_gini_high:
+                label = "more_imbalanced_than_expected"
+                confidence = min(0.55 + (dominance_index - expected_gini_high) * 2.0, 0.75)
+            else:
+                label = "expected_distribution"
+                confidence = 0.60
         elif dominance_index < 0.15:
             label = "well_balanced"
             confidence = min(0.60 + (0.15 - dominance_index) * 1.0, 0.80)
@@ -705,6 +732,7 @@ class ConversationRuleEngine:
         language_signals: Optional[list],
         window_start_ms: int,
         window_end_ms: int,
+        min_indicators: int = 2,
     ) -> list[dict]:
         """
         Detect conflict by combining conversation dynamics with language signals.
@@ -750,8 +778,8 @@ class ConversationRuleEngine:
         elif gottman_count >= 1:
             indicators += 1
 
-        # Need at least 2 indicators to fire
-        if indicators < 2:
+        # Need at least min_indicators to fire (default 2; interview 3 to reduce false positives)
+        if indicators < min_indicators:
             return []
 
         conflict_score = min(1.0, indicators * 0.20)

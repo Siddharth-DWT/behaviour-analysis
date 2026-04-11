@@ -107,7 +107,7 @@ Return a JSON object with these keys:
     {{"name": "short phase name", "start_ms": number, "end_ms": number}}
   ],
   "objections": [
-    {{"text": "exact quote from transcript", "timestamp_ms": number, "resolved": true|false}}
+    {{"text": "exact quote from transcript", "timestamp_ms": number, "resolved": true|false, "resolved_at_ms": number}}
   ],
   "commitments": [
     {{"text": "exact quote from transcript", "speaker": "Speaker_X", "timestamp_ms": number}}
@@ -132,7 +132,7 @@ CRITICAL RULES:
    - Agreed to next steps (shared email, scheduled a call, said "sounds good", "yes", "sure")
    - Asked specification questions showing interest (e.g., "have you worked in education?")
    - Made commitments (agreed to receive a proposal, look at materials, etc.)
-   If ANY of these happened AFTER the objection, mark "resolved": true. Only mark "resolved": false if the conversation ended with the objection still standing and no positive engagement afterward.
+   If ANY of these happened AFTER the objection, mark "resolved": true AND set "resolved_at_ms" to the timestamp (in ms) of the segment where that resolving behaviour occurred. Only mark "resolved": false if the conversation ended with the objection still standing and no positive engagement afterward; in that case set "resolved_at_ms": 0.
 
 Return ONLY the JSON object."""
 
@@ -197,6 +197,7 @@ Return ONLY the JSON object."""
                 people.append({
                     "name": m.group(1).strip(),
                     "role": "seller" if content_type == "sales_call" else "participant",
+                    "speaker_label": speaker,
                     "first_mention_ms": seg.get("start_ms", 0),
                 })
                 companies.append({

@@ -269,7 +269,11 @@ class LanguageRuleEngine:
               "text_preview": features.get("text", "")[:80]})
 
         # ── LANG-SENT-02: Emotional Intensity (all content types) ──
-        emo = self._rule_sent_02(features)
+        # high_pct / suppressed_pct are content-type-aware.
+        # Internal meetings: >6% high, <1.5% suppressed (Tausczik 2010: professional speech).
+        emo_high_pct       = profile.get_threshold("LANG-SENT-02", "high_pct",       0.08) if profile else 0.08
+        emo_suppressed_pct = profile.get_threshold("LANG-SENT-02", "suppressed_pct", 0.02) if profile else 0.02
+        emo = self._rule_sent_02(features, high_pct=emo_high_pct, suppressed_pct=emo_suppressed_pct)
         if emo is not None:
             _add("LANG-SENT-02", "emotional_intensity",
                  emo["value"], emo["label"], emo["confidence"],
@@ -618,7 +622,7 @@ class LanguageRuleEngine:
     # Research: Pennebaker 2015 (word-level affect)
     # ════════════════════════════════════════════════════════
 
-    def _rule_sent_02(self, f: dict) -> Optional[dict]:
+    def _rule_sent_02(self, f: dict, high_pct: float = 0.08, suppressed_pct: float = 0.02) -> Optional[dict]:
         """
         Measure emotional word density as a percentage of total words.
         Fires when density is notably high, moderate, or suppressed.
@@ -640,11 +644,11 @@ class LanguageRuleEngine:
         # Check for negative emotional shift first
         if neg_count > pos_count * 1.5 and neg_count >= 2:
             label = "negative_emotional_shift"
-        elif density > 0.08:
+        elif density > high_pct:
             label = "high"
         elif density > 0.04:
             label = "moderate"
-        elif density < 0.02 and word_count >= 15:
+        elif density < suppressed_pct and word_count >= 15:
             label = "suppressed"
 
         if label is None:

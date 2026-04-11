@@ -259,7 +259,8 @@ export async function getReport(
 export async function uploadSession(
   file: File,
   title: string,
-  meetingType: string
+  meetingType: string,
+  config?: Record<string, unknown>
 ): Promise<{
   session_id: string;
   status: string;
@@ -270,8 +271,35 @@ export async function uploadSession(
   form.append("file", file);
   form.append("title", title);
   form.append("meeting_type", meetingType);
+  if (config) {
+    form.append("config", JSON.stringify(config));
+  }
 
   return request("/sessions", { method: "POST", body: form });
+}
+
+// Raw segment straight from the transcriber — no DB IDs, speaker field not speaker_id
+export interface QuickSegment {
+  speaker: string;   // "Speaker_0", "Speaker_1", …
+  start_ms: number;
+  end_ms: number;
+  text: string;
+}
+
+export async function quickTranscribe(
+  file: File,
+  config: Record<string, unknown>
+): Promise<{
+  segments: QuickSegment[];
+  speakers: string[];
+  duration_seconds: number;
+  backend: string;
+  model: string;
+}> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("config", JSON.stringify(config));
+  return request("/quick-transcribe", { method: "POST", body: form });
 }
 
 export async function getHealth(): Promise<{

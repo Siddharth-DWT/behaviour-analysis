@@ -133,8 +133,11 @@ class VoiceRuleEngine:
                  adjusted_score, stress["level"],
                  adjusted_score * cal_conf, stress["components"])
 
-        # ── VOICE-FILLER-01: Filler Detection ──
-        filler = self._rule_filler_01(features, baseline)
+        # ── VOICE-FILLER-01 + VOICE-FILLER-02: Filler Detection ──
+        # noticeable_pct: minimum filler rate to flag credibility impact.
+        # Default 2.5% per matrix; internal raises to 3.0% (Bortfeld 2001).
+        noticeable_pct = profile.get_threshold("VOICE-FILLER-02", "noticeable_pct", 2.5) if profile else 2.5
+        filler = self._rule_filler_01(features, baseline, noticeable_pct=noticeable_pct)
         if filler is not None:
             _add("VOICE-FILLER-01", "filler_detection",
                  filler["filler_rate_pct"], filler["status"],
@@ -147,7 +150,9 @@ class VoiceRuleEngine:
                  })
 
         # ── VOICE-PITCH-01: Pitch Elevation Flag ──
-        pitch = self._rule_pitch_01(features, baseline)
+        # mild_pct: minimum delta% to flag as mild elevation. Default 7% (Pakosz 1983); interview 12%.
+        mild_pct = profile.get_threshold("VOICE-PITCH-01", "mild_pct", 7.0) if profile else 7.0
+        pitch = self._rule_pitch_01(features, baseline, mild_pct=mild_pct)
         if pitch is not None:
             _add("VOICE-PITCH-01", "pitch_elevation_flag",
                  pitch["delta_pct"], pitch["level"],
@@ -166,7 +171,9 @@ class VoiceRuleEngine:
                  monotone.get("evidence", {}))
 
         # ── VOICE-RATE-01: Speech Rate Anomaly ──
-        rate = self._rule_rate_01(features, baseline)
+        # anomaly_pct: deviation % from baseline to flag. Default 20% (Apple 1979); interview 35%.
+        anomaly_pct = profile.get_threshold("VOICE-RATE-01", "anomaly_pct", 20.0) if profile else 20.0
+        rate = self._rule_rate_01(features, baseline, anomaly_pct=anomaly_pct)
         if rate is not None:
             _add("VOICE-RATE-01", "speech_rate_anomaly",
                  rate["delta_pct"], rate["classification"],
@@ -215,7 +222,10 @@ class VoiceRuleEngine:
                  energy.get("evidence", {}))
 
         # ── VOICE-PAUSE-01: Pause Classification ──
-        pause_signals = self._rule_pause_01(features, baseline)
+        # extended_pause_ms: threshold for extended_hesitation. Default 2000ms;
+        # interview 3000ms (Stivers 2009: complex answers need formulation time).
+        extended_pause_ms = int(profile.get_threshold("VOICE-PAUSE-01", "extended_pause_ms", 2000)) if profile else 2000
+        pause_signals = self._rule_pause_01(features, baseline, extended_pause_ms=extended_pause_ms)
         for ps in pause_signals:
             _add("VOICE-PAUSE-01", "pause_classification",
                  ps["value"], ps["value_text"],
@@ -223,8 +233,11 @@ class VoiceRuleEngine:
                  ps.get("evidence", {}))
 
         # ── VOICE-INT-01: Interruption Detection ──
+        # min_overlap_ms: minimum overlap to count as interruption. Default 500ms (Levinson 1983);
+        # podcast 400ms (crosstalk / simultaneous laughter is normal in podcasts).
         if transcript_segments:
-            int_signals = self._rule_int_01(features, baseline, transcript_segments)
+            min_overlap_ms = int(profile.get_threshold("VOICE-INT-01", "overlap_ms", 500)) if profile else 500
+            int_signals = self._rule_int_01(features, baseline, transcript_segments, min_overlap_ms=min_overlap_ms)
             if int_signals:
                 for isig in int_signals:
                     _add("VOICE-INT-01", "interruption_event",
@@ -310,7 +323,7 @@ class VoiceRuleEngine:
     # Research: Clark & Fox Tree 2002, Duvall 2014
     # ════════════════════════════════════════════════════════
     
-    def _rule_filler_01(self, f: dict, b: SpeakerBaseline) -> Optional[dict]:
+    def _rule_filler_01(self, f: dict, b: SpeakerBaseline, noticeable_pct: float = 2.5) -> Optional[dict]:
         """
         Filler word detection with baseline comparison and credibility assessment.
         """
@@ -337,11 +350,12 @@ class VoiceRuleEngine:
             status = "normal"
         
         # VOICE-FILLER-02: Absolute credibility thresholds
+        # noticeable_pct is content-type-aware (default 2.5%, internal 3.0%)
         if filler_rate > 4.0:
             credibility_impact = "severe"
         elif filler_rate > 2.5:
             credibility_impact = "significant"
-        elif filler_rate > 1.3:
+        elif filler_rate > noticeable_pct:
             credibility_impact = "noticeable"
         else:
             credibility_impact = "none"
@@ -365,13 +379,13 @@ class VoiceRuleEngine:
     # Research: Streeter et al. 1977, Laukka 2008, Weeks 2011
     # ════════════════════════════════════════════════════════
     
-    def _rule_pitch_01(self, f: dict, b: SpeakerBaseline) -> Optional[dict]:
+    def _rule_pitch_01(self, f: dict, b: SpeakerBaseline, mild_pct: float = 7.0) -> Optional[dict]:
         """
         Detect pitch elevation from baseline.
         Pitch rise = arousal/stress indicator (NOT deception per se).
-        
+
         Thresholds:
-          > +8%  → mild (arousal increase)
+          > +7%  → mild (arousal increase, Pakosz 1983)
           > +15% → significant (strong stress response)
           > +25% → extreme (acute stress or strong emotion)
         """
@@ -382,7 +396,7 @@ class VoiceRuleEngine:
         delta_pct = self.cal.compute_delta(f0_current, b.f0_mean) * 100
         
         # Only flag elevations (stress indicator). Drops are separate (confidence/disengagement).
-        if delta_pct < 8.0:
+        if delta_pct < mild_pct:
             return None  # Within normal range, don't flag
         
         if delta_pct >= 25.0:
@@ -404,12 +418,12 @@ class VoiceRuleEngine:
     # Research: Apple et al. 1979, Smith et al. 1975
     # ════════════════════════════════════════════════════════
     
-    def _rule_rate_01(self, f: dict, b: SpeakerBaseline) -> Optional[dict]:
+    def _rule_rate_01(self, f: dict, b: SpeakerBaseline, anomaly_pct: float = 20.0) -> Optional[dict]:
         """
         Detect speech rate deviations from baseline.
-        
-        > +25% → rate_elevated (anxiety, enthusiasm, or rushing)
-        < -25% → rate_depressed (disengagement, cognitive load, or deliberation)
+
+        > +20% → rate_elevated (anxiety, enthusiasm, or rushing)
+        < -20% → rate_depressed (disengagement, cognitive load, or deliberation)
         """
         wpm_current = f.get("speech_rate_wpm", 0)
         if wpm_current < 30 or b.speech_rate_wpm < 30:  # Filter out near-silence
@@ -417,10 +431,10 @@ class VoiceRuleEngine:
         
         delta_pct = self.cal.compute_delta(wpm_current, b.speech_rate_wpm) * 100
         
-        if abs(delta_pct) < 25.0:
+        if abs(delta_pct) < anomaly_pct:
             return None  # Within normal range
-        
-        if delta_pct > 25.0:
+
+        if delta_pct > anomaly_pct:
             classification = "rate_elevated"
             # Sub-classify based on concurrent features
             f0_delta = self.cal.compute_delta(f.get("f0_mean", 0), b.f0_mean) if b.f0_mean > 0 else 0
@@ -899,7 +913,7 @@ class VoiceRuleEngine:
     # Returns a LIST (can emit multiple signals per window)
     # ════════════════════════════════════════════════════════
 
-    def _rule_pause_01(self, f: dict, b: SpeakerBaseline) -> list[dict]:
+    def _rule_pause_01(self, f: dict, b: SpeakerBaseline, extended_pause_ms: int = 2000) -> list[dict]:
         """
         Classify pause patterns in the current window.
 
@@ -941,8 +955,8 @@ class VoiceRuleEngine:
                 },
             })
 
-        # Extended hesitation
-        if max_pause_ms > 2000:
+        # Extended hesitation (threshold is content-type-aware; interview=3000ms)
+        if max_pause_ms > extended_pause_ms:
             confidence = min(max_pause_ms / 5000.0, 0.65)
             results.append({
                 "value": round(max_pause_ms / 1000.0, 4),
@@ -963,14 +977,15 @@ class VoiceRuleEngine:
     # ════════════════════════════════════════════════════════
 
     def _rule_int_01(
-        self, f: dict, b: SpeakerBaseline, transcript_segments: list[dict]
+        self, f: dict, b: SpeakerBaseline, transcript_segments: list[dict],
+        min_overlap_ms: int = 500,
     ) -> Optional[list[dict]]:
         """
         Detect interruptions from transcript segment overlaps.
 
         Checks consecutive segments: if seg_b starts before seg_a ends
-        AND they are different speakers AND overlap > 200 ms, that's
-        an interruption. If the interrupting segment has <= 2 words,
+        AND they are different speakers AND overlap > 500ms (Levinson 1983),
+        that's an interruption. If the interrupting segment has <= 2 words,
         it's a backchannel (skip).
 
         Returns:
@@ -996,8 +1011,8 @@ class VoiceRuleEngine:
                 continue
 
             overlap_ms = seg_a["end_ms"] - seg_b["start_ms"]
-            if overlap_ms <= 200:
-                continue  # Too short to be a real interruption
+            if overlap_ms <= min_overlap_ms:
+                continue  # Below content-type threshold (podcast=400ms, default=500ms)
 
             # Backchannel filter: if interrupting segment has <= 2 words, skip
             interrupter_words = len(seg_b.get("text", "").split())

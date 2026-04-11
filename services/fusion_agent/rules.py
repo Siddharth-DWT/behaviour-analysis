@@ -18,7 +18,7 @@ Research references:
   - Lakoff 1975 (powerless language as incongruence marker)
 
 Confidence caps from RULES.md:
-  FUSION-02 max: 0.55 (deception-adjacent — hard cap)
+  FUSION-02 max: 0.65 (raised from 0.55 per Bond & DePaulo 2006 — stress ≠ deception, incongruence is valid)
   FUSION-07 max: 0.70
   FUSION-13 max: 0.60
 """
@@ -109,11 +109,11 @@ class FusionRuleEngine:
                 "metadata": result["evidence"],
             })
 
-        # ── FUSION-02: Content × Stress → Credibility ──
+        # ── FUSION-02: Content × Stress → Stress-Sentiment Incongruence ──
         if not (profile and profile.is_gated("FUSION-02")):
-            max_conf = profile.get_threshold("FUSION-02", "max_confidence", 0.55) if profile else 0.55
+            max_conf = profile.get_threshold("FUSION-02", "max_confidence", 0.65) if profile else 0.65
             cred = self._rule_fusion_02(voice_signals, language_signals, max_confidence=max_conf)
-            _maybe_append("FUSION-02", cred, "credibility_assessment")
+            _maybe_append("FUSION-02", cred, "stress_sentiment_incongruence")
 
         # ── FUSION-07: Hedge × Positive Sentiment → Incongruence ──
         if not (profile and profile.is_gated("FUSION-07")):
@@ -130,21 +130,21 @@ class FusionRuleEngine:
         return signals
 
     # ════════════════════════════════════════════════════════
-    # FUSION-02: Speech Content × Voice Stress → Credibility
+    # FUSION-02: Speech Content × Voice Stress → Stress-Sentiment Incongruence
     # Research: Bond & DePaulo 2006, Levine 2014
-    # Max confidence: 0.55 (deception-adjacent, hard cap)
+    # Max confidence: 0.65 (raised — stress-sentiment gap ≠ deception claim)
     # ════════════════════════════════════════════════════════
 
     def _rule_fusion_02(
         self,
         voice_signals: list[dict],
         language_signals: list[dict],
-        max_confidence: float = 0.55,
+        max_confidence: float = 0.65,
     ) -> Optional[dict]:
         """
-        Cross-modal credibility check:
+        Cross-modal stress-sentiment incongruence check:
         When the CONTENT says something positive/certain but the VOICE
-        shows elevated stress, the gap suggests reduced credibility.
+        shows elevated stress, the gap flags incongruence for human review.
 
         Scans all time-aligned stress+sentiment pairs (within 10s window)
         and returns the strongest credibility concern found.

@@ -29,7 +29,7 @@ import asyncio
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -151,12 +151,23 @@ async def startup():
     except Exception as e:
         logger.warning(f"PostgreSQL connection failed (non-fatal): {e}")
 
+    try:
+        from neo4j_schema import init_neo4j_schema
+        await init_neo4j_schema()
+    except Exception as e:
+        logger.warning(f"Neo4j schema init failed (non-fatal): {e}")
+
     logger.info("API Gateway ready.")
 
 
 @app.on_event("shutdown")
 async def shutdown():
     await close_pool()
+    try:
+        from neo4j_sync import close_driver as close_neo4j_driver
+        await close_neo4j_driver()
+    except Exception as e:
+        logger.warning(f"Neo4j driver close failed: {e}")
 
 
 @app.get("/health")
@@ -586,6 +597,90 @@ async def change_password(body: ChangePasswordRequest, current_user: dict = Depe
 
 
 # ─────────────────────────────────────────────────────────
+# POST /quick-transcribe — in-memory transcription, no session created
+# ─────────────────────────────────────────────────────────
+
+@app.post("/quick-transcribe")
+async def quick_transcribe_endpoint(
+    file: UploadFile = File(...),
+    config: str = Form(default="{}"),
+    _current_user: dict = Depends(require_role("member")),
+):
+    """
+    Lightweight transcription endpoint — no session, no DB, no report.
+    Saves file to a temp path, calls Voice Agent /transcribe, returns
+    segments immediately, then deletes the temp file.
+
+    Returns:
+        { segments, speakers, duration_seconds, backend, model }
+    """
+    filename = file.filename or "upload.wav"
+    suffix = Path(filename).suffix.lower()
+    allowed = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm", ".mp4"}
+    if suffix not in allowed:
+        raise HTTPException(400, f"Unsupported file type: {suffix}")
+
+    # Parse config
+    try:
+        config_dict = json.loads(config) if config and config.strip() else {}
+    except json.JSONDecodeError:
+        config_dict = {}
+
+    transcription_config = config_dict.get("transcription") or {}
+    analysis_config = config_dict.get("analysis") or {}
+
+    # Save to a temp file (same dir as sessions, but prefixed qt_ for easy cleanup)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path = UPLOAD_DIR / f"qt_{uuid.uuid4()}{suffix}"
+
+    MAX_FILE_SIZE = 300 * 1024 * 1024  # 300 MB
+    file_size = 0
+    try:
+        with open(temp_path, "wb") as f:
+            while chunk := await file.read(1024 * 1024):
+                file_size += len(chunk)
+                if file_size > MAX_FILE_SIZE:
+                    raise HTTPException(413, "File too large. Maximum 300 MB.")
+                f.write(chunk)
+
+        logger.info(
+            f"[quick-transcribe] {filename} ({file_size / 1024 / 1024:.1f} MB) "
+            f"model={transcription_config.get('model_preference')} "
+            f"diarize={analysis_config.get('run_diarization', True)}"
+        )
+
+        payload: dict[str, Any] = {
+            "file_path": str(temp_path.resolve()),
+            "session_id": str(uuid.uuid4()),
+            "meeting_type": config_dict.get("meeting_type", "sales_call"),
+        }
+        if config_dict.get("num_speakers"):
+            payload["num_speakers"] = config_dict["num_speakers"]
+        if transcription_config:
+            payload["transcription_config"] = transcription_config
+        if analysis_config:
+            payload["analysis_config"] = analysis_config
+
+        async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
+            resp = await client.post(f"{VOICE_AGENT_URL}/transcribe", json=payload)
+            resp.raise_for_status()
+            result = resp.json()
+
+        return {
+            "segments": result.get("segments", []),
+            "speakers": result.get("speakers", []),
+            "duration_seconds": result.get("duration_seconds", 0),
+            "backend": result.get("backend", "unknown"),
+            "model": result.get("model", "unknown"),
+        }
+
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 # POST /sessions — Upload + full pipeline
 # ─────────────────────────────────────────────────────────
 
@@ -598,6 +693,7 @@ async def create_session_endpoint(
     title: str = Form(default=""),
     meeting_type: str = Form(default="sales_call"),
     num_speakers: Optional[int] = Form(default=None),
+    config: str = Form(default="{}"),
     current_user: dict = Depends(require_role("member")),
 ):
     """
@@ -640,6 +736,18 @@ async def create_session_endpoint(
     if not title:
         title = Path(filename).stem
 
+    # Parse the optional JSON config field from the settings panel
+    try:
+        config_dict = json.loads(config) if config and config.strip() else {}
+    except json.JSONDecodeError:
+        config_dict = {}
+    transcription_config = config_dict.get("transcription", {})
+    analysis_config = config_dict.get("analysis", {})
+
+    # Override meeting_type from config if present (settings panel sends it there)
+    if not meeting_type or meeting_type == "sales_call":
+        meeting_type = config_dict.get("meeting_type", meeting_type)
+
     # ── Step 2: Create session in DB ──
     try:
         session = await create_session(
@@ -648,6 +756,7 @@ async def create_session_endpoint(
             meeting_type=meeting_type,
             media_url=str(file_path.resolve()),
             user_id=current_user["id"],
+            upload_config=config_dict,
         )
         session_id = str(session["id"])
         await update_session_status(session_id, "processing")
@@ -663,6 +772,8 @@ async def create_session_endpoint(
         title=title,
         meeting_type=meeting_type,
         num_speakers=num_speakers,
+        transcription_config=transcription_config,
+        analysis_config=analysis_config,
     )
 
     return {
@@ -679,19 +790,36 @@ async def _run_pipeline(
     title: str,
     meeting_type: str,
     num_speakers: Optional[int] = None,
+    transcription_config: Optional[dict] = None,
+    analysis_config: Optional[dict] = None,
 ):
     """
     Run the full analysis pipeline in the background.
     Voice → Language → Conversation → Fusion → Persist → Knowledge Store.
     Updates session status in DB as it progresses.
     """
-    logger.info(f"[{session_id}] Pipeline starting (background)")
+    transcription_config = transcription_config or {}
+    analysis_config = analysis_config or {}
+    logger.info(
+        f"[{session_id}] Pipeline starting (background) "
+        f"meeting_type={meeting_type} sensitivity={analysis_config.get('sensitivity', 0.5)}"
+    )
+
+    run_behavioural = analysis_config.get("run_behavioural", True)
+    run_sentiment = analysis_config.get("run_sentiment", False)
+    run_entity_extraction = analysis_config.get("run_entity_extraction", True)
 
     # ── Step 3: Voice Agent (with retry — this is the critical agent) ──
     voice_result = None
     try:
         voice_result = await _call_with_retry(
-            lambda: _call_voice_agent(session_id, str(file_path.resolve()), num_speakers=num_speakers, meeting_type=meeting_type)
+            lambda: _call_voice_agent(
+                session_id, str(file_path.resolve()),
+                num_speakers=num_speakers,
+                meeting_type=meeting_type,
+                transcription_config=transcription_config,
+                analysis_config=analysis_config,
+            )
         )
         logger.info(
             f"[{session_id}] Transcription: "
@@ -735,102 +863,109 @@ async def _run_pipeline(
         "fusion": "skipped",
     }
 
-    # ── Step 4: Language Agent ──
-    language_result = None
-    language_signals = []
-    language_summary = {}
-
-    # Build transcript segments from voice result
+    # Build transcript segments from voice result (always needed for persist + entity extraction)
     transcript_segments = _extract_transcript_segments(voice_result)
 
     if transcript_segments:
-        # Persist transcript
         try:
             await insert_transcript_segments(session_id, transcript_segments, speaker_map)
         except Exception as e:
             logger.warning(f"[{session_id}] Transcript persist failed: {e}")
 
-        try:
-            language_result = await _call_language_agent(
-                session_id, transcript_segments, meeting_type,
-            )
-            language_signals = language_result.get("signals", [])
-            language_summary = language_result.get("summary", {})
-            agent_status["language"] = "completed"
-            logger.info(f"[{session_id}] Language Agent: {len(language_signals)} signals")
-        except Exception as e:
-            agent_status["language"] = "failed"
-            logger.warning(f"[{session_id}] Language Agent failed (continuing): {e}")
+    # ── Step 4: Language Agent (behavioural OR standalone sentiment) ──
+    language_result = None
+    language_signals = []
+    language_summary = {}
 
-        # Persist language signals
-        if language_signals:
+    if run_behavioural or run_sentiment:
+        if transcript_segments:
             try:
-                count = await insert_signals(session_id, language_signals, speaker_map)
-                logger.info(f"[{session_id}] Persisted {count} language signals")
+                language_result = await _call_language_agent(
+                    session_id, transcript_segments, meeting_type,
+                )
+                language_signals = language_result.get("signals", [])
+                language_summary = language_result.get("summary", {})
+                agent_status["language"] = "completed"
+                logger.info(f"[{session_id}] Language Agent: {len(language_signals)} signals")
             except Exception as e:
-                logger.warning(f"[{session_id}] Language signal persist failed: {e}")
-    else:
-        logger.warning(f"[{session_id}] No transcript segments — skipping Language Agent")
+                agent_status["language"] = "failed"
+                logger.warning(f"[{session_id}] Language Agent failed (continuing): {e}")
 
-    # ── Step 4b: Conversation Agent ──
+            if language_signals:
+                try:
+                    count = await insert_signals(session_id, language_signals, speaker_map)
+                    logger.info(f"[{session_id}] Persisted {count} language signals")
+                except Exception as e:
+                    logger.warning(f"[{session_id}] Language signal persist failed: {e}")
+        else:
+            logger.warning(f"[{session_id}] No transcript segments — skipping Language Agent")
+    else:
+        logger.info(f"[{session_id}] Behavioural and sentiment analysis disabled — skipping Language Agent")
+
+    # ── Step 4b: Conversation Agent (only when behavioural analysis enabled) ──
     conversation_result = None
     conversation_signals = []
     conversation_summary = {}
 
-    if transcript_segments and len(set(seg.get("speaker") for seg in transcript_segments)) >= 2:
-        try:
-            conversation_result = await _call_conversation_agent(
-                session_id, transcript_segments, meeting_type,
-            )
-            conversation_signals = conversation_result.get("signals", [])
-            conversation_summary = conversation_result.get("summary", {})
-            agent_status["conversation"] = "completed"
-            logger.info(f"[{session_id}] Conversation Agent: {len(conversation_signals)} signals")
-        except Exception as e:
-            agent_status["conversation"] = "failed"
-            logger.warning(f"[{session_id}] Conversation Agent failed (continuing): {e}")
-
-        # Persist conversation signals
-        if conversation_signals:
+    if run_behavioural:
+        if transcript_segments and len(set(seg.get("speaker") for seg in transcript_segments)) >= 2:
             try:
-                count = await insert_signals(session_id, conversation_signals, speaker_map)
-                logger.info(f"[{session_id}] Persisted {count} conversation signals")
+                conversation_result = await _call_conversation_agent(
+                    session_id, transcript_segments, meeting_type,
+                )
+                conversation_signals = conversation_result.get("signals", [])
+                conversation_summary = conversation_result.get("summary", {})
+                agent_status["conversation"] = "completed"
+                logger.info(f"[{session_id}] Conversation Agent: {len(conversation_signals)} signals")
             except Exception as e:
-                logger.warning(f"[{session_id}] Conversation signal persist failed: {e}")
-    else:
-        logger.info(f"[{session_id}] < 2 speakers — skipping Conversation Agent")
+                agent_status["conversation"] = "failed"
+                logger.warning(f"[{session_id}] Conversation Agent failed (continuing): {e}")
 
-    # ── Step 5: Fusion Agent ──
+            if conversation_signals:
+                try:
+                    count = await insert_signals(session_id, conversation_signals, speaker_map)
+                    logger.info(f"[{session_id}] Persisted {count} conversation signals")
+                except Exception as e:
+                    logger.warning(f"[{session_id}] Conversation signal persist failed: {e}")
+        else:
+            logger.info(f"[{session_id}] < 2 speakers — skipping Conversation Agent")
+    else:
+        logger.info(f"[{session_id}] Behavioural analysis disabled — skipping Conversation Agent")
+
+    # ── Step 5: Fusion Agent (only when behavioural analysis enabled) ──
     fusion_result = None
     fusion_signals = []
     alerts = []
     report = None
 
-    # Enrich voice_summary with conversation dynamics for Fusion Agent
-    enriched_voice_summary = dict(voice_summary)
-    if conversation_summary:
-        enriched_voice_summary["conversation"] = conversation_summary
+    if run_behavioural:
+        # Enrich voice_summary with conversation dynamics for Fusion Agent
+        enriched_voice_summary = dict(voice_summary)
+        if conversation_summary:
+            enriched_voice_summary["conversation"] = conversation_summary
 
-    try:
-        fusion_result = await _call_fusion_agent(
-            session_id=session_id,
-            voice_signals=voice_signals,
-            language_signals=language_signals,
-            voice_summary=enriched_voice_summary,
-            language_summary=language_summary,
-            meeting_type=meeting_type,
-        )
-        fusion_signals = fusion_result.get("fusion_signals", [])
-        alerts = fusion_result.get("alerts", [])
-        report = fusion_result.get("report")
-        agent_status["fusion"] = "completed"
-        logger.info(
-            f"[{session_id}] Fusion Agent: "
-            f"{len(fusion_signals)} signals, {len(alerts)} alerts"
-        )
-    except Exception as e:
-        agent_status["fusion"] = "failed"
-        logger.warning(f"[{session_id}] Fusion Agent failed (continuing): {e}")
+        try:
+            fusion_result = await _call_fusion_agent(
+                session_id=session_id,
+                voice_signals=voice_signals,
+                language_signals=language_signals,
+                voice_summary=enriched_voice_summary,
+                language_summary=language_summary,
+                meeting_type=meeting_type,
+            )
+            fusion_signals = fusion_result.get("fusion_signals", [])
+            alerts = fusion_result.get("alerts", [])
+            report = fusion_result.get("report")
+            agent_status["fusion"] = "completed"
+            logger.info(
+                f"[{session_id}] Fusion Agent: "
+                f"{len(fusion_signals)} signals, {len(alerts)} alerts"
+            )
+        except Exception as e:
+            agent_status["fusion"] = "failed"
+            logger.warning(f"[{session_id}] Fusion Agent failed (continuing): {e}")
+    else:
+        logger.info(f"[{session_id}] Behavioural analysis disabled — skipping Fusion Agent")
 
     # Persist fusion signals
     if fusion_signals:
@@ -887,20 +1022,36 @@ async def _run_pipeline(
 
     logger.info(f"[{session_id}] Pipeline complete (status={final_status}, agents={agent_status})")
 
-    # Store knowledge chunks for RAG chat (non-blocking, non-fatal)
-    try:
-        from knowledge_store import store_session_knowledge
-        _pool = await get_pool()
-        await store_session_knowledge(_pool, session_id, {
-            "transcript_segments": transcript_segments,
-            "signals": voice_signals + language_signals + conversation_signals + fusion_signals,
-            "entities": entities,
-            "report": report_content or {},
-            "graph_analytics": graph_analytics or {},
-            "conversation_summary": conversation_summary or {},
-        })
-    except Exception as e:
-        logger.warning(f"[{session_id}] Knowledge store failed (non-fatal): {e}")
+    # Store knowledge chunks for RAG chat (non-blocking, non-fatal, gated on run_entity_extraction)
+    if run_entity_extraction:
+        try:
+            from knowledge_store import store_session_knowledge
+            _pool = await get_pool()
+            await store_session_knowledge(_pool, session_id, {
+                "transcript_segments": transcript_segments,
+                "signals": voice_signals + language_signals + conversation_signals + fusion_signals,
+                "entities": entities,
+                "report": report_content or {},
+                "graph_analytics": graph_analytics or {},
+                "conversation_summary": conversation_summary or {},
+            })
+        except Exception as e:
+            logger.warning(f"[{session_id}] Knowledge store failed (non-fatal): {e}")
+    else:
+        logger.info(f"[{session_id}] Entity extraction disabled — skipping knowledge store")
+
+    # Sync session graph to Neo4j (non-blocking, non-fatal).
+    # Reads canonical data from PG and projects it as a graph for hybrid chat
+    # and exploration. Pipeline still completes if Neo4j is unreachable.
+    if analysis_config.get("run_knowledge_graph", True):
+        try:
+            from neo4j_sync import sync_session as neo4j_sync_session
+            _pool = await get_pool()
+            await neo4j_sync_session(_pool, session_id)
+        except Exception as e:
+            logger.warning(f"[{session_id}] Neo4j sync failed (non-fatal): {e}")
+    else:
+        logger.info(f"[{session_id}] Neo4j sync skipped (run_knowledge_graph=false)")
 
     # Cleanup old recordings in background
     _cleanup_old_recordings()
@@ -956,6 +1107,11 @@ async def list_sessions_endpoint(
 @app.get("/sessions/{session_id}")
 async def get_session_detail(session_id: str, current_user: dict = Depends(get_current_user)):
     """Get session detail including signals, alerts, and unified states."""
+    import uuid as _uuid
+    try:
+        _uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(404, "Session not found")
     session = await get_session(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
@@ -1003,6 +1159,11 @@ async def get_session_signals(
     current_user: dict = Depends(get_current_user),
 ):
     """Get signals for a session with optional filtering by agent/type."""
+    import uuid as _uuid
+    try:
+        _uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(404, "Session not found")
     session = await get_session(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
@@ -1043,6 +1204,11 @@ async def get_session_report(
     Get the narrative report for a session.
     If no report exists (or regenerate=True), triggers Fusion Agent to generate one.
     """
+    import uuid as _uuid
+    try:
+        _uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(404, "Session not found")
     session = await get_session(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
@@ -1117,6 +1283,11 @@ async def get_session_report(
 @app.get("/sessions/{session_id}/transcript")
 async def get_session_transcript(session_id: str, current_user: dict = Depends(get_current_user)):
     """Get transcript segments for a session."""
+    import uuid as _uuid
+    try:
+        _uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(404, "Session not found")
     session = await get_session(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
@@ -1152,15 +1323,26 @@ async def _call_with_retry(coro_fn, max_retries=2, backoff=2.0):
     raise last_error
 
 
-async def _call_voice_agent(session_id: str, file_path: str, num_speakers: Optional[int] = None, meeting_type: str = "sales_call") -> dict:
+async def _call_voice_agent(
+    session_id: str,
+    file_path: str,
+    num_speakers: Optional[int] = None,
+    meeting_type: str = "sales_call",
+    transcription_config: Optional[dict] = None,
+    analysis_config: Optional[dict] = None,
+) -> dict:
     """Call Voice Agent POST /analyse with file path."""
-    payload = {
+    payload: dict[str, Any] = {
         "file_path": file_path,
         "session_id": session_id,
         "meeting_type": meeting_type,
     }
     if num_speakers is not None:
         payload["num_speakers"] = num_speakers
+    if transcription_config:
+        payload["transcription_config"] = transcription_config
+    if analysis_config:
+        payload["analysis_config"] = analysis_config
     async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
         resp = await client.post(
             f"{VOICE_AGENT_URL}/analyse",
@@ -1474,33 +1656,67 @@ async def chat_with_session(
     if not question_embedding:
         raise HTTPException(500, "Embedding generation failed — check LLM configuration")
 
-    # Step 2: Search pgvector for relevant chunks
-    rows = await pool.fetch(
-        """
-        SELECT text, chunk_type, metadata,
-               1 - (embedding <=> $1::vector) AS similarity
-        FROM knowledge_chunks
-        WHERE session_id = $2
-        ORDER BY embedding <=> $1::vector
-        LIMIT 12
-        """,
-        "[" + ",".join(str(v) for v in question_embedding) + "]",
-        session_id,
-    )
+    # Step 2: Search pgvector for relevant chunks.
+    # Wrap in try/except: if existing rows were indexed under a different
+    # provider (e.g. OpenAI 1536 vs Ollama 768), pgvector raises a dimension
+    # mismatch. Degrade to empty rows so the chat still answers from any
+    # other context (e.g. Neo4j) instead of 500'ing.
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT text, chunk_type, metadata,
+                   1 - (embedding <=> $1::vector) AS similarity
+            FROM knowledge_chunks
+            WHERE session_id = $2
+            ORDER BY embedding <=> $1::vector
+            LIMIT 12
+            """,
+            "[" + ",".join(str(v) for v in question_embedding) + "]",
+            session_id,
+        )
+    except Exception as e:
+        logger.warning(
+            f"[{session_id}] pgvector chat search failed (likely embedding-dim "
+            f"mismatch from a previous provider): {e}. Continuing with empty rows."
+        )
+        rows = []
 
-    if not rows:
-        return {
-            "answer": "No analysis data found for this session. Ensure the session has been fully processed.",
-            "sources": [],
-            "chunks_searched": 0,
-        }
+    # Step 2b: Neo4j hybrid graph query.
+    # Path A (gpt-4o): picks 1 of 10 pre-built tools → hardcoded Cypher. ~90% of questions.
+    # Path B (gpt-5, fallback): generates Cypher when no tool fits. ~10% of questions.
+    # Non-fatal: degrades to pgvector-only if Neo4j is unavailable.
+    graph_context = ""
+    graph_source = None
+    try:
+        from neo4j_semantic_layer import select_tool, execute_tool, search_graph_context_fallback
+        tool_selection = await select_tool(question, session_id)
+        tool_name = tool_selection.get("tool", "none")
+        if tool_name and tool_name != "none" and tool_name in [
+            "get_causal_chain", "get_topic_stress_correlation", "get_speaker_influence",
+            "get_unresolved_objections", "get_conversation_arc", "get_signal_decomposition",
+            "get_convergent_moments", "get_speaker_summary", "get_signal_timeline",
+            "get_entity_network",
+        ]:
+            # Path A: pre-built tool (gpt-4o selected it, ~$0.002)
+            params = tool_selection.get("params", {})
+            graph_context = await execute_tool(tool_name, params, session_id)
+            graph_source = f"semantic:{tool_name}"
+            logger.info(f"[{session_id}] Semantic layer used tool: {tool_name}")
+        else:
+            # Path B: gpt-5 Cypher fallback (~$0.02, only when no tool fits)
+            graph_context = await search_graph_context_fallback(question, session_id)
+            if graph_context:
+                graph_source = "gpt5_cypher_fallback"
+                logger.info(f"[{session_id}] GPT-5 Cypher fallback activated")
+    except Exception as e:
+        logger.warning(f"[{session_id}] Neo4j graph query failed (non-fatal): {e}")
 
     # Step 3: Build context from top relevant chunks
     context_parts = []
     sources = []
     for row in rows:
         sim = float(row["similarity"])
-        if sim < 0.25:
+        if sim < 0.40:  # text-embedding-3-small (1536d cosine): 0.40 = loosely related
             continue
         context_parts.append(f"[{row['chunk_type']}] {row['text']}")
         sources.append({
@@ -1509,26 +1725,35 @@ async def chat_with_session(
             "similarity": round(sim, 3),
         })
 
-    if not context_parts:
+    if not context_parts and not graph_context:
         return {
             "answer": "I couldn't find relevant analysis data for that question. Try rephrasing or ask about specific speakers, signals, or moments.",
             "sources": [],
             "chunks_searched": len(rows),
         }
 
-    context = "\n".join(context_parts[:8])
+    text_context = "\n".join(context_parts[:8])
+    if graph_context:
+        context = f"{text_context}\n\n{graph_context}" if text_context else graph_context
+        sources.append({"type": "knowledge_graph", "text": graph_context[:200], "similarity": 1.0})
+    else:
+        context = text_context
 
     # Step 4: Generate answer with LLM
     from shared.utils.llm_client import acomplete
 
     system_prompt = (
         "You are NEXUS, a behavioural analysis assistant. Answer questions about "
-        "meeting/call analysis using ONLY the provided context.\n\n"
+        "meeting/call analysis using the provided context.\n\n"
         "Rules:\n"
-        "- Only answer based on the provided context. If the context doesn't contain the answer, say so.\n"
-        "- Reference specific timestamps, speaker names, and signal values when available.\n"
+        "- Use BOTH text context and graph context when available. "
+        "Graph context provides causal chains and relationships that text context does not.\n"
+        "- Only answer based on the provided context. If neither source contains the answer, say so.\n"
+        "- Reference specific timestamps (convert ms to mm:ss), speaker names, and signal values.\n"
         "- Be concise but thorough.\n"
         "- Frame behavioural observations as 'indicators suggest' not 'they were definitely'.\n"
+        "- When explaining causal chains from graph context, present as a sequence: 'A led to B which triggered C'.\n"
+        "- If graph context shows speaker influence patterns, describe them as correlations, not causation.\n"
         "- Never claim to detect deception — only note incongruence between modalities."
     )
 
@@ -1547,6 +1772,7 @@ async def chat_with_session(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             max_tokens=600,
+            model="gpt-4o",
         )
     except Exception as e:
         logger.error(f"Chat LLM call failed: {e}")
@@ -1571,6 +1797,7 @@ async def chat_with_session(
         "answer": answer,
         "sources": top_sources,
         "chunks_searched": len(rows),
+        "graph_source": graph_source,
     }
 
 

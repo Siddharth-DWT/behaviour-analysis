@@ -12,11 +12,13 @@ import {
   LogOut,
   User,
   ChevronDown,
+  UploadCloud,
 } from "lucide-react";
 import { useTheme } from "../contexts/ThemeContext";
 import { useAuth } from "../contexts/AuthContext";
 
 const NAV_ITEMS = [
+  { path: "/upload", label: "Upload", icon: UploadCloud },
   { path: "/sessions", label: "Sessions", icon: FolderOpen },
   { path: "/analytics", label: "Analytics", icon: BarChart3, disabled: true },
   { path: "/settings", label: "Settings", icon: Settings, disabled: true },
@@ -84,7 +86,11 @@ export default function Layout({ children }: { children: ReactNode }) {
         {/* Nav items */}
         <nav className="flex-1 py-3">
           {NAV_ITEMS.map((item) => {
-            const active = location.pathname.startsWith(item.path);
+            // /upload is top-level only; /sessions matches all sub-routes
+            const active =
+              item.path === "/upload"
+                ? location.pathname === "/upload"
+                : location.pathname.startsWith(item.path);
             const Icon = item.icon;
             return (
               <Link

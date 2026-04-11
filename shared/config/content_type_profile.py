@@ -71,15 +71,19 @@ PROFILES: dict[str, ContentTypeConfig] = {
         label="Client Meeting",
         intent_categories=[
             "INFORM", "QUESTION", "REQUEST", "PROPOSE", "AGREE", "DISAGREE",
-            "ACKNOWLEDGE", "COMMIT", "RAPPORT", "ASSIGN_ACTION", "ESCALATE",
+            "ACKNOWLEDGE", "COMMIT", "PRESENT", "FOLLOW_UP", "GREET",
+            "ASSIGN_ACTION", "ESCALATE",
         ],
         rules={
             "LANG-PERS-01": RuleProfile(confidence_multiplier=0.7),
             "FUSION-07": RuleProfile(thresholds={"max_confidence": 0.60}),
         },
         signal_renames={
-            "buying_signal": "client_engagement",
-            "objection_signal": "client_concern",
+            # Matrix: RENAME buying_signal → engagement_signal, objection → concern,
+            #         persuasion_technique → influence_tactic
+            "buying_signal": "engagement_signal",
+            "objection_signal": "concern",
+            "persuasion_technique": "influence_tactic",
             "normal": "deliberative",
         },
     ),
@@ -88,19 +92,29 @@ PROFILES: dict[str, ContentTypeConfig] = {
         label="Internal Meeting",
         intent_categories=[
             "INFORM", "QUESTION", "REQUEST", "PROPOSE", "AGREE", "DISAGREE",
-            "ACKNOWLEDGE", "COMMIT", "RAPPORT", "ASSIGN_ACTION", "FACILITATE",
+            "ACKNOWLEDGE", "COMMIT", "PRESENT", "FOLLOW_UP", "GREET",
+            "ASSIGN_ACTION", "FACILITATE",
         ],
         rules={
             "LANG-BUY-01": RuleProfile(gated=True),
-            "LANG-PERS-01": RuleProfile(gated=True),
+            # LANG-PERS-01: matrix says RENAME "influence_attempt", NOT gate
             "FUSION-13": RuleProfile(gated=True),
-            "FUSION-02": RuleProfile(thresholds={"max_confidence": 0.45, "stress_gate": 0.50}),
-            "FUSION-07": RuleProfile(thresholds={"confidence_floor": 0.35}),
+            # FUSION-02 removed: matrix says FIRE for internal meetings
+            # FUSION-07 removed: matrix says FIRE for internal meetings
             "VOICE-FILLER-01": RuleProfile(thresholds={"spike_delta": 0.75}),
-            "VOICE-FILLER-02": RuleProfile(thresholds={"noticeable_pct": 2.0}),
+            # noticeable threshold +0.5% from default 2.5% (Bortfeld 2001: informal speech)
+            "VOICE-FILLER-02": RuleProfile(thresholds={"noticeable_pct": 3.0}),
+            # >50% any peer = significant in peer/internal meetings
+            "VOICE-TALK-01": RuleProfile(thresholds={"significant_pct": 50.0}),
+            # Professional speech runs lower emotional density (Tausczik 2010)
+            "LANG-SENT-02": RuleProfile(thresholds={"high_pct": 0.06, "suppressed_pct": 0.015}),
         },
         signal_renames={
-            "objection_signal": "concern_raised",
+            # Matrix: disagreement (not concern_raised), influence_attempt (not gated),
+            #         stonewalling → disengagement (Cortina: may be adaptive boundary-setting)
+            "objection_signal": "disagreement",
+            "persuasion_technique": "influence_attempt",
+            "stonewalling": "disengagement",
             "normal": "deliberative",
         },
     ),
@@ -108,9 +122,9 @@ PROFILES: dict[str, ContentTypeConfig] = {
     "interview": ContentTypeConfig(
         label="Interview",
         intent_categories=[
-            "INFORM", "QUESTION", "ANSWER", "CLARIFY", "PROBE",
-            "AGREE", "ACKNOWLEDGE", "INTEREST", "HESITATION",
-            "RAPPORT", "CLOSE",
+            "INFORM", "QUESTION", "ANSWER", "RESPOND", "ELABORATE",
+            "CLARIFY", "PROBE", "AGREE", "ACKNOWLEDGE",
+            "INTEREST", "HESITATION", "GREET", "CLOSE",
         ],
         rules={
             "VOICE-STRESS-01": RuleProfile(thresholds={"stress_offset": 0.15}),
@@ -122,7 +136,7 @@ PROFILES: dict[str, ContentTypeConfig] = {
             "VOICE-TONE-03": RuleProfile(confidence_multiplier=0.6),
             "VOICE-TONE-04": RuleProfile(confidence_multiplier=1.2),
             "VOICE-PAUSE-01": RuleProfile(thresholds={"extended_pause_ms": 3000.0}),
-            "LANG-PERS-01": RuleProfile(gated=True),
+            # LANG-PERS-01: matrix says RENAME "impression_management", NOT gate
             "LANG-NEG-01": RuleProfile(confidence_multiplier=0.7),
             "LANG-CLAR-01": RuleProfile(confidence_multiplier=1.2),
             "FUSION-13": RuleProfile(gated=True),
@@ -138,8 +152,13 @@ PROFILES: dict[str, ContentTypeConfig] = {
             "VOICE-TALK-01": RuleProfile(thresholds={"significant_pct": 70.0}),
         },
         signal_renames={
-            "buying_signal": "candidate_interest",
-            "objection_signal": "candidate_hesitation",
+            # Matrix: interest_signal, hesitation, impression_management (not gated),
+            #         stonewalling → disengagement, defensiveness → resistance
+            "buying_signal": "interest_signal",
+            "objection_signal": "hesitation",
+            "persuasion_technique": "impression_management",
+            "stonewalling": "disengagement",
+            "defensiveness": "resistance",
             "aggressive": "assertive",
             "cold": "low_energy",
             "normal": "deliberative",
@@ -156,8 +175,9 @@ PROFILES: dict[str, ContentTypeConfig] = {
     "podcast": ContentTypeConfig(
         label="Podcast",
         intent_categories=[
-            "INFORM", "QUESTION", "ANSWER", "ELABORATE", "AGREE",
-            "DISAGREE", "RAPPORT", "TRANSITION", "SUMMARIZE",
+            # Matrix: NARRATE replaces ANSWER, add JOKE + ACKNOWLEDGE, remove RAPPORT/SUMMARIZE
+            "INFORM", "QUESTION", "NARRATE", "ELABORATE", "AGREE",
+            "DISAGREE", "JOKE", "TRANSITION", "ACKNOWLEDGE",
         ],
         rules={
             "LANG-BUY-01": RuleProfile(gated=True),
@@ -171,7 +191,8 @@ PROFILES: dict[str, ContentTypeConfig] = {
             "CONVO-CONF-01": RuleProfile(gated=True),
             "VOICE-FILLER-01": RuleProfile(thresholds={"spike_delta": 0.30}),
             "VOICE-INT-01": RuleProfile(thresholds={"overlap_ms": 400.0}),
-            "VOICE-TALK-01": RuleProfile(thresholds={"significant_pct": 80.0}),
+            # Matrix: flag host if >50% (guest should dominate 60-80%)
+            "VOICE-TALK-01": RuleProfile(thresholds={"significant_pct": 50.0}),
             "CONVO-TURN-01": RuleProfile(thresholds={"monologue_per_min": 0.5}),
             "CONVO-LAT-01": RuleProfile(thresholds={"delayed_ms": 3000.0}),
             "CONVO-BAL-01": RuleProfile(thresholds={"expected_gini_low": 0.30, "expected_gini_high": 0.50}),

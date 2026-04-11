@@ -20,9 +20,10 @@ logger = logging.getLogger("nexus.assemblyai")
 
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
 BASE_URL = "https://api.assemblyai.com/v2"
-POLL_INTERVAL = 5  # seconds
+POLL_INTERVAL = 5    # seconds between status checks
 UPLOAD_TIMEOUT = 300  # 5 min for large file uploads
-POLL_TIMEOUT = 30
+POLL_TIMEOUT = 30    # per HTTP request
+MAX_POLL_WAIT = 1200  # 20 min total — bail out if job doesn't finish
 
 
 def is_available() -> bool:
@@ -50,8 +51,17 @@ class AssemblyAIClient:
     def transcribe(
         self,
         audio_path: str,
-        language_code: str = "en",
+        language_code: Optional[str] = None,
         speakers_expected: Optional[int] = None,
+        speaker_labels: bool = True,
+        key_terms: Optional[list] = None,
+        custom_prompt: Optional[str] = None,
+        keep_filler_words: bool = False,
+        text_formatting: bool = False,
+        auto_punctuation: bool = True,
+        multichannel: bool = False,
+        temperature: Optional[float] = None,
+        translate_to: Optional[str] = None,
     ) -> dict:
         """
         Transcribe audio with speaker diarization.
@@ -76,15 +86,63 @@ class AssemblyAIClient:
         logger.info(f"AssemblyAI: uploading {audio_file.name}...")
         upload_url = self._upload(audio_path)
 
-        # Step 2: Create transcript request
-        request_body = {
+        # Step 2: Build transcript request for Universal-3 Pro.
+        # Features we use from AssemblyAI:
+        #   - speaker_labels: diarization (who said what)
+        #   - speaker_identification: enhanced speaker labelling via speech_understanding
+        #   - language_detection: auto-detect spoken language (used when no language_code given)
+        #   - language_code: only when user explicitly picks a language
+        #   - temperature, keyterms_prompt, prompt, format_text, punctuate, disfluencies
+        #   - translation via speech_understanding (when translate_to is set)
+        # Everything else (sentiment, IAB, PII, content_safety, profanity) is handled
+        # better by NEXUS own agents and is NOT sent to AssemblyAI.
+        request_body: dict = {
             "audio_url": upload_url,
             "speech_models": ["universal-3-pro"],
-            "speaker_labels": True,
-            "language_code": language_code,
+            "speaker_labels": speaker_labels,
+            "format_text": text_formatting,
+            "punctuate": auto_punctuation,
+            "disfluencies": keep_filler_words,
         }
+
+        # Language: explicit code takes priority; otherwise let AssemblyAI auto-detect
+        if language_code:
+            request_body["language_code"] = language_code
+        else:
+            request_body["language_detection"] = True
+
         if speakers_expected is not None:
-            request_body["speakers_expected"] = speakers_expected
+            request_body["speaker_options"] = {
+                "min_speakers_expected": speakers_expected,
+                "max_speakers_expected": speakers_expected,
+            }
+        if multichannel:
+            request_body["multichannel"] = True
+            del request_body["speaker_labels"]     # mutually exclusive with multichannel
+        if key_terms:
+            request_body["keyterms_prompt"] = key_terms
+        if custom_prompt:
+            request_body["prompt"] = custom_prompt
+        if temperature is not None:
+            request_body["temperature"] = max(0.0, min(1.0, temperature))
+
+        # Build speech_understanding block (speaker_identification + optional translation)
+        speech_understanding: dict = {
+            "request": {
+                "speaker_identification": {
+                    "speaker_type": "name",
+                    "known_values": [],
+                }
+            }
+        }
+        if translate_to:
+            speech_understanding["translation"] = {
+                "target_languages": [translate_to],
+                "match_original_utterance": True,
+            }
+        if not multichannel:
+            # speaker_identification only makes sense alongside speaker_labels
+            request_body["speech_understanding"] = speech_understanding
 
         logger.info("AssemblyAI: creating transcript...")
         with httpx.Client(timeout=POLL_TIMEOUT) as client:
@@ -93,6 +151,8 @@ class AssemblyAIClient:
                 headers=self._headers,
                 json=request_body,
             )
+            if not resp.is_success:
+                logger.error(f"AssemblyAI transcript request failed {resp.status_code}: {resp.text}")
             resp.raise_for_status()
             transcript_id = resp.json()["id"]
 
@@ -104,7 +164,7 @@ class AssemblyAIClient:
         duration = data.get("audio_duration", 0)
 
         # Step 4: Convert to NEXUS format
-        result = self._convert(data, elapsed)
+        result = self._convert(data, elapsed, translate_to=translate_to)
 
         logger.info(
             f"AssemblyAI complete: {duration}s audio, "
@@ -127,8 +187,14 @@ class AssemblyAIClient:
         return resp.json()["upload_url"]
 
     def _poll(self, transcript_id: str) -> dict:
-        """Poll until transcript is completed or errored."""
+        """Poll until transcript is completed or errored. Raises on timeout."""
+        deadline = time.time() + MAX_POLL_WAIT
         while True:
+            if time.time() > deadline:
+                raise TimeoutError(
+                    f"AssemblyAI transcript {transcript_id} did not finish "
+                    f"within {MAX_POLL_WAIT}s"
+                )
             with httpx.Client(timeout=POLL_TIMEOUT) as client:
                 resp = client.get(
                     f"{BASE_URL}/transcript/{transcript_id}",
@@ -146,11 +212,21 @@ class AssemblyAIClient:
             logger.debug(f"AssemblyAI: status={status}, waiting...")
             time.sleep(POLL_INTERVAL)
 
-    def _convert(self, data: dict, elapsed: float) -> dict:
+    def _convert(self, data: dict, elapsed: float, translate_to: Optional[str] = None) -> dict:
         """Convert AssemblyAI response to NEXUS internal format."""
 
-        # Utterances = speaker-labeled segments (text already merged per turn)
-        utterances = data.get("utterances", [])
+        # Utterances = speaker-labeled segments (text already merged per turn).
+        # When speaker_labels=False, utterances is absent — fall back to a single
+        # segment for the whole transcript labelled Speaker_0.
+        utterances = data.get("utterances") or []
+        if not utterances and data.get("text"):
+            utterances = [{
+                "speaker": "A",
+                "start": data.get("words", [{}])[0].get("start", 0) if data.get("words") else 0,
+                "end": data.get("words", [{}])[-1].get("end", int(data.get("audio_duration", 0) * 1000)) if data.get("words") else int(data.get("audio_duration", 0) * 1000),
+                "text": data["text"],
+                "words": data.get("words", []),
+            }]
 
         segments = []
         for u in utterances:
@@ -168,7 +244,13 @@ class AssemblyAIClient:
                     "confidence": w.get("confidence", 0),
                 })
 
-            text = u.get("text", "").strip()
+            # Use translated text if translation was requested and available
+            if translate_to and u.get("translated_texts"):
+                text = u["translated_texts"].get(translate_to) or u.get("text", "")
+            else:
+                text = u.get("text", "")
+            text = text.strip()
+
             if text:
                 segments.append({
                     "speaker": speaker,

@@ -195,9 +195,17 @@ async def analyse(request: AnalysisRequest):
     if HAS_MESSAGE_BUS and signals:
         try:
             for sig in signals:
-                await message_bus.publish(
-                    stream=f"nexus:stream:conversation:{session_id}",
-                    data=sig,
+                await message_bus.publish_signal(
+                    session_id=session_id,
+                    agent="conversation",
+                    speaker_id=sig.get("speaker_id", "unknown"),
+                    signal_type=sig.get("signal_type", ""),
+                    value=sig.get("value"),
+                    value_text=sig.get("value_text", ""),
+                    confidence=sig.get("confidence", 0.5),
+                    window_start_ms=sig.get("window_start_ms", 0),
+                    window_end_ms=sig.get("window_end_ms", 0),
+                    metadata=sig.get("metadata"),
                 )
             logger.info(f"[{session_id}] Published {len(signals)} signals to Redis")
         except Exception as e:
