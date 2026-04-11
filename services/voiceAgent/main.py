@@ -120,8 +120,8 @@ async def health():
 async def transcribe_only(request: AnalysisRequest):
     """
     Fast path: return transcript + diarisation without features/rules.
-    Used by API Gateway to start Language Agent early while Voice features
-    continue processing in parallel (Optimization 1).
+    Respects full transcription_config and analysis_config.run_diarization.
+    Used by /quick-transcribe gateway endpoint and the parallel optimisation path.
     """
     file_path = Path(request.file_path)
     if not file_path.exists():
@@ -130,9 +130,31 @@ async def transcribe_only(request: AnalysisRequest):
     session_id = request.session_id or str(uuid.uuid4())
     start_time = time.time()
 
-    logger.info(f"[{session_id}] Transcribe-only: {file_path.name}")
+    tc = request.transcription_config
+    ac = request.analysis_config
 
-    transcript = transcriber.transcribe(str(file_path), num_speakers=request.num_speakers)
+    logger.info(
+        f"[{session_id}] Transcribe-only: {file_path.name} "
+        f"(model={getattr(tc, 'model_preference', None)}, "
+        f"diarize={getattr(ac, 'run_diarization', True)})"
+    )
+
+    transcript = transcriber.transcribe(
+        str(file_path),
+        num_speakers=request.num_speakers,
+        language=getattr(tc, "language", None) if tc else None,
+        model_preference=getattr(tc, "model_preference", None) if tc else None,
+        custom_prompt=getattr(tc, "custom_prompt", None) if tc else None,
+        key_terms=getattr(tc, "key_terms", None) if tc else None,
+        multichannel=getattr(tc, "multichannel", False) if tc else False,
+        keep_filler_words=getattr(tc, "keep_filler_words", False) if tc else False,
+        text_formatting=getattr(tc, "text_formatting", False) if tc else False,
+        auto_punctuation=getattr(tc, "auto_punctuation", True) if tc else True,
+        temperature=getattr(tc, "temperature", None) if tc else None,
+        run_diarization=getattr(ac, "run_diarization", True) if ac else True,
+        run_behavioural=getattr(ac, "run_behavioural", True) if ac else True,
+        translate_to=getattr(ac, "translate_to", None) if ac else None,
+    )
 
     elapsed = time.time() - start_time
     speakers = list(set(seg["speaker"] for seg in transcript["segments"]))
@@ -147,6 +169,8 @@ async def transcribe_only(request: AnalysisRequest):
         "duration_seconds": transcript["duration_seconds"],
         "segments": transcript["segments"],
         "speakers": speakers,
+        "backend": transcript.get("backend", "unknown"),
+        "model": transcript.get("model", "unknown"),
     }
 
 
@@ -179,15 +203,80 @@ async def analyse_audio(request: AnalysisRequest):
         import librosa as _lr
         audio_data = _lr.load(str(file_path), sr=16000, mono=True)
 
-    # ── Step 1: Transcribe + diarise ──
+    # ── Create content-type profile ──
     meeting_type = request.meeting_type or "sales_call"
-    logger.info(f"[{session_id}] Step 1: Transcribing (num_speakers={request.num_speakers}, meeting_type={meeting_type})...")
-    transcript = transcriber.transcribe(str(file_path), num_speakers=request.num_speakers, audio_data=audio_data, meeting_type=meeting_type)
-    
+    _profile = None
+    try:
+        from shared.config.content_type_profile import ContentTypeProfile
+        _profile = ContentTypeProfile(meeting_type)
+    except ImportError:
+        pass
+
+    # ── Step 1: Transcribe + diarise ──
+    tc = request.transcription_config
+    ac = request.analysis_config
+    logger.info(
+        f"[{session_id}] Step 1: Transcribing "
+        f"(num_speakers={request.num_speakers}, meeting_type={meeting_type}, "
+        f"model_pref={getattr(tc, 'model_preference', None)}, "
+        f"lang={getattr(tc, 'language', None)})"
+    )
+    transcript = transcriber.transcribe(
+        str(file_path),
+        num_speakers=request.num_speakers,
+        audio_data=audio_data,
+        meeting_type=meeting_type,
+        language=getattr(tc, "language", None) if tc else None,
+        model_preference=getattr(tc, "model_preference", None) if tc else None,
+        custom_prompt=getattr(tc, "custom_prompt", None) if tc else None,
+        key_terms=getattr(tc, "key_terms", None) if tc else None,
+        multichannel=getattr(tc, "multichannel", False) if tc else False,
+        keep_filler_words=getattr(tc, "keep_filler_words", False) if tc else False,
+        text_formatting=getattr(tc, "text_formatting", False) if tc else False,
+        auto_punctuation=getattr(tc, "auto_punctuation", True) if tc else True,
+        temperature=getattr(tc, "temperature", None) if tc else None,
+        run_diarization=getattr(ac, "run_diarization", True) if ac else True,
+        run_behavioural=getattr(ac, "run_behavioural", True) if ac else True,
+        translate_to=getattr(ac, "translate_to", None) if ac else None,
+    )
+
     duration_sec = transcript["duration_seconds"]
     speakers = list(set(seg["speaker"] for seg in transcript["segments"]))
     logger.info(f"[{session_id}] Transcribed: {duration_sec:.1f}s, {len(speakers)} speakers, {len(transcript['segments'])} segments")
-    
+
+    # ── Early return: transcript-only mode (behavioural analysis disabled) ──
+    run_behavioural = getattr(ac, "run_behavioural", True) if ac else True
+
+    if not run_behavioural:
+        elapsed = time.time() - start_time
+        logger.info(f"[{session_id}] Transcript-only mode — skipping features/rules ({elapsed:.1f}s)")
+        word_counts: dict[str, int] = {}
+        transcript_speech_quick: dict[str, float] = {}
+        for seg in transcript["segments"]:
+            spk = seg["speaker"]
+            word_counts[spk] = word_counts.get(spk, 0) + len(seg.get("text", "").split())
+            transcript_speech_quick[spk] = transcript_speech_quick.get(spk, 0.0) + (seg["end_ms"] - seg["start_ms"]) / 1000.0
+        total_speech_sec_quick = sum(transcript_speech_quick.values()) or duration_sec
+        return AnalysisResponse(
+            session_id=session_id,
+            duration_seconds=duration_sec,
+            speakers=[
+                {
+                    "speaker_id": sid,
+                    "baseline": None,
+                    "signal_count": 0,
+                    "talk_time_ms": int(transcript_speech_quick.get(sid, 0.0) * 1000),
+                    "talk_time_pct": round(transcript_speech_quick.get(sid, 0.0) / total_speech_sec_quick * 100, 2),
+                    "total_words": word_counts.get(sid, 0),
+                    "calibration_confidence": 0.0,
+                }
+                for sid in speakers
+            ],
+            signals=[],
+            summary={},
+            transcript_segments=transcript["segments"],
+        )
+
     # ── Step 2: Extract acoustic features ──
     logger.info(f"[{session_id}] Step 2: Extracting features...")
     try:
@@ -224,16 +313,16 @@ async def analyse_audio(request: AnalysisRequest):
             f"F0={baseline.f0_mean:.1f}Hz, rate={baseline.speech_rate_wpm:.0f}wpm, "
             f"confidence={baseline.calibration_confidence:.2f}"
         )
-    
+
     # ── Step 4: Run rules ──
     logger.info(f"[{session_id}] Step 4: Running rule engine...")
     all_signals = []
-    
+
     for speaker_id, features_list in features_by_speaker.items():
         baseline = baselines.get(speaker_id)
         if not baseline:
             continue
-        
+
         for features in features_list:
             # All segments in this window (all speakers) for interruption detection
             window_all_segments = [
@@ -246,9 +335,10 @@ async def analyse_audio(request: AnalysisRequest):
                 baseline=baseline,
                 speaker_id=speaker_id,
                 transcript_segments=window_all_segments,
+                profile=_profile,
             )
             all_signals.extend(signals)
-    
+
     # ── Step 4b: Talk time signals (session-level) ──
     talk_time_signals = VoiceRuleEngine._emit_talk_time_signals(
         features_by_speaker, duration_sec
@@ -260,18 +350,33 @@ async def analyse_audio(request: AnalysisRequest):
     # ── Step 5: Build summary ──
     elapsed = time.time() - start_time
     logger.info(f"[{session_id}] Complete: {len(all_signals)} signals in {elapsed:.1f}s")
-    
+
     summary = _build_summary(all_signals, baselines, transcript)
-    
+
+    # Compute per-speaker word counts from transcript segments
+    word_counts = {}
+    for seg in transcript["segments"]:
+        spk = seg["speaker"]
+        words = len(seg.get("text", "").split())
+        word_counts[spk] = word_counts.get(spk, 0) + words
+
+    total_speech_sec = sum(transcript_speech.values()) or duration_sec
+
     speaker_data = [
         {
             "speaker_id": sid,
             "baseline": baselines[sid].to_dict() if sid in baselines else None,
-            "signal_count": len([s for s in all_signals if s.get("speaker_id") == sid])
+            "signal_count": len([s for s in all_signals if s.get("speaker_id") == sid]),
+            "talk_time_ms": int(transcript_speech.get(sid, 0.0) * 1000),
+            "talk_time_pct": round(transcript_speech.get(sid, 0.0) / total_speech_sec * 100, 2),
+            "total_words": word_counts.get(sid, 0),
+            "calibration_confidence": round(
+                baselines[sid].calibration_confidence if sid in baselines else 0.0, 4
+            ),
         }
         for sid in speakers
     ]
-    
+
     return AnalysisResponse(
         session_id=session_id,
         duration_seconds=duration_sec,

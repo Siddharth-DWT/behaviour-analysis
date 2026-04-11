@@ -14,12 +14,39 @@ from shared.models.transcript import TranscriptSegment
 # VOICE AGENT  (port 8001)
 # ─────────────────────────────────────────────────────────
 
+class TranscriptionConfig(BaseModel):
+    """User-configurable transcription settings (from upload settings panel)."""
+    language: Optional[str] = None            # None = auto-detect; ISO 639-1 code e.g. "en"
+    model_preference: Optional[str] = None    # None = auto; "parakeet"|"whisper"|"deepgram"|"assemblyai"
+    custom_prompt: Optional[str] = None       # Style instructions forwarded to Whisper initial_prompt
+    key_terms: Optional[list[str]] = None     # Domain vocabulary boost (word_boost / keywords)
+    multichannel: bool = False                # Each audio channel = one speaker
+    keep_filler_words: bool = False           # Keep "um", "uh" in transcript text
+    auto_punctuation: bool = True             # Smart punctuation
+    text_formatting: bool = False             # Smart formatting (dates, numbers, URLs)
+    word_timestamps: bool = False             # Per-word timing
+    temperature: Optional[float] = None       # 0.0–1.0 — AssemblyAI + Whisper randomness control
+
+
+class AnalysisConfig(BaseModel):
+    """User-configurable analysis settings (from upload settings panel)."""
+    run_behavioural: bool = True              # Voice + Language + Conversation + Fusion
+    run_sentiment: bool = False               # Sentiment-only pass (Language Agent without full behavioural)
+    run_diarization: bool = True             # Speaker separation (if false, all speech = Speaker_0)
+    run_entity_extraction: bool = True        # Entity extractor
+    run_knowledge_graph: bool = True          # Neo4j sync
+    sensitivity: float = 0.5                  # 0.0 (low/high-confidence only) to 1.0 (catch everything)
+    translate_to: Optional[str] = None        # Target language for post-transcription translation
+
+
 class VoiceAnalysisRequest(BaseModel):
     """POST /analyse — process an audio file already on disk."""
     file_path: str
     session_id: Optional[str] = None
     meeting_type: Optional[str] = "sales_call"
-    num_speakers: Optional[int] = None  # Diarisation hint (2–10)
+    num_speakers: Optional[int] = None              # Diarisation hint (2–10)
+    transcription_config: Optional[TranscriptionConfig] = None
+    analysis_config: Optional[AnalysisConfig] = None
 
 
 class VoiceAnalysisResponse(BaseModel):

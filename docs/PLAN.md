@@ -3,7 +3,11 @@
 ## Overview
 
 Total estimated timeline: **40-48 weeks** from vertical slice to production.
-Current status: **Week 2** (infrastructure + Voice Agent built).
+Current status: **Phase 1 complete · Phase 3A in progress** (Neo4j single-session knowledge graph + hybrid RAG chat).
+Phase 2 (visual agents) is deferred — audio-only pipeline is the active focus.
+
+> **See `docs/STATUS.md` for the authoritative build state.** This file is the
+> forward-looking roadmap; STATUS.md tracks what is actually shipped.
 
 ---
 
@@ -23,8 +27,17 @@ Current status: **Week 2** (infrastructure + Voice Agent built).
 
 ---
 
-## Phase 1: Vertical Slice — Audio-Only MVP
-**Duration: 4 weeks | Target: Weeks 3-6**
+## Phase 1: Vertical Slice — Audio-Only MVP ✅ COMPLETE
+**Duration: 4 weeks | Status: DONE (and significantly extended beyond original scope)**
+
+Phase 1 actually delivered the original MVP plus content-type adaptation
+(`ContentTypeProfile`), full RAG chat over pgvector, multi-backend
+transcription cascade (Whisper+NeMo / Parakeet / AssemblyAI / Deepgram /
+local), GPU diarization cascade, knowledge_store, and graph analytics in
+the Fusion Agent. JWT auth was also pulled forward from Phase 4.
+
+The original Phase 1 task list below is preserved for reference; nearly
+all items are done.
 
 ### Week 3: Ground Truth + Voice Agent Validation
 - [ ] Obtain 5-10 real sales call recordings (30-60 min each)
@@ -133,36 +146,48 @@ Current status: **Week 2** (infrastructure + Voice Agent built).
 ## Phase 3: Intelligence Refinement
 **Duration: 8 weeks | Target: Weeks 15-22**
 
-### Weeks 15-16: Remaining Compound Patterns
+> Phase 3 has been re-scoped around the **Neo4j knowledge graph** plan in
+> `prompt.md`. The original "Remaining Compound Patterns" sub-phase is
+> deferred until after the visual agents (Phase 2) come online, since most
+> compound patterns require facial/body/gaze signals.
+
+### Phase 3A: Single-Session Knowledge Graph 🚧 IN PROGRESS
+- [x] Add Neo4j 5.26 to docker-compose (`neo4j:5.26-community` + APOC + GDS)
+- [x] `services/api_gateway/neo4j_sync.py` — sync session data from PG to Neo4j after pipeline completes
+- [x] Node types: Session, Speaker, Segment, Topic, Signal, FusionInsight, Entity (Person/Company/Product/Objection/Commitment), Alert
+- [x] Structural + temporal + containment edges (PARTICIPATED_IN, PART_OF, NEXT, FOLLOWED_BY, PRECEDED, OCCURRED_DURING, DISCUSSES, MENTIONED_IN, RESOLVED_IN, etc.)
+- [x] Causal edges via post-load Cypher MERGE (CONTRADICTS, REINFORCES, TRIGGERED)
+- [x] Cross-speaker INFLUENCED edges within 30 s
+- [x] Hybrid `/sessions/:id/chat` — pgvector text search + Neo4j Cypher search via LLM-generated queries
+- [ ] **Validate** with real sessions: run all 8 prompt.md Cypher use-cases manually
+- [ ] Add `COMPOSED_OF` / `COMBINES` provenance to fusion + composite signals (unlocks signal decomposition + fusion explanation queries)
+
+### Phase 3B: Speaker Identity 🔲 NOT STARTED
+- [ ] Add `voice_embedding VECTOR(256)` column to `speakers` table
+- [ ] Extract per-speaker pyannote/embedding during diarization (model already loaded for community-1 fallback)
+- [ ] Vector index in Neo4j Speaker nodes for cross-session matching
+- [ ] Manual speaker labelling UI in dashboard
+
+### Phase 3C: Cross-Session Intelligence 🔲 NOT STARTED
+- [ ] Add `Session.outcome` (won/lost/unknown) column + dashboard tagger
+- [ ] Entity resolver for cross-session companies/people/topics (`apoc.text.fuzzyMatch`)
+- [ ] `INTERACTED_WITH`, `HAS_TREND`, `SHOWS_PATTERN` aggregations
+- [ ] Winning vs losing pattern detection (Cypher)
+
+### Phase 3D: Dashboard 🔲 NOT STARTED
+- [ ] `/speakers/:id` Speaker Profile page (behavioural DNA radar, trajectory, interaction map)
+- [ ] `/insights` Organization Insights page (team heatmap, topic sensitivity, won-vs-lost comparison)
+- [ ] `/graph` Knowledge Graph Explorer (neovis.js)
+
+### Deferred from original Phase 3 (require Phase 2 visual agents)
 - [ ] Implement all 12 compound patterns (COMPOUND-01 through 12)
 - [ ] Implement all 8 temporal sequences (TEMPORAL-01 through 08)
-- [ ] Implement CONVO-RAP-01: Multi-modal rapport score
-- [ ] Implement CONVO-CONF-01: Multi-modal conflict detection (Gottman 4 Horsemen)
-- [ ] Implement CONVO-DOM-01: Multi-modal dominance mapping
 
-### Weeks 17-18: Knowledge Graph
-- [ ] Add Neo4j Community to Docker Compose
-- [ ] Design meeting knowledge graph schema (entities, relationships, sentiments)
-- [ ] Build graph population from Language Agent outputs
-- [ ] Implement cross-session entity tracking (competitor mentions, pricing discussions)
-- [ ] Build graph query API for dashboard
-
-### Weeks 19-20: Speaker Profiles + Cross-Session Memory
-- [ ] Implement speaker_profiles table population
-- [ ] Build voice embedding for speaker recognition (cross-session)
-- [ ] Implement baseline averaging across sessions
-- [ ] Implement stress_triggers detection (topics that historically trigger stress)
-- [ ] Build predictive alerts ("this speaker historically shows stress during pricing discussions")
-
-### Weeks 21-22: Post-Session Reports + Coaching
-- [ ] Claude API report generator with structured prompts per meeting type
-- [ ] Sales call report: buying signals timeline, objection map, decision readiness moments
-- [ ] Client meeting report: rapport trajectory, satisfaction indicators, risk flags
-- [ ] Internal meeting report: engagement distribution, contribution balance, action items
-- [ ] Coaching report: per-speaker communication effectiveness scores with improvement suggestions
+### Deferred to a separate reports milestone
+- [ ] Per-meeting-type structured report templates (sales / client / internal / coaching)
 - [ ] Export: PDF, DOCX, JSON, Slack message, CRM push
 
-**Phase 3 Deliverable**: Full intelligence layer with knowledge graph, cross-session memory, and meeting-type-specific reports.
+**Phase 3 Deliverable**: Single-session Neo4j knowledge graph, hybrid RAG chat, cross-session speaker identity + entity resolution, behavioural-DNA dashboard pages.
 
 ---
 

@@ -37,6 +37,14 @@ logger = logging.getLogger("nexus.llm_client")
 # ── Configuration ──────────────────────────────────────────────
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower().strip()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "").rstrip("/")
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
+
+
+def _ollama_headers() -> dict:
+    """Authorization header for Ollama; empty when unset (open server)."""
+    if OLLAMA_API_KEY:
+        return {"Authorization": f"Bearer {OLLAMA_API_KEY}"}
+    return {}
 
 # Default models per provider
 DEFAULT_MODELS = {
@@ -195,6 +203,18 @@ def _complete_openai(
     return response.choices[0].message.content.strip()
 
 
+def _ollama_options(model: str, max_tokens: int, temperature: float) -> dict:
+    """
+    Build the options dict for an Ollama /api/chat request.
+    GLM models silently return empty content when num_predict is set,
+    so we omit it for those models and rely on the model's default limit.
+    """
+    opts: dict = {"temperature": temperature}
+    if not model.startswith("glm"):
+        opts["num_predict"] = max_tokens
+    return opts
+
+
 def _complete_ollama(
     system_prompt: str,
     user_prompt: str,
@@ -217,11 +237,9 @@ def _complete_ollama(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "options": {
-                "num_predict": max_tokens,
-                "temperature": temperature,
-            },
+            "options": _ollama_options(model, max_tokens, temperature),
         },
+        headers=_ollama_headers(),
         timeout=120,
     )
     resp.raise_for_status()
@@ -240,20 +258,27 @@ async def acomplete(
     system_prompt: str,
     user_prompt: str,
     max_tokens: int = 1000,
-    temperature: float = 0.0,
+    temperature: float = 0.3,
+    model: Optional[str] = None,
 ) -> str:
     """
-    Async version of complete(). Uses provider's async client if available,
-    otherwise runs the sync version in an executor.
+    Async LLM call routed purely by model name.
+
+    When model is None, uses DEFAULT_LLM_MODEL env var (default: gpt-4o).
+    Model routing:
+      "gpt-*" / "o1*" / "o3*" / None → OpenAI API
+      "glm-*" / "llama*" / "mistral*" / "qwen*" → Ollama
+      Anything else → OpenAI API (safe default)
     """
-    if LLM_PROVIDER == "anthropic":
-        return await _acomplete_anthropic(system_prompt, user_prompt, max_tokens, temperature)
-    elif LLM_PROVIDER == "openai":
-        return await _acomplete_openai(system_prompt, user_prompt, max_tokens, temperature)
-    elif LLM_PROVIDER == "ollama":
-        return await _acomplete_ollama(system_prompt, user_prompt, max_tokens, temperature)
+    if model is None:
+        model = os.getenv("DEFAULT_LLM_MODEL", "gpt-4o")
+
+    if model.startswith("gpt-") or model.startswith("o1") or model.startswith("o3"):
+        return await _acomplete_openai(system_prompt, user_prompt, max_tokens, temperature, model=model)
+    elif any(model.startswith(p) for p in ("glm-", "llama", "mistral", "qwen")):
+        return await _acomplete_ollama(system_prompt, user_prompt, max_tokens, temperature, model=model)
     else:
-        raise ValueError(f"Unknown LLM_PROVIDER: '{LLM_PROVIDER}'")
+        return await _acomplete_openai(system_prompt, user_prompt, max_tokens, temperature, model=model)
 
 
 async def _acomplete_anthropic(
@@ -295,6 +320,7 @@ async def _acomplete_openai(
     user_prompt: str,
     max_tokens: int,
     temperature: float,
+    model: Optional[str] = None,
 ) -> str:
     """Async call to OpenAI API."""
     api_key = os.getenv("OPENAI_API_KEY", "")
@@ -304,10 +330,10 @@ async def _acomplete_openai(
     try:
         from openai import AsyncOpenAI
         client = AsyncOpenAI(api_key=api_key)
-        model = _get_model()
+        resolved_model = model or _get_model()
 
         response = await client.chat.completions.create(
-            model=model,
+            model=resolved_model,
             max_tokens=max_tokens,
             temperature=temperature,
             messages=[
@@ -331,29 +357,28 @@ async def _acomplete_ollama(
     user_prompt: str,
     max_tokens: int,
     temperature: float,
+    model: Optional[str] = None,
 ) -> str:
     """Async call to Ollama /api/chat endpoint."""
     if not OLLAMA_URL:
-        raise RuntimeError("LLM_PROVIDER=ollama but OLLAMA_URL is not set")
+        raise RuntimeError("OLLAMA_URL is not set — cannot call Ollama model")
 
     import httpx
-    model = _get_model()
+    resolved_model = model or _get_model()
 
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             f"{OLLAMA_URL}/api/chat",
             json={
-                "model": model,
+                "model": resolved_model,
                 "stream": False,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                "options": {
-                    "num_predict": max_tokens,
-                    "temperature": temperature,
-                },
+                "options": _ollama_options(resolved_model, max_tokens, temperature),
             },
+            headers=_ollama_headers(),
         )
     resp.raise_for_status()
     return resp.json()["message"]["content"].strip()
@@ -420,6 +445,7 @@ async def get_embedding(text: str, model: str = "") -> Optional[list[float]]:
                         "model": model or OLLAMA_EMBED_MODEL,
                         "input": text[:2000],
                     },
+                    headers=_ollama_headers(),
                 )
             resp.raise_for_status()
             data = resp.json()

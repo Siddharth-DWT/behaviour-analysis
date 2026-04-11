@@ -4,6 +4,7 @@ import { Loader2 } from "lucide-react";
 import { useAuth } from "./contexts/AuthContext";
 import { setAccessToken } from "./api/client";
 import Layout from "./components/Layout";
+import UploadPage from "./pages/UploadPage";
 import SessionList from "./pages/SessionList";
 import SessionDetail from "./pages/SessionDetail";
 import ReportView from "./pages/ReportView";
@@ -44,7 +45,7 @@ function PublicRoute({ children }: { children: React.ReactNode }) {
   }
 
   if (isAuthenticated) {
-    return <Navigate to="/sessions" replace />;
+    return <Navigate to="/upload" replace />;
   }
 
   return <>{children}</>;
@@ -53,7 +54,6 @@ function PublicRoute({ children }: { children: React.ReactNode }) {
 export default function App() {
   const { accessToken } = useAuth();
 
-  // Sync access token to the API client module
   useEffect(() => {
     setAccessToken(accessToken);
   }, [accessToken]);
@@ -77,10 +77,24 @@ export default function App() {
           </PublicRoute>
         }
       />
-      {/* Email verification (accessible regardless of auth state) */}
       <Route path="/verify-email" element={<VerifyEmail />} />
 
-      {/* Protected routes */}
+      {/* ── Primary: Upload ── */}
+      <Route
+        path="/upload"
+        element={
+          <ProtectedRoute>
+            <Layout>
+              <UploadPage />
+            </Layout>
+          </ProtectedRoute>
+        }
+      />
+
+      {/* Legacy redirect — /sessions/new → /upload */}
+      <Route path="/sessions/new" element={<Navigate to="/upload" replace />} />
+
+      {/* ── Sessions ── */}
       <Route
         path="/sessions"
         element={
@@ -112,8 +126,8 @@ export default function App() {
         }
       />
 
-      {/* Default redirect */}
-      <Route path="*" element={<Navigate to="/sessions" replace />} />
+      {/* Default → Upload */}
+      <Route path="*" element={<Navigate to="/upload" replace />} />
     </Routes>
   );
 }

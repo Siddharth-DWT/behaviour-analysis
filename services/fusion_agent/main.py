@@ -145,6 +145,13 @@ async def analyse_signals(request: AnalyseRequest):
     content_type = request.content_type or request.meeting_type or "sales_call"
     start_time = time.time()
 
+    # Create content-type profile for all rules
+    try:
+        from shared.config.content_type_profile import ContentTypeProfile
+        profile = ContentTypeProfile(content_type)
+    except ImportError:
+        profile = None
+
     voice_dicts = [s.model_dump() for s in request.voice_signals]
     language_dicts = [s.model_dump() for s in request.language_signals]
 
@@ -202,6 +209,7 @@ async def analyse_signals(request: AnalyseRequest):
             window_start_ms=window_start,
             window_end_ms=window_end,
             content_type=content_type,
+            profile=profile,
         )
 
         state = compute_unified_state(
@@ -214,7 +222,7 @@ async def analyse_signals(request: AnalyseRequest):
         speaker_alerts = []
         for fs in fusion_signals:
             if fs.get("confidence", 0) >= 0.50:
-                alert = _create_alert(session_id, speaker_id, fs, content_type)
+                alert = _create_alert(session_id, speaker_id, fs, content_type, profile)
                 if alert:
                     speaker_alerts.append(alert)
 
@@ -310,7 +318,8 @@ async def analyse_signals(request: AnalyseRequest):
         graph_insights = analytics.compute_all(content_type=content_type)
 
         graph_signals = rule_engine.evaluate_graph_insights(
-            graph_insights, speakers, all_fusion_signals, content_type=content_type
+            graph_insights, speakers, all_fusion_signals,
+            content_type=content_type, profile=profile,
         )
         all_fusion_signals.extend(graph_signals)
 
@@ -501,13 +510,13 @@ def _normalise_redis_signal(s: dict) -> dict:
     }
 
 
-def _create_alert(session_id: str, speaker_id: str, fusion_signal: dict, content_type: str = "sales_call") -> Optional[dict]:
+def _create_alert(session_id: str, speaker_id: str, fusion_signal: dict, content_type: str = "sales_call", profile=None) -> Optional[dict]:
     """Create an alert from a significant fusion signal."""
     sig_type = fusion_signal.get("signal_type", "")
     value_text = fusion_signal.get("value_text", "")
     confidence = fusion_signal.get("confidence", 0)
 
-    # Content-type gating: some alerts only make sense for certain content types
+    # Content-type gating via profile
     SALES_ONLY_ALERTS = {
         ("urgency_authenticity", "manufactured_urgency"),
         ("urgency_authenticity", "ambiguous_urgency"),
@@ -516,9 +525,12 @@ def _create_alert(session_id: str, speaker_id: str, fusion_signal: dict, content
     if (sig_type, value_text) in SALES_ONLY_ALERTS and content_type not in ("sales_call", "pitch", "presentation"):
         return None
 
-    # For internal meetings, raise confidence threshold
-    if content_type in ("internal", "meeting"):
-        if confidence < 0.60:
+    # For non-sales content types, raise confidence threshold
+    if content_type in ("internal", "meeting", "interview", "podcast"):
+        min_alert_conf = 0.60
+        if profile:
+            min_alert_conf = profile.get_threshold("ALERT", "min_confidence", 0.60)
+        if confidence < min_alert_conf:
             return None
 
     alert_map = {

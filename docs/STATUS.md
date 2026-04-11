@@ -1,7 +1,7 @@
 # STATUS.md — NEXUS Build Status Tracker
 
-**Last updated**: March 24, 2026
-**Current phase**: Phase 1 Week 6+ — Universal Media Input & Content-Adaptive Analysis
+**Last updated**: April 10, 2026
+**Current phase**: Phase 1 done · Phase 3A in progress (Neo4j single-session knowledge graph + hybrid RAG chat)
 
 ---
 
@@ -9,20 +9,56 @@
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Docker Compose | ✅ Done | PostgreSQL + Valkey orchestration |
-| PostgreSQL 16 + pgvector | ✅ Done | 15 tables, auto-created on first start |
+| Docker Compose | ✅ Done | PostgreSQL + Valkey + Neo4j orchestration |
+| PostgreSQL 16 + pgvector | ✅ Done | 15 tables incl. `knowledge_chunks`, `chat_messages`, auto-created on first start |
 | Valkey 8 (Redis) | ✅ Done | Streams-optimised config |
-| Database schema | ✅ Done | sessions, signals, alerts, rule_config, fusion_weights, etc. |
+| **Neo4j 5.26 (community)** | ✅ Done | Single-session knowledge graph; APOC + GDS plugins enabled |
+| Database schema | ✅ Done | sessions, signals, alerts, rule_config, fusion_weights, knowledge_chunks, chat_messages, session_reports, etc. |
 | Rule config seeded | ✅ Done | All rule thresholds in rule_config table |
 | Shared models | ✅ Done | Signal, SpeakerBaseline, Alert, CompoundPattern, UnifiedSpeakerState |
 | Message bus | ✅ Done | Redis Streams wrapper (publish, subscribe, get_latest) |
 | Config module | ✅ Done | Central settings from environment variables |
-| LLM client (dual provider) | ✅ Done | OpenAI + Anthropic via `shared/utils/llm_client.py` |
+| LLM client (tri-provider) | ✅ Done | OpenAI + Anthropic + **Ollama** via `shared/utils/llm_client.py` (all three with optional auth headers) |
 | Media ingestion | ✅ Done | Universal audio/video/URL input via `shared/utils/media_ingest.py` |
 | Content classifier | ✅ Done | Auto-detect content type via `shared/utils/content_classifier.py` |
+| **ContentTypeProfile** | ✅ Done | `shared/config/content_type_profile.py` — gating, threshold, confidence multiplier, signal renames per content type. **PROFILES dict still sparsely populated** (~10 of 42 rules have explicit entries). |
+| **Multi-backend transcription** | ✅ Done | Auto-cascade: Whisper+NeMo combined → Parakeet TDT → AssemblyAI → Deepgram → Whisper-only → local faster-whisper |
+| **GPU diarization cascade** | ✅ Done | External GPU `/diarize` → pyannote community-1 → pyannote 3.1 → KMeans → gap+pitch → round-robin |
 | Health check script | ✅ Done | Verifies PostgreSQL, pgvector, Redis, env vars |
-| .env.example | ✅ Done | All environment variable templates |
+| .env.example | ✅ Done | All env templates incl. Ollama, Neo4j |
 | .gitignore | ✅ Done | Python + Node + Docker + media files |
+
+---
+
+## Recent Changes (April 10, 2026)
+
+### Phase 3A — Single-Session Knowledge Graph (Neo4j)
+- **NEW**: `services/api_gateway/neo4j_sync.py` — projects each completed session into Neo4j after the analysis pipeline finishes. PostgreSQL stays the source of truth; Neo4j is a re-buildable projection.
+  - Node types: `Session`, `Speaker`, `Segment`, `Topic`, `Signal`, `FusionInsight`, `Entity:Person/Company/Product/Objection/Commitment`, `Alert`
+  - Edges built: `PARTICIPATED_IN`, `PART_OF`, `OCCURRED_IN`, `SPOKEN_BY`, `EMITTED_BY`, `NEXT`, `FOLLOWED_BY`, `PRECEDED`, `OCCURRED_DURING`, `DISCUSSES`, `MENTIONED_IN`, `IS_SPEAKER`, `RAISED_BY`, `RESOLVED_IN`, `RAISED_FOR`
+  - Causal edges (post-load Cypher): `CONTRADICTS`, `REINFORCES`, `TRIGGERED`
+  - Cross-speaker: `INFLUENCED {lag_ms}` within 30 s
+  - Sync is non-fatal: pipeline still completes if Neo4j is unreachable; idempotent (`DETACH DELETE` per session before re-write)
+- **UPDATED**: `/sessions/:id/chat` is now hybrid — pgvector text similarity **+** Neo4j graph search via LLM-generated Cypher (read-only, mutating queries refused). Either side can fail gracefully; the answer is built from whatever returned.
+- **NEW**: docker-compose `neo4j` service (`neo4j:5.26-community`, ports 7474/7687, APOC + GDS plugins, healthcheck), `NEO4J_URI/USER/PASSWORD` env vars, `neo4j_data` + `neo4j_logs` volumes
+- **NEW**: `neo4j>=5.20` added to api_gateway requirements
+- **NEW**: `services/api_gateway/neo4j_sync.search_graph_context()` — schema-aware Cypher generation with strict guardrails (forbids CREATE/MERGE/DELETE/SET, scopes every query to `$session_id`, caps at 15 rows)
+
+### Ollama LLM Provider Support
+- **NEW**: `LLM_PROVIDER=ollama` option in `shared/utils/llm_client.py` — routes `complete()`, `acomplete()`, and `get_embedding()` to a self-hosted or remote Ollama server
+- **NEW**: `OLLAMA_API_KEY` env var + `Authorization: Bearer` header support for gated Ollama proxies (e.g. `https://llm.vidoshare.com`)
+- **UPDATED**: `OLLAMA_URL`, `OLLAMA_API_KEY`, `OLLAMA_MODEL`, `OLLAMA_EMBED_MODEL` forwarded to `language`, `fusion`, and `api` services in docker-compose (previously only the `api` service)
+- **FIX**: Without these env-passthroughs, Language and Fusion agents were silently defaulting to OpenAI and hitting `429 insufficient_quota` despite the global Ollama setting
+
+### Pipeline & Data-Quality Fixes
+- **FIX**: AssemblyAI client wiring — collapsed three duplicate `_init_assemblyai` definitions in `services/voiceAgent/transcriber.py` (only the last one ran in Python). The kept definition uses `shared/utils/assemblyai_client.py` (standalone, supports `speakers_expected` hint, has poll timeout)
+- **FIX**: AssemblyAI standalone client — added `MAX_POLL_WAIT = 1200` cap in `_poll()` to prevent infinite hang on stuck transcripts
+- **FIX**: Parakeet + NeMo `/diarize` cascade — `_diarize_external_gpu` was reading `result["segments"]` but the GPU API returns `result["timeline"]`, so 22 valid speaker turns were always discarded as "0 segments" and the cascade fell through to local pyannote-community-1. Now reads `timeline` first, falls back to `segments` for older builds.
+- **FIX**: Removed dead duplicate `_init_deepgram_diarize` definitions in `transcriber.py` (the method was never called from `__init__` and only set a flag that's now confirmed always-False; cleaned up dead code path)
+- **FIX**: `entity_extractor.py` lightweight regex fallback now sets `speaker_label` on extracted people, so the dashboard's `speakerNames` map works even when the LLM is unreachable
+- **FIX**: `entity_extractor.py` LLM prompt now asks for `resolved_at_ms` per objection so Neo4j can build `(Objection)-[:RESOLVED_IN]->(Segment)` edges
+- **FIX**: `database.insert_signals` whitelist now accepts `speaker_id="session"` (Conversation Agent session-level signals) and `"X__Y"` pair labels (rapport/latency between speaker pairs) without warning — these intentionally store with `speaker_id=NULL`
+- **FIX**: `/sessions/:id/chat` pgvector query wrapped in try/except — degrades to empty rows on cross-provider embedding-dim mismatch (e.g. OpenAI 1536 → Ollama 768) instead of returning HTTP 500
 
 ---
 
@@ -205,59 +241,77 @@
 
 ---
 
-## API Gateway — ✅ COMPLETE (v0.2)
+## API Gateway — ✅ COMPLETE (v0.3)
 
 | Component | Status | File |
 |-----------|--------|------|
 | FastAPI application | ✅ Done | `services/api_gateway/main.py` |
 | Database module (asyncpg) | ✅ Done | `services/api_gateway/database.py` |
 | Auth module (JWT + bcrypt) | ✅ Done | `services/api_gateway/auth.py` |
-| POST /auth/signup | ✅ Done | Register with email, password, name |
-| POST /auth/login | ✅ Done | Returns access + refresh tokens |
-| POST /auth/refresh | ✅ Done | Exchange refresh token for new pair |
-| POST /auth/logout | ✅ Done | Invalidate refresh token (auth required) |
-| GET /auth/me | ✅ Done | Current user profile (auth required) |
-| PUT /auth/me | ✅ Done | Update profile fields (auth required) |
-| PUT /auth/change-password | ✅ Done | Change password (auth required) |
-| POST /sessions (upload + full pipeline) | ✅ Done | Auth required (member+), sets session owner |
-| GET /sessions (list, paginated) | ✅ Done | Auth required, user-scoped (admin sees all) |
-| GET /sessions/:id (detail) | ✅ Done | Auth required, ownership check |
-| GET /sessions/:id/signals | ✅ Done | Auth required, ownership check |
-| GET /sessions/:id/report | ✅ Done | Auth required, ownership check |
-| GET /sessions/:id/transcript | ✅ Done | Auth required, ownership check |
-| GET /health | ✅ Done | Public (no auth) |
+| Email service (ZeptoMail) | ✅ Done | `services/api_gateway/email_service.py` |
+| **Knowledge store (pgvector RAG)** | ✅ Done | `services/api_gateway/knowledge_store.py` — chunks transcript/signals/entities, embeds, persists to `knowledge_chunks` |
+| **Neo4j sync (Phase 3A)** | ✅ Done | `services/api_gateway/neo4j_sync.py` — single-session graph projection + hybrid Cypher chat search |
+| POST /auth/signup, /login, /refresh, /logout | ✅ Done | Full JWT lifecycle |
+| POST /auth/verify-email, /resend-verification | ✅ Done | Email verification flow |
+| GET/PUT /auth/me, /change-password | ✅ Done | Profile management |
+| POST /sessions (upload + full pipeline) | ✅ Done | Async background pipeline; emits status updates |
+| GET /sessions, /:id, /:id/signals, /:id/report, /:id/transcript | ✅ Done | All auth-gated, ownership-scoped |
+| **POST /sessions/:id/chat** | ✅ Done | Hybrid RAG: pgvector + Neo4j graph search |
+| **GET /sessions/:id/chat** | ✅ Done | Chat history retrieval |
+| GET /health | ✅ Done | Public, probes downstream agents |
 
 ---
 
-## Dashboard — ✅ PHASE 1 COMPLETE (v0.1)
+## Dashboard — ✅ COMPLETE (v0.3)
 
 **Stack**: React 18 + TypeScript + Vite + Tailwind CSS + Recharts + React Query + React Router
+
+| Page / Component | Status | File |
+|---|---|---|
+| SessionList | ✅ Done | `pages/SessionList.tsx` |
+| SessionDetail | ✅ Done | `pages/SessionDetail.tsx` (with content-type-aware speaker name/role inference from `entities.people`) |
+| ReportView | ✅ Done | `pages/ReportView.tsx` |
+| Login / Signup / VerifyEmail | ✅ Done | `pages/Login.tsx`, `Signup.tsx`, `VerifyEmail.tsx` |
+| SignalChainCards, SignalNetwork | ✅ Done | Per-signal explorers |
+| SwimlaneTimeline | ✅ Done | Multi-track signal timeline |
+| ConversationGraph, SpeakerGraph | ✅ Done | Per-pair rapport / dominance graphs |
+| StressTimeline, TopicTimeline | ✅ Done | Time-series visualisations |
+| GraphInsightsCard | ✅ Done | Tension clusters / momentum / persistent incongruence |
+| **SessionChat** | ✅ Done | RAG chat panel inside Session Detail |
+| `/speakers/:id`, `/insights`, `/graph` | 🔲 Phase 3B/3D | Cross-session pages — not started |
 
 ---
 
 ## What To Build Next (Priority Order)
 
-### Immediate
-1. ~~Build Language Agent~~ ✅
-2. ~~Build Fusion Agent~~ ✅
-3. ~~Build API Gateway~~ ✅
-4. ~~Build React Dashboard v1~~ ✅
-5. ~~Dual LLM provider support~~ ✅
-6. ~~Universal media input~~ ✅
-7. ~~Content-adaptive analysis~~ ✅
-8. Test with real recordings (sales calls, podcasts, interviews)
-9. Tune rule_config thresholds from real data
+### Immediate (Phase 3A — in progress)
+1. ~~Add Neo4j to docker-compose~~ ✅
+2. ~~`neo4j_sync.py` — single-session projection~~ ✅
+3. ~~Causal + cross-speaker influence edges~~ ✅
+4. ~~Hybrid pgvector + Neo4j chat~~ ✅
+5. **Validate on a real session**: upload recording, inspect Neo4j browser at `:7474`, run all 8 prompt.md Cypher use-cases manually
+6. Populate `ContentTypeProfile.PROFILES` for all 42 Phase 1 rules × 5 content types (currently ~10 entries; rest fall through to defaults)
+7. Test with real recordings (sales calls, podcasts, interviews) and tune `rule_config` thresholds
 
-### Next Week
-10. ~~Build Conversation Agent~~ ✅
-11. Add Speaker Cards to Session Detail
-12. Integrate media ingestion into API Gateway (accept URLs via POST)
+### Phase 3B Prerequisites (next 1–2 weeks)
+8. Add `voice_embedding VECTOR(256)` column to `speakers` table
+9. Extract per-speaker pyannote/embedding during diarization (model already loaded for community-1 fallback)
+10. `Session.outcome` column (won/lost/unknown) + dashboard tagger — Phase 3C precondition
+11. Add `COMPOSED_OF` / `COMBINES` provenance to fusion + conversation composite signals (rapport components, etc.) — unlocks prompt.md use-cases #6 and #7
 
-### Following Weeks
-13. Implement remaining compound patterns
-14. Add remaining fusion rules as video agents come online
-15. WebSocket support for live session updates
-16. Multi-track signal timeline (Phase 2 dashboard)
+### Phase 3B–3D (Weeks 19–24)
+12. Cross-session speaker identity (cosine match on voice embeddings, manual labelling UI)
+13. Entity resolver for cross-session companies/people/topics (`apoc.text.fuzzyMatch`)
+14. `/speakers/:id` Speaker Profile page (behavioural DNA radar, trajectory)
+15. `/insights` Organization Insights page (team heatmap, topic sensitivity, won-vs-lost)
+16. `/graph` Knowledge Graph Explorer (neovis.js)
+
+### Phase 2 (visual agents — deferred)
+17. Body Agent first (BODY-HEAD-01 head nod/shake — highest universal value)
+18. Facial Agent (FACE-EMO-01, FACE-SMILE-01, FACE-STRESS-01)
+19. Gaze Agent (GAZE-DIR-01, GAZE-CONTACT-01, GAZE-BLINK-01)
+20. Remaining 12 Fusion pairwise rules (need video signals)
+21. WebSocket `/ws/sessions/:id` for live session updates (precondition for Phase 4)
 
 ---
 
@@ -265,9 +319,16 @@
 
 | Issue | Severity | Mitigation |
 |-------|----------|-----------|
-| Simple diarisation inaccurate for 3+ speakers | Medium | Enable pyannote (USE_PYANNOTE=true + HF_TOKEN) |
+| `ContentTypeProfile.PROFILES` dict only ~10 of 42 rules populated | High | Mechanical data-entry from `docs/OPTIMIZATION_PLAN.md` tables; the wiring is in place, just unpopulated |
+| No real-data validation of any rule yet | High | Priority: label 3+ recordings, run pipeline, compare outputs to ground truth, tune thresholds |
+| `signal_graph.py` and `neo4j_sync.py` derive causal edges with **slightly different** sentiment/stress thresholds | Medium | Cross-check both code paths after first Neo4j validation run |
+| `knowledge_chunks` rows may have mixed embedding dims (OpenAI 1536 + Ollama 768) — old sessions break chat | Low | Chat now degrades gracefully (catches dim mismatch). For full re-index, drop and re-run knowledge_store on existing sessions |
+| Conversation pair / session signals (`Speaker_0__Speaker_1`, `"session"`) store with `speaker_id=NULL` | Low | Whitelisted to silence the warning. Pair identity preserved in `metadata` JSON, not as a queryable column |
+| `STATUS.md` / `PLAN.md` previously said Phase 1 Week 6+ but reality is Phase 3A in progress | ~~High~~ | ✅ Refreshed April 10, 2026 |
+| Simple diarisation inaccurate for 3+ speakers | ~~Medium~~ | ✅ External GPU `/diarize` cascade now primary; community-1 + KMeans fallbacks |
 | yt-dlp YouTube download blocked by bot detection | Medium | Use --cookies-from-browser or download manually |
 | ffmpeg not installed on dev machine | Low | afconvert (macOS) works for audio; ffmpeg needed for video |
-| Whisper "medium" model slow on CPU | Low | Use "small" for dev, "medium" for production |
-| No real data testing yet | High | Priority: test with diverse content types |
+| Whisper "medium" model slow on CPU | Low | Use external GPU Whisper instead (now primary) |
 | ~~No authentication~~ | ~~Low~~ | ✅ JWT auth implemented (March 24, 2026) |
+| ~~Language/Fusion agents hit OpenAI 429 despite LLM_PROVIDER=ollama~~ | ~~High~~ | ✅ Fixed April 10 — env vars now forwarded to all three services |
+| ~~Parakeet+NeMo `/diarize` always returns 0 segments~~ | ~~High~~ | ✅ Fixed April 10 — was reading wrong key (`segments` vs `timeline`) |

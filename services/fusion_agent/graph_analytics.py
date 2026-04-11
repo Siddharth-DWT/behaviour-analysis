@@ -41,7 +41,7 @@ class GraphAnalytics:
             "vocal_stress_score", "objection_signal", "filler_detection",
             "credibility_assessment", "verbal_incongruence",
         }
-        is_meeting = content_type in ("internal", "meeting")
+        is_meeting = content_type in ("internal", "meeting", "interview")
         negative_nodes = []
         for n in self.nodes.values():
             if n["type"] not in ("voice_signal", "lang_signal", "fusion_signal"):

@@ -18,12 +18,17 @@ Research references:
   - Lakoff 1975 (powerless language as incongruence marker)
 
 Confidence caps from RULES.md:
-  FUSION-02 max: 0.55 (deception-adjacent — hard cap)
+  FUSION-02 max: 0.65 (raised from 0.55 per Bond & DePaulo 2006 — stress ≠ deception, incongruence is valid)
   FUSION-07 max: 0.70
   FUSION-13 max: 0.60
 """
 import logging
 from typing import Optional
+
+try:
+    from shared.config.content_type_profile import ContentTypeProfile
+except ImportError:
+    ContentTypeProfile = None
 
 try:
     from shared.utils.conversions import to_float as _to_float, to_int as _to_int
@@ -53,9 +58,6 @@ class FusionRuleEngine:
     from different agents within temporal windows.
     """
 
-    # Content types where persuasion/urgency detection is relevant
-    URGENCY_RELEVANT_TYPES = {"sales_call", "presentation", "pitch", "debate"}
-
     def evaluate(
         self,
         speaker_id: str,
@@ -64,6 +66,7 @@ class FusionRuleEngine:
         window_start_ms: int = 0,
         window_end_ms: int = 0,
         content_type: str = "sales_call",
+        profile: "ContentTypeProfile | None" = None,
     ) -> list[dict]:
         """
         Run all fusion rules for a speaker given their recent signals.
@@ -75,74 +78,73 @@ class FusionRuleEngine:
             window_start_ms: Fusion window start
             window_end_ms: Fusion window end
             content_type: Meeting type for content-aware gating
+            profile: ContentTypeProfile instance (created from content_type if not passed)
 
         Returns:
             List of fusion signal dicts
         """
+        if profile is None and ContentTypeProfile is not None:
+            profile = ContentTypeProfile(content_type)
+
         signals = []
 
-        # ── FUSION-02: Content × Stress → Credibility ──
-        cred = self._rule_fusion_02(voice_signals, language_signals)
-        if cred is not None:
+        def _maybe_append(rule_id: str, result: dict | None, signal_type: str):
+            if result is None:
+                return
+            if profile and profile.is_gated(rule_id):
+                return
+            conf = round(result["confidence"], 4)
+            if profile:
+                conf = round(profile.apply_confidence(rule_id, conf), 4)
+            renamed = profile.rename_signal(signal_type) if profile else signal_type
             signals.append({
                 "agent": "fusion",
                 "speaker_id": speaker_id,
-                "signal_type": "credibility_assessment",
-                "value": round(cred["score"], 4),
-                "value_text": cred["level"],
-                "confidence": round(cred["confidence"], 4),
+                "signal_type": renamed,
+                "value": round(result["score"], 4),
+                "value_text": result["level"],
+                "confidence": conf,
                 "window_start_ms": window_start_ms,
                 "window_end_ms": window_end_ms,
-                "metadata": cred["evidence"],
+                "metadata": result["evidence"],
             })
+
+        # ── FUSION-02: Content × Stress → Stress-Sentiment Incongruence ──
+        if not (profile and profile.is_gated("FUSION-02")):
+            max_conf = profile.get_threshold("FUSION-02", "max_confidence", 0.65) if profile else 0.65
+            cred = self._rule_fusion_02(voice_signals, language_signals, max_confidence=max_conf)
+            _maybe_append("FUSION-02", cred, "stress_sentiment_incongruence")
 
         # ── FUSION-07: Hedge × Positive Sentiment → Incongruence ──
-        incong = self._rule_fusion_07(language_signals, voice_signals, content_type)
-        if incong is not None:
-            signals.append({
-                "agent": "fusion",
-                "speaker_id": speaker_id,
-                "signal_type": "verbal_incongruence",
-                "value": round(incong["score"], 4),
-                "value_text": incong["level"],
-                "confidence": round(incong["confidence"], 4),
-                "window_start_ms": window_start_ms,
-                "window_end_ms": window_end_ms,
-                "metadata": incong["evidence"],
-            })
+        if not (profile and profile.is_gated("FUSION-07")):
+            conf_floor = profile.get_threshold("FUSION-07", "confidence_floor", 0.10) if profile else 0.10
+            max_conf = profile.get_threshold("FUSION-07", "max_confidence", 0.70) if profile else 0.70
+            incong = self._rule_fusion_07(language_signals, voice_signals, content_type, conf_floor=conf_floor, max_conf=max_conf)
+            _maybe_append("FUSION-07", incong, "verbal_incongruence")
 
         # ── FUSION-13: Persuasion × Pace → Urgency Authenticity ──
-        urg = self._rule_fusion_13(voice_signals, language_signals, content_type)
-        if urg is not None:
-            signals.append({
-                "agent": "fusion",
-                "speaker_id": speaker_id,
-                "signal_type": "urgency_authenticity",
-                "value": round(urg["score"], 4),
-                "value_text": urg["level"],
-                "confidence": round(urg["confidence"], 4),
-                "window_start_ms": window_start_ms,
-                "window_end_ms": window_end_ms,
-                "metadata": urg["evidence"],
-            })
+        if not (profile and profile.is_gated("FUSION-13")):
+            urg = self._rule_fusion_13(voice_signals, language_signals, content_type)
+            _maybe_append("FUSION-13", urg, "urgency_authenticity")
 
         return signals
 
     # ════════════════════════════════════════════════════════
-    # FUSION-02: Speech Content × Voice Stress → Credibility
+    # FUSION-02: Speech Content × Voice Stress → Stress-Sentiment Incongruence
     # Research: Bond & DePaulo 2006, Levine 2014
-    # Max confidence: 0.55 (deception-adjacent, hard cap)
+    # Max confidence: 0.65 (raised — stress-sentiment gap ≠ deception claim)
     # ════════════════════════════════════════════════════════
 
     def _rule_fusion_02(
         self,
         voice_signals: list[dict],
         language_signals: list[dict],
+        max_confidence: float = 0.65,
     ) -> Optional[dict]:
         """
-        Cross-modal credibility check:
+        Cross-modal stress-sentiment incongruence check:
         When the CONTENT says something positive/certain but the VOICE
-        shows elevated stress, the gap suggests reduced credibility.
+        shows elevated stress, the gap flags incongruence for human review.
 
         Scans all time-aligned stress+sentiment pairs (within 10s window)
         and returns the strongest credibility concern found.
@@ -212,9 +214,9 @@ class FusionRuleEngine:
                 else:
                     level = "mostly_congruent"
 
-                raw_confidence = min(0.45 + (1.0 - credibility_score) * 0.20, 0.55)
+                raw_confidence = min(0.45 + (1.0 - credibility_score) * 0.20, max_confidence)
                 if reinforcing_count > 0:
-                    raw_confidence = min(raw_confidence + 0.05 * reinforcing_count, 0.55)
+                    raw_confidence = min(raw_confidence + 0.05 * reinforcing_count, max_confidence)
 
                 best_result = {
                     "score": credibility_score,
@@ -245,6 +247,8 @@ class FusionRuleEngine:
         language_signals: list[dict],
         voice_signals: list[dict] = None,
         content_type: str = "sales_call",
+        conf_floor: float = 0.10,
+        max_conf: float = 0.70,
     ) -> Optional[dict]:
         """
         Audio-only adaptation of FUSION-07 (Head Shake × Affirmative Language).
@@ -344,7 +348,7 @@ class FusionRuleEngine:
         if not has_voice_stress:
             # Downgrade: polite hedging, not true incongruence
             hedged_conf = min(0.35, score * 0.50)
-            if hedged_conf < 0.10:
+            if hedged_conf < conf_floor:
                 return None  # Below noise floor
             return {
                 "score": min(score, 0.30),
@@ -361,16 +365,11 @@ class FusionRuleEngine:
         else:
             level = "mild_verbal_incongruence"
 
-        raw_confidence = min(0.40 + score * 0.30, 0.70)
+        raw_confidence = min(0.40 + score * 0.30, max_conf)
 
         # (d) Minimum confidence threshold
-        if raw_confidence < 0.45:
+        if raw_confidence < conf_floor:
             return None
-
-        # For internal meetings, require higher confidence (more natural variance)
-        if content_type in ("internal", "meeting", "interview"):
-            if raw_confidence < 0.35:
-                return None
 
         return {
             "score": score,
@@ -414,10 +413,6 @@ class FusionRuleEngine:
         genuinely enthusiastic about their product from one artificially
         creating time pressure.
         """
-        # GATE: Only fire on content types where persuasion/urgency detection makes sense
-        if content_type not in self.URGENCY_RELEVANT_TYPES:
-            return None
-
         # Need rate anomaly signal (elevated = speaking faster than baseline)
         rate_signals = [
             s for s in voice_signals
@@ -580,25 +575,31 @@ class FusionRuleEngine:
         speakers: list[str],
         existing_fusion_signals: list[dict],
         content_type: str = "sales_call",
+        profile: "ContentTypeProfile | None" = None,
     ) -> list[dict]:
         """Generate fusion signals from graph analytics."""
+        if profile is None and ContentTypeProfile is not None:
+            profile = ContentTypeProfile(content_type)
+
         signals = []
 
         # FUSION-GRAPH-01: Tension Cluster Detection
-        for cluster in graph_insights.get("tension_clusters", []):
-            if cluster["signal_count"] >= 3:
-                conf = min(0.50 + (cluster["signal_count"] - 3) * 0.05, 0.75)
-                signals.append({
-                    "agent": "fusion",
-                    "speaker_id": cluster["speaker_id"],
-                    "signal_type": "tension_cluster",
-                    "value": round(cluster["signal_count"] / 10.0, 3),
-                    "value_text": "high_tension" if cluster["signal_count"] >= 5 else "moderate_tension",
-                    "confidence": round(conf, 3),
-                    "window_start_ms": cluster["timestamp_ms"],
-                    "window_end_ms": cluster["timestamp_ms"] + cluster["duration_ms"],
-                    "metadata": cluster,
-                })
+        if not (profile and profile.is_gated("FUSION-GRAPH-01")):
+            min_signals = int(profile.get_threshold("FUSION-GRAPH-01", "min_signals", 3)) if profile else 3
+            for cluster in graph_insights.get("tension_clusters", []):
+                if cluster["signal_count"] >= min_signals:
+                    conf = min(0.50 + (cluster["signal_count"] - min_signals) * 0.05, 0.75)
+                    signals.append({
+                        "agent": "fusion",
+                        "speaker_id": cluster["speaker_id"],
+                        "signal_type": "tension_cluster",
+                        "value": round(cluster["signal_count"] / 10.0, 3),
+                        "value_text": "high_tension" if cluster["signal_count"] >= min_signals + 2 else "moderate_tension",
+                        "confidence": round(conf, 3),
+                        "window_start_ms": cluster["timestamp_ms"],
+                        "window_end_ms": cluster["timestamp_ms"] + cluster["duration_ms"],
+                        "metadata": cluster,
+                    })
 
         # FUSION-GRAPH-02: Momentum Shift Detection
         momentum = graph_insights.get("momentum", {})
@@ -619,18 +620,19 @@ class FusionRuleEngine:
             })
 
         # FUSION-GRAPH-03: Persistent Incongruence
-        for speaker_id, pattern in graph_insights.get("incongruence_patterns", {}).items():
-            if pattern.get("consistency") == "persistent":
-                signals.append({
-                    "agent": "fusion",
-                    "speaker_id": speaker_id,
-                    "signal_type": "persistent_incongruence",
-                    "value": round(pattern["total_contradicts_edges"] / 10.0, 3),
-                    "value_text": "persistent_incongruence",
-                    "confidence": 0.60,
-                    "window_start_ms": pattern.get("worst_incongruence_ms", 0),
-                    "window_end_ms": pattern.get("worst_incongruence_ms", 0),
-                    "metadata": pattern,
-                })
+        if not (profile and profile.is_gated("FUSION-GRAPH-03")):
+            for speaker_id, pattern in graph_insights.get("incongruence_patterns", {}).items():
+                if pattern.get("consistency") == "persistent":
+                    signals.append({
+                        "agent": "fusion",
+                        "speaker_id": speaker_id,
+                        "signal_type": "persistent_incongruence",
+                        "value": round(pattern["total_contradicts_edges"] / 10.0, 3),
+                        "value_text": "persistent_incongruence",
+                        "confidence": 0.60,
+                        "window_start_ms": pattern.get("worst_incongruence_ms", 0),
+                        "window_end_ms": pattern.get("worst_incongruence_ms", 0),
+                        "metadata": pattern,
+                    })
 
         return signals

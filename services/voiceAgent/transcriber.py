@@ -31,7 +31,7 @@ warnings.filterwarnings("ignore", message=".*libtorchcodec.*")
 
 import torchaudio as _ta
 import torch
-from typing import Optional
+from typing import Any, Optional
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -142,32 +142,31 @@ class Transcriber:
 
         backend = TRANSCRIPTION_BACKEND.lower()
 
-        # Fallback chains by backend mode:
-        #   auto:       AssemblyAI → Parakeet+NeMo → Whisper+NeMo → Deepgram → Local
-        #   assemblyai: AssemblyAI → Parakeet+NeMo → Local
-        #   parakeet:   Parakeet+NeMo → AssemblyAI → Whisper+NeMo → Deepgram → Local
-        #   whisper-nemo: Whisper+NeMo → Parakeet+NeMo → AssemblyAI → Deepgram → Local
+        # Always initialise every backend whose credentials/URL are configured.
+        # TRANSCRIPTION_BACKEND only controls the AUTO cascade order (which backend
+        # is tried first when no explicit model_preference is given).
+        # Explicit model_preference overrides always need the target backend ready.
 
-        # Init all backends that this mode can use
-        if backend in ("auto", "assemblyai", "parakeet") and ASSEMBLYAI_API_KEY:
-            self._init_assemblyai()
-
-        if backend in ("auto", "parakeet", "whisper-nemo", "whisper-pyannote") and PARAKEET_URL:
-            self._init_parakeet()
-
-        if backend in ("auto", "whisper-nemo", "whisper-pyannote", "parakeet") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
+        if EXTERNAL_TRANSCRIBE_DIARIZE_URL:
             self._init_whisper_pyannote()
 
-        # Parakeet needs a separate diarization backend (/diarize endpoint)
-        if backend in ("auto", "parakeet", "whisper") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
-            if not self._use_external_diarize:
-                self._init_external_diarize()
+        if PARAKEET_URL:
+            self._init_parakeet()
 
-        if backend in ("auto", "parakeet", "whisper-nemo") and DEEPGRAM_API_KEY:
+        # External GPU diarizer (used by Parakeet + separate-Whisper modes)
+        if EXTERNAL_TRANSCRIBE_DIARIZE_URL and not self._use_external_diarize:
+            self._init_external_diarize()
+
+        if ASSEMBLYAI_API_KEY:
+            self._init_assemblyai()
+
+        if DEEPGRAM_API_KEY:
             self._init_deepgram()
 
-        if backend in ("auto", "whisper") and EXTERNAL_WHISPER_URL:
+        if EXTERNAL_WHISPER_URL:
             self._init_external()
+
+        _ = backend  # used below in auto-cascade ordering only
 
     def _init_whisper_pyannote(self):
         """Try to initialise Whisper+Pyannote combined endpoint (single call, GPU)."""
@@ -182,11 +181,11 @@ class Transcriber:
             resp = httpx.get(f"{base}/health", headers=headers, timeout=30)
             if resp.status_code == 200:
                 self._use_whisper_pyannote = True
-                logger.info(f"Using Whisper+Pyannote combined endpoint: {url}")
+                logger.info(f"Using Whisper+NEMO combined endpoint: {url}")
             else:
-                logger.warning(f"Whisper+Pyannote endpoint not healthy ({resp.status_code})")
+                logger.warning(f"Whisper+NEMO endpoint not healthy ({resp.status_code})")
         except Exception as e:
-            logger.warning(f"Could not connect to Whisper+Pyannote endpoint: {e}")
+            logger.warning(f"Could not connect to Whisper+NEMO endpoint: {e}")
 
     def _init_parakeet(self):
         """Try to initialise Parakeet TDT client (fast transcription with word timestamps)."""
@@ -279,46 +278,6 @@ class Transcriber:
                 f"Falling back to local faster-whisper."
             )
 
-    def _init_deepgram_diarize(self):
-        """Try to initialise Deepgram Nova-3 diarization client."""
-        try:
-            project_root = str(Path(__file__).parent.parent.parent)
-            if project_root not in sys.path:
-                sys.path.insert(0, project_root)
-
-            from shared.utils.external_apis import DeepgramDiarizeClient
-
-            client = DeepgramDiarizeClient(api_key=DEEPGRAM_API_KEY)
-
-            if client.is_healthy():
-                self._deepgram_client = client
-                self._use_deepgram_diarize = True
-                logger.info("Using DEEPGRAM Nova-3 for transcription + diarization (fallback)")
-            else:
-                logger.warning("Deepgram API not reachable. Trying other backends.")
-        except Exception as e:
-            logger.warning(f"Could not initialise Deepgram client: {e}")
-
-    def _init_deepgram_diarize(self):
-        """Try to initialise Deepgram Nova-3 diarization client."""
-        try:
-            project_root = str(Path(__file__).parent.parent.parent)
-            if project_root not in sys.path:
-                sys.path.insert(0, project_root)
-
-            from shared.utils.external_apis import DeepgramDiarizeClient
-
-            client = DeepgramDiarizeClient(api_key=DEEPGRAM_API_KEY)
-
-            if client.is_healthy():
-                self._deepgram_client = client
-                self._use_deepgram_diarize = True
-                logger.info("Using DEEPGRAM Nova-3 for transcription + diarization (fallback)")
-            else:
-                logger.warning("Deepgram API not reachable. Trying other backends.")
-        except Exception as e:
-            logger.warning(f"Could not initialise Deepgram client: {e}")
-
     def _init_external_diarize(self):
         """Try to connect to the external GPU diarization API."""
         try:
@@ -372,71 +331,116 @@ class Transcriber:
             logger.error("faster-whisper not installed. Run: pip install faster-whisper")
             raise
 
-    def transcribe(self, audio_path: str, num_speakers: Optional[int] = None, audio_data: tuple = None, meeting_type: str = "sales_call") -> dict:
+    def transcribe(
+        self,
+        audio_path: str,
+        num_speakers: Optional[int] = None,
+        audio_data: tuple = None,
+        meeting_type: str = "sales_call",
+        language: Optional[str] = None,
+        model_preference: Optional[str] = None,
+        custom_prompt: Optional[str] = None,
+        key_terms: Optional[list] = None,
+        multichannel: bool = False,
+        keep_filler_words: bool = False,
+        text_formatting: bool = False,
+        auto_punctuation: bool = True,
+        temperature: Optional[float] = None,
+        run_diarization: bool = True,
+        run_behavioural: bool = True,
+        translate_to: Optional[str] = None,
+    ) -> dict:
         """
         Transcribe an audio file with word-level timestamps.
 
-        Uses external GPU API if configured, otherwise local faster-whisper.
-
         Args:
-            audio_path: Path to audio file
-            num_speakers: Optional hint for number of speakers (2-10).
-                         None = auto-detect (defaults to 2 for simple diarization).
-
-        Returns:
-            {
-                "duration_seconds": float,
-                "backend": "external" | "local",
-                "model": str,
-                "segments": [
-                    {
-                        "speaker": "Speaker_0",
-                        "start_ms": int,
-                        "end_ms": int,
-                        "text": str,
-                        "words": [{"word": str, "start": float, "end": float, "probability": float}]
-                    }
-                ]
-            }
+            audio_path:       Path to audio file
+            num_speakers:     Optional hint for number of speakers (2-10)
+            audio_data:       Pre-loaded (y, sr) tuple — avoids redundant disk reads
+            meeting_type:     Content type for diarisation hints
+            language:         ISO 639-1 code (e.g. "en") or None for auto-detect
+            model_preference: "parakeet"|"whisper"|"deepgram"|"assemblyai" or None (auto)
+            custom_prompt:    Style instructions forwarded to Whisper as initial_prompt
+            key_terms:        Domain vocabulary list (word_boost / keywords per backend)
+            multichannel:     Each audio channel is a separate speaker (not yet implemented)
         """
         self._num_speakers = num_speakers
         self._audio_data = audio_data
         self._meeting_type = meeting_type
+        self._language = language
+        self._custom_prompt = custom_prompt
+        self._key_terms = key_terms or []
+        self._multichannel = multichannel
+        self._keep_filler_words = keep_filler_words
+        self._text_formatting = text_formatting
+        self._auto_punctuation = auto_punctuation
+        self._temperature = temperature
+        self._run_diarization = run_diarization
+        self._run_behavioural = run_behavioural
+        self._translate_to = translate_to
         self._tmp_wav = None  # Track temp WAV for cleanup
 
         try:
-            # Convert to 16kHz mono WAV upfront if input is a video/non-WAV container.
-            # This ensures ALL backends get clean audio regardless of input format.
+            # Convert to 16kHz mono WAV upfront so all backends get clean audio.
             effective_path = self._ensure_wav(audio_path)
 
-            # Dispatch by backend mode:
-            #   auto:       AssemblyAI -> Parakeet+NeMo -> Whisper+NeMo -> Deepgram -> Local
-            #   assemblyai: AssemblyAI -> Parakeet+NeMo -> Local
-            #   parakeet:   Parakeet+NeMo -> AssemblyAI -> Whisper+NeMo -> Deepgram -> Local
-            #   whisper-nemo: Whisper+NeMo -> Parakeet+NeMo -> AssemblyAI -> Deepgram -> Local
-            backend = TRANSCRIPTION_BACKEND.lower()
-
-            if backend == "assemblyai" and self._use_assemblyai:
-                return self._transcribe_assemblyai(effective_path)
-            elif backend == "parakeet" and self._use_parakeet:
-                return self._transcribe_parakeet(effective_path)
-            elif backend in ("whisper-nemo", "whisper-pyannote") and self._use_whisper_pyannote:
-                return self._transcribe_whisper_pyannote(effective_path)
-            elif backend == "auto":
+            # model_preference overrides the normal backend cascade.
+            # Falls back to auto cascade if the preferred backend is unavailable.
+            result = None
+            if model_preference == "assemblyai":
                 if self._use_assemblyai:
-                    return self._transcribe_assemblyai(effective_path)
-                elif self._use_parakeet:
-                    return self._transcribe_parakeet(effective_path)
-                elif self._use_whisper_pyannote:
-                    return self._transcribe_whisper_pyannote(effective_path)
-                elif self._use_deepgram:
-                    return self._transcribe_deepgram(effective_path)
-                elif self._use_external:
-                    return self._transcribe_external(effective_path)
+                    result = self._transcribe_assemblyai(effective_path)
                 else:
-                    return self._transcribe_local(effective_path)
-            else:
-                return self._transcribe_local(effective_path)
+                    logger.warning("model_preference=assemblyai requested but AssemblyAI not configured — using auto")
+            elif model_preference == "deepgram":
+                if self._use_deepgram:
+                    result = self._transcribe_deepgram(effective_path)
+                else:
+                    logger.warning("model_preference=deepgram requested but Deepgram not configured — using auto")
+            elif model_preference == "whisper":
+                need_diarize = self._run_diarization or self._run_behavioural
+                if need_diarize and self._use_whisper_pyannote:
+                    # Combined /transcribe-diarize endpoint — best quality, one GPU call
+                    result = self._transcribe_whisper_pyannote(effective_path)
+                elif self._use_external:
+                    # /transcribe only — diarize internally gated on need_diarize
+                    result = self._transcribe_external(effective_path)
+                else:
+                    result = self._transcribe_local(effective_path)
+            elif model_preference == "parakeet":
+                if self._use_parakeet:
+                    result = self._transcribe_parakeet(effective_path)
+                else:
+                    logger.warning("model_preference=parakeet requested but Parakeet not configured — using auto")
+
+            if result is None:
+                # Auto cascade (default):
+                #   1. Whisper+NeMo combined (/transcribe-diarize — best quality)
+                #   2. Parakeet + NeMo (/transcribe + /diarize — fast)
+                #   3. AssemblyAI (one call, Universal-3 Pro)
+                #   4. Deepgram (one call, Nova-3)
+                #   5. Whisper + separate diarize cascade
+                #   6. Local faster-whisper + local diarize (CPU)
+                if self._use_whisper_pyannote:
+                    result = self._transcribe_whisper_pyannote(effective_path)
+                elif self._use_parakeet:
+                    result = self._transcribe_parakeet(effective_path)
+                elif self._use_assemblyai:
+                    result = self._transcribe_assemblyai(effective_path)
+                elif self._use_deepgram:
+                    result = self._transcribe_deepgram(effective_path)
+                elif self._use_external:
+                    result = self._transcribe_external(effective_path)
+                else:
+                    result = self._transcribe_local(effective_path)
+
+            # When diarization is disabled, collapse all speakers to Speaker_0
+            if not self._run_diarization and result:
+                for seg in result.get("segments", []):
+                    seg["speaker"] = "Speaker_0"
+                result["speakers"] = ["Speaker_0"] if result.get("segments") else []
+
+            return result
         finally:
             # Cleanup temp WAV if we created one
             if self._tmp_wav is not None:
@@ -449,6 +453,13 @@ class Transcriber:
             self._num_speakers = None
             self._audio_data = None
             self._meeting_type = None
+            self._language = None
+            self._custom_prompt = None
+            self._key_terms = []
+            self._multichannel = False
+            self._run_diarization = True
+            self._run_behavioural = True
+            self._translate_to = None
 
     def _ensure_wav(self, audio_path: str) -> str:
         """
@@ -540,8 +551,9 @@ class Transcriber:
             f"{len(segments)} segments (after split), time={proc_time:.1f}s"
         )
 
-        # Apply speaker diarization (same cascade as Whisper separate path)
-        segments = self._diarize_simple(segments, self._num_speakers, audio_path)
+        # Apply speaker diarization when needed (GPU /diarize → pyannote → KMeans cascade)
+        if self._run_diarization or self._run_behavioural:
+            segments = self._diarize_simple(segments, self._num_speakers, audio_path)
 
         return {
             "duration_seconds": duration,
@@ -689,10 +701,29 @@ class Transcriber:
         logger.info(f"Transcribing via AssemblyAI: {audio_path}")
 
         try:
-            result = self._assemblyai_client.transcribe(
-                audio_path,
-                speakers_expected=self._num_speakers,
-            )
+            # AssemblyAIClient may come from assemblyai_client.py (.transcribe)
+            # or external_apis.py (.transcribe_and_diarize) — try both
+            if hasattr(self._assemblyai_client, 'transcribe'):
+                kwargs: dict = {
+                    "speakers_expected": self._num_speakers,
+                    "keep_filler_words": self._keep_filler_words,
+                    "text_formatting": self._text_formatting,
+                    "auto_punctuation": self._auto_punctuation,
+                    "multichannel": self._multichannel,
+                }
+                if self._language:
+                    kwargs["language_code"] = self._language
+                if self._key_terms:
+                    kwargs["key_terms"] = self._key_terms
+                if self._custom_prompt:
+                    kwargs["custom_prompt"] = self._custom_prompt
+                if self._temperature is not None:
+                    kwargs["temperature"] = self._temperature
+                if self._translate_to:
+                    kwargs["translate_to"] = self._translate_to
+                result = self._assemblyai_client.transcribe(audio_path, **kwargs)
+            else:
+                result = self._assemblyai_client.transcribe_and_diarize(audio_path)
         except Exception as e:
             logger.error(f"AssemblyAI failed: {e}. Falling back to next backend.")
             self._use_assemblyai = False
@@ -738,7 +769,18 @@ class Transcriber:
         logger.info(f"Transcribing via Deepgram: {audio_path}")
 
         try:
-            result = self._deepgram_client.transcribe(audio_path)
+            dg_kwargs: dict = {
+                "smart_format": self._text_formatting,
+                "punctuate": self._auto_punctuation,
+                "filler_words": self._keep_filler_words,
+                "multichannel": self._multichannel,
+            }
+            if self._language:
+                dg_kwargs["language"] = self._language
+            # detect_language is the default when no language is given — handled inside client
+            if self._key_terms:
+                dg_kwargs["key_terms"] = self._key_terms
+            result = self._deepgram_client.transcribe(audio_path, **dg_kwargs)
         except Exception as e:
             logger.error(f"Deepgram failed: {e}. Falling back to next backend.")
             self._use_deepgram = False
@@ -781,8 +823,10 @@ class Transcriber:
 
         meeting_type = getattr(self, "_meeting_type", "") or ""
 
+        need_diarize = self._run_diarization or self._run_behavioural
+
         # ── PARALLEL PATH: both Whisper + diarization on GPU ──
-        if self._use_external_diarize:
+        if self._use_external_diarize and need_diarize:
             logger.info(
                 f"Transcribing + diarizing in PARALLEL via GPU APIs: {audio_path}"
             )
@@ -792,14 +836,23 @@ class Transcriber:
             whisper_error = None
 
             def run_whisper():
-                return self._external_client.transcribe(
-                    audio_path,
-                    model=EXTERNAL_WHISPER_MODEL,
-                    language="en",
-                    word_timestamps=True,
-                    vad_filter=True,
-                    stream=True,
-                )
+                w_kwargs: dict = {
+                    "model": EXTERNAL_WHISPER_MODEL,
+                    "language": self._language,   # None = auto-detect
+                    "word_timestamps": True,
+                    "vad_filter": True,
+                    "stream": True,
+                }
+                if self._custom_prompt or self._key_terms:
+                    prompt_parts = []
+                    if self._custom_prompt:
+                        prompt_parts.append(self._custom_prompt)
+                    if self._key_terms:
+                        prompt_parts.append(", ".join(self._key_terms))
+                    w_kwargs["initial_prompt"] = ". ".join(prompt_parts)
+                if self._temperature is not None:
+                    w_kwargs["temperature"] = self._temperature
+                return self._external_client.transcribe(audio_path, **w_kwargs)
 
             def run_diarize():
                 config = self.SPEAKER_DEFAULTS.get(
@@ -890,14 +943,23 @@ class Transcriber:
         logger.info(f"Transcribing via EXTERNAL API: {audio_path}")
 
         try:
-            result = self._external_client.transcribe(
-                audio_path,
-                model=EXTERNAL_WHISPER_MODEL,
-                language="en",
-                word_timestamps=True,
-                vad_filter=True,
-                stream=True,
-            )
+            seq_kwargs: dict = {
+                "model": EXTERNAL_WHISPER_MODEL,
+                "language": self._language or "en",
+                "word_timestamps": True,
+                "vad_filter": True,
+                "stream": True,
+            }
+            if self._custom_prompt or self._key_terms:
+                prompt_parts = []
+                if self._custom_prompt:
+                    prompt_parts.append(self._custom_prompt)
+                if self._key_terms:
+                    prompt_parts.append(", ".join(self._key_terms))
+                seq_kwargs["initial_prompt"] = ". ".join(prompt_parts)
+            if self._temperature is not None:
+                seq_kwargs["temperature"] = self._temperature
+            result = self._external_client.transcribe(audio_path, **seq_kwargs)
         except Exception as e:
             logger.error(
                 f"External Whisper API failed: {e}. "
@@ -920,8 +982,9 @@ class Transcriber:
             f"server_time={proc_time:.2f}s"
         )
 
-        # Apply speaker diarization (cascade handles pyannote/embedding/kmeans)
-        segments = self._diarize_simple(segments, self._num_speakers, audio_path)
+        # Apply speaker diarization only when needed
+        if need_diarize:
+            segments = self._diarize_simple(segments, self._num_speakers, audio_path)
 
         return {
             "duration_seconds": duration,
@@ -1025,11 +1088,28 @@ class Transcriber:
 
     def _run_whisper(self, audio_path: str, vad_filter: bool = True) -> tuple[list[dict], float]:
         """Run Whisper transcription and return (segments, duration_seconds)."""
-        kwargs = dict(
+        temperature = getattr(self, "_temperature", None)
+        kwargs: dict = dict(
             beam_size=5,
             word_timestamps=True,
-            language="en",
+            language=getattr(self, "_language", None),   # None = auto-detect
         )
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        # Forward custom_prompt and key_terms as Whisper initial_prompt
+        prompt_parts = []
+        custom_prompt = getattr(self, "_custom_prompt", None)
+        key_terms = getattr(self, "_key_terms", None) or []
+        if custom_prompt:
+            prompt_parts.append(custom_prompt)
+        if key_terms:
+            prompt_parts.append(", ".join(key_terms))
+        if prompt_parts:
+            kwargs["initial_prompt"] = ". ".join(prompt_parts)
+        # Whisper natively translates any language → English via task="translate"
+        translate_to = getattr(self, "_translate_to", None)
+        if translate_to and translate_to.startswith("en"):
+            kwargs["task"] = "translate"
         if vad_filter:
             kwargs["vad_filter"] = True
             kwargs["vad_parameters"] = dict(
@@ -1390,8 +1470,7 @@ class Transcriber:
         if num_speakers is not None:
             max_speakers = min(max(1, num_speakers), 10)
         else:
-            # GPU backends auto-detect within full range — don't limit them
-            max_speakers = config["max"]
+            max_speakers = config["max"]  # Let GPU backends auto-detect within full range
 
         # Single speaker — assign all segments and skip clustering
         if num_speakers == 1:
@@ -1434,7 +1513,7 @@ class Transcriber:
                 logger.warning(f"Pyannote 3.1 failed: {e}")
 
         # ── Local fallbacks need estimated speaker count ──
-        # GPU backends above auto-detect within min/max range.
+        # GPU backends above use full max_speakers range and auto-detect.
         # Local KMeans/gap need an explicit count to cluster.
         if num_speakers is None:
             estimated = self._estimate_speaker_count(segments)

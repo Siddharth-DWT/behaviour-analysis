@@ -37,6 +37,11 @@ except ImportError:
     from shared.models.signals import Signal, SpeakerBaseline
     from services.voiceAgent.calibration import CalibrationModule
 
+try:
+    from shared.config.content_type_profile import ContentTypeProfile
+except ImportError:
+    ContentTypeProfile = None
+
 logger = logging.getLogger("nexus.voice.rules")
 
 
@@ -80,6 +85,7 @@ class VoiceRuleEngine:
         speaker_id: str,
         transcript_segments: list[dict] = None,
         conversation_features: dict = None,
+        profile: "ContentTypeProfile | None" = None,
     ) -> list[dict]:
         """
         Run all rules against a single feature window.
@@ -90,6 +96,7 @@ class VoiceRuleEngine:
             speaker_id: Speaker identifier
             transcript_segments: Transcript segments in this window
             conversation_features: Reserved for future conversation-level features
+            profile: ContentTypeProfile for content-aware thresholds/gating/renaming
 
         Returns:
             List of Signal dicts (one per fired rule)
@@ -103,88 +110,89 @@ class VoiceRuleEngine:
         if cal_conf < 0.1:
             return signals
 
+        def _add(rule_id: str, signal_type: str, value, value_text: str,
+                 confidence: float, metadata: dict = None):
+            """Helper: apply profile gating, confidence multiplier, and renaming."""
+            if profile and profile.is_gated(rule_id):
+                return
+            conf = confidence
+            if profile:
+                conf = profile.apply_confidence(rule_id, conf)
+            renamed = profile.rename_signal(value_text) if profile else value_text
+            signals.append(_make_signal(
+                speaker_id, signal_type, value, renamed, conf,
+                window_start, window_end, metadata or {},
+            ))
+
         # ── VOICE-STRESS-01: Composite Vocal Stress Score ──
         stress = self._rule_stress_01(features, baseline)
         if stress is not None:
-            signals.append(_make_signal(
-                speaker_id, "vocal_stress_score",
-                stress["score"], stress["level"],
-                stress["score"] * cal_conf,
-                window_start, window_end,
-                stress["components"],
-            ))
+            stress_offset = profile.get_threshold("VOICE-STRESS-01", "stress_offset", 0.0) if profile else 0.0
+            adjusted_score = max(0, stress["score"] - stress_offset)
+            _add("VOICE-STRESS-01", "vocal_stress_score",
+                 adjusted_score, stress["level"],
+                 adjusted_score * cal_conf, stress["components"])
 
-        # ── VOICE-FILLER-01: Filler Detection ──
-        filler = self._rule_filler_01(features, baseline)
+        # ── VOICE-FILLER-01 + VOICE-FILLER-02: Filler Detection ──
+        # noticeable_pct: minimum filler rate to flag credibility impact.
+        # Default 2.5% per matrix; internal raises to 3.0% (Bortfeld 2001).
+        noticeable_pct = profile.get_threshold("VOICE-FILLER-02", "noticeable_pct", 2.5) if profile else 2.5
+        filler = self._rule_filler_01(features, baseline, noticeable_pct=noticeable_pct)
         if filler is not None:
-            signals.append(_make_signal(
-                speaker_id, "filler_detection",
-                filler["filler_rate_pct"], filler["status"],
-                0.90 * cal_conf,
-                window_start, window_end,
-                {
-                    "filler_count": filler["filler_count"],
-                    "um_count": filler["um_count"],
-                    "uh_count": filler["uh_count"],
-                    "delta_from_baseline": filler.get("delta", 0),
-                    "credibility_impact": filler.get("credibility_impact", "none"),
-                },
-            ))
+            _add("VOICE-FILLER-01", "filler_detection",
+                 filler["filler_rate_pct"], filler["status"],
+                 0.90 * cal_conf, {
+                     "filler_count": filler["filler_count"],
+                     "um_count": filler["um_count"],
+                     "uh_count": filler["uh_count"],
+                     "delta_from_baseline": filler.get("delta", 0),
+                     "credibility_impact": filler.get("credibility_impact", "none"),
+                 })
 
         # ── VOICE-PITCH-01: Pitch Elevation Flag ──
-        pitch = self._rule_pitch_01(features, baseline)
+        # mild_pct: minimum delta% to flag as mild elevation. Default 7% (Pakosz 1983); interview 12%.
+        mild_pct = profile.get_threshold("VOICE-PITCH-01", "mild_pct", 7.0) if profile else 7.0
+        pitch = self._rule_pitch_01(features, baseline, mild_pct=mild_pct)
         if pitch is not None:
-            signals.append(_make_signal(
-                speaker_id, "pitch_elevation_flag",
-                pitch["delta_pct"], pitch["level"],
-                0.50 * cal_conf,
-                window_start, window_end,
-                {
-                    "f0_current": pitch["f0_current"],
-                    "f0_baseline": pitch["f0_baseline"],
-                    "delta_pct": pitch["delta_pct"],
-                },
-            ))
+            _add("VOICE-PITCH-01", "pitch_elevation_flag",
+                 pitch["delta_pct"], pitch["level"],
+                 0.50 * cal_conf, {
+                     "f0_current": pitch["f0_current"],
+                     "f0_baseline": pitch["f0_baseline"],
+                     "delta_pct": pitch["delta_pct"],
+                 })
 
         # ── VOICE-PITCH-02: Monotone Detection ──
         monotone = self._rule_pitch_02(features, baseline)
         if monotone is not None:
-            signals.append(_make_signal(
-                speaker_id, "monotone_flag",
-                monotone["value"], monotone["value_text"],
-                monotone["confidence_raw"] * cal_conf,
-                window_start, window_end,
-                monotone.get("evidence", {}),
-            ))
+            _add("VOICE-PITCH-02", "monotone_flag",
+                 monotone["value"], monotone["value_text"],
+                 monotone["confidence_raw"] * cal_conf,
+                 monotone.get("evidence", {}))
 
         # ── VOICE-RATE-01: Speech Rate Anomaly ──
-        rate = self._rule_rate_01(features, baseline)
+        # anomaly_pct: deviation % from baseline to flag. Default 20% (Apple 1979); interview 35%.
+        anomaly_pct = profile.get_threshold("VOICE-RATE-01", "anomaly_pct", 20.0) if profile else 20.0
+        rate = self._rule_rate_01(features, baseline, anomaly_pct=anomaly_pct)
         if rate is not None:
-            signals.append(_make_signal(
-                speaker_id, "speech_rate_anomaly",
-                rate["delta_pct"], rate["classification"],
-                0.40 * cal_conf,
-                window_start, window_end,
-                {
-                    "wpm_current": rate["wpm_current"],
-                    "wpm_baseline": rate["wpm_baseline"],
-                    "sub_classification": rate.get("sub_classification", ""),
-                },
-            ))
+            _add("VOICE-RATE-01", "speech_rate_anomaly",
+                 rate["delta_pct"], rate["classification"],
+                 0.40 * cal_conf, {
+                     "wpm_current": rate["wpm_current"],
+                     "wpm_baseline": rate["wpm_baseline"],
+                     "sub_classification": rate.get("sub_classification", ""),
+                 })
 
         # ── VOICE-TONE-03/04: Tone Classification (nervous/confident) ──
-        # If existing tone returns None or "neutral", try the 4 new tones
         tone = self._rule_tone(features, baseline)
+        tone_rule_id = "VOICE-TONE-03"  # nervous/confident
         if tone is not None and tone["tone"] not in ("neutral",):
-            signals.append(_make_signal(
-                speaker_id, "tone_classification",
-                tone["confidence_raw"], tone["tone"],
-                tone["confidence_raw"] * cal_conf,
-                window_start, window_end,
-                tone.get("evidence", {}),
-            ))
+            tone_rule_id = "VOICE-TONE-04" if tone["tone"] == "confident" else "VOICE-TONE-03"
+            _add(tone_rule_id, "tone_classification",
+                 tone["confidence_raw"], tone["tone"],
+                 tone["confidence_raw"] * cal_conf,
+                 tone.get("evidence", {}))
         else:
-            # Try new tone rules in priority order: warm → excited → aggressive → cold
             new_tone = (
                 self._rule_tone_warm(features, baseline)
                 or self._rule_tone_excited(features, baseline)
@@ -192,58 +200,50 @@ class VoiceRuleEngine:
                 or self._rule_tone_cold(features, baseline)
             )
             if new_tone is not None:
-                signals.append(_make_signal(
-                    speaker_id, "tone_classification",
-                    new_tone["confidence_raw"], new_tone["value_text"],
-                    new_tone["confidence_raw"] * cal_conf,
-                    window_start, window_end,
-                    new_tone.get("evidence", {}),
-                ))
+                tone_label = new_tone["value_text"]
+                tone_ids = {"warm": "VOICE-TONE-01", "excited": "VOICE-TONE-06",
+                            "aggressive": "VOICE-TONE-05", "cold": "VOICE-TONE-02"}
+                _add(tone_ids.get(tone_label, "VOICE-TONE-01"), "tone_classification",
+                     new_tone["confidence_raw"], tone_label,
+                     new_tone["confidence_raw"] * cal_conf,
+                     new_tone.get("evidence", {}))
             elif tone is not None:
-                # Emit the original neutral tone if no new tone matched
-                signals.append(_make_signal(
-                    speaker_id, "tone_classification",
-                    tone["confidence_raw"], tone["tone"],
-                    tone["confidence_raw"] * cal_conf,
-                    window_start, window_end,
-                    tone.get("evidence", {}),
-                ))
+                _add("VOICE-TONE-03", "tone_classification",
+                     tone["confidence_raw"], tone["tone"],
+                     tone["confidence_raw"] * cal_conf,
+                     tone.get("evidence", {}))
 
         # ── VOICE-ENERGY-01: Energy Level Classification ──
         energy = self._rule_energy_01(features, baseline)
         if energy is not None:
-            signals.append(_make_signal(
-                speaker_id, "energy_level",
-                energy["value"], energy["value_text"],
-                energy["confidence_raw"] * cal_conf,
-                window_start, window_end,
-                energy.get("evidence", {}),
-            ))
+            _add("VOICE-ENERGY-01", "energy_level",
+                 energy["value"], energy["value_text"],
+                 energy["confidence_raw"] * cal_conf,
+                 energy.get("evidence", {}))
 
         # ── VOICE-PAUSE-01: Pause Classification ──
-        pause_signals = self._rule_pause_01(features, baseline)
+        # extended_pause_ms: threshold for extended_hesitation. Default 2000ms;
+        # interview 3000ms (Stivers 2009: complex answers need formulation time).
+        extended_pause_ms = int(profile.get_threshold("VOICE-PAUSE-01", "extended_pause_ms", 2000)) if profile else 2000
+        pause_signals = self._rule_pause_01(features, baseline, extended_pause_ms=extended_pause_ms)
         for ps in pause_signals:
-            signals.append(_make_signal(
-                speaker_id, "pause_classification",
-                ps["value"], ps["value_text"],
-                ps["confidence_raw"] * cal_conf,
-                window_start, window_end,
-                ps.get("evidence", {}),
-            ))
+            _add("VOICE-PAUSE-01", "pause_classification",
+                 ps["value"], ps["value_text"],
+                 ps["confidence_raw"] * cal_conf,
+                 ps.get("evidence", {}))
 
         # ── VOICE-INT-01: Interruption Detection ──
+        # min_overlap_ms: minimum overlap to count as interruption. Default 500ms (Levinson 1983);
+        # podcast 400ms (crosstalk / simultaneous laughter is normal in podcasts).
         if transcript_segments:
-            int_signals = self._rule_int_01(features, baseline, transcript_segments)
+            min_overlap_ms = int(profile.get_threshold("VOICE-INT-01", "overlap_ms", 500)) if profile else 500
+            int_signals = self._rule_int_01(features, baseline, transcript_segments, min_overlap_ms=min_overlap_ms)
             if int_signals:
                 for isig in int_signals:
-                    signals.append(_make_signal(
-                        speaker_id, "interruption_event",
-                        isig["value"], isig["value_text"],
-                        isig["confidence_raw"] * cal_conf,
-                        isig.get("window_start_ms", window_start),
-                        isig.get("window_end_ms", window_end),
-                        isig.get("evidence", {}),
-                    ))
+                    _add("VOICE-INT-01", "interruption_event",
+                         isig["value"], isig["value_text"],
+                         isig["confidence_raw"] * cal_conf,
+                         isig.get("evidence", {}))
 
         return signals
     
@@ -323,7 +323,7 @@ class VoiceRuleEngine:
     # Research: Clark & Fox Tree 2002, Duvall 2014
     # ════════════════════════════════════════════════════════
     
-    def _rule_filler_01(self, f: dict, b: SpeakerBaseline) -> Optional[dict]:
+    def _rule_filler_01(self, f: dict, b: SpeakerBaseline, noticeable_pct: float = 2.5) -> Optional[dict]:
         """
         Filler word detection with baseline comparison and credibility assessment.
         """
@@ -350,11 +350,12 @@ class VoiceRuleEngine:
             status = "normal"
         
         # VOICE-FILLER-02: Absolute credibility thresholds
+        # noticeable_pct is content-type-aware (default 2.5%, internal 3.0%)
         if filler_rate > 4.0:
             credibility_impact = "severe"
         elif filler_rate > 2.5:
             credibility_impact = "significant"
-        elif filler_rate > 1.3:
+        elif filler_rate > noticeable_pct:
             credibility_impact = "noticeable"
         else:
             credibility_impact = "none"
@@ -378,13 +379,13 @@ class VoiceRuleEngine:
     # Research: Streeter et al. 1977, Laukka 2008, Weeks 2011
     # ════════════════════════════════════════════════════════
     
-    def _rule_pitch_01(self, f: dict, b: SpeakerBaseline) -> Optional[dict]:
+    def _rule_pitch_01(self, f: dict, b: SpeakerBaseline, mild_pct: float = 7.0) -> Optional[dict]:
         """
         Detect pitch elevation from baseline.
         Pitch rise = arousal/stress indicator (NOT deception per se).
-        
+
         Thresholds:
-          > +8%  → mild (arousal increase)
+          > +7%  → mild (arousal increase, Pakosz 1983)
           > +15% → significant (strong stress response)
           > +25% → extreme (acute stress or strong emotion)
         """
@@ -395,7 +396,7 @@ class VoiceRuleEngine:
         delta_pct = self.cal.compute_delta(f0_current, b.f0_mean) * 100
         
         # Only flag elevations (stress indicator). Drops are separate (confidence/disengagement).
-        if delta_pct < 8.0:
+        if delta_pct < mild_pct:
             return None  # Within normal range, don't flag
         
         if delta_pct >= 25.0:
@@ -417,12 +418,12 @@ class VoiceRuleEngine:
     # Research: Apple et al. 1979, Smith et al. 1975
     # ════════════════════════════════════════════════════════
     
-    def _rule_rate_01(self, f: dict, b: SpeakerBaseline) -> Optional[dict]:
+    def _rule_rate_01(self, f: dict, b: SpeakerBaseline, anomaly_pct: float = 20.0) -> Optional[dict]:
         """
         Detect speech rate deviations from baseline.
-        
-        > +25% → rate_elevated (anxiety, enthusiasm, or rushing)
-        < -25% → rate_depressed (disengagement, cognitive load, or deliberation)
+
+        > +20% → rate_elevated (anxiety, enthusiasm, or rushing)
+        < -20% → rate_depressed (disengagement, cognitive load, or deliberation)
         """
         wpm_current = f.get("speech_rate_wpm", 0)
         if wpm_current < 30 or b.speech_rate_wpm < 30:  # Filter out near-silence
@@ -430,10 +431,10 @@ class VoiceRuleEngine:
         
         delta_pct = self.cal.compute_delta(wpm_current, b.speech_rate_wpm) * 100
         
-        if abs(delta_pct) < 25.0:
+        if abs(delta_pct) < anomaly_pct:
             return None  # Within normal range
-        
-        if delta_pct > 25.0:
+
+        if delta_pct > anomaly_pct:
             classification = "rate_elevated"
             # Sub-classify based on concurrent features
             f0_delta = self.cal.compute_delta(f.get("f0_mean", 0), b.f0_mean) if b.f0_mean > 0 else 0
@@ -912,7 +913,7 @@ class VoiceRuleEngine:
     # Returns a LIST (can emit multiple signals per window)
     # ════════════════════════════════════════════════════════
 
-    def _rule_pause_01(self, f: dict, b: SpeakerBaseline) -> list[dict]:
+    def _rule_pause_01(self, f: dict, b: SpeakerBaseline, extended_pause_ms: int = 2000) -> list[dict]:
         """
         Classify pause patterns in the current window.
 
@@ -954,8 +955,8 @@ class VoiceRuleEngine:
                 },
             })
 
-        # Extended hesitation
-        if max_pause_ms > 2000:
+        # Extended hesitation (threshold is content-type-aware; interview=3000ms)
+        if max_pause_ms > extended_pause_ms:
             confidence = min(max_pause_ms / 5000.0, 0.65)
             results.append({
                 "value": round(max_pause_ms / 1000.0, 4),
@@ -976,14 +977,15 @@ class VoiceRuleEngine:
     # ════════════════════════════════════════════════════════
 
     def _rule_int_01(
-        self, f: dict, b: SpeakerBaseline, transcript_segments: list[dict]
+        self, f: dict, b: SpeakerBaseline, transcript_segments: list[dict],
+        min_overlap_ms: int = 500,
     ) -> Optional[list[dict]]:
         """
         Detect interruptions from transcript segment overlaps.
 
         Checks consecutive segments: if seg_b starts before seg_a ends
-        AND they are different speakers AND overlap > 200 ms, that's
-        an interruption. If the interrupting segment has <= 2 words,
+        AND they are different speakers AND overlap > 500ms (Levinson 1983),
+        that's an interruption. If the interrupting segment has <= 2 words,
         it's a backchannel (skip).
 
         Returns:
@@ -1009,8 +1011,8 @@ class VoiceRuleEngine:
                 continue
 
             overlap_ms = seg_a["end_ms"] - seg_b["start_ms"]
-            if overlap_ms <= 200:
-                continue  # Too short to be a real interruption
+            if overlap_ms <= min_overlap_ms:
+                continue  # Below content-type threshold (podcast=400ms, default=500ms)
 
             # Backchannel filter: if interrupting segment has <= 2 words, skip
             interrupter_words = len(seg_b.get("text", "").split())

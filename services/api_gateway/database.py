@@ -54,6 +54,16 @@ async def close_pool():
 # SESSIONS
 # ─────────────────────────────────────────────────────────
 
+async def _ensure_upload_config_column(pool: asyncpg.Pool):
+    """Add upload_config column to sessions if it doesn't exist yet (idempotent)."""
+    try:
+        await pool.execute(
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS upload_config JSONB DEFAULT '{}'"
+        )
+    except Exception:
+        pass  # Column already exists or DB doesn't support IF NOT EXISTS — safe to ignore
+
+
 async def create_session(
     title: str,
     session_type: str = "recording",
@@ -61,20 +71,23 @@ async def create_session(
     media_url: Optional[str] = None,
     org_id: str = DEV_ORG_ID,
     user_id: Optional[str] = None,
+    upload_config: Optional[dict] = None,
 ) -> dict:
     """Create a new session record. Returns the created session."""
     pool = await get_pool()
+    await _ensure_upload_config_column(pool)
     row = await pool.fetchrow(
         """
-        INSERT INTO sessions (org_id, title, session_type, meeting_type, media_url, status, user_id)
-        VALUES ($1, $2, $3, $4, $5, 'created', $6)
+        INSERT INTO sessions (org_id, title, session_type, meeting_type, media_url, status, user_id, upload_config)
+        VALUES ($1, $2, $3, $4, $5, 'created', $6, $7::jsonb)
         RETURNING id, org_id, title, session_type, meeting_type, status,
                   media_url, duration_ms, speaker_count, user_id,
-                  created_at, started_at, completed_at
+                  created_at, started_at, completed_at, upload_config
         """,
         _uuid.UUID(org_id) if isinstance(org_id, str) else org_id,
         title, session_type, meeting_type, media_url,
         _uuid.UUID(user_id) if isinstance(user_id, str) and user_id else user_id,
+        json.dumps(upload_config or {}),
     )
     return _row_to_dict(row)
 
@@ -214,6 +227,10 @@ async def upsert_speakers(
     for speaker in speakers:
         label = speaker.get("speaker_id") or speaker.get("speaker_label", "Unknown")
         baseline_data = speaker.get("baseline")
+        talk_time_ms = int(speaker.get("talk_time_ms") or 0)
+        talk_time_pct = float(speaker.get("talk_time_pct") or 0.0)
+        total_words = int(speaker.get("total_words") or 0)
+        cal_conf = float(speaker.get("calibration_confidence") or 0.0)
 
         # Check if already exists
         existing = await pool.fetchrow(
@@ -226,23 +243,33 @@ async def upsert_speakers(
 
         if existing:
             speaker_uuid = str(existing["id"])
-            if baseline_data:
-                await pool.execute(
-                    """
-                    UPDATE speakers SET baseline_data = $1
-                    WHERE id = $2
-                    """,
-                    json.dumps(baseline_data), existing["id"],
-                )
+            await pool.execute(
+                """
+                UPDATE speakers
+                SET baseline_data          = COALESCE($1, baseline_data),
+                    total_talk_time_ms     = $2,
+                    talk_time_pct          = $3,
+                    total_words            = $4,
+                    calibration_confidence = $5
+                WHERE id = $6
+                """,
+                json.dumps(baseline_data) if baseline_data else None,
+                talk_time_ms, talk_time_pct, total_words, cal_conf,
+                existing["id"],
+            )
         else:
             row = await pool.fetchrow(
                 """
-                INSERT INTO speakers (session_id, speaker_label, baseline_data)
-                VALUES ($1, $2, $3)
+                INSERT INTO speakers (
+                    session_id, speaker_label, baseline_data,
+                    total_talk_time_ms, talk_time_pct, total_words, calibration_confidence
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id
                 """,
                 session_id, label,
                 json.dumps(baseline_data) if baseline_data else None,
+                talk_time_ms, talk_time_pct, total_words, cal_conf,
             )
             speaker_uuid = str(row["id"])
 
@@ -268,7 +295,15 @@ async def insert_signals(session_id: str, signals: list[dict], speaker_map: dict
     for s in signals:
         speaker_label = s.get("speaker_id", "unknown")
         speaker_uuid = speaker_map.get(speaker_label)
-        if speaker_uuid is None and speaker_label not in ("unknown", "all", "multiple", ""):
+        # Conversation Agent emits per-pair signals (e.g. "Speaker_0__Speaker_1"
+        # for rapport/latency) and session-level signals (speaker_id="session"
+        # for turn-taking, balance, conflict). These intentionally don't map to
+        # a single speaker — store with speaker_id=NULL and don't warn.
+        if (
+            speaker_uuid is None
+            and speaker_label not in ("unknown", "all", "multiple", "session", "")
+            and "__" not in speaker_label
+        ):
             unmapped_speakers.add(speaker_label)
 
         metadata = s.get("metadata")

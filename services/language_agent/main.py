@@ -149,6 +149,14 @@ async def analyse_transcript(request: AnalysisRequest):
     content_type = request.content_type or request.meeting_type or "sales_call"
     rule_engine.set_content_type(content_type)
 
+    # Create content-type profile for gating/renaming/confidence
+    _profile = None
+    try:
+        from shared.config.content_type_profile import ContentTypeProfile
+        _profile = ContentTypeProfile(content_type)
+    except ImportError:
+        pass
+
     logger.info(
         f"[{session_id}] Analysing {len(request.segments)} segments "
         f"(content_type={content_type})"
@@ -210,6 +218,7 @@ async def analyse_transcript(request: AnalysisRequest):
         signals = rule_engine.evaluate(
             features=features, speaker_id=speaker_id, content_type=content_type,
             all_features_list=features_list, current_index=i,
+            profile=_profile,
         )
         all_signals.extend(signals)
 
