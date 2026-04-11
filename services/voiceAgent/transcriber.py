@@ -146,6 +146,14 @@ class Transcriber:
         # TRANSCRIPTION_BACKEND only controls the AUTO cascade order (which backend
         # is tried first when no explicit model_preference is given).
         # Explicit model_preference overrides always need the target backend ready.
+        #
+        # AUTO cascade order:
+        #   1. AssemblyAI  (Universal-3 Pro)
+        #   2. Parakeet + NeMo GPU diarize
+        #   3. Deepgram    (Nova-3)
+        #   4. Whisper + NeMo combined (/transcribe-diarize)
+        #   5. External Whisper + local diarize
+        #   6. Local faster-whisper (CPU fallback)
 
         if EXTERNAL_TRANSCRIBE_DIARIZE_URL:
             self._init_whisper_pyannote()
@@ -415,20 +423,20 @@ class Transcriber:
 
             if result is None:
                 # Auto cascade (default):
-                #   1. Whisper+NeMo combined (/transcribe-diarize — best quality)
-                #   2. Parakeet + NeMo (/transcribe + /diarize — fast)
-                #   3. AssemblyAI (one call, Universal-3 Pro)
-                #   4. Deepgram (one call, Nova-3)
-                #   5. Whisper + separate diarize cascade
-                #   6. Local faster-whisper + local diarize (CPU)
-                if self._use_whisper_pyannote:
-                    result = self._transcribe_whisper_pyannote(effective_path)
+                #   1. AssemblyAI (Universal-3 Pro — transcription + diarization, one call)
+                #   2. Parakeet + NeMo (/transcribe + GPU /diarize — fast, GPU)
+                #   3. Deepgram (Nova-3 — transcription + diarization, one call)
+                #   4. Whisper+NeMo combined (/transcribe-diarize — GPU, best accuracy)
+                #   5. External Whisper + local diarize cascade
+                #   6. Local faster-whisper + local diarize (CPU, last resort)
+                if self._use_assemblyai:
+                    result = self._transcribe_assemblyai(effective_path)
                 elif self._use_parakeet:
                     result = self._transcribe_parakeet(effective_path)
-                elif self._use_assemblyai:
-                    result = self._transcribe_assemblyai(effective_path)
                 elif self._use_deepgram:
                     result = self._transcribe_deepgram(effective_path)
+                elif self._use_whisper_pyannote:
+                    result = self._transcribe_whisper_pyannote(effective_path)
                 elif self._use_external:
                     result = self._transcribe_external(effective_path)
                 else:
