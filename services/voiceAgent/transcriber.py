@@ -142,34 +142,31 @@ class Transcriber:
 
         backend = TRANSCRIPTION_BACKEND.lower()
 
-        # Fallback chain:
-        #   1. Whisper+NeMo combined (/transcribe-diarize — one GPU call, best quality)
-        #   2. Parakeet + NeMo (Parakeet /transcribe + /diarize — fast transcription, separate diarize)
-        #   3. AssemblyAI (one call, Universal-3 Pro)
-        #   4. Deepgram (one call, Nova-3)
-        #   5. Whisper transcribe + diarize cascade (two calls, mapping)
-        #   6. Local faster-whisper + local diarize cascade (CPU)
+        # Always initialise every backend whose credentials/URL are configured.
+        # TRANSCRIPTION_BACKEND only controls the AUTO cascade order (which backend
+        # is tried first when no explicit model_preference is given).
+        # Explicit model_preference overrides always need the target backend ready.
 
-        if backend in ("auto", "whisper-pyannote", "whisper-nemo") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
+        if EXTERNAL_TRANSCRIBE_DIARIZE_URL:
             self._init_whisper_pyannote()
 
-        if backend in ("auto", "parakeet") and PARAKEET_URL:
+        if PARAKEET_URL:
             self._init_parakeet()
 
-        # Parakeet needs a separate diarization backend (/diarize endpoint).
-        # Also used by whisper separate mode.
-        if backend in ("auto", "parakeet", "whisper") and EXTERNAL_TRANSCRIBE_DIARIZE_URL:
-            if not self._use_external_diarize:
-                self._init_external_diarize()
+        # External GPU diarizer (used by Parakeet + separate-Whisper modes)
+        if EXTERNAL_TRANSCRIBE_DIARIZE_URL and not self._use_external_diarize:
+            self._init_external_diarize()
 
-        if backend in ("auto", "assemblyai") and ASSEMBLYAI_API_KEY:
+        if ASSEMBLYAI_API_KEY:
             self._init_assemblyai()
 
-        if backend in ("auto", "deepgram") and DEEPGRAM_API_KEY:
+        if DEEPGRAM_API_KEY:
             self._init_deepgram()
 
-        if backend in ("auto", "whisper") and EXTERNAL_WHISPER_URL:
+        if EXTERNAL_WHISPER_URL:
             self._init_external()
+
+        _ = backend  # used below in auto-cascade ordering only
 
     def _init_whisper_pyannote(self):
         """Try to initialise Whisper+Pyannote combined endpoint (single call, GPU)."""
@@ -350,6 +347,7 @@ class Transcriber:
         auto_punctuation: bool = True,
         temperature: Optional[float] = None,
         run_diarization: bool = True,
+        run_behavioural: bool = True,
         translate_to: Optional[str] = None,
     ) -> dict:
         """
@@ -378,6 +376,7 @@ class Transcriber:
         self._auto_punctuation = auto_punctuation
         self._temperature = temperature
         self._run_diarization = run_diarization
+        self._run_behavioural = run_behavioural
         self._translate_to = translate_to
         self._tmp_wav = None  # Track temp WAV for cleanup
 
@@ -399,9 +398,12 @@ class Transcriber:
                 else:
                     logger.warning("model_preference=deepgram requested but Deepgram not configured — using auto")
             elif model_preference == "whisper":
-                if self._use_whisper_pyannote:
+                need_diarize = self._run_diarization or self._run_behavioural
+                if need_diarize and self._use_whisper_pyannote:
+                    # Combined /transcribe-diarize endpoint — best quality, one GPU call
                     result = self._transcribe_whisper_pyannote(effective_path)
                 elif self._use_external:
+                    # /transcribe only — diarize internally gated on need_diarize
                     result = self._transcribe_external(effective_path)
                 else:
                     result = self._transcribe_local(effective_path)
@@ -456,6 +458,7 @@ class Transcriber:
             self._key_terms = []
             self._multichannel = False
             self._run_diarization = True
+            self._run_behavioural = True
             self._translate_to = None
 
     def _ensure_wav(self, audio_path: str) -> str:
@@ -548,8 +551,9 @@ class Transcriber:
             f"{len(segments)} segments (after split), time={proc_time:.1f}s"
         )
 
-        # Apply speaker diarization (same cascade as Whisper separate path)
-        segments = self._diarize_simple(segments, self._num_speakers, audio_path)
+        # Apply speaker diarization when needed (GPU /diarize → pyannote → KMeans cascade)
+        if self._run_diarization or self._run_behavioural:
+            segments = self._diarize_simple(segments, self._num_speakers, audio_path)
 
         return {
             "duration_seconds": duration,
@@ -817,8 +821,10 @@ class Transcriber:
 
         meeting_type = getattr(self, "_meeting_type", "") or ""
 
+        need_diarize = self._run_diarization or self._run_behavioural
+
         # ── PARALLEL PATH: both Whisper + diarization on GPU ──
-        if self._use_external_diarize:
+        if self._use_external_diarize and need_diarize:
             logger.info(
                 f"Transcribing + diarizing in PARALLEL via GPU APIs: {audio_path}"
             )
@@ -974,8 +980,9 @@ class Transcriber:
             f"server_time={proc_time:.2f}s"
         )
 
-        # Apply speaker diarization (cascade handles pyannote/embedding/kmeans)
-        segments = self._diarize_simple(segments, self._num_speakers, audio_path)
+        # Apply speaker diarization only when needed
+        if need_diarize:
+            segments = self._diarize_simple(segments, self._num_speakers, audio_path)
 
         return {
             "duration_seconds": duration,

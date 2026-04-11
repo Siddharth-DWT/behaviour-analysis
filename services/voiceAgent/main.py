@@ -152,6 +152,7 @@ async def transcribe_only(request: AnalysisRequest):
         auto_punctuation=getattr(tc, "auto_punctuation", True) if tc else True,
         temperature=getattr(tc, "temperature", None) if tc else None,
         run_diarization=getattr(ac, "run_diarization", True) if ac else True,
+        run_behavioural=getattr(ac, "run_behavioural", True) if ac else True,
         translate_to=getattr(ac, "translate_to", None) if ac else None,
     )
 
@@ -235,6 +236,7 @@ async def analyse_audio(request: AnalysisRequest):
         auto_punctuation=getattr(tc, "auto_punctuation", True) if tc else True,
         temperature=getattr(tc, "temperature", None) if tc else None,
         run_diarization=getattr(ac, "run_diarization", True) if ac else True,
+        run_behavioural=getattr(ac, "run_behavioural", True) if ac else True,
         translate_to=getattr(ac, "translate_to", None) if ac else None,
     )
 
