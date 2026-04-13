@@ -136,11 +136,11 @@ export default function Layout({ children }: { children: ReactNode }) {
             <span className="font-mono text-sm font-bold tracking-wider text-nexus-text-primary">
               NEXUS
             </span>
-            <span className="text-xs text-nexus-text-muted">
+            <span className="hidden sm:block text-xs text-nexus-text-muted">
               Behavioural Analysis System
             </span>
           </div>
-          <div className="flex items-center gap-3 text-xs text-nexus-text-muted">
+          <div className="flex items-center gap-2 sm:gap-3 text-xs text-nexus-text-muted">
             <button
               onClick={toggleTheme}
               className="rounded-lg p-1.5 text-nexus-text-muted hover:bg-nexus-surface-hover hover:text-nexus-text-primary transition-colors"
@@ -148,7 +148,7 @@ export default function Layout({ children }: { children: ReactNode }) {
             >
               {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </button>
-            <span className="rounded bg-nexus-surface-hover px-2 py-1 font-mono">
+            <span className="hidden sm:block rounded bg-nexus-surface-hover px-2 py-1 font-mono">
               v0.1.0
             </span>
 
@@ -160,7 +160,7 @@ export default function Layout({ children }: { children: ReactNode }) {
                   className="flex items-center gap-2 rounded-lg px-2 py-1 transition-colors hover:bg-nexus-surface-hover"
                 >
                   <UserInitials name={user.full_name} />
-                  <span className="max-w-[120px] truncate text-xs text-nexus-text-secondary">
+                  <span className="hidden sm:block max-w-[120px] truncate text-xs text-nexus-text-secondary">
                     {user.full_name}
                   </span>
                   <ChevronDown
@@ -182,7 +182,7 @@ export default function Layout({ children }: { children: ReactNode }) {
                     </div>
 
                     <button
-                      onClick={() => setMenuOpen(false)}
+                      onClick={() => { setMenuOpen(false); navigate("/profile"); }}
                       className="flex w-full items-center gap-2 px-3 py-2 text-xs text-nexus-text-secondary hover:bg-nexus-surface-hover"
                     >
                       <User className="h-3.5 w-3.5" />

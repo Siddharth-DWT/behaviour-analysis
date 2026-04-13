@@ -154,9 +154,12 @@ export default function Login() {
           </div>
 
           <div className="mb-5">
-            <label className="mb-1 block text-xs font-medium text-nexus-text-secondary">
-              Password
-            </label>
+            <div className="mb-1 flex items-center justify-between">
+              <label className="text-xs font-medium text-nexus-text-secondary">Password</label>
+              <Link to="/forgot-password" className="text-[10px] text-nexus-accent-blue hover:underline">
+                Forgot password?
+              </Link>
+            </div>
             <div className="relative">
               <input
                 type={showPassword ? "text" : "password"}

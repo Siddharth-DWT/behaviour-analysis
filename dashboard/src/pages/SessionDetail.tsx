@@ -457,12 +457,12 @@ export default function SessionDetail() {
           Back to Sessions
         </Link>
 
-        <div className="flex items-start justify-between">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
           <div>
             <h1 className="text-lg font-semibold text-nexus-text-primary">
               {session.title || "Untitled Session"}
             </h1>
-            <div className="mt-1 flex items-center gap-4 text-xs text-nexus-text-muted">
+            <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-nexus-text-muted">
               <span className="flex items-center gap-1">
                 <Clock className="h-3 w-3" />
                 {formatDuration(session.duration_ms)}
@@ -486,7 +486,7 @@ export default function SessionDetail() {
           {detail.has_report && (
             <Link
               to={`/sessions/${id}/report`}
-              className="flex items-center gap-1.5 rounded bg-accent-purple-20 px-3 py-1.5 text-xs font-medium text-nexus-accent-purple transition-colors hover:bg-accent-purple-30"
+              className="self-start flex items-center gap-1.5 rounded bg-accent-purple-20 px-3 py-1.5 text-xs font-medium text-nexus-accent-purple transition-colors hover:bg-accent-purple-30"
             >
               <FileText className="h-3.5 w-3.5" />
               View Report

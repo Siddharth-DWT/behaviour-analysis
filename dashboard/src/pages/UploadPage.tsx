@@ -11,6 +11,7 @@ import {
   X,
   Copy,
   Check,
+  ChevronDown,
 } from "lucide-react";
 import { uploadSession, quickTranscribe, getSession, getTranscript } from "../api/client";
 import type { TranscriptSegment, QuickSegment, Session } from "../api/client";
@@ -323,6 +324,19 @@ function QuickDoneView({
   onReset: () => void;
 }) {
   const [copied, setCopied] = useState(false);
+  const [copyMenuOpen, setCopyMenuOpen] = useState(false);
+  const copyMenuRef = useRef<HTMLDivElement>(null);
+
+  // Close copy dropdown when clicking outside
+  useEffect(() => {
+    function onOutside(e: MouseEvent) {
+      if (copyMenuRef.current && !copyMenuRef.current.contains(e.target as Node)) {
+        setCopyMenuOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", onOutside);
+    return () => document.removeEventListener("mousedown", onOutside);
+  }, []);
 
   // Build unique speaker list from segments (preserves first-appearance order)
   const speakerOrder: string[] = [];
@@ -331,21 +345,27 @@ function QuickDoneView({
   }
   const multiSpeaker = diarization && speakerOrder.length > 1;
 
-  // Copy payload
-  const handleCopy = () => {
-    let text: string;
-    if (multiSpeaker) {
-      // JSON: stripped segments (no words array)
-      const clean = segments.map(({ speaker, start_ms, end_ms, text: t }) => ({
-        speaker, start_ms, end_ms, text: t,
-      }));
-      text = JSON.stringify(clean, null, 2);
-    } else {
-      // Plain text: just the transcript text, one paragraph per segment
-      text = segments.map((s) => s.text).join("\n\n");
-    }
+  // Format ms → M:SS (matches TranscriptBlock display)
+  const fmtTime = (ms: number) => {
+    const s = Math.floor(ms / 1000);
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  };
+
+  const doCopy = (withTimestamps: boolean) => {
+    const text = segments
+      .map((s) => {
+        if (withTimestamps) {
+          const time = fmtTime(s.start_ms);
+          return multiSpeaker
+            ? `${time}  ${s.speaker}  ${s.text}`
+            : `${time}  ${s.text}`;
+        }
+        return multiSpeaker ? `${s.speaker}  ${s.text}` : s.text;
+      })
+      .join("\n");
     navigator.clipboard.writeText(text).then(() => {
       setCopied(true);
+      setCopyMenuOpen(false);
       setTimeout(() => setCopied(false), 2000);
     });
   };
@@ -376,16 +396,43 @@ function QuickDoneView({
           )}
         </div>
         <div className="flex items-center gap-2">
-          <button
-            onClick={handleCopy}
-            className="flex items-center gap-1 rounded px-2 py-1 text-[10px] text-nexus-text-muted hover:text-nexus-text-primary hover:bg-nexus-surface-hover transition-colors"
-          >
-            {copied ? (
-              <><Check className="h-3 w-3 text-emerald-400" /><span className="text-emerald-400">Copied</span></>
-            ) : (
-              <><Copy className="h-3 w-3" />{multiSpeaker ? "Copy JSON" : "Copy text"}</>
+          {/* Copy split-button with dropdown */}
+          <div className="relative flex" ref={copyMenuRef}>
+            <button
+              onClick={() => doCopy(true)}
+              className="flex items-center gap-1 rounded-l px-2 py-1 text-[10px] text-nexus-text-muted hover:text-nexus-text-primary hover:bg-nexus-surface-hover transition-colors border-r border-nexus-border"
+            >
+              {copied ? (
+                <><Check className="h-3 w-3 text-emerald-400" /><span className="text-emerald-400">Copied</span></>
+              ) : (
+                <><Copy className="h-3 w-3" />Copy text</>
+              )}
+            </button>
+            <button
+              onClick={() => setCopyMenuOpen((o) => !o)}
+              className="flex items-center rounded-r px-1.5 py-1 text-[10px] text-nexus-text-muted hover:text-nexus-text-primary hover:bg-nexus-surface-hover transition-colors"
+            >
+              <ChevronDown className={`h-3 w-3 transition-transform ${copyMenuOpen ? "rotate-180" : ""}`} />
+            </button>
+            {copyMenuOpen && (
+              <div className="absolute right-0 top-full z-50 mt-1 w-44 rounded border border-nexus-border bg-nexus-surface py-1 shadow-lg">
+                <button
+                  onClick={() => doCopy(true)}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-[10px] text-nexus-text-secondary hover:bg-nexus-surface-hover"
+                >
+                  <Copy className="h-3 w-3" />
+                  Copy with timestamps
+                </button>
+                <button
+                  onClick={() => doCopy(false)}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-[10px] text-nexus-text-secondary hover:bg-nexus-surface-hover"
+                >
+                  <Copy className="h-3 w-3" />
+                  Copy plain text
+                </button>
+              </div>
             )}
-          </button>
+          </div>
           <button
             onClick={onReset}
             className="flex items-center gap-1 text-[10px] text-nexus-text-muted hover:text-nexus-text-primary transition-colors"
@@ -466,7 +513,7 @@ function buildSteps(cfg: UploadConfig): string[] {
   if (cfg.run_entity_extraction) {
     steps.push("Entity extraction");
   }
-  if (cfg.run_knowledge_graph) {
+  if (cfg.run_behavioural && cfg.run_knowledge_graph) {
     steps.push("Knowledge graph sync");
   }
   if (cfg.run_behavioural) {
@@ -710,7 +757,7 @@ export default function UploadPage() {
     <div className="mx-auto max-w-5xl">
       <h1 className="mb-5 text-xl font-semibold text-nexus-text-primary">Upload Recording</h1>
 
-      <div className="grid grid-cols-[1fr_380px] gap-5">
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-[1fr_380px]">
         {/* ── Left: File + Title + Content Type + Prompt ── */}
         <div className="space-y-4">
           {/* File dropzone */}

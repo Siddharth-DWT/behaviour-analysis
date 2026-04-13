@@ -157,6 +157,24 @@ async def startup():
     except Exception as e:
         logger.warning(f"Neo4j schema init failed (non-fatal): {e}")
 
+    # Ensure password_reset_tokens table exists (idempotent for existing installs)
+    try:
+        _pool = await get_pool()
+        await _pool.execute("""
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token       VARCHAR(128) UNIQUE NOT NULL,
+                expires_at  TIMESTAMPTZ NOT NULL,
+                used_at     TIMESTAMPTZ,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await _pool.execute("CREATE INDEX IF NOT EXISTS idx_prt_token ON password_reset_tokens(token)")
+        await _pool.execute("CREATE INDEX IF NOT EXISTS idx_prt_user_id ON password_reset_tokens(user_id)")
+    except Exception as e:
+        logger.warning(f"Password reset table init failed (non-fatal): {e}")
+
     logger.info("API Gateway ready.")
 
 
@@ -235,6 +253,13 @@ class ChangePasswordRequest(BaseModel):
 
 class ResendVerificationRequest(BaseModel):
     email: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
 
 
 # ─────────────────────────────────────────────────────────
@@ -594,6 +619,82 @@ async def change_password(body: ChangePasswordRequest, current_user: dict = Depe
     )
 
     return {"success": True}
+
+
+@app.post("/auth/forgot-password")
+async def forgot_password(body: ForgotPasswordRequest):
+    """
+    Send a password reset email.
+    Always returns 200 to prevent email enumeration.
+    """
+    from email_service import send_password_reset_email
+
+    email = body.email.strip().lower()
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT id, full_name FROM users WHERE email = $1 AND is_active = true",
+        email,
+    )
+
+    if row:
+        token = generate_verification_token()
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
+        # Invalidate any existing unused tokens for this user
+        await pool.execute(
+            "DELETE FROM password_reset_tokens WHERE user_id = $1 AND used_at IS NULL",
+            row["id"],
+        )
+        await pool.execute(
+            """
+            INSERT INTO password_reset_tokens (user_id, token, expires_at)
+            VALUES ($1, $2, $3)
+            """,
+            row["id"], token, expires_at,
+        )
+
+        asyncio.create_task(
+            send_password_reset_email(email, row["full_name"] or "there", token)
+        )
+
+    return {"message": "If that email is registered you will receive a reset link shortly."}
+
+
+@app.post("/auth/reset-password")
+async def reset_password(body: ResetPasswordRequest):
+    """Reset password using a valid (unexpired, unused) reset token."""
+    validate_password(body.new_password)
+
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        SELECT prt.id, prt.user_id, prt.used_at
+        FROM password_reset_tokens prt
+        WHERE prt.token = $1 AND prt.expires_at > NOW()
+        """,
+        body.token,
+    )
+
+    if not row:
+        raise HTTPException(400, "Invalid or expired reset link.")
+    if row["used_at"] is not None:
+        raise HTTPException(400, "This reset link has already been used.")
+
+    new_hash = hash_password(body.new_password)
+    now = datetime.now(timezone.utc)
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE users SET password_hash = $1, updated_at = $2 WHERE id = $3",
+                new_hash, now, row["user_id"],
+            )
+            await conn.execute(
+                "UPDATE password_reset_tokens SET used_at = $1 WHERE id = $2",
+                now, row["id"],
+            )
+
+    return {"success": True, "message": "Password updated successfully."}
 
 
 # ─────────────────────────────────────────────────────────

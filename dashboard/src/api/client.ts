@@ -319,6 +319,57 @@ export async function verifyEmail(token: string): Promise<{ success: boolean; me
   return res.json();
 }
 
+export async function getProfile(): Promise<{
+  id: string; email: string; full_name: string; role: string;
+  company: string | null; avatar_url: string | null;
+  created_at: string | null; last_login_at: string | null;
+}> {
+  return request("/auth/me");
+}
+
+export async function updateProfile(data: {
+  full_name?: string; company?: string;
+}): Promise<{ id: string; email: string; full_name: string; role: string; company: string | null }> {
+  return request("/auth/me", { method: "PUT", body: JSON.stringify(data) });
+}
+
+export async function changePassword(
+  current_password: string, new_password: string
+): Promise<{ success: boolean }> {
+  return request("/auth/change-password", {
+    method: "PUT",
+    body: JSON.stringify({ current_password, new_password }),
+  });
+}
+
+export async function forgotPassword(email: string): Promise<{ message: string }> {
+  const res = await fetch(`${API_BASE}/auth/forgot-password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({ detail: "Request failed" }));
+    throw new Error(data.detail || "Request failed");
+  }
+  return res.json();
+}
+
+export async function resetPassword(
+  token: string, new_password: string
+): Promise<{ success: boolean; message: string }> {
+  const res = await fetch(`${API_BASE}/auth/reset-password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token, new_password }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({ detail: "Reset failed" }));
+    throw new Error(data.detail || "Reset failed");
+  }
+  return res.json();
+}
+
 export async function resendVerification(email: string): Promise<{ message: string }> {
   const res = await fetch(`${API_BASE}/auth/resend-verification`, {
     method: "POST",
