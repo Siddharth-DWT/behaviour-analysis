@@ -870,9 +870,12 @@ async def create_session_endpoint(
 
     # ── Step 2: Create session in DB ──
     try:
+        # Lightweight sessions (transcript/diarize/entity only) stored separately
+        # so they don't appear in the main Sessions tab
+        _is_lightweight = not analysis_config.get("run_behavioural", True)
         session = await create_session(
             title=title,
-            session_type="recording",
+            session_type="lightweight" if _is_lightweight else "recording",
             meeting_type=meeting_type,
             media_url=str(file_path.resolve()),
             user_id=current_user["id"],
@@ -1164,9 +1167,10 @@ async def _run_pipeline(
 
     logger.info(f"[{session_id}] Pipeline complete (status={final_status}, agents={agent_status})")
 
-    # Store knowledge chunks for RAG chat (non-blocking, non-fatal, gated on run_entity_extraction)
+    # Store knowledge chunks for RAG chat (only for behavioural sessions — needs signals to be useful)
+    # Transcript+entity sessions store entities in the report but skip the embedding store
     _set_step(session_id, "entity_extraction")
-    if run_entity_extraction:
+    if run_behavioural:
         try:
             from knowledge_store import store_session_knowledge
             _pool = await get_pool()
@@ -1181,7 +1185,7 @@ async def _run_pipeline(
         except Exception as e:
             logger.warning(f"[{session_id}] Knowledge store failed (non-fatal): {e}")
     else:
-        logger.info(f"[{session_id}] Entity extraction disabled — skipping knowledge store")
+        logger.info(f"[{session_id}] Knowledge store skipped (behavioural analysis off)")
 
     _set_step(session_id, "knowledge_graph")
     # Sync session graph to Neo4j (non-blocking, non-fatal).
@@ -1222,9 +1226,11 @@ async def list_sessions_endpoint(
     offset: int = Query(default=0, ge=0),
     status: Optional[str] = Query(default=None),
     meeting_type: Optional[str] = Query(default=None),
+    session_type: Optional[str] = Query(default=None),
     current_user: dict = Depends(get_current_user),
 ):
-    """List sessions with pagination and optional filters. User-scoped (admin sees all)."""
+    """List sessions with pagination and optional filters. User-scoped (admin sees all).
+    Pass session_type=lightweight to get lightweight (transcript/diarize) sessions only."""
     user_id = None if current_user["role"] == "admin" else current_user["id"]
     try:
         sessions, total = await list_sessions(
@@ -1232,6 +1238,7 @@ async def list_sessions_endpoint(
             offset=offset,
             status=status,
             meeting_type=meeting_type,
+            session_type=session_type,
             user_id=user_id,
         )
     except Exception as e:

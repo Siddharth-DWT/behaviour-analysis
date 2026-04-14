@@ -13,7 +13,7 @@ import {
   Check,
   ChevronDown,
 } from "lucide-react";
-import { uploadSession, quickTranscribe, getSession, getTranscript, getSessionProgress } from "../api/client";
+import { uploadSession, quickTranscribe, getSession, getTranscript, getSessionProgress, getReport, listSessions } from "../api/client";
 import type { TranscriptSegment, QuickSegment, Session } from "../api/client";
 import { DEFAULT_CONFIG, type UploadConfig } from "../components/UploadSettings";
 
@@ -634,6 +634,47 @@ export default function UploadPage() {
   // Quick-mode (transcript-only): result lives in memory, never stored in DB
   const [quickSegments, setQuickSegments] = useState<QuickSegment[] | null>(null);
   const [quickMeta, setQuickMeta] = useState<{ duration: number; backend: string; model: string } | null>(null);
+  // Entity summary shown in done state when entity extraction was enabled
+  const [entitySummary, setEntitySummary] = useState<{
+    people: Array<{ name: string; role: string }>;
+    topics: Array<{ name: string }>;
+    objections: Array<{ text: string; resolved: boolean }>;
+    commitments: Array<{ text: string }>;
+    companies: Array<{ name: string }>;
+  } | null>(null);
+
+  // Lightweight session history (transcript/diarize/entity sessions stored in DB)
+  const [lightSessions, setLightSessions] = useState<Session[]>([]);
+  const [lightLoading, setLightLoading] = useState(false);
+
+  // Fetch lightweight session history on mount
+  useEffect(() => {
+    setLightLoading(true);
+    listSessions({ session_type: "lightweight", limit: 50 })
+      .then((r: { sessions: Session[] }) => setLightSessions(r.sessions))
+      .catch(() => {})
+      .finally(() => setLightLoading(false));
+  }, []);
+
+  // Load a lightweight session result into the done view
+  const loadLightSession = useCallback(async (s: Session) => {
+    try {
+      const [txRes, reportRes] = await Promise.all([
+        getTranscript(s.id),
+        getReport(s.id).catch(() => null),
+      ]);
+      setSegments(txRes.segments);
+      setSessionInfo(s);
+      setSessionId(s.id);
+      const ents = reportRes?.report?.content?.entities as any;
+      if (ents) setEntitySummary(ents);
+      else setEntitySummary(null);
+      setQuickSegments(null);
+      setPhase("done");
+    } catch {
+      // silently ignore
+    }
+  }, []);
 
   const set = <K extends keyof UploadConfig>(key: K, val: UploadConfig[K]) =>
     setCfg((prev) => ({ ...prev, [key]: val }));
@@ -693,10 +734,21 @@ export default function UploadPage() {
           pollRef.current = null;
           setPipelineStep(null);
           if (status === "completed" || status === "partial") {
-            const txRes = await getTranscript(sid);
+            const [txRes, reportRes] = await Promise.all([
+              getTranscript(sid),
+              getReport(sid).catch(() => null),
+            ]);
             setSegments(txRes.segments);
             setSessionInfo(detail.session);
+            const ents = reportRes?.report?.content?.entities as any;
+            if (ents) setEntitySummary(ents);
             setPhase("done");
+            // Refresh lightweight session list if this was a lightweight session
+            if (detail.session.session_type === "lightweight") {
+              listSessions({ session_type: "lightweight", limit: 50 })
+                .then((r: { sessions: Session[] }) => setLightSessions(r.sessions))
+                .catch(() => {});
+            }
           } else {
             setErrorMsg("Analysis failed. Check logs or try again.");
             setPhase("error");
@@ -749,8 +801,8 @@ export default function UploadPage() {
     };
 
     // ── Quick path: transcript-only — no session, no DB, result lives in memory ──
-    // Only when nothing needs persisting (no entity extraction, no knowledge graph)
-    if (!cfg.run_behavioural && !cfg.run_entity_extraction) {
+    // Only for bare transcript with no diarization, entity extraction, or behavioural analysis
+    if (!cfg.run_behavioural && !cfg.run_entity_extraction && !cfg.run_diarization) {
       try {
         const result = await quickTranscribe(file, configPayload);
         setQuickSegments(result.segments);
@@ -797,6 +849,7 @@ export default function UploadPage() {
     setSessionInfo(null);
     setQuickSegments(null);
     setQuickMeta(null);
+    setEntitySummary(null);
     setErrorMsg(null);
   };
 
@@ -976,12 +1029,21 @@ export default function UploadPage() {
                       <span className="rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[9px] font-medium text-emerald-400 border border-emerald-500/20">
                         DONE
                       </span>
-                      {cfg.run_diarization && sessionInfo?.speaker_count ? (
+                      {sessionInfo?.speaker_count ? (
                         <span className="text-[10px] text-nexus-text-muted">
                           {sessionInfo.speaker_count} speaker{sessionInfo.speaker_count !== 1 ? "s" : ""}
                         </span>
                       ) : null}
                       <span className="text-[10px] text-nexus-text-muted">{segments.length} segments</span>
+                      {sessionId && (
+                        <span
+                          className="font-mono text-[9px] text-nexus-text-muted bg-nexus-surface-hover border border-nexus-border rounded px-1.5 py-0.5 cursor-pointer select-all"
+                          title="Session ID — click to copy"
+                          onClick={() => navigator.clipboard.writeText(sessionId)}
+                        >
+                          {sessionId.slice(0, 8)}…
+                        </span>
+                      )}
                     </div>
                     <div className="flex items-center gap-2">
                       <button
@@ -991,15 +1053,68 @@ export default function UploadPage() {
                         <RotateCcw className="h-3 w-3" />
                         New Upload
                       </button>
-                      <button
-                        onClick={() => navigate(`/sessions/${sessionId}`)}
-                        className="flex items-center gap-1 rounded-md bg-nexus-accent-blue px-2.5 py-1 text-[10px] font-semibold text-white hover:bg-accent-blue-80 transition-colors"
-                      >
-                        View Report
-                        <ArrowRight className="h-3 w-3" />
-                      </button>
+                      {sessionInfo?.session_type !== "lightweight" && (
+                        <button
+                          onClick={() => navigate(`/sessions/${sessionId}`)}
+                          className="flex items-center gap-1 rounded-md bg-nexus-accent-blue px-2.5 py-1 text-[10px] font-semibold text-white hover:bg-accent-blue-80 transition-colors"
+                        >
+                          View Report
+                          <ArrowRight className="h-3 w-3" />
+                        </button>
+                      )}
                     </div>
                   </div>
+                  {entitySummary && (
+                    <div className="border-b border-nexus-border px-4 py-3 space-y-2">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-nexus-text-muted">Extracted Entities</p>
+                      <div className="flex flex-wrap gap-2">
+                        {entitySummary.people?.length > 0 && (
+                          <div className="space-y-1">
+                            <p className="text-[9px] uppercase tracking-wider text-nexus-text-muted">People</p>
+                            <div className="flex flex-wrap gap-1">
+                              {entitySummary.people.map((p, i) => (
+                                <span key={i} className="rounded-full bg-nexus-accent-blue/10 border border-nexus-accent-blue/20 px-2 py-0.5 text-[10px] text-nexus-accent-blue">
+                                  {p.name} <span className="opacity-60">({p.role})</span>
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {entitySummary.companies?.length > 0 && (
+                          <div className="space-y-1">
+                            <p className="text-[9px] uppercase tracking-wider text-nexus-text-muted">Companies</p>
+                            <div className="flex flex-wrap gap-1">
+                              {entitySummary.companies.map((c, i) => (
+                                <span key={i} className="rounded-full bg-purple-500/10 border border-purple-500/20 px-2 py-0.5 text-[10px] text-purple-400">
+                                  {c.name}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex flex-wrap gap-3 pt-1">
+                        {entitySummary.topics?.length > 0 && (
+                          <span className="text-[10px] text-nexus-text-muted">
+                            📌 <span className="text-nexus-text-secondary">{entitySummary.topics.length}</span> topics
+                          </span>
+                        )}
+                        {entitySummary.objections?.length > 0 && (
+                          <span className="text-[10px] text-nexus-text-muted">
+                            ⚠️ <span className="text-nexus-text-secondary">{entitySummary.objections.length}</span> objection{entitySummary.objections.length !== 1 ? "s" : ""}
+                            {entitySummary.objections.filter(o => !o.resolved).length > 0 && (
+                              <span className="text-red-400"> ({entitySummary.objections.filter(o => !o.resolved).length} unresolved)</span>
+                            )}
+                          </span>
+                        )}
+                        {entitySummary.commitments?.length > 0 && (
+                          <span className="text-[10px] text-nexus-text-muted">
+                            ✅ <span className="text-nexus-text-secondary">{entitySummary.commitments.length}</span> commitment{entitySummary.commitments.length !== 1 ? "s" : ""}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
                   <div className="p-4">
                     <TranscriptChatPreview segments={segments} />
                   </div>
@@ -1019,6 +1134,49 @@ export default function UploadPage() {
                   </button>
                 </div>
               )}
+            </div>
+          )}
+
+          {/* ── Lightweight session history ── */}
+          {(lightLoading || lightSessions.length > 0) && (
+            <div className="rounded-xl border border-nexus-border bg-nexus-surface overflow-hidden">
+              <div className="flex items-center justify-between px-4 py-2.5 border-b border-nexus-border">
+                <h3 className="text-[11px] font-semibold uppercase tracking-wider text-nexus-text-muted">
+                  Recent Transcriptions
+                </h3>
+                {lightLoading && <Loader2 className="h-3 w-3 animate-spin text-nexus-text-muted" />}
+              </div>
+              <div className="divide-y divide-nexus-border">
+                {lightSessions.map((s) => (
+                  <button
+                    key={s.id}
+                    onClick={() => loadLightSession(s)}
+                    className={`w-full text-left px-4 py-2.5 hover:bg-nexus-surface-hover transition-colors flex items-center justify-between gap-2 ${
+                      sessionId === s.id ? "bg-nexus-accent-blue/5 border-l-2 border-nexus-accent-blue" : ""
+                    }`}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[11px] font-medium text-nexus-text-primary truncate">{s.title}</p>
+                      <div className="flex items-center gap-2 mt-0.5">
+                        <span className="text-[9px] text-nexus-text-muted">
+                          {new Date(s.created_at).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
+                        </span>
+                        {s.speaker_count != null && (
+                          <span className="text-[9px] text-nexus-text-muted">
+                            · {s.speaker_count} speaker{s.speaker_count !== 1 ? "s" : ""}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <span
+                      className="font-mono text-[9px] text-nexus-text-muted bg-nexus-surface-hover border border-nexus-border rounded px-1.5 py-0.5 shrink-0"
+                      title={s.id}
+                    >
+                      {s.id.slice(0, 8)}…
+                    </span>
+                  </button>
+                ))}
+              </div>
             </div>
           )}
         </div>

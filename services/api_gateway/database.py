@@ -117,9 +117,12 @@ async def list_sessions(
     status: Optional[str] = None,
     meeting_type: Optional[str] = None,
     user_id: Optional[str] = None,
+    session_type: Optional[str] = None,
 ) -> tuple[list[dict], int]:
     """List sessions with pagination. Returns (sessions, total_count).
-    If user_id is provided, only returns sessions owned by that user."""
+    If user_id is provided, only returns sessions owned by that user.
+    By default excludes lightweight sessions (transcript/diarize only).
+    Pass session_type='lightweight' to get only lightweight sessions."""
     pool = await get_pool()
 
     # Build WHERE clause
@@ -138,6 +141,15 @@ async def list_sessions(
     if meeting_type:
         conditions.append(f"meeting_type = ${idx}")
         params.append(meeting_type)
+        idx += 1
+    if session_type == "lightweight":
+        conditions.append(f"session_type = ${idx}")
+        params.append("lightweight")
+        idx += 1
+    else:
+        # Default: exclude lightweight sessions from the main sessions list
+        conditions.append(f"session_type != ${idx}")
+        params.append("lightweight")
         idx += 1
 
     where = " AND ".join(conditions)

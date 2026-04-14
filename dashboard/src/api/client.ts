@@ -201,12 +201,14 @@ export async function listSessions(params?: {
   offset?: number;
   status?: string;
   meeting_type?: string;
+  session_type?: string;
 }): Promise<{ sessions: Session[]; total: number; limit: number; offset: number }> {
   const search = new URLSearchParams();
   if (params?.limit) search.set("limit", String(params.limit));
   if (params?.offset) search.set("offset", String(params.offset));
   if (params?.status) search.set("status", params.status);
   if (params?.meeting_type) search.set("meeting_type", params.meeting_type);
+  if (params?.session_type) search.set("session_type", params.session_type);
   const qs = search.toString();
   return request(`/sessions${qs ? `?${qs}` : ""}`);
 }

@@ -57,7 +57,6 @@ class AssemblyAIClient:
         key_terms: Optional[list] = None,
         custom_prompt: Optional[str] = None,
         keep_filler_words: bool = False,
-        text_formatting: bool = False,
         auto_punctuation: bool = True,
         multichannel: bool = False,
         temperature: Optional[float] = None,
@@ -96,11 +95,11 @@ class AssemblyAIClient:
         #   - translation via speech_understanding (when translate_to is set)
         # Everything else (sentiment, IAB, PII, content_safety, profanity) is handled
         # better by NEXUS own agents and is NOT sent to AssemblyAI.
+        # universal-3-pro does not support the format_text parameter — omit it.
         request_body: dict = {
             "audio_url": upload_url,
             "speech_models": ["universal-3-pro"],
             "speaker_labels": speaker_labels,
-            "format_text": text_formatting,
             "punctuate": auto_punctuation,
             "disfluencies": keep_filler_words,
         }

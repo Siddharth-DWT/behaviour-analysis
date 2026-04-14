@@ -715,7 +715,6 @@ class Transcriber:
                 kwargs: dict = {
                     "speakers_expected": self._num_speakers,
                     "keep_filler_words": self._keep_filler_words,
-                    "text_formatting": self._text_formatting,
                     "auto_punctuation": self._auto_punctuation,
                     "multichannel": self._multichannel,
                 }
