@@ -33,6 +33,8 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
 from pydantic import BaseModel
 import httpx
 
@@ -108,6 +110,14 @@ AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "1800"))  # 30 minutes
 # ── CORS origins (comma-separated list) ──
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:3006,http://localhost:5173").split(",")
 
+# ── In-memory pipeline step tracker ──
+# Tracks the active pipeline step per session so the frontend can poll real progress.
+# Process-local (no DB write needed — sessions only process once per gateway instance).
+_pipeline_progress: dict[str, str] = {}
+
+def _set_step(session_id: str, step: str) -> None:
+    _pipeline_progress[session_id] = step
+
 app = FastAPI(
     title="NEXUS API Gateway",
     description="Central API for the NEXUS multi-agent behavioural analysis system",
@@ -120,6 +130,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Request access logger (replaces missing --access-log) ──
+class AccessLogMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        response = await call_next(request)
+        logger.info(f"{request.method} {request.url.path} → {response.status_code}")
+        return response
+
+app.add_middleware(AccessLogMiddleware)
 
 
 def _cleanup_old_recordings():
@@ -911,6 +930,7 @@ async def _run_pipeline(
     run_entity_extraction = analysis_config.get("run_entity_extraction", True)
 
     # ── Step 3: Voice Agent (with retry — this is the critical agent) ──
+    _set_step(session_id, "transcribing")
     voice_result = None
     try:
         voice_result = await _call_with_retry(
@@ -922,6 +942,7 @@ async def _run_pipeline(
                 analysis_config=analysis_config,
             )
         )
+        _set_step(session_id, "diarization")
         logger.info(
             f"[{session_id}] Transcription: "
             f"{voice_result.get('duration_seconds', 0):.0f}s, "
@@ -974,6 +995,7 @@ async def _run_pipeline(
             logger.warning(f"[{session_id}] Transcript persist failed: {e}")
 
     # ── Step 4: Language Agent (behavioural OR standalone sentiment) ──
+    _set_step(session_id, "language")
     language_result = None
     language_signals = []
     language_summary = {}
@@ -1000,10 +1022,27 @@ async def _run_pipeline(
                     logger.warning(f"[{session_id}] Language signal persist failed: {e}")
         else:
             logger.warning(f"[{session_id}] No transcript segments — skipping Language Agent")
+    elif run_entity_extraction and transcript_segments:
+        # Entity-extraction-only path: call EntityExtractor directly, no language agent HTTP call.
+        # Extracts people, companies, topics, objections, commitments — nothing else.
+        try:
+            from entity_extractor import EntityExtractor
+            extractor = EntityExtractor()
+            entities = await extractor.extract(transcript_segments, meeting_type)
+            language_summary = {"entities": entities}
+            logger.info(
+                f"[{session_id}] Entity extraction only: "
+                f"{len(entities.get('topics', []))} topics, "
+                f"{len(entities.get('people', []))} people, "
+                f"{len(entities.get('objections', []))} objections"
+            )
+        except Exception as e:
+            logger.warning(f"[{session_id}] Standalone entity extraction failed (non-fatal): {e}")
     else:
-        logger.info(f"[{session_id}] Behavioural and sentiment analysis disabled — skipping Language Agent")
+        logger.info(f"[{session_id}] Language Agent skipped (behavioural/sentiment/entity all off)")
 
     # ── Step 4b: Conversation Agent (only when behavioural analysis enabled) ──
+    _set_step(session_id, "conversation")
     conversation_result = None
     conversation_signals = []
     conversation_summary = {}
@@ -1034,6 +1073,7 @@ async def _run_pipeline(
         logger.info(f"[{session_id}] Behavioural analysis disabled — skipping Conversation Agent")
 
     # ── Step 5: Fusion Agent (only when behavioural analysis enabled) ──
+    _set_step(session_id, "fusion")
     fusion_result = None
     fusion_signals = []
     alerts = []
@@ -1090,7 +1130,8 @@ async def _run_pipeline(
     signal_graph = fusion_summary.get("signal_graph", {})
     key_paths = fusion_summary.get("key_paths", [])
 
-    # Persist report
+    # ── Step 6: Persist report ──
+    _set_step(session_id, "report")
     report_generated = False
     report_content = report or {}
     graph_analytics = fusion_summary.get("graph_analytics", {})
@@ -1124,6 +1165,7 @@ async def _run_pipeline(
     logger.info(f"[{session_id}] Pipeline complete (status={final_status}, agents={agent_status})")
 
     # Store knowledge chunks for RAG chat (non-blocking, non-fatal, gated on run_entity_extraction)
+    _set_step(session_id, "entity_extraction")
     if run_entity_extraction:
         try:
             from knowledge_store import store_session_knowledge
@@ -1141,6 +1183,7 @@ async def _run_pipeline(
     else:
         logger.info(f"[{session_id}] Entity extraction disabled — skipping knowledge store")
 
+    _set_step(session_id, "knowledge_graph")
     # Sync session graph to Neo4j (non-blocking, non-fatal).
     # Reads canonical data from PG and projects it as a graph for hybrid chat
     # and exploration. Pipeline still completes if Neo4j is unreachable.
@@ -1156,6 +1199,8 @@ async def _run_pipeline(
 
     # Cleanup old recordings in background
     _cleanup_old_recordings()
+
+    _pipeline_progress.pop(session_id, None)  # stop progress tracking
 
     logger.info(
         f"[{session_id}] Pipeline finished: status={final_status}, "
@@ -1375,6 +1420,19 @@ async def get_session_report(
     except Exception as e:
         logger.warning(f"[{session_id}] Report persist failed: {e}")
         return {"session_id": session_id, "report": report_data}
+
+
+# ─────────────────────────────────────────────────────────
+# GET /sessions/{id}/progress — Pipeline step (polling)
+# ─────────────────────────────────────────────────────────
+
+@app.get("/sessions/{session_id}/progress")
+async def get_session_progress(session_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Return the current pipeline step for a session being processed.
+    Returns pipeline_step=null when the session is no longer in-flight.
+    """
+    return {"pipeline_step": _pipeline_progress.get(session_id)}
 
 
 # ─────────────────────────────────────────────────────────

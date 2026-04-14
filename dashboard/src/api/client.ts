@@ -215,6 +215,10 @@ export async function getSession(id: string): Promise<SessionDetail> {
   return request(`/sessions/${id}`);
 }
 
+export async function getSessionProgress(id: string): Promise<{ pipeline_step: string | null }> {
+  return request(`/sessions/${id}/progress`);
+}
+
 export async function getSignals(
   id: string,
   params?: { agent?: string; signal_type?: string; limit?: number; offset?: number }

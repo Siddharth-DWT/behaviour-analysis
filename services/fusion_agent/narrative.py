@@ -119,6 +119,28 @@ async def generate_session_narrative(
         )
 
 
+def _build_speaker_name_map(entities: dict) -> dict[str, str]:
+    """
+    Build a mapping from speaker label → display name using extracted people entities.
+    e.g. {"Speaker_0": "John (Seller)", "Speaker_1": "Sarah (Prospect)"}
+    Falls back to the label itself when no name is known.
+    """
+    name_map: dict[str, str] = {}
+    for p in entities.get("people", []):
+        label = p.get("speaker_label", "")
+        name = p.get("name", "")
+        role = p.get("role", "")
+        if label and name:
+            display = f"{name} ({role.capitalize()})" if role else name
+            name_map[label] = display
+    return name_map
+
+
+def _display(speaker_id: str, name_map: dict[str, str]) -> str:
+    """Return display name for a speaker label, e.g. 'John (Seller)' or 'Speaker_0'."""
+    return name_map.get(speaker_id, speaker_id)
+
+
 def _build_context(
     session_id: str,
     duration_seconds: float,
@@ -132,16 +154,28 @@ def _build_context(
     conversation_summary: Optional[dict] = None,
 ) -> str:
     """Build a structured text context block for the LLM."""
+    entities = entities or {}
+    name_map = _build_speaker_name_map(entities)
+
     lines = []
     lines.append(f"SESSION: {session_id}")
     lines.append(f"DURATION: {duration_seconds:.0f} seconds ({duration_seconds/60:.1f} minutes)")
-    lines.append(f"SPEAKERS: {', '.join(speakers)}")
+
+    # Show speakers with real names if known
+    speaker_display = [_display(s, name_map) for s in speakers]
+    lines.append(f"SPEAKERS: {', '.join(speaker_display)}")
+
+    # Speaker name legend so LLM always has the mapping
+    if name_map:
+        lines.append("SPEAKER NAME MAP (use these names in the report, not Speaker_X labels):")
+        for label, display in name_map.items():
+            lines.append(f"  {label} = {display}")
     lines.append("")
 
     # Voice summary per speaker
-    lines.append("=== VOICE ANALYSIS ===")
+    lines.append("\n=== VOICE ANALYSIS ===")
     for speaker_id, data in voice_summary.get("per_speaker", {}).items():
-        lines.append(f"\n[{speaker_id}]")
+        lines.append(f"\n[{_display(speaker_id, name_map)}]")
         lines.append(f"  Baseline pitch: {data.get('baseline_f0_hz', 0)} Hz")
         lines.append(f"  Baseline speech rate: {data.get('baseline_rate_wpm', 0)} WPM")
         lines.append(f"  Average stress: {data.get('avg_stress', 0):.3f}")
@@ -159,14 +193,14 @@ def _build_context(
         for p in peaks[:5]:
             time_s = p.get('time_ms', 0) / 1000
             lines.append(
-                f"  {time_s:.0f}s — {p.get('speaker', '?')}: "
+                f"  {time_s:.0f}s — {_display(p.get('speaker', '?'), name_map)}: "
                 f"stress={p.get('stress_score', 0):.3f}"
             )
 
     # Language summary per speaker
     lines.append("\n=== LANGUAGE ANALYSIS ===")
     for speaker_id, data in language_summary.get("per_speaker", {}).items():
-        lines.append(f"\n[{speaker_id}]")
+        lines.append(f"\n[{_display(speaker_id, name_map)}]")
         lines.append(f"  Segments analysed: {data.get('total_segments', 0)}")
         lines.append(f"  Average sentiment: {data.get('avg_sentiment', 0):.3f}")
         lines.append(f"  Sentiment range: {data.get('min_sentiment', 0):.3f} to {data.get('max_sentiment', 0):.3f}")
@@ -184,7 +218,7 @@ def _build_context(
         for m in buy_moments[:5]:
             time_s = m.get('time_ms', 0) / 1000
             lines.append(
-                f"  {time_s:.0f}s — {m.get('speaker', '?')}: "
+                f"  {time_s:.0f}s — {_display(m.get('speaker', '?'), name_map)}: "
                 f"strength={m.get('strength', 0):.3f}, "
                 f"categories={m.get('categories', [])}"
             )
@@ -196,7 +230,7 @@ def _build_context(
         for m in obj_moments[:5]:
             time_s = m.get('time_ms', 0) / 1000
             lines.append(
-                f"  {time_s:.0f}s — {m.get('speaker', '?')}: "
+                f"  {time_s:.0f}s — {_display(m.get('speaker', '?'), name_map)}: "
                 f"strength={m.get('strength', 0):.3f}, "
                 f"categories={m.get('categories', [])}"
             )
@@ -218,12 +252,12 @@ def _build_context(
         if dominance:
             lines.append(f"  Dominance index: {dominance.get('index', 0):.2f}")
             for sid, pct in dominance.get("per_speaker", {}).items():
-                lines.append(f"    {sid}: {pct:.1f}% talk time")
+                lines.append(f"    {_display(sid, name_map)}: {pct:.1f}% talk time")
         interruptions = conversation_summary.get("interruptions", {})
         if interruptions:
             lines.append(f"  Total interruptions: {interruptions.get('total', 0)}")
             for sid, cnt in interruptions.get("per_speaker", {}).items():
-                lines.append(f"    {sid}: {cnt} interruptions")
+                lines.append(f"    {_display(sid, name_map)}: {cnt} interruptions")
         response_latency = conversation_summary.get("response_latency", {})
         if response_latency:
             lines.append(f"  Avg response latency: {response_latency.get('avg_ms', 0):.0f} ms")
@@ -243,7 +277,7 @@ def _build_context(
         lines.append("\n=== FINAL SPEAKER STATES ===")
         for state in unified_states:
             sid = state.get("speaker_id", "?")
-            lines.append(f"\n[{sid}]")
+            lines.append(f"\n[{_display(sid, name_map)}]")
             lines.append(f"  Engagement: {state.get('engagement', 0.5):.2f}")
             lines.append(f"  Confidence: {state.get('confidence_level', 0.5):.2f}")
             lines.append(f"  Stress: {state.get('stress_level', 0):.2f}")
@@ -279,14 +313,17 @@ def _build_context(
             for o in objections:
                 ts = o.get("timestamp_ms", 0) // 1000
                 status = "RESOLVED" if o.get("resolved") else "UNRESOLVED"
-                lines.append(f'  [{ts}s] "{o.get("text", "")}" — {status}')
+                spk = _display(o.get("speaker", ""), name_map) if o.get("speaker") else ""
+                spk_str = f" by {spk}" if spk else ""
+                lines.append(f'  [{ts}s]{spk_str} "{o.get("text", "")}" — {status}')
 
         commitments = entities.get("commitments", [])
         if commitments:
             lines.append("COMMITMENTS:")
             for c in commitments:
                 ts = c.get("timestamp_ms", 0) // 1000
-                lines.append(f'  [{ts}s] {c.get("speaker", "?")}: "{c.get("text", "")}"')
+                spk = _display(c.get("speaker", "?"), name_map)
+                lines.append(f'  [{ts}s] {spk}: "{c.get("text", "")}"')
 
         key_terms = entities.get("key_terms", [])
         if key_terms:
@@ -302,7 +339,7 @@ def _build_context(
             for c in clusters[:5]:
                 lines.append(
                     f"  {c['timestamp_ms']//1000}s — {c['signal_count']} signals, "
-                    f"severity={c['severity']}, speaker={c['speaker_id']}"
+                    f"severity={c['severity']}, speaker={_display(c['speaker_id'], name_map)}"
                 )
 
         topics_density = graph_analytics.get("topic_signal_density", [])
@@ -329,7 +366,7 @@ def _build_context(
             lines.append("\nSPEAKER PATTERNS:")
             for sid, p in patterns.items():
                 lines.append(
-                    f"  {sid}: {p.get('response_pattern', 'unknown')} pattern, "
+                    f"  {_display(sid, name_map)}: {p.get('response_pattern', 'unknown')} pattern, "
                     f"escalation={p.get('escalation_trend', 'stable')}, "
                     f"contradiction_ratio={p.get('contradiction_ratio', 0):.1%}"
                 )
@@ -429,7 +466,9 @@ def _build_prompt(context: str, meeting_type: str) -> tuple[str, str]:
         "You produce PROBABILISTIC INDICATORS, never binary determinations. "
         "Never claim to detect deception — only flag incongruence for human review. "
         "Maximum certainty for any claim is 'likely' or 'suggests' — never 'definitely'. "
-        "Cross-modal insights (where voice and language disagree) are the most valuable findings."
+        "Cross-modal insights (where voice and language disagree) are the most valuable findings. "
+        "IMPORTANT: Always use real names (e.g. 'John', 'Sarah') instead of Speaker_X labels "
+        "wherever a name is available from the SPEAKER NAME MAP. Only use Speaker_X when no name is known."
     )
 
     user_prompt = f"""Analyse the following multi-modal signal data from a recorded meeting and produce a structured report.

@@ -560,11 +560,13 @@ async def _create_entity_nodes(
     # ── Objections ──
     for i, o in enumerate(objections):
         eid = f"{session_id}::objection::{i}"
+        speaker_label = o.get("speaker") or ""
         await nsession.run(
             """
             MERGE (e:Entity:Objection {id: $id})
             SET e.session_id     = $sid,
                 e.text           = $text,
+                e.speaker_label  = $spk_label,
                 e.timestamp_ms   = $timestamp_ms,
                 e.resolved       = $resolved,
                 e.resolved_at_ms = $resolved_at_ms
@@ -572,10 +574,22 @@ async def _create_entity_nodes(
             id=eid,
             sid=session_id,
             text=o.get("text") or "",
+            spk_label=speaker_label,
             timestamp_ms=int(o.get("timestamp_ms") or 0),
             resolved=bool(o.get("resolved", False)),
             resolved_at_ms=int(o.get("resolved_at_ms") or 0),
         )
+        if speaker_label:
+            await nsession.run(
+                """
+                MATCH (e:Entity:Objection {id: $eid})
+                MATCH (spk:Speaker {session_id: $sid, label: $label})
+                MERGE (e)-[:RAISED_BY]->(spk)
+                """,
+                eid=eid,
+                sid=session_id,
+                label=speaker_label,
+            )
 
     # ── Commitments ──
     for i, c in enumerate(commitments):

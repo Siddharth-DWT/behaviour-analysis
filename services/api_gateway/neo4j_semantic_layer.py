@@ -144,6 +144,7 @@ ORDER BY avg_stress DESC
         "description": (
             "Show how one speaker's behavior affects the other. Use when user asks "
             "'how did X influence Y', 'speaker dynamics', 'reaction', "
+            "'dominant speaker', 'who spoke most', 'talk time', "
             "'how did they respond to each other'."
         ),
         "parameters": {
@@ -154,14 +155,14 @@ ORDER BY avg_stress DESC
             },
         },
         "cypher": """
-MATCH (a:Signal {session_id: $session_id})-[inf:INFLUENCED]->(b:Signal)
+MATCH (a:Signal {session_id: $session_id})-[rel:INFLUENCED]->(b:Signal)
 WHERE ($speaker_a IS NULL OR a.speaker_label = $speaker_a)
 OPTIONAL MATCH (a)-[:OCCURRED_DURING]->(segA:Segment)
 OPTIONAL MATCH (b)-[:OCCURRED_DURING]->(segB:Segment)
 RETURN a.speaker_label AS influencer, a.signal_type AS trigger_signal,
        a.value_text AS trigger_detail, b.speaker_label AS responder,
        b.signal_type AS response_signal, b.value AS response_value,
-       inf.lag_ms / 1000.0 AS delay_sec,
+       round(rel.lag_ms / 1000, 1) AS delay_sec,
        left(segA.text, 60) AS trigger_text, left(segB.text, 60) AS response_text
 ORDER BY a.timestamp_ms LIMIT 15
 """,
@@ -188,7 +189,9 @@ ORDER BY obj.timestamp_ms
         "description": (
             "Show the complete flow of the conversation as topic phases with key signals. "
             "Use when user asks 'walk me through', 'what was the flow', 'summary', "
-            "'what happened'."
+            "'what happened', 'conversation arc', 'how did it evolve', 'escalating tension', "
+            "'resolution', 'stay flat', 'arc evolve', 'sentiment shift', 'incongruence', "
+            "'mood change', 'dynamic change', 'emotional journey'."
         ),
         "parameters": {},
         "cypher": """
@@ -197,14 +200,17 @@ OPTIONAL MATCH (topic)<-[:DISCUSSES]-(seg:Segment)<-[:OCCURRED_DURING]-(sig:Sign
 WHERE sig.confidence > 0.4
   AND sig.signal_type IN ['buying_signal','objection_signal','tension_cluster',
                            'rapport_indicator','momentum_shift','vocal_stress_score',
-                           'persuasion_technique','filler_detection','pitch_elevation_flag']
+                           'sentiment_score','tone_classification','energy_level',
+                           'persuasion_technique','filler_detection','pitch_elevation_flag',
+                           'emotional_intensity','disagreement','power_language_score']
   AND (sig.signal_type <> 'vocal_stress_score' OR sig.value > 0.4)
+  AND (sig.signal_type <> 'sentiment_score' OR sig.value < -0.2 OR sig.value > 0.4)
 WITH topic, collect(DISTINCT {type: sig.signal_type,
      value: coalesce(sig.value_text, toString(round(sig.value * 100) / 100)),
      speaker: sig.speaker_label}) AS signals
 ORDER BY topic.start_ms
-RETURN topic.name AS phase, topic.start_ms / 1000.0 AS start_sec,
-       topic.end_ms / 1000.0 AS end_sec, signals
+RETURN topic.name AS phase, round(topic.start_ms / 1000) AS start_sec,
+       round(topic.end_ms / 1000) AS end_sec, signals
 """,
     },
     {

@@ -13,7 +13,7 @@ import {
   Check,
   ChevronDown,
 } from "lucide-react";
-import { uploadSession, quickTranscribe, getSession, getTranscript } from "../api/client";
+import { uploadSession, quickTranscribe, getSession, getTranscript, getSessionProgress } from "../api/client";
 import type { TranscriptSegment, QuickSegment, Session } from "../api/client";
 import { DEFAULT_CONFIG, type UploadConfig } from "../components/UploadSettings";
 
@@ -509,6 +509,7 @@ function buildSteps(cfg: UploadConfig): string[] {
     steps.push("Language & sentiment analysis");
     steps.push("Conversation dynamics");
     steps.push("Fusion & signal scoring");
+    steps.push("Report generation");
   }
   if (cfg.run_entity_extraction) {
     steps.push("Entity extraction");
@@ -516,24 +517,56 @@ function buildSteps(cfg: UploadConfig): string[] {
   if (cfg.run_behavioural && cfg.run_knowledge_graph) {
     steps.push("Knowledge graph sync");
   }
-  if (cfg.run_behavioural) {
-    steps.push("Report generation");
-  }
   return steps;
+}
+
+// Map a backend pipeline_step name to the active step index in buildSteps()
+const STEP_LABEL: Record<string, string> = {
+  transcribing:       "Transcribing speech",
+  diarization:        "Speaker diarization",
+  language:           "Language & sentiment analysis",
+  conversation:       "Conversation dynamics",
+  fusion:             "Fusion & signal scoring",
+  report:             "Report generation",
+  entity_extraction:  "Entity extraction",
+  knowledge_graph:    "Knowledge graph sync",
+};
+
+// Ordered backend pipeline — used to find the nearest visible step when the
+// current backend step isn't present in this config's step list.
+const PIPELINE_ORDER = [
+  "transcribing", "diarization", "language", "conversation",
+  "fusion", "report", "entity_extraction", "knowledge_graph",
+];
+
+function pipelineStepToIndex(stepName: string | null, steps: string[]): number {
+  if (!stepName) return 0;
+
+  // Direct match
+  const label = STEP_LABEL[stepName];
+  if (label) {
+    const idx = steps.indexOf(label);
+    if (idx >= 0) return idx;
+  }
+
+  // Step not visible in this config — walk backwards to find the last visible step
+  const pos = PIPELINE_ORDER.indexOf(stepName);
+  for (let i = pos - 1; i >= 0; i--) {
+    const prevLabel = STEP_LABEL[PIPELINE_ORDER[i]];
+    if (prevLabel) {
+      const idx = steps.indexOf(prevLabel);
+      if (idx >= 0) return idx;
+    }
+  }
+
+  return 0;
 }
 
 // ─── Inline step list (used in chat area while processing) ─────────────────────
 
-function InlineStepList({ cfg }: { cfg: UploadConfig }) {
+function InlineStepList({ cfg, pipelineStep }: { cfg: UploadConfig; pipelineStep: string | null }) {
   const steps = buildSteps(cfg);
-  const [activeStep, setActiveStep] = useState(0);
-
-  useEffect(() => {
-    const id = setInterval(() => {
-      setActiveStep((s) => (s < steps.length - 1 ? s + 1 : s));
-    }, 4000);
-    return () => clearInterval(id);
-  }, [steps.length]);
+  const activeStep = pipelineStepToIndex(pipelineStep, steps);
 
   return (
     <div className="space-y-2">
@@ -593,6 +626,7 @@ export default function UploadPage() {
   const [phase, setPhase] = useState<Phase>("form");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [pipelineStep, setPipelineStep] = useState<string | null>("transcribing");
   const [title, setTitle] = useState("");
   const [cfg, setCfg] = useState<UploadConfig>({ ...DEFAULT_CONFIG });
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
@@ -616,6 +650,7 @@ export default function UploadPage() {
     setSessionId(null);
     setSessionInfo(null);
     setErrorMsg(null);
+    setPipelineStep("transcribing");
   };
 
   const onDrop = useCallback(
@@ -638,14 +673,25 @@ export default function UploadPage() {
 
   const startPolling = useCallback((sid: string) => {
     if (pollRef.current) clearInterval(pollRef.current);
+    setPipelineStep("transcribing");
     pollRef.current = setInterval(async () => {
       try {
-        const detail = await getSession(sid);
+        // Fetch step + session status in parallel
+        const [progress, detail] = await Promise.all([
+          getSessionProgress(sid).catch(() => ({ pipeline_step: null })),
+          getSession(sid),
+        ]);
+
+        if (progress.pipeline_step) {
+          setPipelineStep(progress.pipeline_step);
+        }
+
         const status = detail.session.status;
         // "partial" = some agents failed but transcript succeeded — show it
         if (status === "completed" || status === "partial" || status === "failed") {
           clearInterval(pollRef.current!);
           pollRef.current = null;
+          setPipelineStep(null);
           if (status === "completed" || status === "partial") {
             const txRes = await getTranscript(sid);
             setSegments(txRes.segments);
@@ -703,7 +749,8 @@ export default function UploadPage() {
     };
 
     // ── Quick path: transcript-only — no session, no DB, result lives in memory ──
-    if (!cfg.run_behavioural) {
+    // Only when nothing needs persisting (no entity extraction, no knowledge graph)
+    if (!cfg.run_behavioural && !cfg.run_entity_extraction) {
       try {
         const result = await quickTranscribe(file, configPayload);
         setQuickSegments(result.segments);
@@ -906,7 +953,7 @@ export default function UploadPage() {
                     </div>
                   </div>
                   {/* Step list — built from config */}
-                  <InlineStepList cfg={cfg} />
+                  <InlineStepList cfg={cfg} pipelineStep={pipelineStep} />
                 </div>
               )}
 
