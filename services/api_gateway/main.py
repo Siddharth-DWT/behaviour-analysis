@@ -1882,7 +1882,7 @@ async def chat_with_session(
     sources = []
     for row in rows:
         sim = float(row["similarity"])
-        if sim < 0.40:  # text-embedding-3-small (1536d cosine): 0.40 = loosely related
+        if sim < 0.60:  # text-embedding-3-small (1536d cosine): 0.60 = strongly related
             continue
         context_parts.append(f"[{row['chunk_type']}] {row['text']}")
         sources.append({

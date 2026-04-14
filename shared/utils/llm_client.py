@@ -190,15 +190,29 @@ def _complete_openai(
     client = _ensure_openai()
     model = _get_model()
 
-    response = client.chat.completions.create(
-        model=model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
+    # o1, o3, and gpt-5 use max_completion_tokens; older models use max_tokens
+    _uses_completion_tokens = any(model.startswith(p) for p in ("o1", "o3", "gpt-5"))
+
+    if _uses_completion_tokens:
+        response = client.chat.completions.create(
+            model=model,
+            max_completion_tokens=max_tokens,
+            temperature=temperature,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+    else:
+        response = client.chat.completions.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
 
     return response.choices[0].message.content.strip()
 
@@ -332,15 +346,29 @@ async def _acomplete_openai(
         client = AsyncOpenAI(api_key=api_key)
         resolved_model = model or _get_model()
 
-        response = await client.chat.completions.create(
-            model=resolved_model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
+        # o1, o3, and gpt-5 use max_completion_tokens; older models use max_tokens
+        _uses_completion_tokens = any(resolved_model.startswith(p) for p in ("o1", "o3", "gpt-5"))
+
+        if _uses_completion_tokens:
+            response = await client.chat.completions.create(
+                model=resolved_model,
+                max_completion_tokens=max_tokens,
+                temperature=temperature,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        else:
+            response = await client.chat.completions.create(
+                model=resolved_model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
 
         return response.choices[0].message.content.strip()
     except ImportError:
