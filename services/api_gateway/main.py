@@ -1061,21 +1061,32 @@ async def _run_pipeline(
         else:
             logger.warning(f"[{session_id}] No transcript segments — skipping Language Agent")
     elif run_entity_extraction and transcript_segments:
-        # Entity-extraction-only path: call EntityExtractor directly, no language agent HTTP call.
-        # Extracts people, companies, topics, objections, commitments — nothing else.
-        try:
-            from entity_extractor import EntityExtractor
-            extractor = EntityExtractor()
-            entities = await extractor.extract(transcript_segments, meeting_type)
+        # Entity-extraction-only path (behavioural OFF).
+        # Prefer AssemblyAI entities when the voice agent returned them;
+        # fall back to NEXUS EntityExtractor for non-AssemblyAI backends.
+        assemblyai_raw = voice_result.get("assemblyai_entities") if voice_result else None
+        if assemblyai_raw is not None:
+            entities = _format_assemblyai_entities(assemblyai_raw)
             language_summary = {"entities": entities}
             logger.info(
-                f"[{session_id}] Entity extraction only: "
-                f"{len(entities.get('topics', []))} topics, "
+                f"[{session_id}] Entity extraction (AssemblyAI): "
                 f"{len(entities.get('people', []))} people, "
-                f"{len(entities.get('objections', []))} objections"
+                f"{len(entities.get('organizations', []))} orgs, "
+                f"{len(entities.get('topics', []))} topics"
             )
-        except Exception as e:
-            logger.warning(f"[{session_id}] Standalone entity extraction failed (non-fatal): {e}")
+        else:
+            try:
+                from entity_extractor import EntityExtractor
+                extractor = EntityExtractor()
+                entities = await extractor.extract(transcript_segments, meeting_type)
+                language_summary = {"entities": entities}
+                logger.info(
+                    f"[{session_id}] Entity extraction (NEXUS fallback): "
+                    f"{len(entities.get('topics', []))} topics, "
+                    f"{len(entities.get('people', []))} people"
+                )
+            except Exception as e:
+                logger.warning(f"[{session_id}] Standalone entity extraction failed (non-fatal): {e}")
     else:
         logger.info(f"[{session_id}] Language Agent skipped (behavioural/sentiment/entity all off)")
 
@@ -1541,6 +1552,31 @@ async def _call_with_retry(coro_fn, max_retries=2, backoff=2.0):
                 logger.warning(f"Retry {attempt+1}/{max_retries} after {wait}s: {e}")
                 await asyncio.sleep(wait)
     raise last_error
+
+
+def _format_assemblyai_entities(raw: list[dict]) -> dict:
+    """Convert AssemblyAI entity_detection results to NEXUS entity format."""
+    _TYPE_MAP = {
+        "person_name":   "people",
+        "organization":  "organizations",
+        "location":      "locations",
+        "product_name":  "products",
+    }
+    result: dict[str, list] = {
+        "people": [], "organizations": [], "locations": [],
+        "products": [], "topics": [], "objections": [], "commitments": [],
+    }
+    seen: set[tuple] = set()
+    for ent in raw:
+        bucket = _TYPE_MAP.get(ent.get("entity_type", ""))
+        if not bucket:
+            continue
+        text = (ent.get("text") or "").strip()
+        key = (bucket, text.lower())
+        if text and key not in seen:
+            seen.add(key)
+            result[bucket].append({"text": text, "start_ms": ent.get("start"), "end_ms": ent.get("end")})
+    return result
 
 
 async def _call_voice_agent(

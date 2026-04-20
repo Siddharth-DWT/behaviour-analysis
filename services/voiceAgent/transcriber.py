@@ -358,6 +358,7 @@ class Transcriber:
         run_diarization: bool = True,
         run_behavioural: bool = True,
         translate_to: Optional[str] = None,
+        entity_detection: bool = False,
     ) -> dict:
         """
         Transcribe an audio file with word-level timestamps.
@@ -372,6 +373,7 @@ class Transcriber:
             custom_prompt:    Style instructions forwarded to Whisper as initial_prompt
             key_terms:        Domain vocabulary list (word_boost / keywords per backend)
             multichannel:     Each audio channel is a separate speaker (not yet implemented)
+            entity_detection: Request entity detection from AssemblyAI (entity-only mode)
         """
         self._num_speakers = num_speakers
         self._audio_data = audio_data
@@ -387,6 +389,7 @@ class Transcriber:
         self._run_diarization = run_diarization
         self._run_behavioural = run_behavioural
         self._translate_to = translate_to
+        self._entity_detection = entity_detection
         self._tmp_wav = None  # Track temp WAV for cleanup
 
         try:
@@ -729,6 +732,8 @@ class Transcriber:
                     kwargs["temperature"] = self._temperature
                 if self._translate_to:
                     kwargs["translate_to"] = self._translate_to
+                if self._entity_detection:
+                    kwargs["entity_detection"] = True
                 result = self._assemblyai_client.transcribe(audio_path, **kwargs)
             else:
                 result = self._assemblyai_client.transcribe_and_diarize(audio_path)

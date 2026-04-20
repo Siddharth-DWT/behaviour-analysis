@@ -155,6 +155,7 @@ async def transcribe_only(request: AnalysisRequest):
         run_diarization=getattr(ac, "run_diarization", True) if ac else True,
         run_behavioural=getattr(ac, "run_behavioural", True) if ac else True,
         translate_to=getattr(ac, "translate_to", None) if ac else None,
+        entity_detection=(not getattr(ac, "run_behavioural", True) and getattr(ac, "run_entity_extraction", True)) if ac else False,
     )
 
     elapsed = time.time() - start_time
@@ -239,6 +240,7 @@ async def analyse_audio(request: AnalysisRequest):
         run_diarization=getattr(ac, "run_diarization", True) if ac else True,
         run_behavioural=getattr(ac, "run_behavioural", True) if ac else True,
         translate_to=getattr(ac, "translate_to", None) if ac else None,
+        entity_detection=(not getattr(ac, "run_behavioural", True) and getattr(ac, "run_entity_extraction", True)) if ac else False,
     )
 
     duration_sec = transcript["duration_seconds"]

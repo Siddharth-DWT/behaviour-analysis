@@ -61,6 +61,7 @@ class AssemblyAIClient:
         multichannel: bool = False,
         temperature: Optional[float] = None,
         translate_to: Optional[str] = None,
+        entity_detection: bool = False,
     ) -> dict:
         """
         Transcribe audio with speaker diarization.
@@ -128,6 +129,9 @@ class AssemblyAIClient:
         # speaker_identification requires pre-enrolled voice profiles (known_values).
         # Sending speaker_identification with known_values=[] overrides speaker_labels
         # diarization and collapses all audio to a single speaker — do NOT include it.
+        if entity_detection:
+            request_body["entity_detection"] = True
+
         if translate_to and not multichannel:
             request_body["speech_understanding"] = {
                 "translation": {
@@ -157,6 +161,8 @@ class AssemblyAIClient:
 
         # Step 4: Convert to NEXUS format
         result = self._convert(data, elapsed, translate_to=translate_to)
+        if entity_detection:
+            result["assemblyai_entities"] = data.get("entities", [])
 
         logger.info(
             f"AssemblyAI complete: {duration}s audio, "
