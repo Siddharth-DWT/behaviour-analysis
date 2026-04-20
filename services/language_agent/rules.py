@@ -98,6 +98,39 @@ def _check_llm_ready() -> bool:
 INTENT_BATCH_SIZE = 15  # 10-20 utterances per LLM call
 SHORT_UTTERANCE_WORDS = 5  # ≤5 words need surrounding context for classification
 
+# Descriptions used when building per-content-type intent prompts
+_INTENT_DESC: dict[str, str] = {
+    "INFORM":        "Sharing facts, data, or status updates",
+    "QUESTION":      "Asking for information",
+    "REQUEST":       "Asking someone to do something",
+    "PROPOSE":       "Suggesting an idea, plan, or solution",
+    "AGREE":         "Expressing agreement or acceptance",
+    "DISAGREE":      "Expressing disagreement or pushback",
+    "ACKNOWLEDGE":   'Confirming receipt, accepting a point ("Fine.", "Okay.", "Right.", "Sure.")',
+    "NEGOTIATE":     "Bargaining, counter-offering, or discussing terms",
+    "COMMIT":        "Making a promise, commitment, or decision",
+    "DEFLECT":       "Avoiding, redirecting, or evading a topic",
+    "RAPPORT":       "Small talk, relationship building, empathy",
+    "CLOSE":         "Attempting to close a deal or reach a decision",
+    "OBJECTION":     "Raising a concern or barrier",
+    "PRESENT":       "Delivering prepared or structured content",
+    "FOLLOW_UP":     "Following up on a prior action or commitment",
+    "GREET":         "Opening or closing pleasantries",
+    "ASSIGN_ACTION": "Delegating a task or action item",
+    "ESCALATE":      "Raising urgency or escalating to a decision-maker",
+    "FACILITATE":    "Guiding the group process or managing discussion",
+    "ANSWER":        "Directly responding to a question",
+    "RESPOND":       "Reacting to a statement or prompt",
+    "ELABORATE":     "Expanding on a previous point with more detail",
+    "CLARIFY":       "Clearing up ambiguity or asking for clarification",
+    "PROBE":         "Digging deeper into a candidate's response",
+    "INTEREST":      "Expressing interest or enthusiasm about the role/topic",
+    "HESITATION":    "Expressing uncertainty or reluctance",
+    "NARRATE":       "Telling a story or recounting an experience",
+    "JOKE":          "Humour or playful interjection",
+    "TRANSITION":    "Moving the conversation to a new topic",
+}
+
 
 class LanguageRuleEngine:
     # Per RULES.md: no single-domain signal may exceed 0.85
@@ -387,6 +420,7 @@ class LanguageRuleEngine:
     async def evaluate_batch_intent(
         self,
         features_list: list[dict],
+        profile=None,
     ) -> list[dict]:
         """
         LANG-INTENT-01: Batch intent classification via LLM API.
@@ -398,6 +432,7 @@ class LanguageRuleEngine:
         if not _check_llm_ready():
             return []
 
+        categories = profile.get_intent_categories() if profile else None
         signals = []
 
         # Process in batches of INTENT_BATCH_SIZE
@@ -405,6 +440,7 @@ class LanguageRuleEngine:
             batch = features_list[batch_start:batch_start + INTENT_BATCH_SIZE]
             batch_signals = await self._classify_intent_batch(
                 batch, all_features=features_list, batch_offset=batch_start,
+                categories=categories,
             )
             signals.extend(batch_signals)
 
@@ -1036,6 +1072,7 @@ class LanguageRuleEngine:
         self, batch: list[dict],
         all_features: list[dict] | None = None,
         batch_offset: int = 0,
+        categories: list[str] | None = None,
     ) -> list[dict]:
         """
         Send a batch of utterances to the LLM for intent classification.
@@ -1085,6 +1122,17 @@ class LanguageRuleEngine:
 
         utterance_block = "\n".join(utterance_lines)
 
+        # Build category list — use content-type-specific set when available
+        active_cats = categories or [
+            "INFORM", "QUESTION", "REQUEST", "PROPOSE", "AGREE", "DISAGREE",
+            "ACKNOWLEDGE", "NEGOTIATE", "COMMIT", "DEFLECT", "RAPPORT",
+            "CLOSE", "OBJECTION",
+        ]
+        cat_lines = "\n".join(
+            f"- {c}: {_INTENT_DESC.get(c, c)}" for c in active_cats
+        )
+        cat_list_str = ", ".join(active_cats)
+
         system_prompt = (
             "You are a conversation intent classifier for a behavioural analysis system. "
             "You classify utterances into exactly one intent category and return structured JSON."
@@ -1092,19 +1140,7 @@ class LanguageRuleEngine:
 
         user_prompt = f"""Classify each utterance's primary intent. Use EXACTLY one of these categories:
 
-- INFORM: Sharing facts, data, or status updates
-- QUESTION: Asking for information
-- REQUEST: Asking someone to do something
-- PROPOSE: Suggesting an idea, plan, or solution
-- AGREE: Expressing agreement or acceptance
-- DISAGREE: Expressing disagreement or pushback
-- ACKNOWLEDGE: Confirming receipt, accepting a point ("Fine.", "Okay.", "Right.", "Sure.")
-- NEGOTIATE: Bargaining, counter-offering, or discussing terms
-- COMMIT: Making a promise, commitment, or decision
-- DEFLECT: Avoiding, redirecting, or evading a topic
-- RAPPORT: Small talk, relationship building, empathy
-- CLOSE: Attempting to close a deal or reach a decision
-- OBJECTION: Raising a concern or barrier
+{cat_lines}
 
 IMPORTANT for context-enriched utterances (marked with >>> and <<<):
 - Classify ONLY the marked segment. Surrounding text is context.
@@ -1114,7 +1150,8 @@ IMPORTANT for context-enriched utterances (marked with >>> and <<<):
 - When in doubt for short utterances, prefer ACKNOWLEDGE over REQUEST.
 
 Respond with a JSON array of objects: [{{"id": 1, "intent": "CATEGORY", "confidence": 0.0-1.0}}]
-Only include utterances where you have confidence > 0.4. Return ONLY the JSON array, no other text.
+Only include utterances where you have confidence > 0.4. Use only categories from this list: {cat_list_str}
+Return ONLY the JSON array, no other text.
 
 Utterances:
 {utterance_block}"""

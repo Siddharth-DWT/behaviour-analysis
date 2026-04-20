@@ -187,7 +187,7 @@ async def analyse_transcript(request: AnalysisRequest):
         if not request.run_intent_classification:
             return []
         try:
-            return await rule_engine.evaluate_batch_intent(features_list)
+            return await rule_engine.evaluate_batch_intent(features_list, profile=_profile)
         except Exception as e:
             logger.warning(f"[{session_id}] Intent classification failed: {e}")
             return []
@@ -260,7 +260,7 @@ async def analyse_transcript(request: AnalysisRequest):
     speakers = list(set(f.get("speaker_id", "unknown") for f in features_list))
     logger.info(f"[{session_id}] Complete: {len(all_signals)} signals in {elapsed:.1f}s")
 
-    summary = _build_summary(all_signals, features_list, speakers)
+    summary = _build_summary(all_signals, features_list, speakers, profile=_profile)
     summary["entities"] = entities
 
     return AnalysisResponse(
@@ -272,8 +272,12 @@ async def analyse_transcript(request: AnalysisRequest):
     )
 
 
-def _build_summary(signals: list[dict], features_list: list[dict], speakers: list[str]) -> dict:
+def _build_summary(signals: list[dict], features_list: list[dict], speakers: list[str], profile=None) -> dict:
     """Build a human-readable summary from all signals."""
+    # Resolve content-type-aware signal type names
+    buy_type = profile.rename_signal("buying_signal") if profile else "buying_signal"
+    obj_type  = profile.rename_signal("objection_signal") if profile else "objection_signal"
+
     summary = {
         "total_signals": len(signals),
         "per_speaker": {},
@@ -291,11 +295,11 @@ def _build_summary(signals: list[dict], features_list: list[dict], speakers: lis
         sent_signals = [s for s in speaker_signals if s.get("signal_type") == "sentiment_score"]
         sent_values = [s["value"] for s in sent_signals if s.get("value") is not None]
 
-        # Buying signals
-        buy_signals = [s for s in speaker_signals if s.get("signal_type") == "buying_signal"]
+        # Buying signals (content-type label aware)
+        buy_signals = [s for s in speaker_signals if s.get("signal_type") == buy_type]
 
-        # Objection signals
-        obj_signals = [s for s in speaker_signals if s.get("signal_type") == "objection_signal"]
+        # Objection signals (content-type label aware)
+        obj_signals = [s for s in speaker_signals if s.get("signal_type") == obj_type]
 
         # Power stats
         pwr_signals = [s for s in speaker_signals if s.get("signal_type") == "power_language_score"]

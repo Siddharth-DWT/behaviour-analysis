@@ -100,6 +100,7 @@ VOICE_AGENT_URL = os.getenv("VOICE_AGENT_URL", "http://localhost:8002")
 LANGUAGE_AGENT_URL = os.getenv("LANGUAGE_AGENT_URL", "http://localhost:8003")
 CONVERSATION_AGENT_URL = os.getenv("CONVERSATION_AGENT_URL", "http://localhost:8011")
 FUSION_AGENT_URL = os.getenv("FUSION_AGENT_URL", "http://localhost:8004")
+VIDEO_AGENT_URL  = os.getenv("VIDEO_AGENT_URL",  "http://localhost:8012")
 
 # ── Upload directory ──
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/recordings"))
@@ -889,6 +890,8 @@ async def create_session_endpoint(
         logger.warning(f"[{session_id}] DB create failed (continuing without DB): {e}")
 
     # ── Step 3: Launch pipeline in background ──
+    # Pass the same file as video_path when it contains a video track
+    _video_path = file_path if suffix in {".mp4", ".webm"} else None
     background_tasks.add_task(
         _run_pipeline,
         session_id=session_id,
@@ -898,6 +901,8 @@ async def create_session_endpoint(
         num_speakers=num_speakers,
         transcription_config=transcription_config,
         analysis_config=analysis_config,
+        video_path=_video_path,
+        user_email=current_user.get("email", ""),
     )
 
     return {
@@ -916,6 +921,8 @@ async def _run_pipeline(
     num_speakers: Optional[int] = None,
     transcription_config: Optional[dict] = None,
     analysis_config: Optional[dict] = None,
+    video_path: Optional[Path] = None,
+    user_email: str = "",
 ):
     """
     Run the full analysis pipeline in the background.
@@ -985,6 +992,7 @@ async def _run_pipeline(
         "voice": "completed",
         "language": "skipped",
         "conversation": "skipped",
+        "video": "skipped",
         "fusion": "skipped",
     }
 
@@ -996,6 +1004,33 @@ async def _run_pipeline(
             await insert_transcript_segments(session_id, transcript_segments, speaker_map)
         except Exception as e:
             logger.warning(f"[{session_id}] Transcript persist failed: {e}")
+
+    # ── Start video agent in background (runs parallel with language+conversation) ──
+    video_signals: list[dict] = []
+    video_task: Optional[asyncio.Task] = None
+    run_video = (
+        video_path is not None
+        and run_behavioural
+        and user_email.split("@")[0] == "mernhash"
+    )
+    if run_video:
+        diar_segments_for_video = [
+            {"speaker": seg.get("speaker", "unknown"),
+             "start_ms": int(seg.get("start_ms", 0)),
+             "end_ms":   int(seg.get("end_ms", 0))}
+            for seg in transcript_segments
+            if seg.get("start_ms") is not None
+        ]
+        video_task = asyncio.create_task(
+            _call_video_agent(
+                session_id, str(video_path.resolve()),
+                diar_segments_for_video, meeting_type, num_speakers or 2,
+            )
+        )
+        logger.info(
+            f"[{session_id}] Video agent task started "
+            f"({len(diar_segments_for_video)} diar segments)"
+        )
 
     # ── Step 4: Language Agent (behavioural OR standalone sentiment) ──
     _set_step(session_id, "language")
@@ -1075,6 +1110,24 @@ async def _run_pipeline(
     else:
         logger.info(f"[{session_id}] Behavioural analysis disabled — skipping Conversation Agent")
 
+    # ── Step 4c: Video Agent result (ran in parallel above; await here) ──
+    if video_task is not None:
+        _set_step(session_id, "video")
+        try:
+            video_result = await video_task
+            video_signals = video_result.get("signals", [])
+            agent_status["video"] = "completed"
+            logger.info(f"[{session_id}] Video Agent: {len(video_signals)} signals")
+        except Exception as e:
+            agent_status["video"] = "failed"
+            logger.warning(f"[{session_id}] Video Agent failed (non-fatal): {e}")
+        if video_signals:
+            try:
+                count = await insert_signals(session_id, video_signals, speaker_map)
+                logger.info(f"[{session_id}] Persisted {count} video signals")
+            except Exception as e:
+                logger.warning(f"[{session_id}] Video signal persist failed: {e}")
+
     # ── Step 5: Fusion Agent (only when behavioural analysis enabled) ──
     _set_step(session_id, "fusion")
     fusion_result = None
@@ -1096,6 +1149,7 @@ async def _run_pipeline(
                 voice_summary=enriched_voice_summary,
                 language_summary=language_summary,
                 meeting_type=meeting_type,
+                video_signals=video_signals,
             )
             fusion_signals = fusion_result.get("fusion_signals", [])
             alerts = fusion_result.get("alerts", [])
@@ -1176,7 +1230,7 @@ async def _run_pipeline(
             _pool = await get_pool()
             await store_session_knowledge(_pool, session_id, {
                 "transcript_segments": transcript_segments,
-                "signals": voice_signals + language_signals + conversation_signals + fusion_signals,
+                "signals": voice_signals + language_signals + conversation_signals + video_signals + fusion_signals,
                 "entities": entities,
                 "report": report_content or {},
                 "graph_analytics": graph_analytics or {},
@@ -1559,6 +1613,33 @@ async def _call_conversation_agent(
         return resp.json()
 
 
+async def _call_video_agent(
+    session_id: str,
+    video_path: str,
+    diar_segments: list[dict],
+    meeting_type: str,
+    num_speakers: int = 2,
+) -> dict:
+    """Call Video Agent POST /analyse with the video file."""
+    import json as _json
+    video_file = Path(video_path)
+    with open(video_file, "rb") as f:
+        video_bytes = f.read()
+    async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
+        resp = await client.post(
+            f"{VIDEO_AGENT_URL}/analyse",
+            files={"video": (video_file.name, video_bytes, "video/mp4")},
+            data={
+                "session_id":          session_id,
+                "meeting_type":        meeting_type,
+                "diar_segments_json":  _json.dumps(diar_segments),
+                "num_speakers":        str(num_speakers),
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
 async def _call_fusion_agent(
     session_id: str,
     voice_signals: list[dict],
@@ -1566,6 +1647,7 @@ async def _call_fusion_agent(
     voice_summary: dict,
     language_summary: dict,
     meeting_type: str,
+    video_signals: Optional[list[dict]] = None,
 ) -> dict:
     """Call Fusion Agent POST /analyse with all signals."""
     # Convert signals to FusionSignalInput format
@@ -1582,11 +1664,16 @@ async def _call_fusion_agent(
             "metadata": signal.get("metadata"),
         }
 
+    # Merge video signals into the voice-side pool so fusion sees all modalities
+    all_voice_side = [_to_fusion_input(s, "voice") for s in voice_signals]
+    if video_signals:
+        all_voice_side += [_to_fusion_input(s, "video") for s in video_signals]
+
     async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
         resp = await client.post(
             f"{FUSION_AGENT_URL}/analyse",
             json={
-                "voice_signals": [_to_fusion_input(s, "voice") for s in voice_signals],
+                "voice_signals": all_voice_side,
                 "language_signals": [_to_fusion_input(s, "language") for s in language_signals],
                 "session_id": session_id,
                 "meeting_type": meeting_type,
@@ -1882,7 +1969,7 @@ async def chat_with_session(
     sources = []
     for row in rows:
         sim = float(row["similarity"])
-        if sim < 0.50:  # text-embedding-3-small (1536d cosine): 0.50 = semantically related
+        if sim < 0.45:  # text-embedding-3-small (1536d cosine): 0.45 = semantically related
             continue
         context_parts.append(f"[{row['chunk_type']}] {row['text']}")
         sources.append({

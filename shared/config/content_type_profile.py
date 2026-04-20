@@ -59,8 +59,8 @@ PROFILES: dict[str, ContentTypeConfig] = {
             "CLOSE", "OBJECTION",
         ],
         rules={
+            # Matrix: only 1 threshold change for sales_call (Gong: top performers 43%, underperformers 64%)
             "VOICE-TALK-01": RuleProfile(thresholds={"significant_pct": 60.0}),
-            "CONVO-DOM-01": RuleProfile(thresholds={"expected_dominant_pct": 65.0}),
         },
         signal_renames={
             "normal": "deliberative",
@@ -75,15 +75,19 @@ PROFILES: dict[str, ContentTypeConfig] = {
             "ASSIGN_ACTION", "ESCALATE",
         ],
         rules={
+            # Matrix: LANG-PERS-01 confidence reduced — influence attempts less diagnostic in client context
             "LANG-PERS-01": RuleProfile(confidence_multiplier=0.7),
-            "FUSION-07": RuleProfile(thresholds={"max_confidence": 0.60}),
+            # Matrix: FUSION-07 FIRE for client_meeting — do NOT cap below 0.65
         },
         signal_renames={
-            # Matrix: RENAME buying_signal → engagement_signal, objection → concern,
-            #         persuasion_technique → influence_tactic
-            "buying_signal": "engagement_signal",
-            "objection_signal": "concern",
-            "persuasion_technique": "influence_tactic",
+            # Matrix: same detection, different labels for client context
+            "buying_signal":              "engagement_signal",       # LANG-BUY-01
+            "objection_signal":           "concern",                 # LANG-OBJ-01
+            "persuasion_technique":       "influence_tactic",        # LANG-PERS-01
+            "purchase_intent_validation": "engagement_verification", # FUSION-05 (Phase 2)
+            "decision_readiness":         "commitment_signals",      # COMPOUND-04 (Phase 3)
+            "objection_formation":        "concern_formation",       # TEMPORAL-04 (Phase 3)
+            "buying_decision_sequence":   "commitment_sequence",     # TEMPORAL-06 (Phase 3)
             "normal": "deliberative",
         },
     ),
@@ -96,25 +100,28 @@ PROFILES: dict[str, ContentTypeConfig] = {
             "ASSIGN_ACTION", "FACILITATE",
         ],
         rules={
+            # Matrix: GATE — buying signals have no meaning in peer/internal context
             "LANG-BUY-01": RuleProfile(gated=True),
-            # LANG-PERS-01: matrix says RENAME "influence_attempt", NOT gate
+            # Matrix: GATE — urgency/persuasion detection irrelevant (no persuasion context)
             "FUSION-13": RuleProfile(gated=True),
-            # FUSION-02 removed: matrix says FIRE for internal meetings
-            # FUSION-07 removed: matrix says FIRE for internal meetings
-            "VOICE-FILLER-01": RuleProfile(thresholds={"spike_delta": 0.75}),
-            # noticeable threshold +0.5% from default 2.5% (Bortfeld 2001: informal speech)
+            # Matrix: GATE — no buying/decision progression in peer meetings
+            "TEMPORAL-06": RuleProfile(gated=True),
+            # Matrix: ADAPT — noticeable threshold +0.5% (Bortfeld 2001: informal speech, 82% more fillers)
             "VOICE-FILLER-02": RuleProfile(thresholds={"noticeable_pct": 3.0}),
-            # >50% any peer = significant in peer/internal meetings
+            # Matrix: ADAPT — >50% any peer = significant in flat-hierarchy meetings
             "VOICE-TALK-01": RuleProfile(thresholds={"significant_pct": 50.0}),
-            # Professional speech runs lower emotional density (Tausczik 2010)
+            # Matrix: ADAPT — professional speech runs lower emotional density (Tausczik 2010, avg ~3-3.5%)
             "LANG-SENT-02": RuleProfile(thresholds={"high_pct": 0.06, "suppressed_pct": 0.015}),
+            # Note: VOICE-FILLER-01 is FIRE for internal (matrix row 3) — baseline absorbs variation
+            # Note: LANG-PERS-01 is RENAME "influence_attempt", NOT gated (matrix row 23)
         },
         signal_renames={
-            # Matrix: disagreement (not concern_raised), influence_attempt (not gated),
-            #         stonewalling → disengagement (Cortina: may be adaptive boundary-setting)
-            "objection_signal": "disagreement",
-            "persuasion_technique": "influence_attempt",
-            "stonewalling": "disengagement",
+            # Matrix: same detection, reframed for peer context
+            "objection_signal":           "disagreement",            # LANG-OBJ-01
+            "persuasion_technique":       "influence_attempt",       # LANG-PERS-01 (Cortina: boundary-setting)
+            "stonewalling":               "disengagement",           # LANG-NEG-01 (Cortina: may be adaptive)
+            "decision_readiness":         "consensus_signals",       # COMPOUND-04 (Phase 3)
+            "objection_formation":        "disagreement_formation",  # TEMPORAL-04 (Phase 3)
             "normal": "deliberative",
         },
     ),
@@ -127,48 +134,45 @@ PROFILES: dict[str, ContentTypeConfig] = {
             "INTEREST", "HESITATION", "GREET", "CLOSE",
         ],
         rules={
-            "VOICE-STRESS-01": RuleProfile(thresholds={"stress_offset": 0.15}),
-            "VOICE-FILLER-01": RuleProfile(thresholds={"spike_delta": 1.00}),
+            # Matrix: GATE — filler credibility unfair in interview (cognitive load, not credibility)
             "VOICE-FILLER-02": RuleProfile(gated=True),
-            "VOICE-PITCH-01": RuleProfile(thresholds={"mild_pct": 12.0}),
-            "VOICE-PITCH-02": RuleProfile(thresholds={"variance_drop_pct": 50.0}),
-            "VOICE-RATE-01": RuleProfile(thresholds={"anomaly_pct": 35.0}),
-            "VOICE-TONE-03": RuleProfile(confidence_multiplier=0.6),
-            "VOICE-TONE-04": RuleProfile(confidence_multiplier=1.2),
+            # Matrix: ADAPT — extended hesitation >3000ms (Stivers 2009: complex answers need formulation time)
             "VOICE-PAUSE-01": RuleProfile(thresholds={"extended_pause_ms": 3000.0}),
-            # LANG-PERS-01: matrix says RENAME "impression_management", NOT gate
-            "LANG-NEG-01": RuleProfile(confidence_multiplier=0.7),
-            "LANG-CLAR-01": RuleProfile(confidence_multiplier=1.2),
-            "FUSION-13": RuleProfile(gated=True),
-            "FUSION-02": RuleProfile(thresholds={"max_confidence": 0.40}),
-            "FUSION-07": RuleProfile(thresholds={"confidence_floor": 0.35, "max_confidence": 0.50}),
-            "FUSION-GRAPH-01": RuleProfile(thresholds={"min_signals": 4.0}),
-            "FUSION-GRAPH-03": RuleProfile(thresholds={"threshold_bonus": 3.0}),
-            "CONVO-TURN-01": RuleProfile(thresholds={"monologue_per_min": 1.0}),
-            "CONVO-LAT-01": RuleProfile(thresholds={"delayed_ms": 2500.0}),
-            "CONVO-DOM-01": RuleProfile(thresholds={"expected_dominant_pct": 70.0}),
-            "CONVO-BAL-01": RuleProfile(thresholds={"expected_gini_low": 0.20, "expected_gini_high": 0.40}),
-            "CONVO-CONF-01": RuleProfile(thresholds={"min_indicators": 3.0}),
+            # Matrix: ADAPT — flag only if candidate <30% or >70% (BarRaiser: optimal 40-55%)
             "VOICE-TALK-01": RuleProfile(thresholds={"significant_pct": 70.0}),
+            # Matrix: GATE — urgency authenticity inappropriate for interviews
+            "FUSION-13": RuleProfile(gated=True),
+            # Matrix: ADAPT — expected Gini 0.20-0.40 (candidate talks more than symmetric)
+            "CONVO-BAL-01": RuleProfile(thresholds={"expected_gini_low": 0.20, "expected_gini_high": 0.40}),
+            # Matrix: structural dominance expected; flag only extreme deviation
+            "CONVO-DOM-01": RuleProfile(thresholds={"expected_dominant_pct": 70.0}),
+            # Matrix: GATE — deception detection produces unacceptable false positives
+            # (DePaulo 2003: stress and deception share overlapping profiles in interviews)
+            "COMPOUND-12": RuleProfile(gated=True),
+            # All other rules FIRE with universal thresholds — per-speaker baseline absorbs
+            # interview-elevated stress, pitch, filler rate (matrix rows 2-13, 30-37)
         },
         signal_renames={
-            # Matrix: interest_signal, hesitation, impression_management (not gated),
-            #         stonewalling → disengagement, defensiveness → resistance
-            "buying_signal": "interest_signal",
-            "objection_signal": "hesitation",
-            "persuasion_technique": "impression_management",
-            "stonewalling": "disengagement",
-            "defensiveness": "resistance",
-            "aggressive": "assertive",
-            "cold": "low_energy",
-            "normal": "deliberative",
+            # Matrix: same detection, candidate-appropriate labels
+            "buying_signal":              "interest_signal",         # LANG-BUY-01
+            "objection_signal":           "hesitation",              # LANG-OBJ-01
+            "persuasion_technique":       "impression_management",   # LANG-PERS-01
+            "stonewalling":               "disengagement",           # LANG-NEG-01 (legitimate in interview)
+            "defensiveness":              "resistance",              # LANG-NEG-01
+            "purchase_intent_validation": "interest_verification",   # FUSION-05 (Phase 2)
+            "decision_readiness":         "decision_signals",        # COMPOUND-04 (Phase 3)
+            "objection_formation":        "hesitation_formation",    # TEMPORAL-04 (Phase 3)
+            "buying_decision_sequence":   "decision_sequence",       # TEMPORAL-06 (Phase 3)
+            "aggressive":                 "assertive",
+            "cold":                       "low_energy",
+            "normal":                     "deliberative",
         },
         interpretations={
-            "vocal_stress_score": "Interview stress is expected and less diagnostic",
-            "filler_detection": "Cognitive load during complex answers",
-            "interruption_event": "Interviewer interruptions = topic control",
-            "power_language_score": "Powerful = competent, hedging may be appropriate",
-            "empathy_language": "Soft skill signal for candidate assessment",
+            "vocal_stress_score":   "Interview stress is expected and less diagnostic",
+            "filler_detection":     "Cognitive load during complex answers",
+            "interruption_event":   "Interviewer interruptions = topic control",
+            "power_language_score": "Powerful = competent; hedging may be appropriate",
+            "empathy_language":     "Soft skill signal for candidate assessment",
         },
     ),
 
@@ -180,30 +184,36 @@ PROFILES: dict[str, ContentTypeConfig] = {
             "DISAGREE", "JOKE", "TRANSITION", "ACKNOWLEDGE",
         ],
         rules={
-            "LANG-BUY-01": RuleProfile(gated=True),
-            "LANG-OBJ-01": RuleProfile(gated=True),
-            "LANG-PERS-01": RuleProfile(gated=True),
-            "LANG-NEG-01": RuleProfile(gated=True),
-            "FUSION-02": RuleProfile(gated=True),
-            "FUSION-07": RuleProfile(gated=True),
-            "FUSION-13": RuleProfile(gated=True),
+            # Matrix: GATE — sales/persuasion signals don't apply to podcasts
+            "LANG-BUY-01":    RuleProfile(gated=True),
+            "LANG-OBJ-01":    RuleProfile(gated=True),
+            "LANG-PERS-01":   RuleProfile(gated=True),
+            "LANG-NEG-01":    RuleProfile(gated=True),
+            "FUSION-02":      RuleProfile(gated=True),
+            "FUSION-05":      RuleProfile(gated=True),   # Matrix: GATE (audio-visual sales rule)
+            "FUSION-07":      RuleProfile(gated=True),   # N/A — no video track for head-nod detection
+            "FUSION-13":      RuleProfile(gated=True),
             "FUSION-GRAPH-03": RuleProfile(gated=True),
-            "CONVO-CONF-01": RuleProfile(gated=True),
+            "CONVO-CONF-01":  RuleProfile(gated=True),
+            "TEMPORAL-06":    RuleProfile(gated=True),   # Matrix: GATE — no buying/decision progression
+            # Matrix: ADAPT — podcast speech has more filler (informal context)
             "VOICE-FILLER-01": RuleProfile(thresholds={"spike_delta": 0.30}),
-            "VOICE-INT-01": RuleProfile(thresholds={"overlap_ms": 400.0}),
-            # Matrix: flag host if >50% (guest should dominate 60-80%)
-            "VOICE-TALK-01": RuleProfile(thresholds={"significant_pct": 50.0}),
-            "CONVO-TURN-01": RuleProfile(thresholds={"monologue_per_min": 0.5}),
-            "CONVO-LAT-01": RuleProfile(thresholds={"delayed_ms": 3000.0}),
-            "CONVO-BAL-01": RuleProfile(thresholds={"expected_gini_low": 0.30, "expected_gini_high": 0.50}),
-            "LANG-CLAR-01": RuleProfile(confidence_multiplier=1.2),
+            # Matrix: ADAPT — 400ms overlap threshold (podcast crosstalk is style, not interruption)
+            "VOICE-INT-01":    RuleProfile(thresholds={"overlap_ms": 400.0}),
+            # Matrix: ADAPT — flag host if >50% (guest should dominate 60-80%)
+            "VOICE-TALK-01":   RuleProfile(thresholds={"significant_pct": 50.0}),
+            "CONVO-TURN-01":   RuleProfile(thresholds={"monologue_per_min": 0.5}),
+            "CONVO-LAT-01":    RuleProfile(thresholds={"delayed_ms": 3000.0}),
+            # Matrix: ADAPT — expected Gini 0.30-0.50 (guest dominates)
+            "CONVO-BAL-01":    RuleProfile(thresholds={"expected_gini_low": 0.30, "expected_gini_high": 0.50}),
+            "LANG-CLAR-01":    RuleProfile(confidence_multiplier=1.2),
         },
         signal_renames={
-            "aggressive": "assertive",
+            # Matrix: 0 renames for podcast
             "normal": "deliberative",
         },
         interpretations={
-            "excited": "Positive engagement signal",
+            "excited":      "Positive engagement signal",
             "energy_level": "Elevated energy is positive for podcasts",
         },
     ),

@@ -210,6 +210,25 @@ services:
     networks:
       - nexus-network
 
+  video:
+    build:
+      context: ./services/video_agent
+      dockerfile: Dockerfile
+    container_name: nexus-video-agent
+    restart: unless-stopped
+    ports:
+      - "8012:8004"
+    environment:
+      - PYTHONPATH=/app
+      - MEDIAPIPE_MODEL_DIR=/app/models/mediapipe
+    volumes:
+      - ./services/video_agent:/app
+      - ./shared:/app/shared
+      - ./data:/app/data
+      - ./models:/app/models
+    networks:
+      - nexus-network
+
   fusion:
     build:
       context: ./services/fusion_agent
@@ -258,6 +277,7 @@ services:
       - LANGUAGE_AGENT_URL=http://language:8002
       - CONVERSATION_AGENT_URL=http://conversation:8006
       - FUSION_AGENT_URL=http://fusion:8007
+      - VIDEO_AGENT_URL=http://video:8004
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - LLM_PROVIDER=${LLM_PROVIDER:-openai}

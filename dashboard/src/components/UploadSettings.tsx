@@ -32,6 +32,7 @@ export interface UploadConfig {
   run_diarization: boolean;
   run_entity_extraction: boolean;
   run_knowledge_graph: boolean;
+  run_video: boolean;
   sensitivity: number; // 0.0 – 1.0
 
   // Speech understanding
@@ -55,6 +56,7 @@ export const DEFAULT_CONFIG: UploadConfig = {
   run_diarization: true,
   run_entity_extraction: true,
   run_knowledge_graph: true,
+  run_video: true,
   sensitivity: 0.5,
   translate_to: null,
   temperature: null,

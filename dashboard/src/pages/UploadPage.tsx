@@ -496,7 +496,7 @@ function QuickDoneView({
 
 // ─── Processing steps ──────────────────────────────────────────────────────────
 
-function buildSteps(cfg: UploadConfig): string[] {
+function buildSteps(cfg: UploadConfig, hasVideo?: boolean): string[] {
   const steps = [
     "Uploading audio file",
     "Transcribing speech",
@@ -508,6 +508,7 @@ function buildSteps(cfg: UploadConfig): string[] {
     steps.push("Acoustic feature extraction");
     steps.push("Language & sentiment analysis");
     steps.push("Conversation dynamics");
+    if (hasVideo) steps.push("Video analysis");
     steps.push("Fusion & signal scoring");
     steps.push("Report generation");
   }
@@ -526,6 +527,7 @@ const STEP_LABEL: Record<string, string> = {
   diarization:        "Speaker diarization",
   language:           "Language & sentiment analysis",
   conversation:       "Conversation dynamics",
+  video:              "Video analysis",
   fusion:             "Fusion & signal scoring",
   report:             "Report generation",
   entity_extraction:  "Entity extraction",
@@ -536,7 +538,7 @@ const STEP_LABEL: Record<string, string> = {
 // current backend step isn't present in this config's step list.
 const PIPELINE_ORDER = [
   "transcribing", "diarization", "language", "conversation",
-  "fusion", "report", "entity_extraction", "knowledge_graph",
+  "video", "fusion", "report", "entity_extraction", "knowledge_graph",
 ];
 
 function pipelineStepToIndex(stepName: string | null, steps: string[]): number {
@@ -564,8 +566,8 @@ function pipelineStepToIndex(stepName: string | null, steps: string[]): number {
 
 // ─── Inline step list (used in chat area while processing) ─────────────────────
 
-function InlineStepList({ cfg, pipelineStep }: { cfg: UploadConfig; pipelineStep: string | null }) {
-  const steps = buildSteps(cfg);
+function InlineStepList({ cfg, pipelineStep, hasVideo }: { cfg: UploadConfig; pipelineStep: string | null; hasVideo?: boolean }) {
+  const steps = buildSteps(cfg, hasVideo);
   const activeStep = pipelineStepToIndex(pipelineStep, steps);
 
   return (
@@ -795,6 +797,7 @@ export default function UploadPage() {
         run_diarization: cfg.run_diarization,
         run_entity_extraction: cfg.run_entity_extraction,
         run_knowledge_graph: cfg.run_knowledge_graph,
+        run_video: cfg.run_video,
         sensitivity: cfg.sensitivity,
         translate_to: cfg.translate_to,
       },
@@ -899,10 +902,13 @@ export default function UploadPage() {
                 </div>
                 <div className="text-center">
                   <p className="text-sm font-medium text-nexus-text-secondary">
-                    Drop audio file here
+                    Drop audio or video file here
                   </p>
                   <p className="mt-0.5 text-xs text-nexus-text-muted">
                     or click to browse — WAV, MP3, M4A, FLAC, OGG, WEBM, MP4
+                  </p>
+                  <p className="mt-0.5 text-[10px] text-nexus-text-muted opacity-70">
+                    MP4 / WEBM files also run facial, gaze &amp; body analysis
                   </p>
                 </div>
               </div>
@@ -1006,7 +1012,7 @@ export default function UploadPage() {
                     </div>
                   </div>
                   {/* Step list — built from config */}
-                  <InlineStepList cfg={cfg} pipelineStep={pipelineStep} />
+                  <InlineStepList cfg={cfg} pipelineStep={pipelineStep} hasVideo={file ? /\.(mp4|webm)$/i.test(file.name) : false} />
                 </div>
               )}
 
@@ -1302,34 +1308,37 @@ export default function UploadPage() {
                   }}
                   help="voice, language, conversation, fusion rules"
                 />
-                {/* Sensitivity only applies to the rule engine — hide when behavioural is off */}
+                {/* Sub-options only relevant when behavioural analysis is on */}
                 {cfg.run_behavioural && (
-                  <div className="pt-0.5 pl-1 border-l-2 border-nexus-accent-blue/30">
-                    <div className="mb-1.5 flex items-center justify-between">
-                      <label className="text-[11px] font-medium uppercase tracking-wide text-nexus-text-muted">
-                        Sensitivity
-                      </label>
-                      <span className="text-[11px] text-nexus-text-muted">
-                        {cfg.sensitivity < 0.35
-                          ? "Low"
-                          : cfg.sensitivity > 0.65
-                          ? "High"
-                          : "Normal"}{" "}
-                        <span className="font-mono">({cfg.sensitivity.toFixed(2)})</span>
-                      </span>
-                    </div>
-                    <input
-                      type="range"
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      value={cfg.sensitivity}
-                      onChange={(e) => set("sensitivity", parseFloat(e.target.value))}
-                      className="w-full accent-nexus-accent-blue"
-                    />
-                    <div className="flex justify-between text-[10px] text-nexus-text-muted mt-0.5">
-                      <span>Low — fewer false positives</span>
-                      <span>High</span>
+                  <div className="pt-0.5 pl-1 border-l-2 border-nexus-accent-blue/30 space-y-3">
+                    {/* Sensitivity */}
+                    <div>
+                      <div className="mb-1.5 flex items-center justify-between">
+                        <label className="text-[11px] font-medium uppercase tracking-wide text-nexus-text-muted">
+                          Sensitivity
+                        </label>
+                        <span className="text-[11px] text-nexus-text-muted">
+                          {cfg.sensitivity < 0.35
+                            ? "Low"
+                            : cfg.sensitivity > 0.65
+                            ? "High"
+                            : "Normal"}{" "}
+                          <span className="font-mono">({cfg.sensitivity.toFixed(2)})</span>
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={cfg.sensitivity}
+                        onChange={(e) => set("sensitivity", parseFloat(e.target.value))}
+                        className="w-full accent-nexus-accent-blue"
+                      />
+                      <div className="flex justify-between text-[10px] text-nexus-text-muted mt-0.5">
+                        <span>Low — fewer false positives</span>
+                        <span>High</span>
+                      </div>
                     </div>
                   </div>
                 )}
