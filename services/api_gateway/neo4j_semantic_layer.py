@@ -1,3 +1,4 @@
+# services/api_gateway/neo4j_semantic_layer.py
 """
 NEXUS Neo4j Semantic Layer — 10 pre-built Cypher tools.
 

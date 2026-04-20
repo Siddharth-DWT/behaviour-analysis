@@ -1,3 +1,4 @@
+# services/api_gateway/neo4j_schema.py
 """
 Neo4j index and constraint initialisation for NEXUS.
 Called once at API Gateway startup — idempotent (IF NOT EXISTS guards).
@@ -27,6 +28,9 @@ _SCHEMA_QUERIES = [
     "CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)",
     "CREATE INDEX speaker_session IF NOT EXISTS FOR (s:Speaker) ON (s.session_id)",
     "CREATE INDEX alert_session IF NOT EXISTS FOR (a:Alert) ON (a.session_id)",
+    # ── Relationship property indexes for faster edge lookups (Neo4j 5.x) ──
+    "CREATE INDEX rel_replied_gap IF NOT EXISTS FOR ()-[r:REPLIED_TO]-() ON (r.gap_ms)",
+    "CREATE INDEX rel_influenced_lag IF NOT EXISTS FOR ()-[r:INFLUENCED]-() ON (r.lag_ms)",
 ]
 
 

@@ -1,3 +1,4 @@
+# services/api_gateway/knowledge_store.py
 """
 NEXUS API Gateway — Knowledge Store
 Stores session analysis data as vector embeddings in pgvector for RAG chat.

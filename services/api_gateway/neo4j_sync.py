@@ -1,3 +1,4 @@
+# services/api_gateway/neo4j_sync.py
 """
 NEXUS API Gateway — Neo4j Sync (Phase 3A: Single-Session Knowledge Graph)
 
@@ -280,11 +281,22 @@ async def _fetch_report(pool, session_id: str) -> Optional[dict]:
 # ─────────────────────────────────────────────────────────
 
 async def _wipe_session(nsession, session_id: str):
-    """Delete any pre-existing graph for this session before re-syncing."""
+    """Delete any pre-existing graph for this session before re-syncing.
+
+    Two-step: delete relationships first (avoids DETACH DELETE memory pressure
+    on large graphs), then delete orphaned nodes.
+    """
+    await nsession.run(
+        """
+        MATCH (n {session_id: $sid})-[r]-()
+        DELETE r
+        """,
+        sid=session_id,
+    )
     await nsession.run(
         """
         MATCH (n {session_id: $sid})
-        DETACH DELETE n
+        DELETE n
         """,
         sid=session_id,
     )
@@ -684,7 +696,8 @@ async def _build_temporal_edges(nsession, session_id: str):
         WHERE a.speaker_label <> b.speaker_label
           AND a.speaker_label <> ''
           AND b.speaker_label <> ''
-        MERGE (b)-[:REPLIED_TO {gap_ms: b.start_ms - a.end_ms}]->(a)
+        MERGE (b)-[r:REPLIED_TO]->(a)
+        SET r.gap_ms = b.start_ms - a.end_ms
         """,
         sid=session_id,
     )
@@ -932,9 +945,9 @@ async def _link_fusion_to_signals(nsession, session_id: str):
     """
     COMBINES: link FusionInsight nodes to their contributing Signal nodes (typed).
 
-    Each fusion signal type only links to the specific raw signal types that
-    actually feed into it. Prevents one FusionInsight from connecting to every
-    signal in its window (was producing 30-50 COMBINES per insight).
+    Each fusion type links to the TOP 3 signals per type (highest confidence,
+    closest to window midpoint). This caps fan-out and prevents cartesian product
+    explosion (was producing 30-50+ COMBINES per insight without the limit).
     """
     # stress_sentiment_incongruence / credibility_assessment — driven by stress + sentiment
     await nsession.run(
@@ -949,7 +962,12 @@ async def _link_fusion_to_signals(nsession, session_id: str):
           AND sig.timestamp_ms <= fi.window_end_ms
           AND (fi.speaker_label = sig.speaker_label
                OR fi.speaker_label IN ['all', ''])
-        MERGE (fi)-[:COMBINES]->(sig)
+        WITH fi, sig
+        ORDER BY sig.confidence DESC,
+                 abs(sig.timestamp_ms - (fi.window_start_ms + fi.window_end_ms) / 2) ASC
+        WITH fi, collect(sig)[0..3] AS top_sigs
+        UNWIND top_sigs AS best
+        MERGE (fi)-[:COMBINES]->(best)
         """,
         sid=session_id,
     )
@@ -966,7 +984,12 @@ async def _link_fusion_to_signals(nsession, session_id: str):
           AND sig.timestamp_ms <= fi.window_end_ms
           AND (fi.speaker_label = sig.speaker_label
                OR fi.speaker_label IN ['all', ''])
-        MERGE (fi)-[:COMBINES]->(sig)
+        WITH fi, sig
+        ORDER BY sig.confidence DESC,
+                 abs(sig.timestamp_ms - (fi.window_start_ms + fi.window_end_ms) / 2) ASC
+        WITH fi, collect(sig)[0..3] AS top_sigs
+        UNWIND top_sigs AS best
+        MERGE (fi)-[:COMBINES]->(best)
         """,
         sid=session_id,
     )
@@ -983,11 +1006,16 @@ async def _link_fusion_to_signals(nsession, session_id: str):
           AND sig.timestamp_ms <= fi.window_end_ms
           AND (fi.speaker_label = sig.speaker_label
                OR fi.speaker_label IN ['all', ''])
-        MERGE (fi)-[:COMBINES]->(sig)
+        WITH fi, sig
+        ORDER BY sig.confidence DESC,
+                 abs(sig.timestamp_ms - (fi.window_start_ms + fi.window_end_ms) / 2) ASC
+        WITH fi, collect(sig)[0..3] AS top_sigs
+        UNWIND top_sigs AS best
+        MERGE (fi)-[:COMBINES]->(best)
         """,
         sid=session_id,
     )
-    # tension_cluster / momentum_shift / persistent_incongruence — top-confidence signals only
+    # tension_cluster / momentum_shift / persistent_incongruence — top 5 by confidence
     await nsession.run(
         """
         MATCH (fi:FusionInsight {session_id: $sid})
@@ -1000,7 +1028,11 @@ async def _link_fusion_to_signals(nsession, session_id: str):
           AND sig.timestamp_ms <= fi.window_end_ms
           AND (fi.speaker_label = sig.speaker_label
                OR fi.speaker_label IN ['all', ''])
-        MERGE (fi)-[:COMBINES]->(sig)
+        WITH fi, sig
+        ORDER BY sig.confidence DESC
+        WITH fi, collect(sig)[0..5] AS top_sigs
+        UNWIND top_sigs AS best
+        MERGE (fi)-[:COMBINES]->(best)
         """,
         sid=session_id,
     )
@@ -1036,7 +1068,8 @@ async def _build_influence_edges(nsession, session_id: str):
           AND EXISTS {
               MATCH (segA)-[:NEXT*1..3]->(segB)
           }
-        MERGE (a)-[:INFLUENCED {lag_ms: b.timestamp_ms - a.timestamp_ms}]->(b)
+        MERGE (a)-[r:INFLUENCED]->(b)
+        SET r.lag_ms = b.timestamp_ms - a.timestamp_ms
         """,
         sid=session_id,
     )

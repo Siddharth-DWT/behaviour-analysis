@@ -1,3 +1,4 @@
+# services/api_gateway/database.py
 """
 NEXUS API Gateway - Database Module
 Async PostgreSQL operations for sessions, signals, alerts, and reports.
