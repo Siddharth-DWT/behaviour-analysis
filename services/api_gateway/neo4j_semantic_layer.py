@@ -276,23 +276,25 @@ ORDER BY signal_count DESC, seg.start_ms LIMIT 10
         ),
         "parameters": {
             "speaker_label": {
-                "description": "Speaker_0 or Speaker_1",
-                "required": True,
+                "description": "Speaker_0, Speaker_1, or omit for all speakers",
+                "required": False,
                 "default": None,
             },
         },
         "cypher": """
-MATCH (spk:Speaker {session_id: $session_id, label: $speaker_label})
+MATCH (spk:Speaker {session_id: $session_id})
+WHERE $speaker_label IS NULL OR spk.label = $speaker_label
 OPTIONAL MATCH (stress:Signal {session_id: $session_id, signal_type: 'vocal_stress_score',
-                                speaker_label: $speaker_label})
+                                speaker_label: spk.label})
 OPTIONAL MATCH (tone:Signal {session_id: $session_id, signal_type: 'tone_classification',
-                               speaker_label: $speaker_label})
+                               speaker_label: spk.label})
 WHERE tone.value_text <> 'neutral'
 WITH spk, round(avg(stress.value)*100)/100 AS avg_stress, max(stress.value) AS peak_stress,
      collect(DISTINCT tone.value_text) AS tones
 RETURN spk.label AS speaker, spk.name AS name, spk.role AS role,
        spk.talk_time_pct AS talk_pct, spk.word_count AS words,
        avg_stress, peak_stress, tones
+ORDER BY spk.label
 """,
     },
     {

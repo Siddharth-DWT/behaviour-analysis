@@ -350,10 +350,10 @@ async def _acomplete_openai(
         _uses_completion_tokens = any(resolved_model.startswith(p) for p in ("o1", "o3", "gpt-5"))
 
         if _uses_completion_tokens:
+            # o1 / o3 / gpt-5: temperature parameter is not supported (only default=1 allowed)
             response = await client.chat.completions.create(
                 model=resolved_model,
                 max_completion_tokens=max_tokens,
-                temperature=temperature,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
