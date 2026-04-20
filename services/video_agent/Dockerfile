@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxext6 \
         libxrender1 \
         libgles2 \
-        libegl1-mesa \
+        libegl1 \
     && ldconfig \
     && rm -rf /var/lib/apt/lists/*
 
