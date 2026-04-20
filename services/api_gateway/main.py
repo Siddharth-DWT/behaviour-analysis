@@ -1855,7 +1855,7 @@ async def chat_with_session(
     graph_source = None
     try:
         from neo4j_semantic_layer import select_tool, execute_tool, search_graph_context_fallback
-        tool_selection = await select_tool(question, session_id)
+        tool_selection = await select_tool(question, session_id, history=body.history)
         tool_name = tool_selection.get("tool", "none")
         if tool_name and tool_name != "none" and tool_name in [
             "get_causal_chain", "get_topic_stress_correlation", "get_speaker_influence",
@@ -1882,7 +1882,7 @@ async def chat_with_session(
     sources = []
     for row in rows:
         sim = float(row["similarity"])
-        if sim < 0.60:  # text-embedding-3-small (1536d cosine): 0.60 = strongly related
+        if sim < 0.50:  # text-embedding-3-small (1536d cosine): 0.50 = semantically related
             continue
         context_parts.append(f"[{row['chunk_type']}] {row['text']}")
         sources.append({
@@ -1891,7 +1891,7 @@ async def chat_with_session(
             "similarity": round(sim, 3),
         })
 
-    if not context_parts and not graph_context:
+    if not context_parts and not graph_context and not body.history:
         return {
             "answer": "I couldn't find relevant analysis data for that question. Try rephrasing or ask about specific speakers, signals, or moments.",
             "sources": [],

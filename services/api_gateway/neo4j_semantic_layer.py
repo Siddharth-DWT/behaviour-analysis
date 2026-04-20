@@ -378,12 +378,14 @@ Rules:
 Return ONLY valid JSON: {{"tool": "name_or_none", "params": {{"param": "value"}}}}"""
 
 
-async def select_tool(question: str, session_id: str) -> dict:
+async def select_tool(question: str, session_id: str, history: list[dict] | None = None) -> dict:
     """
     GPT-4o picks the best pre-built tool and extracts its parameters.
 
     Speaker labels are resolved from the real session data (Neo4j) so the LLM
     can map natural-language role references ("the seller", "Holly") to Speaker_N labels.
+    history (last 2-4 turns) is appended so follow-up questions ("elaborate more",
+    "what about Speaker_0?") resolve to the correct tool.
 
     Returns {"tool": "tool_name_or_none", "params": {...}}
     """
@@ -424,10 +426,20 @@ async def select_tool(question: str, session_id: str) -> dict:
         indent=2,
     )
 
+    history_block = ""
+    if history:
+        recent = history[-4:]  # last 2 exchanges (4 messages)
+        lines = []
+        for m in recent:
+            role = m.get("role", "user").title()
+            content = str(m.get("content", ""))[:300]
+            lines.append(f"{role}: {content}")
+        history_block = "\n\nPrevious conversation (use for follow-up resolution):\n" + "\n".join(lines)
+
     prompt = _TOOL_SELECTION_PROMPT.format(
         tool_descriptions=tool_descriptions,
         speaker_hint=speaker_hint,
-    ) + f'\n\nQuestion: "{question}"'
+    ) + history_block + f'\n\nQuestion: "{question}"'
 
     def _parse(raw: str) -> dict:
         text = raw.strip()
