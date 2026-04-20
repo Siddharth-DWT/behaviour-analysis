@@ -156,15 +156,21 @@ async def analyse_signals(request: AnalyseRequest):
     voice_dicts = [s.model_dump() for s in request.voice_signals]
     language_dicts = [s.model_dump() for s in request.language_signals]
 
+    # Separate video signals out of voice_dicts (gateway bundles them together)
+    video_dicts = [s for s in voice_dicts if s.get("agent") == "video"]
+    pure_voice_dicts = [s for s in voice_dicts if s.get("agent") != "video"]
+
     logger.info(
         f"[{session_id}] Fusion analysis: "
-        f"{len(voice_dicts)} voice + {len(language_dicts)} language signals"
+        f"{len(pure_voice_dicts)} voice + {len(language_dicts)} language"
+        f" + {len(video_dicts)} video signals"
     )
 
     # ── Step 1: Buffer signals ──
     buffer = SignalBuffer()
-    buffer.add_many(voice_dicts)
+    buffer.add_many(pure_voice_dicts)
     buffer.add_many(language_dicts)
+    buffer.add_many(video_dicts)
 
     # ── Step 2: Run fusion per speaker (parallel via asyncio.gather) ──
     speakers = buffer.speakers
@@ -172,7 +178,7 @@ async def analyse_signals(request: AnalyseRequest):
     all_unified_states = []
     all_alerts = []
 
-    ref_time = _max_time(voice_dicts + language_dicts)
+    ref_time = _max_time(pure_voice_dicts + language_dicts + video_dicts)
 
     async def _analyse_speaker(speaker_id: str) -> dict:
         speaker_voice = buffer.get_signals(
@@ -183,22 +189,28 @@ async def analyse_signals(request: AnalyseRequest):
             speaker_id, "language", window_ms=WINDOW_SHORT_MS,
             reference_time_ms=ref_time,
         )
+        speaker_video = buffer.get_signals(
+            speaker_id, "video", window_ms=WINDOW_SHORT_MS,
+            reference_time_ms=ref_time,
+        )
 
         if not speaker_voice:
-            speaker_voice = [s for s in voice_dicts if s.get("speaker_id") == speaker_id]
+            speaker_voice = [s for s in pure_voice_dicts if s.get("speaker_id") == speaker_id]
         if not speaker_language:
             speaker_language = [s for s in language_dicts if s.get("speaker_id") == speaker_id]
+        if not speaker_video:
+            speaker_video = [s for s in video_dicts if s.get("speaker_id") == speaker_id]
 
         if not speaker_voice and not speaker_language:
             return {"signals": [], "state": None, "alerts": []}
 
         all_starts = [
             _to_int(s.get("window_start_ms", 0))
-            for s in speaker_voice + speaker_language
+            for s in speaker_voice + speaker_language + speaker_video
         ]
         all_ends = [
             _to_int(s.get("window_end_ms", 0))
-            for s in speaker_voice + speaker_language
+            for s in speaker_voice + speaker_language + speaker_video
         ]
         window_start = min(all_starts) if all_starts else 0
         window_end = max(all_ends) if all_ends else 0
@@ -207,6 +219,7 @@ async def analyse_signals(request: AnalyseRequest):
             speaker_id=speaker_id,
             voice_signals=speaker_voice,
             language_signals=speaker_language,
+            video_signals=speaker_video,
             window_start_ms=window_start,
             window_end_ms=window_end,
             content_type=content_type,

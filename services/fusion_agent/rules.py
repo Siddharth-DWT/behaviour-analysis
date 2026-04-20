@@ -1,27 +1,46 @@
 # services/fusion_agent/rules.py
 """
 NEXUS Fusion Agent - Pairwise Cross-Modal Rules
-Implements 3 fusion rules for the Phase 1 audio-only vertical slice.
+Phase 1 (audio-only) + Phase 2E (audio × video) pairwise rules.
 
-Each rule takes signals from two different agents within a temporal window
+Each rule takes signals from two or more agents within a temporal window
 and detects patterns that neither agent can detect alone.
 
 Rules implemented:
-  FUSION-02: Speech Content × Voice Stress → Credibility assessment
-  FUSION-07: Hedge Language × Positive Sentiment → Incongruence detection
-             (Audio-only simplification of Head Shake × Affirmative Language)
-  FUSION-13: Persuasion Language × Speech Pace → Urgency authenticity
+  Audio-only (Phase 1):
+    FUSION-02: Speech Content × Voice Stress → Credibility assessment
+    FUSION-07: Hedge Language × Positive Sentiment → Incongruence detection
+    FUSION-13: Persuasion Language × Speech Pace → Urgency authenticity
+
+  Audio × Video (Phase 2E):
+    FUSION-01: Tone × Facial Emotion → Masking detection
+    FUSION-03: Voice Stress × Facial Stress → Suppression detection
+    FUSION-04: Filler Words × Gaze Break → Cognitive load
+    FUSION-05: Head Nod/Shake × Objection → Disagreement signal
+    FUSION-06: Body Lean × Attention Level → Physical engagement
+    FUSION-08: Gaze Break × Hedge Language → False confidence
+    FUSION-09: Smile Quality × Negative Sentiment → Sarcasm / masking
+    FUSION-10: Response Latency × Facial Stress → Cognitive processing
+    FUSION-11: Dominance Score × Gaze Avoidance → Anxiety under pressure
+    FUSION-12: Interruption × Body Lean → Intent (cooperative vs competitive)
+    FUSION-14: Empathy Language × Head Nod → Rapport confirmation
 
 Research references:
   - Bond & DePaulo 2006 (deception detection accuracy ceiling)
   - Levine 2014 (truth-default theory)
   - Rackham 1988 (persuasion + pace in sales)
   - Lakoff 1975 (powerless language as incongruence marker)
+  - Ekman 1969 (leakage hypothesis — face leaks suppressed emotion)
+  - Mehrabian 1972 (body language channels)
+  - Tickle-Degnen & Rosenthal 1990 (rapport = nodding + gaze + lean)
+  - Navarro 2008 (body language clusters)
 
-Confidence caps from RULES.md:
-  FUSION-02 max: 0.65 (raised from 0.55 per Bond & DePaulo 2006 — stress ≠ deception, incongruence is valid)
-  FUSION-07 max: 0.70
-  FUSION-13 max: 0.60
+Confidence caps:
+  FUSION-01: 0.65   FUSION-02: 0.65   FUSION-03: 0.65
+  FUSION-04: 0.70   FUSION-05: 0.55   FUSION-06: 0.60
+  FUSION-07: 0.70   FUSION-08: 0.55   FUSION-09: 0.60
+  FUSION-10: 0.60   FUSION-11: 0.65   FUSION-12: 0.55
+  FUSION-13: 0.60   FUSION-14: 0.70
 """
 import logging
 from typing import Optional
@@ -64,6 +83,7 @@ class FusionRuleEngine:
         speaker_id: str,
         voice_signals: list[dict],
         language_signals: list[dict],
+        video_signals: Optional[list[dict]] = None,
         window_start_ms: int = 0,
         window_end_ms: int = 0,
         content_type: str = "sales_call",
@@ -76,6 +96,7 @@ class FusionRuleEngine:
             speaker_id: Speaker identifier
             voice_signals: Recent voice agent signals for this speaker
             language_signals: Recent language agent signals for this speaker
+            video_signals: Recent video agent signals (facial/gaze/body) — Phase 2E
             window_start_ms: Fusion window start
             window_end_ms: Fusion window end
             content_type: Meeting type for content-aware gating
@@ -87,6 +108,7 @@ class FusionRuleEngine:
         if profile is None and ContentTypeProfile is not None:
             profile = ContentTypeProfile(content_type)
 
+        video_signals = video_signals or []
         signals = []
 
         def _maybe_append(rule_id: str, result: dict | None, signal_type: str):
@@ -127,6 +149,63 @@ class FusionRuleEngine:
         if not (profile and profile.is_gated("FUSION-13")):
             urg = self._rule_fusion_13(voice_signals, language_signals, content_type)
             _maybe_append("FUSION-13", urg, "urgency_authenticity")
+
+        # ── Phase 2E: Audio × Video pairwise rules (skipped if no video signals) ──
+        if video_signals:
+            # FUSION-01: Tone × Facial Emotion → Masking
+            if not (profile and profile.is_gated("FUSION-01")):
+                max_conf = profile.get_threshold("FUSION-01", "max_confidence", 0.65) if profile else 0.65
+                _maybe_append("FUSION-01", self._rule_fusion_01(voice_signals, video_signals, max_conf), "tone_face_masking")
+
+            # FUSION-03: Voice Stress × Facial Stress → Suppression
+            if not (profile and profile.is_gated("FUSION-03")):
+                max_conf = profile.get_threshold("FUSION-03", "max_confidence", 0.65) if profile else 0.65
+                _maybe_append("FUSION-03", self._rule_fusion_03(voice_signals, video_signals, max_conf), "stress_suppression")
+
+            # FUSION-04: Filler × Gaze Break → Cognitive Load
+            if not (profile and profile.is_gated("FUSION-04")):
+                max_conf = profile.get_threshold("FUSION-04", "max_confidence", 0.70) if profile else 0.70
+                _maybe_append("FUSION-04", self._rule_fusion_04(voice_signals, video_signals, max_conf), "cognitive_load")
+
+            # FUSION-05: Head Nod/Shake × Objection → Disagreement
+            if not (profile and profile.is_gated("FUSION-05")):
+                max_conf = profile.get_threshold("FUSION-05", "max_confidence", 0.55) if profile else 0.55
+                _maybe_append("FUSION-05", self._rule_fusion_05(language_signals, video_signals, max_conf), "nonverbal_disagreement")
+
+            # FUSION-06: Body Lean × Attention Level → Physical Engagement
+            if not (profile and profile.is_gated("FUSION-06")):
+                max_conf = profile.get_threshold("FUSION-06", "max_confidence", 0.60) if profile else 0.60
+                _maybe_append("FUSION-06", self._rule_fusion_06(video_signals, max_conf), "physical_engagement")
+
+            # FUSION-08: Gaze Break × Hedge Language → False Confidence
+            if not (profile and profile.is_gated("FUSION-08")):
+                max_conf = profile.get_threshold("FUSION-08", "max_confidence", 0.55) if profile else 0.55
+                _maybe_append("FUSION-08", self._rule_fusion_08(language_signals, video_signals, max_conf), "false_confidence")
+
+            # FUSION-09: Smile Quality × Negative Sentiment → Masking / Sarcasm
+            if not (profile and profile.is_gated("FUSION-09")):
+                max_conf = profile.get_threshold("FUSION-09", "max_confidence", 0.60) if profile else 0.60
+                _maybe_append("FUSION-09", self._rule_fusion_09(language_signals, video_signals, max_conf), "smile_sentiment_incongruence")
+
+            # FUSION-10: Response Latency × Facial Stress → Processing Load
+            if not (profile and profile.is_gated("FUSION-10")):
+                max_conf = profile.get_threshold("FUSION-10", "max_confidence", 0.60) if profile else 0.60
+                _maybe_append("FUSION-10", self._rule_fusion_10(language_signals, video_signals, max_conf), "processing_load")
+
+            # FUSION-11: Dominance Score × Gaze Avoidance → Anxiety Under Pressure
+            if not (profile and profile.is_gated("FUSION-11")):
+                max_conf = profile.get_threshold("FUSION-11", "max_confidence", 0.65) if profile else 0.65
+                _maybe_append("FUSION-11", self._rule_fusion_11(language_signals, video_signals, max_conf), "dominance_anxiety")
+
+            # FUSION-12: Interruption × Body Lean → Interrupt Intent
+            if not (profile and profile.is_gated("FUSION-12")):
+                max_conf = profile.get_threshold("FUSION-12", "max_confidence", 0.55) if profile else 0.55
+                _maybe_append("FUSION-12", self._rule_fusion_12(language_signals, voice_signals, video_signals, max_conf), "interrupt_intent")
+
+            # FUSION-14: Empathy Language × Head Nod → Rapport
+            if not (profile and profile.is_gated("FUSION-14")):
+                max_conf = profile.get_threshold("FUSION-14", "max_confidence", 0.70) if profile else 0.70
+                _maybe_append("FUSION-14", self._rule_fusion_14(language_signals, video_signals, max_conf), "rapport_confirmation")
 
         return signals
 
@@ -564,6 +643,796 @@ class FusionRuleEngine:
             "level": level,
             "confidence": raw_confidence,
             "evidence": evidence,
+        }
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # PHASE 2E — AUDIO × VIDEO PAIRWISE RULES
+    # ════════════════════════════════════════════════════════════════════════════
+
+    # ════════════════════════════════════════════════════════
+    # FUSION-01: Tone × Facial Emotion → Masking Detection
+    # Research: Ekman 1969 (leakage), Ekman & Friesen 1974
+    # Max confidence: 0.65
+    # ════════════════════════════════════════════════════════
+
+    def _rule_fusion_01(
+        self,
+        voice_signals: list[dict],
+        video_signals: list[dict],
+        max_confidence: float = 0.65,
+    ) -> Optional[dict]:
+        """
+        Detects fake positivity: voice tone says positive/confident but face
+        shows a contradicting primary emotion (fear, disgust, contempt, sadness).
+
+        Ekman's leakage hypothesis: the face is harder to fully control under
+        stress — microexpressions and subtle incongruence reveal suppressed state.
+        """
+        ALIGN_MS = 8_000
+        tone_sigs = [s for s in voice_signals if s.get("signal_type") == "tone_classification"]
+        face_sigs = [s for s in video_signals if s.get("signal_type") == "facial_emotion"]
+
+        if not tone_sigs or not face_sigs:
+            return None
+
+        POSITIVE_TONES = {"confident", "enthusiastic", "warm", "positive"}
+        NEGATIVE_EMOTIONS = {"fear", "disgust", "contempt", "sadness", "anger"}
+
+        best: dict | None = None
+        best_score = 0.0
+
+        for tone_sig in tone_sigs:
+            tone_val = tone_sig.get("value_text", "").lower()
+            if tone_val not in POSITIVE_TONES:
+                continue
+            tone_conf = _to_float(tone_sig.get("confidence", 0))
+            t_time = _to_int(tone_sig.get("window_start_ms", 0))
+
+            for face_sig in face_sigs:
+                emotion = (face_sig.get("value_text") or "").lower()
+                if emotion not in NEGATIVE_EMOTIONS:
+                    continue
+                f_conf = _to_float(face_sig.get("confidence", 0))
+                f_time = _to_int(face_sig.get("window_start_ms", 0))
+
+                if abs(t_time - f_time) > ALIGN_MS:
+                    continue
+
+                score = min(tone_conf * f_conf * 2.0, 1.0)
+                if score <= best_score:
+                    continue
+                best_score = score
+
+                if score >= 0.70:
+                    level = "strong_masking"
+                elif score >= 0.40:
+                    level = "moderate_masking"
+                else:
+                    level = "mild_masking"
+
+                raw_conf = min(0.40 + score * 0.25, max_confidence)
+                best = {
+                    "score": score,
+                    "level": level,
+                    "confidence": raw_conf,
+                    "evidence": {
+                        "voice_tone": tone_val,
+                        "facial_emotion": emotion,
+                        "tone_confidence": round(tone_conf, 3),
+                        "face_confidence": round(f_conf, 3),
+                        "aligned_window_ms": abs(t_time - f_time),
+                    },
+                }
+
+        return best
+
+    # ════════════════════════════════════════════════════════
+    # FUSION-03: Voice Stress × Facial Stress → Suppression
+    # Research: Ekman 1969, Harrigan 2005 (suppression channels)
+    # Max confidence: 0.65
+    # ════════════════════════════════════════════════════════
+
+    def _rule_fusion_03(
+        self,
+        voice_signals: list[dict],
+        video_signals: list[dict],
+        max_confidence: float = 0.65,
+    ) -> Optional[dict]:
+        """
+        Corroborating stress across channels → higher confidence stress detection.
+        Opposing stress → suppression: voice calm but face stressed = hiding it.
+
+        Both high: corroborated stress (both channels agree).
+        Voice high + face low: stress leaking through voice only (verbal suppression).
+        Voice low + face high: stress leaking through face only (vocal suppression).
+        """
+        ALIGN_MS = 10_000
+        v_stress = [s for s in voice_signals if s.get("signal_type") == "vocal_stress_score"]
+        f_stress = [s for s in video_signals if s.get("signal_type") == "facial_stress"]
+
+        if not v_stress or not f_stress:
+            return None
+
+        latest_v = max(v_stress, key=lambda s: _to_int(s.get("window_start_ms", 0)))
+        v_val = _to_float(latest_v.get("value", 0))
+        v_time = _to_int(latest_v.get("window_start_ms", 0))
+
+        best: dict | None = None
+        best_score = 0.0
+
+        for fs in f_stress:
+            f_val = _to_float(fs.get("value", 0))
+            f_time = _to_int(fs.get("window_start_ms", 0))
+
+            if abs(v_time - f_time) > ALIGN_MS:
+                continue
+
+            gap = abs(v_val - f_val)
+            combined = (v_val + f_val) / 2.0
+
+            if v_val > 0.50 and f_val > 0.50:
+                level = "corroborated_stress"
+                score = combined
+                raw_conf = min(0.45 + combined * 0.20, max_confidence)
+            elif gap > 0.30 and max(v_val, f_val) > 0.45:
+                level = "stress_suppression"
+                score = gap
+                raw_conf = min(0.40 + gap * 0.25, max_confidence)
+            else:
+                continue
+
+            if score <= best_score:
+                continue
+            best_score = score
+
+            best = {
+                "score": round(score, 4),
+                "level": level,
+                "confidence": raw_conf,
+                "evidence": {
+                    "voice_stress": round(v_val, 3),
+                    "facial_stress": round(f_val, 3),
+                    "channel_gap": round(gap, 3),
+                    "suppression_channel": "vocal" if f_val > v_val else "facial",
+                    "aligned_window_ms": abs(v_time - f_time),
+                },
+            }
+
+        return best
+
+    # ════════════════════════════════════════════════════════
+    # FUSION-04: Filler Words × Gaze Break → Cognitive Load
+    # Research: Goldman-Eisler 1968, Rayner 1998
+    # Max confidence: 0.70
+    # ════════════════════════════════════════════════════════
+
+    def _rule_fusion_04(
+        self,
+        voice_signals: list[dict],
+        video_signals: list[dict],
+        max_confidence: float = 0.70,
+    ) -> Optional[dict]:
+        """
+        Co-occurring filler spikes + gaze breaks indicate cognitive overload:
+        the person is searching for information while simultaneously losing
+        visual contact — a reliable multi-channel overwhelm signal.
+        """
+        ALIGN_MS = 8_000
+        filler_sigs = [
+            s for s in voice_signals
+            if s.get("signal_type") == "filler_detection"
+            and s.get("value_text") in ("filler_spike", "filler_elevated", "elevated", "high")
+        ]
+        gaze_sigs = [
+            s for s in video_signals
+            if s.get("signal_type") == "gaze_direction_shift"
+        ]
+
+        if not filler_sigs or not gaze_sigs:
+            return None
+
+        # Also check for sustained distraction which amplifies the signal
+        distraction_sigs = [s for s in video_signals if s.get("signal_type") == "sustained_distraction"]
+
+        aligned_pairs = 0
+        for fs in filler_sigs:
+            f_time = _to_int(fs.get("window_start_ms", 0))
+            for gs in gaze_sigs:
+                g_time = _to_int(gs.get("window_start_ms", 0))
+                if abs(f_time - g_time) <= ALIGN_MS:
+                    aligned_pairs += 1
+                    break
+
+        if aligned_pairs == 0:
+            return None
+
+        # Score based on filler severity + gaze break count + distraction
+        filler_rate = max(_to_float(s.get("value", 0)) for s in filler_sigs)
+        gaze_shift_count = len(gaze_sigs)
+        has_distraction = len(distraction_sigs) > 0
+
+        score = min(0.30 + filler_rate * 0.40 + min(gaze_shift_count, 5) * 0.06, 1.0)
+        if has_distraction:
+            score = min(score + 0.10, 1.0)
+
+        if score >= 0.70:
+            level = "high_cognitive_load"
+        elif score >= 0.45:
+            level = "moderate_cognitive_load"
+        else:
+            level = "mild_cognitive_load"
+
+        raw_conf = min(0.40 + score * 0.30, max_confidence)
+
+        return {
+            "score": round(score, 4),
+            "level": level,
+            "confidence": raw_conf,
+            "evidence": {
+                "filler_rate": round(filler_rate, 3),
+                "gaze_shift_count": gaze_shift_count,
+                "aligned_pairs": aligned_pairs,
+                "sustained_distraction": has_distraction,
+            },
+        }
+
+    # ════════════════════════════════════════════════════════
+    # FUSION-05: Head Nod/Shake × Objection → Disagreement Signal
+    # Research: Burgoon et al. 1995, Navarro 2008
+    # Max confidence: 0.55 (subtle — nod + objection could be "I hear you but…")
+    # ════════════════════════════════════════════════════════
+
+    def _rule_fusion_05(
+        self,
+        language_signals: list[dict],
+        video_signals: list[dict],
+        max_confidence: float = 0.55,
+    ) -> Optional[dict]:
+        """
+        Head shake co-occurring with objection language = clear disagreement.
+        Head nod co-occurring with objection language = polite disagreement
+        ("I understand but no") — a softer but commercially important signal.
+        """
+        ALIGN_MS = 10_000
+        objection_sigs = [
+            s for s in language_signals
+            if s.get("signal_type") == "objection_signal"
+            and _to_float(s.get("confidence", 0)) > 0.40
+        ]
+        nod_sigs = [s for s in video_signals if s.get("signal_type") == "head_nod"]
+        shake_sigs = [s for s in video_signals if s.get("signal_type") == "head_shake"]
+
+        if not objection_sigs or not (nod_sigs or shake_sigs):
+            return None
+
+        has_aligned_shake = False
+        has_aligned_nod = False
+
+        for obj in objection_sigs:
+            o_time = _to_int(obj.get("window_start_ms", 0))
+            for s in shake_sigs:
+                if abs(o_time - _to_int(s.get("window_start_ms", 0))) <= ALIGN_MS:
+                    has_aligned_shake = True
+                    break
+            for n in nod_sigs:
+                if abs(o_time - _to_int(n.get("window_start_ms", 0))) <= ALIGN_MS:
+                    has_aligned_nod = True
+                    break
+
+        if not (has_aligned_shake or has_aligned_nod):
+            return None
+
+        obj_conf = max(_to_float(s.get("confidence", 0)) for s in objection_sigs)
+
+        if has_aligned_shake:
+            level = "explicit_disagreement"
+            score = min(0.60 + obj_conf * 0.30, 1.0)
+            raw_conf = min(0.45 + obj_conf * 0.10, max_confidence)
+        else:
+            level = "polite_disagreement"
+            score = min(0.40 + obj_conf * 0.20, 1.0)
+            raw_conf = min(0.35 + obj_conf * 0.10, max_confidence)
+
+        return {
+            "score": round(score, 4),
+            "level": level,
+            "confidence": raw_conf,
+            "evidence": {
+                "head_shake_aligned": has_aligned_shake,
+                "head_nod_aligned": has_aligned_nod,
+                "objection_confidence": round(obj_conf, 3),
+                "objection_count": len(objection_sigs),
+            },
+        }
+
+    # ════════════════════════════════════════════════════════
+    # FUSION-06: Body Lean × Attention Level → Physical Engagement
+    # Research: Mehrabian 1972, Tickle-Degnen & Rosenthal 1990
+    # Max confidence: 0.60
+    # ════════════════════════════════════════════════════════
+
+    def _rule_fusion_06(
+        self,
+        video_signals: list[dict],
+        max_confidence: float = 0.60,
+    ) -> Optional[dict]:
+        """
+        Body lean direction combined with gaze attention level measures
+        physical engagement: forward lean + high screen contact = engaged;
+        backward lean + low attention = disengaged.
+        """
+        ALIGN_MS = 10_000
+        lean_sigs = [s for s in video_signals if s.get("signal_type") == "body_lean"]
+        attention_sigs = [s for s in video_signals if s.get("signal_type") == "attention_level"]
+
+        if not lean_sigs or not attention_sigs:
+            return None
+
+        latest_lean = max(lean_sigs, key=lambda s: _to_int(s.get("window_start_ms", 0)))
+        lean_dir = (latest_lean.get("value_text") or "").lower()
+        lean_time = _to_int(latest_lean.get("window_start_ms", 0))
+
+        best_attn: dict | None = None
+        for a in attention_sigs:
+            if abs(lean_time - _to_int(a.get("window_start_ms", 0))) <= ALIGN_MS:
+                if best_attn is None or _to_float(a.get("value", 0)) > _to_float(best_attn.get("value", 0)):
+                    best_attn = a
+
+        if best_attn is None:
+            return None
+
+        attn_val = _to_float(best_attn.get("value", 0))
+        lean_val = _to_float(latest_lean.get("value", 0))
+
+        forward = "forward" in lean_dir
+        backward = "backward" in lean_dir or "back" in lean_dir
+
+        if forward and attn_val > 0.60:
+            level = "high_engagement"
+            score = min((lean_val + attn_val) / 2.0, 1.0)
+        elif backward and attn_val < 0.40:
+            level = "disengagement"
+            score = 1.0 - min((lean_val + attn_val) / 2.0, 1.0)
+        elif forward and attn_val < 0.40:
+            level = "body_engaged_mind_elsewhere"
+            score = 0.50
+        else:
+            return None
+
+        raw_conf = min(0.35 + score * 0.25, max_confidence)
+
+        return {
+            "score": round(score, 4),
+            "level": level,
+            "confidence": raw_conf,
+            "evidence": {
+                "lean_direction": lean_dir,
+                "lean_magnitude": round(lean_val, 3),
+                "attention_level": round(attn_val, 3),
+            },
+        }
+
+    # ════════════════════════════════════════════════════════
+    # FUSION-08: Gaze Break × Hedge Language → False Confidence
+    # Research: Lakoff 1975, Vrij 2008
+    # Max confidence: 0.55
+    # ════════════════════════════════════════════════════════
+
+    def _rule_fusion_08(
+        self,
+        language_signals: list[dict],
+        video_signals: list[dict],
+        max_confidence: float = 0.55,
+    ) -> Optional[dict]:
+        """
+        Hedged language (power language low) co-occurring with gaze breaks
+        indicates the speaker lacks genuine confidence in what they are saying.
+        """
+        ALIGN_MS = 10_000
+        power_sigs = [
+            s for s in language_signals
+            if s.get("signal_type") == "power_language_score"
+            and _to_float(s.get("value", 1.0)) < 0.35
+        ]
+        gaze_sigs = [
+            s for s in video_signals
+            if s.get("signal_type") in ("gaze_direction_shift", "sustained_distraction")
+        ]
+
+        if not power_sigs or not gaze_sigs:
+            return None
+
+        aligned = False
+        for p in power_sigs:
+            p_time = _to_int(p.get("window_start_ms", 0))
+            for g in gaze_sigs:
+                if abs(p_time - _to_int(g.get("window_start_ms", 0))) <= ALIGN_MS:
+                    aligned = True
+                    break
+            if aligned:
+                break
+
+        if not aligned:
+            return None
+
+        avg_power = sum(_to_float(s.get("value", 0)) for s in power_sigs) / len(power_sigs)
+        gaze_break_count = len(gaze_sigs)
+
+        score = min((0.35 - avg_power) * 2.0 + min(gaze_break_count, 4) * 0.08, 1.0)
+        score = max(score, 0.0)
+
+        if score >= 0.60:
+            level = "low_confidence_detected"
+        elif score >= 0.35:
+            level = "mild_uncertainty"
+        else:
+            level = "hedged_statement"
+
+        raw_conf = min(0.35 + score * 0.20, max_confidence)
+
+        return {
+            "score": round(score, 4),
+            "level": level,
+            "confidence": raw_conf,
+            "evidence": {
+                "avg_power_score": round(avg_power, 3),
+                "gaze_break_count": gaze_break_count,
+                "hedge_signals": len(power_sigs),
+            },
+        }
+
+    # ════════════════════════════════════════════════════════
+    # FUSION-09: Smile Quality × Negative Sentiment → Masking / Sarcasm
+    # Research: Ekman & Friesen 1982 (Duchenne smile), Niedenthal 2007
+    # Max confidence: 0.60
+    # ════════════════════════════════════════════════════════
+
+    def _rule_fusion_09(
+        self,
+        language_signals: list[dict],
+        video_signals: list[dict],
+        max_confidence: float = 0.60,
+    ) -> Optional[dict]:
+        """
+        Non-Duchenne (social/fake) smile co-occurring with negative sentiment
+        or objection language = masking displeasure.
+        Duchenne smile + negative sentiment = possible sarcasm or irony.
+        """
+        ALIGN_MS = 10_000
+        smile_sigs = [s for s in video_signals if s.get("signal_type") == "smile_type"]
+        sentiment_sigs = [
+            s for s in language_signals
+            if s.get("signal_type") == "sentiment_score"
+            and _to_float(s.get("value", 0)) < -0.20
+        ]
+        objection_sigs = [s for s in language_signals if s.get("signal_type") == "objection_signal"]
+
+        if not smile_sigs or not (sentiment_sigs or objection_sigs):
+            return None
+
+        negative_signals = sentiment_sigs + objection_sigs
+
+        best: dict | None = None
+        best_score = 0.0
+
+        for smile in smile_sigs:
+            smile_type = (smile.get("value_text") or "").lower()
+            smile_conf = _to_float(smile.get("confidence", 0))
+            s_time = _to_int(smile.get("window_start_ms", 0))
+
+            for neg in negative_signals:
+                if abs(s_time - _to_int(neg.get("window_start_ms", 0))) > ALIGN_MS:
+                    continue
+
+                neg_val = abs(_to_float(neg.get("value", 0.3)))
+                is_social = "social" in smile_type or "non_duchenne" in smile_type or "fake" in smile_type
+                is_duchenne = "duchenne" in smile_type or "genuine" in smile_type
+
+                if is_social:
+                    level = "emotion_masking"
+                    score = min(smile_conf * neg_val * 2.0, 1.0)
+                elif is_duchenne:
+                    level = "possible_sarcasm"
+                    score = min(smile_conf * neg_val * 1.5, 1.0)
+                else:
+                    continue
+
+                if score <= best_score:
+                    continue
+                best_score = score
+
+                raw_conf = min(0.35 + score * 0.25, max_confidence)
+                best = {
+                    "score": round(score, 4),
+                    "level": level,
+                    "confidence": raw_conf,
+                    "evidence": {
+                        "smile_type": smile_type,
+                        "smile_confidence": round(smile_conf, 3),
+                        "sentiment_value": round(_to_float(neg.get("value", 0)), 3),
+                        "negative_signal_type": neg.get("signal_type", ""),
+                    },
+                }
+
+        return best
+
+    # ════════════════════════════════════════════════════════
+    # FUSION-10: Response Latency × Facial Stress → Processing Load
+    # Research: Greene 1984, Vrij 2008 (latency as cognitive load indicator)
+    # Max confidence: 0.60
+    # ════════════════════════════════════════════════════════
+
+    def _rule_fusion_10(
+        self,
+        language_signals: list[dict],
+        video_signals: list[dict],
+        max_confidence: float = 0.60,
+    ) -> Optional[dict]:
+        """
+        Long response latency + elevated facial stress = processing overload,
+        not just thoughtfulness. The face confirms it's stress-driven delay.
+        """
+        ALIGN_MS = 15_000
+        latency_sigs = [
+            s for s in language_signals
+            if s.get("signal_type") == "response_latency"
+            and _to_float(s.get("value", 0)) > 0.50
+        ]
+        f_stress_sigs = [
+            s for s in video_signals
+            if s.get("signal_type") == "facial_stress"
+            and _to_float(s.get("value", 0)) > 0.35
+        ]
+
+        if not latency_sigs or not f_stress_sigs:
+            return None
+
+        aligned = False
+        for lat in latency_sigs:
+            l_time = _to_int(lat.get("window_start_ms", 0))
+            for fs in f_stress_sigs:
+                if abs(l_time - _to_int(fs.get("window_start_ms", 0))) <= ALIGN_MS:
+                    aligned = True
+                    break
+            if aligned:
+                break
+
+        if not aligned:
+            return None
+
+        max_latency = max(_to_float(s.get("value", 0)) for s in latency_sigs)
+        max_face_stress = max(_to_float(s.get("value", 0)) for s in f_stress_sigs)
+
+        score = min((max_latency + max_face_stress) / 2.0, 1.0)
+
+        if score >= 0.70:
+            level = "high_processing_load"
+        elif score >= 0.50:
+            level = "elevated_processing_load"
+        else:
+            level = "mild_processing_load"
+
+        raw_conf = min(0.35 + score * 0.25, max_confidence)
+
+        return {
+            "score": round(score, 4),
+            "level": level,
+            "confidence": raw_conf,
+            "evidence": {
+                "max_latency_score": round(max_latency, 3),
+                "max_facial_stress": round(max_face_stress, 3),
+                "latency_event_count": len(latency_sigs),
+            },
+        }
+
+    # ════════════════════════════════════════════════════════
+    # FUSION-11: Dominance Score × Gaze Avoidance → Anxiety Under Pressure
+    # Research: Burgoon & Dunbar 2006, Knapp & Hall 2009
+    # Max confidence: 0.65
+    # ════════════════════════════════════════════════════════
+
+    def _rule_fusion_11(
+        self,
+        language_signals: list[dict],
+        video_signals: list[dict],
+        max_confidence: float = 0.65,
+    ) -> Optional[dict]:
+        """
+        A speaker using dominant language while simultaneously showing gaze
+        avoidance is exhibiting anxiety under their dominant persona — the
+        body betrays what the words are trying to project.
+        """
+        ALIGN_MS = 12_000
+        dominance_sigs = [
+            s for s in language_signals
+            if s.get("signal_type") == "dominance_score"
+            and _to_float(s.get("value", 0)) > 0.55
+        ]
+        gaze_avoid_sigs = [
+            s for s in video_signals
+            if s.get("signal_type") in ("gaze_direction_shift", "sustained_distraction")
+        ]
+
+        if not dominance_sigs or not gaze_avoid_sigs:
+            return None
+
+        aligned_pairs = 0
+        for d in dominance_sigs:
+            d_time = _to_int(d.get("window_start_ms", 0))
+            for g in gaze_avoid_sigs:
+                if abs(d_time - _to_int(g.get("window_start_ms", 0))) <= ALIGN_MS:
+                    aligned_pairs += 1
+                    break
+
+        if aligned_pairs == 0:
+            return None
+
+        avg_dominance = sum(_to_float(s.get("value", 0)) for s in dominance_sigs) / len(dominance_sigs)
+        gaze_break_count = len(gaze_avoid_sigs)
+
+        # High dominance + many gaze breaks = stronger anxiety signal
+        score = min((avg_dominance - 0.55) * 2.0 + min(gaze_break_count, 6) * 0.07, 1.0)
+        score = max(score, 0.0)
+
+        if score >= 0.60:
+            level = "dominance_anxiety"
+        elif score >= 0.35:
+            level = "mild_dominance_anxiety"
+        else:
+            level = "dominance_with_uncertainty"
+
+        raw_conf = min(0.40 + score * 0.25, max_confidence)
+
+        return {
+            "score": round(score, 4),
+            "level": level,
+            "confidence": raw_conf,
+            "evidence": {
+                "avg_dominance": round(avg_dominance, 3),
+                "gaze_avoidance_count": gaze_break_count,
+                "aligned_pairs": aligned_pairs,
+            },
+        }
+
+    # ════════════════════════════════════════════════════════
+    # FUSION-12: Interruption × Body Lean → Interrupt Intent
+    # Research: Tannen 1994, Beattie 1982 (turn-taking signals)
+    # Max confidence: 0.55
+    # ════════════════════════════════════════════════════════
+
+    def _rule_fusion_12(
+        self,
+        language_signals: list[dict],
+        voice_signals: list[dict],
+        video_signals: list[dict],
+        max_confidence: float = 0.55,
+    ) -> Optional[dict]:
+        """
+        Interruption + forward lean = competitive/assertive interrupt (dominance).
+        Interruption + backward lean = reactive interrupt (defensive or confused).
+        Distinguishes between cooperative and competitive turn-taking.
+        """
+        ALIGN_MS = 8_000
+        interrupt_sigs = [
+            s for s in language_signals
+            if s.get("signal_type") == "interruption_event"
+        ]
+        if not interrupt_sigs:
+            interrupt_sigs = [
+                s for s in voice_signals
+                if s.get("signal_type") == "interruption_event"
+            ]
+
+        lean_sigs = [s for s in video_signals if s.get("signal_type") == "body_lean"]
+
+        if not interrupt_sigs or not lean_sigs:
+            return None
+
+        forward_aligned = 0
+        backward_aligned = 0
+
+        for intr in interrupt_sigs:
+            i_time = _to_int(intr.get("window_start_ms", 0))
+            for lean in lean_sigs:
+                if abs(i_time - _to_int(lean.get("window_start_ms", 0))) > ALIGN_MS:
+                    continue
+                lean_dir = (lean.get("value_text") or "").lower()
+                if "forward" in lean_dir:
+                    forward_aligned += 1
+                elif "back" in lean_dir:
+                    backward_aligned += 1
+
+        if forward_aligned == 0 and backward_aligned == 0:
+            return None
+
+        total = forward_aligned + backward_aligned
+        if forward_aligned >= backward_aligned:
+            level = "competitive_interrupt"
+            score = min(0.50 + (forward_aligned / total) * 0.50, 1.0)
+        else:
+            level = "reactive_interrupt"
+            score = min(0.50 + (backward_aligned / total) * 0.50, 1.0)
+
+        raw_conf = min(0.35 + (total / max(len(interrupt_sigs), 1)) * 0.20, max_confidence)
+
+        return {
+            "score": round(score, 4),
+            "level": level,
+            "confidence": raw_conf,
+            "evidence": {
+                "interrupt_count": len(interrupt_sigs),
+                "forward_lean_aligned": forward_aligned,
+                "backward_lean_aligned": backward_aligned,
+            },
+        }
+
+    # ════════════════════════════════════════════════════════
+    # FUSION-14: Empathy Language × Head Nod → Rapport Confirmation
+    # Research: Tickle-Degnen & Rosenthal 1990, Bavelas et al. 1987
+    # Max confidence: 0.70 (strongest fusion rule — research well-supported)
+    # ════════════════════════════════════════════════════════
+
+    def _rule_fusion_14(
+        self,
+        language_signals: list[dict],
+        video_signals: list[dict],
+        max_confidence: float = 0.70,
+    ) -> Optional[dict]:
+        """
+        Empathy language co-occurring with head nods is the strongest
+        multi-channel rapport signal. Tickle-Degnen & Rosenthal 1990: rapport
+        is characterised by mutual attention, positivity, and co-ordination.
+        Nodding while using empathy language confirms genuine alignment.
+        """
+        ALIGN_MS = 12_000
+        empathy_sigs = [
+            s for s in language_signals
+            if s.get("signal_type") in ("empathy_language", "rapport_signal", "sentiment_score")
+            and _to_float(s.get("value", 0)) > 0.30
+        ]
+        nod_sigs = [s for s in video_signals if s.get("signal_type") == "head_nod"]
+
+        if not empathy_sigs or not nod_sigs:
+            return None
+
+        aligned_pairs = 0
+        for emp in empathy_sigs:
+            e_time = _to_int(emp.get("window_start_ms", 0))
+            for nod in nod_sigs:
+                if abs(e_time - _to_int(nod.get("window_start_ms", 0))) <= ALIGN_MS:
+                    aligned_pairs += 1
+                    break
+
+        if aligned_pairs == 0:
+            return None
+
+        avg_empathy = sum(_to_float(s.get("value", 0)) for s in empathy_sigs) / len(empathy_sigs)
+        nod_intensity = sum(_to_float(s.get("value", 0)) for s in nod_sigs) / len(nod_sigs)
+
+        # Both channels reinforce each other
+        score = min((avg_empathy + nod_intensity) / 2.0 + (aligned_pairs / max(len(empathy_sigs), 1)) * 0.15, 1.0)
+
+        if score >= 0.70:
+            level = "strong_rapport"
+        elif score >= 0.45:
+            level = "building_rapport"
+        else:
+            level = "rapport_indicator"
+
+        # Rapport is positive — cap applies only to prevent over-certainty
+        raw_conf = min(0.45 + score * 0.25, max_confidence)
+
+        return {
+            "score": round(score, 4),
+            "level": level,
+            "confidence": raw_conf,
+            "evidence": {
+                "avg_empathy_score": round(avg_empathy, 3),
+                "avg_nod_intensity": round(nod_intensity, 3),
+                "aligned_pairs": aligned_pairs,
+                "empathy_signal_count": len(empathy_sigs),
+                "nod_count": len(nod_sigs),
+            },
         }
 
     # ════════════════════════════════════════════════════════
