@@ -36,6 +36,7 @@ import SessionChat from "../components/SessionChat";
 import SwimlaneTimeline from "../components/SwimlaneTimeline";
 import TranscriptView from "../components/TranscriptView";
 import GraphInsightsCard from "../components/GraphInsightsCard";
+import BehavioralOverview from "../components/BehavioralOverview";
 
 // ── Helpers ──
 
@@ -202,6 +203,93 @@ function computeSpeakerStats(signals: Signal[]): SpeakerStats[] {
   return stats;
 }
 
+// ── Video Stats per speaker ──
+
+interface VideoStats {
+  screenEngagementPct: number;   // avg screen_contact value × 100
+  dominantEmotion: string | null;
+  smileCount: number;
+  nodCount: number;
+  fidgetLevel: "low" | "moderate" | "high" | null;
+  voiceFaceAlignmentPct: number; // 0 = no data, else 0-100
+}
+
+function computeVideoStats(signals: Signal[]): Record<string, VideoStats> {
+  const speakers = [...new Set(signals.filter((s) => s.speaker_label).map((s) => s.speaker_label!))];
+  const result: Record<string, VideoStats> = {};
+
+  for (const label of speakers) {
+    const sigs = signals.filter((s) => s.speaker_label === label);
+    const video = sigs.filter((s) => s.agent === "video");
+    const fusion = sigs.filter((s) => s.agent === "fusion");
+
+    if (video.length === 0) continue;
+
+    // Screen engagement
+    const screenVals = video
+      .filter((s) => s.signal_type === "screen_contact" && s.value != null)
+      .map((s) => s.value!);
+    const screenEngagementPct = screenVals.length > 0
+      ? Math.round((screenVals.reduce((a, b) => a + b, 0) / screenVals.length) * 100)
+      : 0;
+
+    // Dominant emotion
+    const emotionFreq = new Map<string, number>();
+    for (const s of video.filter((s) => s.signal_type === "facial_emotion" && s.value_text)) {
+      const e = s.value_text!;
+      emotionFreq.set(e, (emotionFreq.get(e) ?? 0) + 1);
+    }
+    let dominantEmotion: string | null = null;
+    let maxFreq = 0;
+    for (const [e, freq] of emotionFreq) {
+      if (freq > maxFreq && e !== "neutral") { dominantEmotion = e; maxFreq = freq; }
+    }
+
+    // Counts
+    const smileCount = video.filter((s) => s.signal_type === "smile_type").length;
+    const nodCount = video.filter((s) => s.signal_type === "head_nod").length;
+
+    // Fidget level
+    const fidgetVals = video
+      .filter((s) => s.signal_type === "body_fidgeting" && s.value != null)
+      .map((s) => s.value!);
+    const avgFidget = fidgetVals.length > 0
+      ? fidgetVals.reduce((a, b) => a + b, 0) / fidgetVals.length
+      : -1;
+    const fidgetLevel: VideoStats["fidgetLevel"] =
+      avgFidget < 0 ? null
+      : avgFidget > 0.6 ? "high"
+      : avgFidget > 0.3 ? "moderate"
+      : "low";
+
+    // Voice-face alignment (inverse of incongruence confidence × score)
+    const incongSigs = fusion.filter(
+      (s) => ["tone_face_masking", "smile_sentiment_incongruence", "stress_suppression"].includes(s.signal_type)
+    );
+    let voiceFaceAlignmentPct = 0;
+    if (video.length > 0) {
+      if (incongSigs.length === 0) {
+        voiceFaceAlignmentPct = 88; // No incongruence detected → high alignment
+      } else {
+        const avgIncon =
+          incongSigs.reduce((a, s) => a + (s.value ?? 0) * (s.confidence ?? 0), 0) / incongSigs.length;
+        voiceFaceAlignmentPct = Math.round(Math.max(0, 1 - avgIncon) * 100);
+      }
+    }
+
+    result[label] = {
+      screenEngagementPct,
+      dominantEmotion,
+      smileCount,
+      nodCount,
+      fidgetLevel,
+      voiceFaceAlignmentPct,
+    };
+  }
+
+  return result;
+}
+
 // ── Call Outcome ──
 
 function computeCallOutcome(speakerStats: SpeakerStats[]) {
@@ -329,20 +417,67 @@ function inferSpeakerRoles(
 // ── Fusion Signal Display ──
 
 const FUSION_SIGNAL_LABELS: Record<string, { label: string; icon: string }> = {
-  credibility_assessment: { label: "Credibility Concern", icon: "🔴" },
-  verbal_incongruence: { label: "Verbal Mismatch", icon: "⚠️" },
-  urgency_authenticity: { label: "Urgency Pattern", icon: "⚠️" },
+  // Phase 1 (audio-only)
+  stress_sentiment_incongruence: { label: "Credibility Concern",         icon: "🔴" },
+  credibility_assessment:        { label: "Credibility Concern",         icon: "🔴" },
+  verbal_incongruence:           { label: "Verbal Mismatch",             icon: "⚠️" },
+  urgency_authenticity:          { label: "Urgency Pattern",             icon: "⚠️" },
+  // Phase 2E (audio × video)
+  tone_face_masking:             { label: "Voice-Face Masking",          icon: "🎭" },
+  stress_suppression:            { label: "Stress Suppression",          icon: "😬" },
+  cognitive_load:                { label: "Cognitive Overload",          icon: "🧠" },
+  nonverbal_disagreement:        { label: "Nonverbal Disagreement",      icon: "👎" },
+  physical_engagement:           { label: "Physical Engagement",         icon: "🙌" },
+  false_confidence:              { label: "False Confidence",            icon: "🎯" },
+  smile_sentiment_incongruence:  { label: "Smile Masks Sentiment",       icon: "😊⚠️" },
+  processing_load:               { label: "Processing Load",             icon: "⏳" },
+  dominance_anxiety:             { label: "Dominance Anxiety",           icon: "😰" },
+  interrupt_intent:              { label: "Interrupt Intent",            icon: "✋" },
+  rapport_confirmation:          { label: "Rapport Confirmed",           icon: "🤝" },
 };
 
 const FUSION_VALUE_LABELS: Record<string, string> = {
-  credibility_concern: "Content contradicts vocal stress patterns",
-  mild_incongruence: "Slight mismatch between verbal content and vocal indicators",
-  strong_verbal_incongruence: "Positive sentiment expressed with heavy hedging",
-  moderate_verbal_incongruence: "Agreement with notable hedging language",
-  incongruence_with_objection: "Positive sentiment combined with hidden objection markers",
-  manufactured_urgency: "Fast-paced persuasion with concurrent stress indicators",
-  authentic_urgency: "Persuasive language supported by confident vocal patterns",
-  ambiguous_urgency: "Urgency pattern with mixed vocal signals",
+  // Phase 1
+  credibility_concern:            "Content contradicts vocal stress patterns",
+  mild_incongruence:              "Slight mismatch between verbal content and vocal indicators",
+  strong_verbal_incongruence:     "Positive sentiment expressed with heavy hedging",
+  moderate_verbal_incongruence:   "Agreement with notable hedging language",
+  mild_verbal_incongruence:       "Mild verbal hedging alongside positive sentiment",
+  hedged_agreement:               "Agreement language with underlying uncertainty markers",
+  incongruence_with_objection:    "Positive sentiment combined with hidden objection markers",
+  manufactured_urgency:           "Fast-paced persuasion with concurrent stress indicators",
+  authentic_urgency:              "Persuasive language supported by confident vocal patterns",
+  ambiguous_urgency:              "Urgency pattern with mixed vocal signals",
+  // Phase 2E
+  strong_masking:                 "Voice tone and facial emotion strongly contradict each other",
+  moderate_masking:               "Facial expression partially contradicts voice tone",
+  mild_masking:                   "Slight misalignment between voice and face",
+  corroborated_stress:            "Both voice and face confirm elevated stress",
+  stress_suppression:             "Stress visible in one channel but suppressed in the other",
+  high_cognitive_load:            "Filler words and gaze breaks co-occurring — high cognitive demand",
+  moderate_cognitive_load:        "Some filler spikes with gaze breaks indicating mental effort",
+  mild_cognitive_load:            "Minor signs of cognitive processing",
+  explicit_disagreement:          "Head shake co-occurs with objection language — clear disagreement",
+  polite_disagreement:            "Head nod with objection language — polite but resistant",
+  high_engagement:                "Forward lean and strong visual attention — fully engaged",
+  disengagement:                  "Backward lean with low attention — disengaging",
+  body_engaged_mind_elsewhere:    "Physical presence but attention is elsewhere",
+  low_confidence_detected:        "Gaze breaks align with hedging language — low genuine confidence",
+  mild_uncertainty:               "Some gaze avoidance alongside hedged statements",
+  hedged_statement:               "Hedged language with mild gaze avoidance",
+  emotion_masking:                "Social smile co-occurring with negative sentiment — masking displeasure",
+  possible_sarcasm:               "Genuine smile with negative sentiment — possible sarcasm or irony",
+  high_processing_load:           "Long response latency with facial stress — overwhelmed",
+  elevated_processing_load:       "Slightly delayed response with visible facial tension",
+  mild_processing_load:           "Minor processing delay with mild facial stress",
+  dominance_anxiety:              "Dominant language but gaze avoidance — anxiety under dominant facade",
+  mild_dominance_anxiety:         "Dominant tone with occasional gaze breaks",
+  dominance_with_uncertainty:     "Assertive language with mild nonverbal uncertainty",
+  competitive_interrupt:          "Forward lean during interruption — assertive intent",
+  reactive_interrupt:             "Backward lean during interruption — defensive or confused",
+  strong_rapport:                 "Empathy language and head nods strongly aligned — deep rapport",
+  building_rapport:               "Empathy and nodding building connection",
+  rapport_indicator:              "Mild rapport signal from verbal-nonverbal alignment",
 };
 
 // ── Main Component ──
