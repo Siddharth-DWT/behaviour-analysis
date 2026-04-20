@@ -111,10 +111,9 @@ class AssemblyAIClient:
             request_body["language_detection"] = True
 
         if speakers_expected is not None:
-            request_body["speaker_options"] = {
-                "min_speakers_expected": speakers_expected,
-                "max_speakers_expected": speakers_expected,
-            }
+            # Top-level integer — correct AssemblyAI v2 API field.
+            # (speaker_options.min/max_speakers_expected is not a valid v2 field.)
+            request_body["speakers_expected"] = speakers_expected
         if multichannel:
             request_body["multichannel"] = True
             del request_body["speaker_labels"]     # mutually exclusive with multichannel
@@ -125,23 +124,17 @@ class AssemblyAIClient:
         if temperature is not None:
             request_body["temperature"] = max(0.0, min(1.0, temperature))
 
-        # Build speech_understanding block (speaker_identification + optional translation)
-        speech_understanding: dict = {
-            "request": {
-                "speaker_identification": {
-                    "speaker_type": "name",
-                    "known_values": [],
+        # Build speech_understanding block — translation only.
+        # speaker_identification requires pre-enrolled voice profiles (known_values).
+        # Sending speaker_identification with known_values=[] overrides speaker_labels
+        # diarization and collapses all audio to a single speaker — do NOT include it.
+        if translate_to and not multichannel:
+            request_body["speech_understanding"] = {
+                "translation": {
+                    "target_languages": [translate_to],
+                    "match_original_utterance": True,
                 }
             }
-        }
-        if translate_to:
-            speech_understanding["translation"] = {
-                "target_languages": [translate_to],
-                "match_original_utterance": True,
-            }
-        if not multichannel:
-            # speaker_identification only makes sense alongside speaker_labels
-            request_body["speech_understanding"] = speech_understanding
 
         logger.info("AssemblyAI: creating transcript...")
         with httpx.Client(timeout=POLL_TIMEOUT) as client:
