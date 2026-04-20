@@ -1,3 +1,4 @@
+# services/fusion_agent/rules.py
 """
 NEXUS Fusion Agent - Pairwise Cross-Modal Rules
 Implements 3 fusion rules for the Phase 1 audio-only vertical slice.

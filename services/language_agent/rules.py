@@ -1,3 +1,4 @@
+# services/language_agent/rules.py
 """
 NEXUS Language Agent - Rule Engine
 Implements 12 core rules from the NEXUS Rule Engine specification.
@@ -343,7 +344,7 @@ class LanguageRuleEngine:
                   "text_preview": features.get("text", "")[:80]})
 
         # ── LANG-NEG-01: Gottman Four Horsemen ──
-        neg = self._rule_neg_01(features, active_type)
+        neg = self._rule_neg_01(features, active_type, all_features_list, current_index)
         if neg is not None:
             _add("LANG-NEG-01", "gottman_horsemen",
                  neg["value"], neg["label"], neg["confidence"],
@@ -376,6 +377,8 @@ class LanguageRuleEngine:
                 _add("LANG-TOPIC-01", "topic_shift",
                      topic["value"], topic["label"], topic["confidence"],
                      {"rule": "LANG-TOPIC-01", "overlap_pct": topic["overlap_pct"],
+                      "threshold_pct": topic.get("threshold_pct", 0.15),
+                      "method": topic.get("method", "fixed"),
                       "current_keywords": topic.get("current_keywords", [])[:10],
                       "text_preview": features.get("text", "")[:80]})
 
@@ -780,10 +783,16 @@ class LanguageRuleEngine:
     # Research: Gottman 1994
     # ════════════════════════════════════════════════════════
 
-    def _rule_neg_01(self, f: dict, content_type: str) -> Optional[dict]:
+    _QUESTION_RE = re.compile(r"\?|^(what|where|when|why|who|how|do|does|did|can|could|will|would|is|are|was|were|have|has)\b", re.IGNORECASE)
+
+    def _rule_neg_01(
+        self, f: dict, content_type: str,
+        all_features_list: Optional[list] = None, current_index: int = 0,
+    ) -> Optional[dict]:
         """
         Detect the Four Horsemen of relationship breakdown:
         criticism, contempt, defensiveness, stonewalling.
+        Stonewalling only fires when preceded by a substantive question from another speaker.
         """
         text = f.get("text", "").strip()
         if not text:
@@ -793,6 +802,23 @@ class LanguageRuleEngine:
 
         # Check stonewalling first: very short responses
         if text_lower in self.STONEWALLING_RESPONSES:
+            # Only fire if the previous segment from a different speaker was a question
+            prev_was_question = False
+            if all_features_list is not None and current_index > 0:
+                current_speaker = f.get("speaker_id", "")
+                for look_back in range(1, min(4, current_index + 1)):
+                    prev_f = all_features_list[current_index - look_back]
+                    if prev_f.get("speaker_id", "") != current_speaker:
+                        prev_text = prev_f.get("text", "").strip()
+                        if prev_text and self._QUESTION_RE.search(prev_text):
+                            prev_was_question = True
+                        break
+            else:
+                prev_was_question = True  # No context available — preserve prior behaviour
+
+            if not prev_was_question:
+                return None  # "fine"/"okay" without a preceding question is not stonewalling
+
             return {
                 "value": 0.4,
                 "label": "stonewalling",
@@ -885,10 +911,10 @@ class LanguageRuleEngine:
         sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
         if sentences:
             avg_sentence_length = sum(len(s.split()) for s in sentences) / len(sentences)
-            if avg_sentence_length > 35:
-                score -= 0.30  # -0.15 for >25 and additional -0.15 for >35
+            if avg_sentence_length > 30:
+                score -= 0.30
                 penalties.append(f"very_long_sentences ({avg_sentence_length:.1f} avg)")
-            elif avg_sentence_length > 25:
+            elif avg_sentence_length > 18:
                 score -= 0.15
                 penalties.append(f"long_sentences ({avg_sentence_length:.1f} avg)")
 
@@ -936,11 +962,13 @@ class LanguageRuleEngine:
         self, f: dict, all_features_list: list, current_index: int,
     ) -> Optional[dict]:
         """
-        Detect topic shifts by comparing content words of the current segment
-        against the last 3 segments. Overlap < 15% → topic_change_detected.
+        Detect topic shifts using an adaptive threshold (Hearst 1997 TextTiling).
+        Computes rolling 3-segment overlaps for all prior windows, then sets
+        threshold = mean(overlaps) - 1*std(overlaps), floored at 0.05.
+        Falls back to fixed 0.15 when fewer than 4 prior segments exist.
         """
         if current_index == 0:
-            return None  # First segment — nothing to compare against
+            return None
 
         def _content_words(text: str) -> set:
             words = re.findall(r"[a-z]+", text.lower())
@@ -948,11 +976,11 @@ class LanguageRuleEngine:
 
         current_words = _content_words(f.get("text", ""))
         if len(current_words) < 3:
-            return None  # Too few content words to compare
+            return None
 
-        # Gather content words from last 3 segments
+        # Gather content words from last 3 segments (immediate context window)
         lookback = max(0, current_index - 3)
-        previous_words = set()
+        previous_words: set = set()
         for idx in range(lookback, current_index):
             prev_text = all_features_list[idx].get("text", "")
             previous_words.update(_content_words(prev_text))
@@ -960,11 +988,33 @@ class LanguageRuleEngine:
         if not previous_words:
             return None
 
-        # Compute overlap
         overlap = current_words & previous_words
-        overlap_pct = len(overlap) / len(current_words) if current_words else 1.0
+        overlap_pct = len(overlap) / len(current_words)
 
-        if overlap_pct >= 0.15:
+        # Adaptive threshold: mean - 1SD across all prior windows (Hearst 1997)
+        threshold_pct = 0.15
+        method = "fixed"
+        if current_index >= 4:
+            prior_overlaps = []
+            for i in range(1, current_index):
+                win_words = _content_words(all_features_list[i].get("text", ""))
+                if len(win_words) < 3:
+                    continue
+                ctx_start = max(0, i - 3)
+                ctx_words: set = set()
+                for j in range(ctx_start, i):
+                    ctx_words.update(_content_words(all_features_list[j].get("text", "")))
+                if ctx_words:
+                    ov = len(win_words & ctx_words) / len(win_words)
+                    prior_overlaps.append(ov)
+            if len(prior_overlaps) >= 3:
+                mean_ov = sum(prior_overlaps) / len(prior_overlaps)
+                variance = sum((x - mean_ov) ** 2 for x in prior_overlaps) / len(prior_overlaps)
+                std_ov = variance ** 0.5
+                threshold_pct = max(0.05, mean_ov - std_ov)
+                method = "adaptive"
+
+        if overlap_pct >= threshold_pct:
             return None  # Enough continuity — no topic shift
 
         return {
@@ -972,6 +1022,8 @@ class LanguageRuleEngine:
             "label": "topic_change_detected",
             "confidence": 0.55,
             "overlap_pct": round(overlap_pct, 4),
+            "threshold_pct": round(threshold_pct, 4),
+            "method": method,
             "current_keywords": list(current_words)[:10],
         }
 

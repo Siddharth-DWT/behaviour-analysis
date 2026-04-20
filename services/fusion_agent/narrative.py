@@ -1,3 +1,4 @@
+# services/fusion_agent/narrative.py
 """
 NEXUS Fusion Agent - Narrative Generator
 Uses the shared LLM client (Anthropic Claude or OpenAI) to produce

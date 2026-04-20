@@ -1,3 +1,4 @@
+# services/voiceAgent/rules.py
 """
 NEXUS Voice Agent - Rule Engine
 Implements 14 core rules from the NEXUS Rule Engine specification.
@@ -20,9 +21,11 @@ Rules implemented:
   VOICE-TONE-07: Aggressive tone classification
   VOICE-TONE-08: Excited tone classification
   VOICE-ENERGY-01: Energy level classification
-  VOICE-PAUSE-01: Pause classification
-  VOICE-INT-01: Interruption detection
-  VOICE-TALK-01: Talk time ratio (session level)
+  VOICE-VOL-01:   Volume shift from baseline
+  VOICE-PAUSE-01: Pause classification (hesitation)
+  VOICE-PAUSE-02: Strategic pause detection
+  VOICE-INT-01:   Interruption detection
+  VOICE-TALK-01:  Talk time ratio (session level)
 """
 import logging
 import sys
@@ -194,9 +197,9 @@ class VoiceRuleEngine:
                  tone.get("evidence", {}))
         else:
             new_tone = (
-                self._rule_tone_warm(features, baseline)
+                self._rule_tone_aggressive(features, baseline)
                 or self._rule_tone_excited(features, baseline)
-                or self._rule_tone_aggressive(features, baseline)
+                or self._rule_tone_warm(features, baseline)
                 or self._rule_tone_cold(features, baseline)
             )
             if new_tone is not None:
@@ -221,6 +224,18 @@ class VoiceRuleEngine:
                  energy["confidence_raw"] * cal_conf,
                  energy.get("evidence", {}))
 
+        # ── VOICE-VOL-01: Volume Shift From Baseline ──
+        vol = self._rule_vol_01(features, baseline)
+        if vol is not None:
+            _add("VOICE-VOL-01", "volume_shift",
+                 vol["delta_db"], vol["level"],
+                 vol["confidence_raw"] * cal_conf,
+                 {
+                     "delta_db": vol["delta_db"],
+                     "energy_current_db": vol["energy_current_db"],
+                     "energy_baseline_db": vol["energy_baseline_db"],
+                 })
+
         # ── VOICE-PAUSE-01: Pause Classification ──
         # extended_pause_ms: threshold for extended_hesitation. Default 2000ms;
         # interview 3000ms (Stivers 2009: complex answers need formulation time).
@@ -231,6 +246,18 @@ class VoiceRuleEngine:
                  ps["value"], ps["value_text"],
                  ps["confidence_raw"] * cal_conf,
                  ps.get("evidence", {}))
+
+        # ── VOICE-PAUSE-02: Strategic Pause Detection ──
+        strategic = self._rule_pause_02(features, baseline)
+        if strategic is not None:
+            _add("VOICE-PAUSE-02", "strategic_pause",
+                 strategic["pause_ms"] / 1000.0, strategic["level"],
+                 strategic["confidence_raw"] * cal_conf,
+                 {
+                     "pause_ms": strategic["pause_ms"],
+                     "word_count_after": strategic["word_count_after"],
+                     "baseline_pause_ratio": strategic["baseline_pause_ratio"],
+                 })
 
         # ── VOICE-INT-01: Interruption Detection ──
         # min_overlap_ms: minimum overlap to count as interruption. Default 500ms (Levinson 1983);
@@ -260,9 +287,9 @@ class VoiceRuleEngine:
           pitch delta:   0.30 (most reliable - Streeter 1977)
           jitter delta:  0.20 (Kappen 2022)
           rate change:   0.15
-          filler rate:   0.15
+          filler rate:   0.10 (Veiga 2025: lacks direct stress validation)
           pause freq:    0.10
-          HNR inverse:   0.05 (spectral-flatness proxy, reduced weight)
+          HNR inverse:   0.10 (Veiga 2025: spectral quality more diagnostic than filler)
           shimmer:       0.05
         """
         if b.f0_mean == 0:
@@ -289,14 +316,14 @@ class VoiceRuleEngine:
             "shimmer_norm": self.cal.normalise_delta_to_01(max(shimmer_delta, 0), max_delta=0.50), # Shimmer increase
         }
         
-        # Weighted composite
+        # Weighted composite (Veiga 2025: HNR raised to 0.10, filler lowered to 0.10)
         score = (
             0.30 * components["f0_norm"] +
             0.20 * components["jitter_norm"] +
             0.15 * components["rate_norm"] +
-            0.15 * components["filler_norm"] +
+            0.10 * components["filler_norm"] +
             0.10 * components["pause_norm"] +
-            0.05 * components["hnr_norm"] +
+            0.10 * components["hnr_norm"] +
             0.05 * components["shimmer_norm"]
         )
         
@@ -337,9 +364,8 @@ class VoiceRuleEngine:
         if b.filler_rate_pct > 0:
             delta = self.cal.compute_delta(filler_rate, b.filler_rate_pct)
         elif filler_rate > 0:
-            # Zero-baseline speaker: any fillers are a spike.
-            # Use absolute rate as the delta proxy (1% = 1.0 delta).
-            delta = filler_rate / 1.0  # 1% filler rate = 100% delta
+            # Zero-baseline speaker: use 3% normal floor (Bortfeld 2001 lower bound).
+            delta = filler_rate / 3.0  # 3% filler rate = 100% delta
 
         # Status based on delta
         if delta > 0.50:  # 50% more fillers than baseline (or >0.5% absolute for zero-baseline)
@@ -349,11 +375,11 @@ class VoiceRuleEngine:
         else:
             status = "normal"
         
-        # VOICE-FILLER-02: Absolute credibility thresholds
+        # VOICE-FILLER-02: Absolute credibility thresholds (Bortfeld 2001: normal range 1.3–4.4%)
         # noticeable_pct is content-type-aware (default 2.5%, internal 3.0%)
-        if filler_rate > 4.0:
+        if filler_rate > 6.0:
             credibility_impact = "severe"
-        elif filler_rate > 2.5:
+        elif filler_rate > 4.0:
             credibility_impact = "significant"
         elif filler_rate > noticeable_pct:
             credibility_impact = "noticeable"
@@ -386,8 +412,8 @@ class VoiceRuleEngine:
 
         Thresholds:
           > +7%  → mild (arousal increase, Pakosz 1983)
-          > +15% → significant (strong stress response)
-          > +25% → extreme (acute stress or strong emotion)
+          > +12% → significant (strong stress response, Veiga 2025 avg effect ~10.7%)
+          > +20% → extreme (acute stress or strong emotion)
         """
         f0_current = f.get("f0_mean", 0)
         if f0_current == 0 or b.f0_mean == 0:
@@ -399,9 +425,9 @@ class VoiceRuleEngine:
         if delta_pct < mild_pct:
             return None  # Within normal range, don't flag
         
-        if delta_pct >= 25.0:
+        if delta_pct >= 20.0:
             level = "pitch_elevated_extreme"
-        elif delta_pct >= 15.0:
+        elif delta_pct >= 12.0:
             level = "pitch_elevated_significant"
         else:
             level = "pitch_elevated_mild"
@@ -908,6 +934,58 @@ class VoiceRuleEngine:
         }
 
     # ════════════════════════════════════════════════════════
+    # VOICE-VOL-01: Volume Shift From Baseline
+    # Research: Scherer 2003 — vocal effort correlates with
+    # dominance, emphasis, and emotional arousal.
+    # 6 dB ≈ doubling of perceived loudness (Stevens' power law).
+    # ════════════════════════════════════════════════════════
+
+    def _rule_vol_01(self, f: dict, b: SpeakerBaseline) -> Optional[dict]:
+        """
+        Detect significant volume shifts from speaker's baseline.
+
+        Uses energy_rms_db already extracted by VoiceFeatureExtractor.
+        Complements VOICE-ENERGY-01 with clinically named 4-level output
+        and a separate signal_type ("volume_shift") for downstream fusion.
+
+        Thresholds:
+          > +10 dB → volume_increase_significant (strong emphasis / frustration)
+          > +6 dB  → volume_increase (emphasis, dominance, arousal)
+          < -6 dB  → volume_decrease (disengagement, submission, uncertainty)
+          < -10 dB → volume_decrease_significant (withdrawal, very low confidence)
+        """
+        if b.energy_rms_db == 0:
+            return None
+        energy_db = f.get("energy_rms_db", 0)
+        if energy_db == 0:
+            return None
+
+        delta_db = energy_db - b.energy_rms_db
+        if abs(delta_db) < 6.0:
+            return None
+
+        if delta_db >= 10.0:
+            level = "volume_increase_significant"
+            confidence = min(0.65, 0.50 + (delta_db - 10.0) * 0.03)
+        elif delta_db >= 6.0:
+            level = "volume_increase"
+            confidence = min(0.55, 0.40 + (delta_db - 6.0) * 0.04)
+        elif delta_db <= -10.0:
+            level = "volume_decrease_significant"
+            confidence = min(0.60, 0.45 + (abs(delta_db) - 10.0) * 0.03)
+        else:
+            level = "volume_decrease"
+            confidence = min(0.50, 0.35 + (abs(delta_db) - 6.0) * 0.04)
+
+        return {
+            "delta_db": round(delta_db, 2),
+            "energy_current_db": round(energy_db, 2),
+            "energy_baseline_db": round(b.energy_rms_db, 2),
+            "level": level,
+            "confidence_raw": round(confidence, 4),
+        }
+
+    # ════════════════════════════════════════════════════════
     # VOICE-PAUSE-01: Pause Classification
     # Research: Goldman-Eisler 1968, Campione & Véronis 2002
     # Returns a LIST (can emit multiple signals per window)
@@ -969,6 +1047,63 @@ class VoiceRuleEngine:
             })
 
         return results
+
+    # ════════════════════════════════════════════════════════
+    # VOICE-PAUSE-02: Strategic Pause Detection
+    # Research: Duez 2001 — political speakers use pre-content
+    # pauses for emphasis. Goldman-Eisler 1968 — pauses before
+    # high-information content are longer.
+    # Distinct from PAUSE-01 (hesitation): intentional emphasis.
+    # ════════════════════════════════════════════════════════
+
+    def _rule_pause_02(
+        self, f: dict, b: SpeakerBaseline, min_pause_ms: int = 500,
+    ) -> Optional[dict]:
+        """
+        Detect strategic pauses: silence 500–3000 ms before substantive content.
+
+        Distinguishes from hesitation (PAUSE-01) by requiring:
+          1. No filler words in the window (fillers = uncertainty, not strategy)
+          2. Substantive content following (>= 5 words)
+          3. Pause in 500–3000 ms range (> 3000 ms is hesitation, handled by PAUSE-01)
+          4. Speaker's baseline pause ratio is not already high (< 0.50)
+
+        Levels:
+          500–1500 ms → strategic_pause (emphasis before key point)
+          1500–3000 ms → dramatic_pause (strong rhetorical emphasis)
+        """
+        max_pause_ms = f.get("max_pause_ms", 0)
+        if max_pause_ms < min_pause_ms:
+            return None
+        if max_pause_ms > 3000:
+            return None  # Too long — hesitation territory (PAUSE-01 handles this)
+
+        # Strategic pause must NOT be accompanied by fillers (that's hesitation)
+        if f.get("filler_count", 0) > 0:
+            return None
+
+        # Must have substantive content in the window
+        if f.get("word_count", 0) < 5:
+            return None
+
+        # Speaker who already pauses a lot — pause is not strategic
+        if b.pause_ratio_pct > 0.50:
+            return None
+
+        if max_pause_ms >= 1500:
+            level = "dramatic_pause"
+            confidence = min(0.55, 0.40 + (max_pause_ms - 1500) / 5000.0)
+        else:
+            level = "strategic_pause"
+            confidence = min(0.50, 0.35 + (max_pause_ms - 500) / 3000.0)
+
+        return {
+            "pause_ms": max_pause_ms,
+            "level": level,
+            "confidence_raw": round(confidence, 4),
+            "word_count_after": f.get("word_count", 0),
+            "baseline_pause_ratio": round(b.pause_ratio_pct, 3),
+        }
 
     # ════════════════════════════════════════════════════════
     # VOICE-INT-01: Interruption Detection

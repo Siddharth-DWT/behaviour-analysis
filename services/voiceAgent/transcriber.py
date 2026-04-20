@@ -1,3 +1,4 @@
+# services/voiceAgent/transcriber.py
 """
 NEXUS Voice Agent - Transcriber
 Handles audio transcription (Whisper) and speaker diarization.

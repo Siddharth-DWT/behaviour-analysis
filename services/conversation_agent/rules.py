@@ -1,3 +1,4 @@
+# services/conversation_agent/rules.py
 """
 NEXUS Conversation Agent - Rule Engine
 Implements 7 rules from the NEXUS Rule Engine specification for dialogue dynamics.
