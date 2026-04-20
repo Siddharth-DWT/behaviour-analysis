@@ -45,6 +45,10 @@ class GazeRuleEngine(BaseVideoRuleEngine):
     CONTACT_BLOCK_WINDOWS  = 15    # 30s block (15 × 2s windows)
     MIN_GAZE_RATE          = 0.30  # skip window if face < 30%
 
+    # GAZE-SYNC-01 thresholds
+    SYNC_ALIGN_MS   = 3000  # two gaze breaks within 3s = "simultaneous"
+    SYNC_MIN_BREAKS = 3     # minimum synchronized breaks before flagging
+
     def evaluate(
         self,
         windows_by_speaker: dict,
@@ -61,6 +65,9 @@ class GazeRuleEngine(BaseVideoRuleEngine):
             signals += self._per_window_rules(windows, gaze_bl, speaker_id)
             signals += self._rule_screen_contact(windows, gaze_bl, speaker_id)
             signals += self._rule_distraction(windows, gaze_bl, speaker_id)
+
+        # Cross-speaker rule (needs all speakers simultaneously)
+        signals += self._rule_gaze_sync(windows_by_speaker)
 
         logger.info(f"[{session_id}] GazeRuleEngine: {len(signals)} signals")
         return signals
@@ -321,4 +328,87 @@ class GazeRuleEngine(BaseVideoRuleEngine):
                 run_count = 0
 
         _flush_run()
+        return signals
+
+    # ── GAZE-SYNC-01 (EXPERIMENTAL) ──────────────────────────────────────────
+    def _rule_gaze_sync(self, windows_by_speaker: dict) -> list[dict]:
+        """
+        GAZE-SYNC-01 (EXPERIMENTAL): synchronized gaze breaks across speakers.
+        When multiple participants look away simultaneously it suggests shared
+        distraction or mutual disengagement (Sellen et al. 1992).
+        Cap 0.40 — experimental, too many confounders.
+
+        DSA: sorted windows + advancing pointer → O(A + B) per pair.
+        """
+        speaker_ids = list(windows_by_speaker.keys())
+        if len(speaker_ids) < 2:
+            return []
+
+        signals: list[dict] = []
+
+        for i in range(len(speaker_ids)):
+            for j in range(i + 1, len(speaker_ids)):
+                sp_a = speaker_ids[i]
+                sp_b = speaker_ids[j]
+
+                wins_a = sorted(
+                    [w for w in windows_by_speaker[sp_a]
+                     if w.face_detection_rate >= self.MIN_GAZE_RATE],
+                    key=lambda w: w.window_start_ms,
+                )
+                wins_b = sorted(
+                    [w for w in windows_by_speaker[sp_b]
+                     if w.face_detection_rate >= self.MIN_GAZE_RATE],
+                    key=lambda w: w.window_start_ms,
+                )
+                if not wins_a or not wins_b:
+                    continue
+
+                sync_events: list[tuple[int, int]] = []
+                ptr_b = 0
+                for wa in wins_a:
+                    if wa.gaze_on_screen_pct >= self.GAZE_OFF_THRESHOLD:
+                        continue
+                    # Advance pointer past windows that ended too early
+                    while (ptr_b < len(wins_b)
+                           and wins_b[ptr_b].window_end_ms
+                           < wa.window_start_ms - self.SYNC_ALIGN_MS):
+                        ptr_b += 1
+                    for wb in wins_b[ptr_b:]:
+                        if wb.window_start_ms > wa.window_end_ms + self.SYNC_ALIGN_MS:
+                            break
+                        if wb.gaze_on_screen_pct < self.GAZE_OFF_THRESHOLD:
+                            sync_events.append((
+                                min(wa.window_start_ms, wb.window_start_ms),
+                                max(wa.window_end_ms,   wb.window_end_ms),
+                            ))
+                            break
+
+                if len(sync_events) < self.SYNC_MIN_BREAKS:
+                    continue
+
+                all_wins = wins_a + wins_b
+                session_start = min(w.window_start_ms for w in all_wins)
+                session_end   = max(w.window_end_ms   for w in all_wins)
+                sync_rate  = len(sync_events) / max(len(wins_a), 1)
+                confidence = min(sync_rate * 1.5, 0.40)  # hard cap 0.40
+
+                for sp in (sp_a, sp_b):
+                    signals.append(self._make_signal(
+                        rule_id="GAZE-SYNC-01",
+                        signal_type="gaze_synchrony",
+                        speaker_id=sp,
+                        value=round(sync_rate, 4),
+                        value_text="synchronized_gaze_break",
+                        confidence=confidence,
+                        window_start_ms=session_start,
+                        window_end_ms=session_end,
+                        metadata={
+                            "pair": f"{sp_a}+{sp_b}",
+                            "sync_break_count": len(sync_events),
+                            "sync_rate": round(sync_rate, 4),
+                            "experimental": True,
+                        },
+                    ))
+
         return signals

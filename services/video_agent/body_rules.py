@@ -13,6 +13,7 @@ Research anchors:
 """
 import logging
 import math
+from typing import Optional
 
 import numpy as np
 
@@ -89,6 +90,11 @@ class BodyRuleEngine(BaseVideoRuleEngine):
     # Minimum body detection rate to process window
     MIN_BODY_RATE = 0.30
 
+    # BODY-MIRROR-01 thresholds
+    MIRROR_ALIGN_MS   = 5000  # 5s temporal alignment window for mirroring
+    MIRROR_MIN_EVENTS = 3     # minimum matching lean windows before flagging
+    LEAN_THRESHOLD    = 0.03  # normalized head-shoulder distance change = directional lean
+
     def evaluate(
         self,
         windows_by_speaker: dict,
@@ -115,6 +121,9 @@ class BodyRuleEngine(BaseVideoRuleEngine):
                 signals += self._rule_gesture(w, body_bl, speaker_id, conf_mult)
                 signals += self._rule_fidget(w, body_bl, speaker_id, conf_mult)
                 signals += self._rule_self_touch(w, body_bl, speaker_id, conf_mult)
+
+        # Cross-speaker rule (needs all speakers simultaneously)
+        signals += self._rule_mirror(windows_by_speaker, baselines)
 
         logger.info(f"[{session_id}] BodyRuleEngine: {len(signals)} signals")
         return signals
@@ -422,3 +431,101 @@ class BodyRuleEngine(BaseVideoRuleEngine):
                 "blink_count_window": w.blink_count,
             },
         )]
+
+    # ── BODY-MIRROR-01 (EXPERIMENTAL) ────────────────────────────────────────
+    def _rule_mirror(self, windows_by_speaker: dict, baselines: dict) -> list[dict]:
+        """
+        BODY-MIRROR-01 (EXPERIMENTAL): synchronized lean direction between speakers.
+        When two speakers lean the same direction within 5s, it suggests rapport
+        through postural mirroring (Chartrand & Bargh 1999 — Chameleon Effect).
+        Cap 0.25 — experimental, lean estimation from head-shoulder distance is noisy.
+
+        DSA: sorted windows + advancing pointer → O(A + B) per pair.
+        """
+        speaker_ids = list(windows_by_speaker.keys())
+        if len(speaker_ids) < 2:
+            return []
+
+        def _lean_dir(w: WindowFeatures, bl: BodyBaseline) -> Optional[str]:
+            delta = w.head_shoulder_dist_mean - bl.head_shoulder_dist_mean
+            if delta < -self.LEAN_THRESHOLD:
+                return "forward"
+            if delta > self.LEAN_THRESHOLD:
+                return "backward"
+            return None
+
+        signals: list[dict] = []
+
+        for i in range(len(speaker_ids)):
+            for j in range(i + 1, len(speaker_ids)):
+                sp_a = speaker_ids[i]
+                sp_b = speaker_ids[j]
+
+                _, bl_a, _ = baselines.get(sp_a, (None, BodyBaseline(speaker_id=sp_a), None))
+                _, bl_b, _ = baselines.get(sp_b, (None, BodyBaseline(speaker_id=sp_b), None))
+
+                wins_a = sorted(
+                    [w for w in windows_by_speaker[sp_a]
+                     if w.body_detection_rate >= self.MIN_BODY_RATE],
+                    key=lambda w: w.window_start_ms,
+                )
+                wins_b = sorted(
+                    [w for w in windows_by_speaker[sp_b]
+                     if w.body_detection_rate >= self.MIN_BODY_RATE],
+                    key=lambda w: w.window_start_ms,
+                )
+                if not wins_a or not wins_b:
+                    continue
+
+                mirror_events: list[tuple[int, int]] = []
+                eligible_a = 0
+                ptr_b = 0
+
+                for wa in wins_a:
+                    dir_a = _lean_dir(wa, bl_a)
+                    if dir_a is None:
+                        continue
+                    eligible_a += 1
+                    while (ptr_b < len(wins_b)
+                           and wins_b[ptr_b].window_end_ms
+                           < wa.window_start_ms - self.MIRROR_ALIGN_MS):
+                        ptr_b += 1
+                    for wb in wins_b[ptr_b:]:
+                        if wb.window_start_ms > wa.window_end_ms + self.MIRROR_ALIGN_MS:
+                            break
+                        if _lean_dir(wb, bl_b) == dir_a:
+                            mirror_events.append((
+                                min(wa.window_start_ms, wb.window_start_ms),
+                                max(wa.window_end_ms,   wb.window_end_ms),
+                            ))
+                            break
+
+                if len(mirror_events) < self.MIRROR_MIN_EVENTS:
+                    continue
+
+                mirror_rate = len(mirror_events) / max(eligible_a, 1)
+                confidence  = min(mirror_rate * 0.8, 0.25)  # hard cap 0.25
+
+                all_wins    = wins_a + wins_b
+                session_start = min(w.window_start_ms for w in all_wins)
+                session_end   = max(w.window_end_ms   for w in all_wins)
+
+                for sp in (sp_a, sp_b):
+                    signals.append(self._make_signal(
+                        rule_id="BODY-MIRROR-01",
+                        signal_type="body_mirroring",
+                        speaker_id=sp,
+                        value=round(mirror_rate, 4),
+                        value_text="synchronized_lean",
+                        confidence=confidence,
+                        window_start_ms=session_start,
+                        window_end_ms=session_end,
+                        metadata={
+                            "pair": f"{sp_a}+{sp_b}",
+                            "mirror_event_count": len(mirror_events),
+                            "mirror_rate": round(mirror_rate, 4),
+                            "experimental": True,
+                        },
+                    ))
+
+        return signals

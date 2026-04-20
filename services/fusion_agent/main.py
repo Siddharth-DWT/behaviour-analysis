@@ -50,12 +50,16 @@ try:
     from narrative import generate_session_narrative
     from signal_graph import SignalGraph
     from graph_analytics import GraphAnalytics
+    from compound_patterns import CompoundPatternEngine
+    from temporal_patterns import TemporalPatternEngine
 except ImportError:
     from services.fusion_agent.fusion_engine import SignalBuffer, compute_unified_state, WINDOW_SHORT_MS
     from services.fusion_agent.rules import FusionRuleEngine
     from services.fusion_agent.narrative import generate_session_narrative
     from services.fusion_agent.signal_graph import SignalGraph
     from services.fusion_agent.graph_analytics import GraphAnalytics
+    from services.fusion_agent.compound_patterns import CompoundPatternEngine
+    from services.fusion_agent.temporal_patterns import TemporalPatternEngine
 
 try:
     from shared.utils.message_bus import message_bus
@@ -81,14 +85,18 @@ app.add_middleware(
 )
 
 # ── Globals ──
-rule_engine: Optional[FusionRuleEngine] = None
+rule_engine:     Optional[FusionRuleEngine]     = None
+compound_engine: Optional[CompoundPatternEngine] = None
+temporal_engine: Optional[TemporalPatternEngine] = None
 
 
 @app.on_event("startup")
 async def startup():
-    global rule_engine
+    global rule_engine, compound_engine, temporal_engine
     logger.info("Starting NEXUS Fusion Agent...")
-    rule_engine = FusionRuleEngine()
+    rule_engine     = FusionRuleEngine()
+    compound_engine = CompoundPatternEngine()
+    temporal_engine = TemporalPatternEngine()
 
     if HAS_MESSAGE_BUS:
         try:
@@ -226,6 +234,19 @@ async def analyse_signals(request: AnalyseRequest):
             profile=profile,
         )
 
+        # Compound patterns (Phase 2F) — run on the same windowed signal set
+        if compound_engine is not None:
+            compound_signals = compound_engine.evaluate(
+                speaker_id=speaker_id,
+                voice_signals=speaker_voice,
+                language_signals=speaker_language,
+                video_signals=speaker_video,
+                fusion_signals=fusion_signals,
+                window_start_ms=window_start,
+                window_end_ms=window_end,
+            )
+            fusion_signals = fusion_signals + compound_signals
+
         state = compute_unified_state(
             speaker_id=speaker_id,
             voice_signals=speaker_voice,
@@ -259,6 +280,33 @@ async def analyse_signals(request: AnalyseRequest):
         if result["state"] is not None:
             all_unified_states.append(asdict(result["state"]))
         all_alerts.extend(result["alerts"])
+
+    # ── Step 2.5: Temporal patterns (Phase 2G) — session-level, full signal set ──
+    if temporal_engine is not None:
+        all_source_sigs = pure_voice_dicts + language_dicts + video_dicts
+        if all_source_sigs:
+            session_start_ms_val = min(
+                _to_int(s.get("window_start_ms", 0)) for s in all_source_sigs
+            )
+        else:
+            session_start_ms_val = 0
+
+        for sid in speakers:
+            speaker_full = [
+                s for s in all_source_sigs
+                if s.get("speaker_id") == sid
+            ]
+            temporal_sigs = temporal_engine.evaluate(
+                speaker_id=sid,
+                all_signals=speaker_full,
+                session_start_ms=session_start_ms_val,
+                session_end_ms=ref_time,
+            )
+            if temporal_sigs:
+                logger.info(
+                    f"[{session_id}] Speaker {sid}: {len(temporal_sigs)} temporal pattern signals"
+                )
+            all_fusion_signals.extend(temporal_sigs)
 
     # ── Step 3: Publish to Redis ──
     if HAS_MESSAGE_BUS:

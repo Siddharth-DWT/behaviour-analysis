@@ -539,6 +539,8 @@ export default function SessionDetail() {
 
   // Compute analytics from signals
   const speakerStats = computeSpeakerStats(signals);
+  const videoStats = computeVideoStats(signals);
+  const hasVideoSignals = signals.some((s) => s.agent === "video");
   const callOutcome = computeCallOutcome(speakerStats);
 
   // Infer speaker roles (uses transcript to detect who introduces themselves)
@@ -637,6 +639,7 @@ export default function SessionDetail() {
               language: "var(--agent-language)",
               fusion: "var(--agent-fusion)",
               conversation: "var(--accent-blue, #4F8BFF)",
+              video: "var(--agent-gaze, #EC4899)",
             };
             return (
               <span
@@ -742,6 +745,13 @@ export default function SessionDetail() {
         </>
       )}
 
+      {/* 3b. BEHAVIORAL OVERVIEW (shows when video or fusion signals present) */}
+      <BehavioralOverview
+        signals={signals}
+        meetingType={session.meeting_type}
+        durationMs={session.duration_ms || 0}
+      />
+
       {/* 4. SPEAKER ANALYSIS + STRESS TIMELINE (two-column) */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-5">
         {/* LEFT: Speaker Analysis Cards */}
@@ -840,6 +850,48 @@ export default function SessionDetail() {
                           );
                         })()}
                       </div>
+
+                      {/* VISUAL section — only shown when video signals exist for this speaker */}
+                      {hasVideoSignals && videoStats[speaker.label] && (() => {
+                        const vs = videoStats[speaker.label];
+                        const EMOTION_LABEL: Record<string, string> = {
+                          happy: "😊 happy", joy: "😊 joyful", excited: "😄 excited",
+                          sad: "😢 sad", angry: "😠 angry", fearful: "😨 fearful",
+                          disgusted: "😒 disgusted", surprised: "😲 surprised",
+                          contempt: "🙄 contempt", stressed: "😬 stressed",
+                        };
+                        return (
+                          <div className="mt-3 rounded-md bg-nexus-surface-hover p-2.5">
+                            <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-nexus-text-muted">
+                              Visual
+                            </div>
+                            <div className="flex flex-wrap gap-1.5">
+                              {vs.screenEngagementPct > 0 && (
+                                <StatChip label="Screen" value={`${vs.screenEngagementPct}%`} color={vs.screenEngagementPct >= 70 ? "#22C55E" : vs.screenEngagementPct >= 45 ? "#F59E0B" : "#EF4444"} />
+                              )}
+                              {vs.dominantEmotion && (
+                                <StatChip label="Emotion" value={EMOTION_LABEL[vs.dominantEmotion] ?? vs.dominantEmotion} />
+                              )}
+                              {vs.smileCount > 0 && (
+                                <StatChip label="Smiles" value={vs.smileCount} color="#22C55E" />
+                              )}
+                              {vs.nodCount > 0 && (
+                                <StatChip label="Nods" value={vs.nodCount} color="#4F8BFF" />
+                              )}
+                              {vs.fidgetLevel && (
+                                <StatChip label="Fidget" value={vs.fidgetLevel} color={vs.fidgetLevel === "high" ? "#EF4444" : vs.fidgetLevel === "moderate" ? "#F59E0B" : "#22C55E"} />
+                              )}
+                              {vs.voiceFaceAlignmentPct > 0 && (
+                                <StatChip
+                                  label="Alignment"
+                                  value={`${vs.voiceFaceAlignmentPct}%`}
+                                  color={vs.voiceFaceAlignmentPct >= 75 ? "#22C55E" : vs.voiceFaceAlignmentPct >= 55 ? "#F59E0B" : "#EF4444"}
+                                />
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })()}
 
                       {i < speakerStats.length - 1 && (
                         <div className="mt-4 border-b border-nexus-border" />
