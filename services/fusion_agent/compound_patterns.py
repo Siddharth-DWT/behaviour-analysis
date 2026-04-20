@@ -189,15 +189,19 @@ class CompoundPatternEngine:
         voice_stress = _sig(signals, "vocal_stress_score", min_value=0.50)
         if voice_stress is None:
             return None
+        # Suppression = high internal arousal (voice stress) but masked externally.
+        # tone_face_masking / stress_suppression are the fusion signals that encode this
+        # directly. facial_stress is intentionally excluded: its presence means the
+        # face IS showing stress → not suppressed.
         components = {
-            "voice_stress":     voice_stress,
+            "voice_stress":    voice_stress,
             "masking": (
                 _sig(signals, "tone_face_masking")
                 or _sig(signals, "stress_suppression")
             ),
-            "controlled_rate":  _sig(signals, "speech_rate_anomaly"),
-            "neutral_words":    _sig(signals, "sentiment_score"),
-            "facial_stress":    _sig(signals, "facial_stress"),
+            "controlled_rate": _sig(signals, "speech_rate_anomaly"),
+            "neutral_words":   _sig(signals, "sentiment_score"),
+            "fillers":         _sig(signals, "filler_detection"),
         }
         hits = {k: v for k, v in components.items() if v is not None}
         if len(hits) < 3:
@@ -433,11 +437,11 @@ class CompoundPatternEngine:
         """
         Reduced talk + backward lean + gaze avoidance + low engagement.
         """
+        # conversation_engagement/passive was previously in both low_talk and
+        # low_engagement, letting the same signal satisfy two slots. Separated:
+        # low_talk uses only the talk-time signal; low_engagement uses only attention.
         components = {
-            "low_talk": (
-                _sig(signals, "talk_time_imbalance")
-                or _sig(signals, "conversation_engagement", "passive")
-            ),
+            "low_talk": _sig(signals, "talk_time_imbalance"),
             "backward_lean":  _sig(signals, "body_lean", "backward_lean"),
             "gaze_avoidance": (
                 _sig(signals, "screen_contact", "low_screen_contact")

@@ -197,7 +197,7 @@ class TemporalPatternEngine:
         slope = _linear_slope(combined)
         if delta > 0:
             label      = "stress_trajectory_rising"
-            confidence = min(slope * 3.0, 0.70)
+            confidence = min(abs(slope) * 3.0, 0.70)
         else:
             label      = "stress_trajectory_declining"
             confidence = min(abs(slope) * 3.0, 0.65)
@@ -431,24 +431,38 @@ class TemporalPatternEngine:
         if not early_sigs or not late_sigs:
             return None
 
-        def _energy(sigs: list[dict]) -> float:
+        ENERGY_TYPES = frozenset({
+            "gesture_animation", "speech_rate_anomaly", "attention_level",
+        })
+
+        def _energy(sigs: list[dict]) -> tuple[float, int]:
+            """Returns (energy_score, n_energy_signals). n=0 means no data."""
             score, n = 0.0, 0
             for s in sigs:
                 st = s.get("signal_type", "")
                 if st == "gesture_animation":
-                    score += s.get("value") or 0.3; n += 1
+                    score += s.get("value") or 0.3
+                    n += 1
                 elif st == "speech_rate_anomaly":
                     if s.get("value_text") == "rate_elevated":
-                        score += 0.6; n += 1
+                        score += 0.6
+                        n += 1
                     elif s.get("value_text") == "rate_suppressed":
-                        score -= 0.4; n += 1
+                        score -= 0.4
+                        n += 1
                 elif st == "attention_level" and s.get("value_text") == "high_attention":
-                    score += s.get("value") or 0.7; n += 1
-            return score / max(n, 1)
+                    score += s.get("value") or 0.7
+                    n += 1
+            return (score / n if n > 0 else 0.0), n
 
-        early_e = _energy(early_sigs)
-        late_e  = _energy(late_sigs)
-        delta   = late_e - early_e
+        early_e, early_n = _energy(early_sigs)
+        late_e,  late_n  = _energy(late_sigs)
+
+        # Require energy signals in both halves — silence ≠ fatigue
+        if early_n == 0 or late_n == 0:
+            return None
+
+        delta = late_e - early_e
 
         if delta > -0.10:
             return None
@@ -459,9 +473,11 @@ class TemporalPatternEngine:
             "T-06", "fatigue_detection", speaker_id, round(delta, 4),
             "energy_declining", confidence, late_start, se, cap=0.60,
             metadata={
-                "early_energy": round(early_e, 4),
-                "late_energy":  round(late_e,  4),
-                "energy_delta": round(delta,   4),
+                "early_energy":        round(early_e, 4),
+                "late_energy":         round(late_e,  4),
+                "energy_delta":        round(delta,   4),
+                "early_signal_count":  early_n,
+                "late_signal_count":   late_n,
             },
         )
 
@@ -544,8 +560,12 @@ class TemporalPatternEngine:
         )
         stage2 = sum(
             1 for s in signals
-            if s.get("signal_type") in ("vocal_stress_score", "interruption_event")
-            and (s.get("value") or 0.0) > 0.55
+            if (
+                s.get("signal_type") == "vocal_stress_score"
+                and (s.get("value") or 0.0) > 0.55
+            ) or (
+                s.get("signal_type") == "interruption_event"
+            )
         )
         stage3 = sum(
             1 for s in signals
