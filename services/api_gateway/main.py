@@ -1032,94 +1032,110 @@ async def _run_pipeline(
             f"({len(diar_segments_for_video)} diar segments)"
         )
 
-    # ── Step 4: Language Agent (behavioural OR standalone sentiment) ──
+    # ── Steps 4 + 4b: Language Agent + Conversation Agent (parallel) ──
+    # Both depend only on transcript_segments — no dependency on each other.
+    # Video agent is already running as a background task started above.
     _set_step(session_id, "language")
+
     language_result = None
     language_signals = []
     language_summary = {}
-
-    if run_behavioural or run_sentiment:
-        if transcript_segments:
-            try:
-                language_result = await _call_language_agent(
-                    session_id, transcript_segments, meeting_type,
-                )
-                language_signals = language_result.get("signals", [])
-                language_summary = language_result.get("summary", {})
-                agent_status["language"] = "completed"
-                logger.info(f"[{session_id}] Language Agent: {len(language_signals)} signals")
-            except Exception as e:
-                agent_status["language"] = "failed"
-                logger.warning(f"[{session_id}] Language Agent failed (continuing): {e}")
-
-            if language_signals:
-                try:
-                    count = await insert_signals(session_id, language_signals, speaker_map)
-                    logger.info(f"[{session_id}] Persisted {count} language signals")
-                except Exception as e:
-                    logger.warning(f"[{session_id}] Language signal persist failed: {e}")
-        else:
-            logger.warning(f"[{session_id}] No transcript segments — skipping Language Agent")
-    elif run_entity_extraction and transcript_segments:
-        # Entity-extraction-only path (behavioural OFF).
-        # Prefer AssemblyAI entities when the voice agent returned them;
-        # fall back to NEXUS EntityExtractor for non-AssemblyAI backends.
-        assemblyai_raw = voice_result.get("assemblyai_entities") if voice_result else None
-        if assemblyai_raw is not None:
-            entities = _format_assemblyai_entities(assemblyai_raw)
-            language_summary = {"entities": entities}
-            logger.info(
-                f"[{session_id}] Entity extraction (AssemblyAI): "
-                f"{len(entities.get('people', []))} people, "
-                f"{len(entities.get('organizations', []))} orgs, "
-                f"{len(entities.get('topics', []))} topics"
-            )
-        else:
-            try:
-                from entity_extractor import EntityExtractor
-                extractor = EntityExtractor()
-                entities = await extractor.extract(transcript_segments, meeting_type)
-                language_summary = {"entities": entities}
-                logger.info(
-                    f"[{session_id}] Entity extraction (NEXUS fallback): "
-                    f"{len(entities.get('topics', []))} topics, "
-                    f"{len(entities.get('people', []))} people"
-                )
-            except Exception as e:
-                logger.warning(f"[{session_id}] Standalone entity extraction failed (non-fatal): {e}")
-    else:
-        logger.info(f"[{session_id}] Language Agent skipped (behavioural/sentiment/entity all off)")
-
-    # ── Step 4b: Conversation Agent (only when behavioural analysis enabled) ──
-    _set_step(session_id, "conversation")
     conversation_result = None
     conversation_signals = []
     conversation_summary = {}
 
-    if run_behavioural:
-        if transcript_segments and len(set(seg.get("speaker") for seg in transcript_segments)) >= 2:
-            try:
-                conversation_result = await _call_conversation_agent(
-                    session_id, transcript_segments, meeting_type,
-                )
-                conversation_signals = conversation_result.get("signals", [])
-                conversation_summary = conversation_result.get("summary", {})
-                agent_status["conversation"] = "completed"
-                logger.info(f"[{session_id}] Conversation Agent: {len(conversation_signals)} signals")
-            except Exception as e:
-                agent_status["conversation"] = "failed"
-                logger.warning(f"[{session_id}] Conversation Agent failed (continuing): {e}")
+    run_conversation = (
+        run_behavioural
+        and bool(transcript_segments)
+        and len(set(seg.get("speaker") for seg in transcript_segments)) >= 2
+    )
 
-            if conversation_signals:
+    async def _run_language() -> dict:
+        try:
+            if run_behavioural or run_sentiment:
+                if not transcript_segments:
+                    logger.warning(f"[{session_id}] No transcript segments — skipping Language Agent")
+                    return {}
+                result = await _call_language_agent(session_id, transcript_segments, meeting_type)
+                agent_status["language"] = "completed"
+                return result
+
+            if run_entity_extraction and transcript_segments:
+                assemblyai_raw = voice_result.get("assemblyai_entities") if voice_result else None
+                if assemblyai_raw is not None:
+                    entities = _format_assemblyai_entities(assemblyai_raw)
+                    logger.info(
+                        f"[{session_id}] Entity extraction (AssemblyAI): "
+                        f"{len(entities.get('people', []))} people, "
+                        f"{len(entities.get('organizations', []))} orgs, "
+                        f"{len(entities.get('topics', []))} topics"
+                    )
+                    return {"summary": {"entities": entities}}
                 try:
-                    count = await insert_signals(session_id, conversation_signals, speaker_map)
-                    logger.info(f"[{session_id}] Persisted {count} conversation signals")
+                    from entity_extractor import EntityExtractor
+                    extractor = EntityExtractor()
+                    entities = await extractor.extract(transcript_segments, meeting_type)
+                    logger.info(
+                        f"[{session_id}] Entity extraction (NEXUS fallback): "
+                        f"{len(entities.get('topics', []))} topics, "
+                        f"{len(entities.get('people', []))} people"
+                    )
+                    return {"summary": {"entities": entities}}
                 except Exception as e:
-                    logger.warning(f"[{session_id}] Conversation signal persist failed: {e}")
-        else:
-            logger.info(f"[{session_id}] < 2 speakers — skipping Conversation Agent")
-    else:
-        logger.info(f"[{session_id}] Behavioural analysis disabled — skipping Conversation Agent")
+                    logger.warning(f"[{session_id}] Standalone entity extraction failed (non-fatal): {e}")
+                    return {}
+
+            logger.info(f"[{session_id}] Language Agent skipped (behavioural/sentiment/entity all off)")
+            return {}
+        except Exception as e:
+            agent_status["language"] = "failed"
+            logger.warning(f"[{session_id}] Language Agent failed (continuing): {e}")
+            return {}
+
+    async def _run_conversation() -> dict:
+        try:
+            if not run_conversation:
+                if not run_behavioural:
+                    logger.info(f"[{session_id}] Behavioural analysis disabled — skipping Conversation Agent")
+                else:
+                    logger.info(f"[{session_id}] < 2 speakers — skipping Conversation Agent")
+                return {}
+            result = await _call_conversation_agent(session_id, transcript_segments, meeting_type)
+            agent_status["conversation"] = "completed"
+            return result
+        except Exception as e:
+            agent_status["conversation"] = "failed"
+            logger.warning(f"[{session_id}] Conversation Agent failed (continuing): {e}")
+            return {}
+
+    lang_outcome, conv_outcome = await asyncio.gather(_run_language(), _run_conversation())
+
+    # ── Unpack language result ──
+    if lang_outcome:
+        language_result = lang_outcome
+        language_signals = language_result.get("signals", [])
+        language_summary = language_result.get("summary", {})
+        logger.info(f"[{session_id}] Language Agent: {len(language_signals)} signals")
+        if language_signals:
+            try:
+                count = await insert_signals(session_id, language_signals, speaker_map)
+                logger.info(f"[{session_id}] Persisted {count} language signals")
+            except Exception as e:
+                logger.warning(f"[{session_id}] Language signal persist failed: {e}")
+
+    # ── Unpack conversation result ──
+    _set_step(session_id, "conversation")
+    if conv_outcome:
+        conversation_result = conv_outcome
+        conversation_signals = conversation_result.get("signals", [])
+        conversation_summary = conversation_result.get("summary", {})
+        logger.info(f"[{session_id}] Conversation Agent: {len(conversation_signals)} signals")
+        if conversation_signals:
+            try:
+                count = await insert_signals(session_id, conversation_signals, speaker_map)
+                logger.info(f"[{session_id}] Persisted {count} conversation signals")
+            except Exception as e:
+                logger.warning(f"[{session_id}] Conversation signal persist failed: {e}")
 
     # ── Step 4c: Video Agent result (ran in parallel above; await here) ──
     if video_task is not None:
