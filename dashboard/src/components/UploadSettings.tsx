@@ -54,7 +54,7 @@ export const DEFAULT_CONFIG: UploadConfig = {
   run_sentiment: false,
   run_diarization: true,
   run_entity_extraction: true,
-  run_knowledge_graph: false,
+  run_knowledge_graph: true,
   sensitivity: 0.5,
   translate_to: null,
   temperature: null,
