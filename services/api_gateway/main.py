@@ -1011,7 +1011,6 @@ async def _run_pipeline(
     run_video = (
         video_path is not None
         and run_behavioural
-        and user_email.split("@")[0] == "mernhash"
     )
     if run_video:
         diar_segments_for_video = [
