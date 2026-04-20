@@ -1,3 +1,4 @@
+# services/api_gateway/main.py
 """
 NEXUS API Gateway
 Central entry point for the NEXUS system. Accepts audio uploads, orchestrates
@@ -945,7 +946,6 @@ async def _run_pipeline(
                 analysis_config=analysis_config,
             )
         )
-        _set_step(session_id, "diarization")
         logger.info(
             f"[{session_id}] Transcription: "
             f"{voice_result.get('duration_seconds', 0):.0f}s, "

@@ -1,3 +1,4 @@
+# services/language_agent/entity_extractor.py
 """
 NEXUS Language Agent — Entity & Topic Extraction
 

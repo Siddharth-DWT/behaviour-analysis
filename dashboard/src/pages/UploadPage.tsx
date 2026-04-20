@@ -540,7 +540,7 @@ const PIPELINE_ORDER = [
 ];
 
 function pipelineStepToIndex(stepName: string | null, steps: string[]): number {
-  if (!stepName) return 0;
+  if (!stepName) return steps.length;  // null = pipeline done, all steps complete
 
   // Direct match
   const label = STEP_LABEL[stepName];

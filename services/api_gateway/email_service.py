@@ -1,3 +1,4 @@
+# services/api_gateway/email_service.py
 """
 NEXUS API Gateway - Email Service
 Sends transactional emails via ZeptoMail REST API.

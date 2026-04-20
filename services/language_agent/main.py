@@ -1,3 +1,4 @@
+# services/language_agent/main.py
 """
 NEXUS Language Agent (Agent 2)
 FastAPI service for linguistic analysis of transcript segments.

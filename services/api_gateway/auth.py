@@ -1,3 +1,4 @@
+# services/api_gateway/auth.py
 """
 NEXUS API Gateway - Authentication Module
 Password hashing (bcrypt), JWT tokens, and FastAPI auth dependencies.

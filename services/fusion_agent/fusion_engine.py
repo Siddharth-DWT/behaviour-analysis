@@ -1,3 +1,4 @@
+# services/fusion_agent/fusion_engine.py
 """
 NEXUS Fusion Agent - Fusion Engine
 Temporal alignment, signal buffering, and Unified Speaker State computation.

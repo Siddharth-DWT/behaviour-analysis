@@ -1,3 +1,4 @@
+# services/fusion_agent/main.py
 """
 NEXUS Fusion Agent (Agent 7)
 FastAPI service for cross-modal behavioural analysis.
