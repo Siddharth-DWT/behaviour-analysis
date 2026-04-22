@@ -344,7 +344,15 @@ class CompoundPatternEngine:
         Confident tone + power language + upright posture + steady gaze + low stress.
         High stress disqualifies this pattern — it contradicts the peak state.
         """
+        # Guard: window too short (single utterances like "Hello", "Okay" produce false hits)
+        if (we - ws) < 3000:
+            return None
+        # Guard: high stress disqualifies
         if _sig(signals, "vocal_stress_score", min_value=0.55) is not None:
+            return None
+        # Guard: signals must come from at least 2 different agents (multimodal requirement)
+        agents_present = {s.get("agent") for s in signals if s.get("agent")}
+        if len(agents_present) < 2:
             return None
         components = {
             "confident_tone": (

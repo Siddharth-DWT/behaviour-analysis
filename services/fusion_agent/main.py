@@ -25,6 +25,7 @@ import time
 import json
 import asyncio
 import logging
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 from dataclasses import asdict
@@ -234,18 +235,67 @@ async def analyse_signals(request: AnalyseRequest):
             profile=profile,
         )
 
-        # Compound patterns (Phase 2F) — run on the same windowed signal set
+        # Compound patterns (Phase 2F) — per-segment evaluation with ±5s signal window.
+        # Running on the single window_start/window_end span causes compound signals to
+        # timestamp across the full session when the buffer fallback is used, making
+        # them appear on every transcript segment in the dashboard.
+        compound_signals: list[dict] = []
         if compound_engine is not None:
-            compound_signals = compound_engine.evaluate(
-                speaker_id=speaker_id,
-                voice_signals=speaker_voice,
-                language_signals=speaker_language,
-                video_signals=speaker_video,
-                fusion_signals=fusion_signals,
-                window_start_ms=window_start,
-                window_end_ms=window_end,
-            )
-            fusion_signals = fusion_signals + compound_signals
+            all_speaker_sigs = speaker_voice + speaker_language + speaker_video + fusion_signals
+
+            COMPOUND_ALIGN_MS = 5000  # look ±5s around each voice/language segment
+
+            # Collect unique time windows from voice + language (the "anchor" agents)
+            segment_windows: set[tuple[int, int]] = set()
+            for s in speaker_voice + speaker_language:
+                ws_ms = s.get("window_start_ms", 0)
+                we_ms = s.get("window_end_ms", 0)
+                if ws_ms >= 0 and we_ms > ws_ms:
+                    segment_windows.add((ws_ms, we_ms))
+
+            for seg_start, seg_end in sorted(segment_windows):
+                # Only include signals that co-occur within ±5s of this segment
+                seg_sigs = [
+                    s for s in all_speaker_sigs
+                    if s.get("window_start_ms", 0) >= seg_start - COMPOUND_ALIGN_MS
+                    and s.get("window_end_ms", 0) <= seg_end + COMPOUND_ALIGN_MS
+                ]
+                if len(seg_sigs) < 3:
+                    continue
+
+                seg_compounds = compound_engine.evaluate(
+                    speaker_id=speaker_id,
+                    voice_signals=[s for s in seg_sigs if s.get("agent") == "voice"],
+                    language_signals=[s for s in seg_sigs if s.get("agent") == "language"],
+                    video_signals=[s for s in seg_sigs
+                                   if s.get("agent") in ("facial", "body", "gaze", "video")],
+                    fusion_signals=[s for s in seg_sigs if s.get("agent") == "fusion"],
+                    window_start_ms=seg_start,
+                    window_end_ms=seg_end,
+                )
+                compound_signals.extend(seg_compounds)
+
+            # Session-level frequency cap: keep highest-confidence firing per signal_type.
+            # Must be done here (not inside evaluate()) so the cap is session-wide, not
+            # per-segment (evaluate() is called once per segment above).
+            _MAX_FIRES: dict[str, int] = {
+                "peak_performance": 2, "genuine_engagement": 2,
+                "active_disengagement": 2, "conflict_escalation": 2,
+                "deception_cluster": 1, "emotional_suppression": 2,
+            }
+            _DEFAULT_MAX = 3
+            if compound_signals:
+                fire_counts: dict[str, int] = defaultdict(int)
+                deduped: list[dict] = []
+                for s in sorted(compound_signals,
+                                key=lambda x: x.get("confidence", 0), reverse=True):
+                    st = s.get("signal_type", "")
+                    if fire_counts[st] < _MAX_FIRES.get(st, _DEFAULT_MAX):
+                        deduped.append(s)
+                        fire_counts[st] += 1
+                compound_signals = deduped
+
+        fusion_signals = fusion_signals + compound_signals
 
         state = compute_unified_state(
             speaker_id=speaker_id,
