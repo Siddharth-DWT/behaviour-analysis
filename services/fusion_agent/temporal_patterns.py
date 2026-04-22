@@ -390,21 +390,31 @@ class TemporalPatternEngine:
         if not has_eng and not has_fidget:
             return None
 
+        # Guard: need at least 5 relevant signals for a meaningful trend.
+        # Forward-fill from a single signal creates a non-zero flat line whose slope
+        # is ~0, but random bucketing noise can still exceed 0.005 — causing false fires.
+        relevant_count = sum(
+            1 for s in signals
+            if s.get("signal_type") in ("attention_level", "body_fidgeting")
+        )
+        if relevant_count < 5:
+            return None
+
         adapt_signals: list[tuple[str, float]] = []
         if has_eng:
             slope_e = _linear_slope(eng_b)
-            if slope_e > 0.005:
+            if slope_e > 0.02:   # raised from 0.005 — requires a real rising trend
                 adapt_signals.append(("engagement_increase", slope_e))
         if has_fidget:
             slope_f = _linear_slope(fidget_b)
-            if slope_f < -0.002:
+            if slope_f < -0.01:  # raised from -0.002 — requires a real declining trend
                 adapt_signals.append(("fidget_decrease", abs(slope_f)))
 
         if not adapt_signals:
             return None
 
         max_slope  = max(v for _, v in adapt_signals)
-        confidence = min(max_slope * 8.0, 0.60)
+        confidence = min(max_slope * 4.0, 0.55)  # halved multiplier, tighter cap
 
         return self._make_signal(
             "T-05", "adaptation_pattern", speaker_id, round(max_slope, 6),
@@ -553,53 +563,89 @@ class TemporalPatternEngine:
           Stage 1 (objective tension): objections, head shakes, disagreements
           Stage 2 (personal):          stress spikes, interruptions
           Stage 3 (hostile):           aggressive/contemptuous tone, angry facial expression
+
+        FIXED: Requires a RISING conflict trend across chronological time phases.
+        Counting total signals across the session detects mere presence of conflict,
+        not escalation — one objection + 2 head shakes satisfies stage1 >= 3 with no
+        progressive worsening. Chronological ordering enforces the Glasl model.
         """
-        stage1 = sum(
-            1 for s in signals
-            if s.get("signal_type") in ("objection_signal", "objection_detected", "head_shake")
+        phase_ms   = (se - ss) / 3
+        phase1_end = ss + int(phase_ms)
+        phase2_end = ss + int(phase_ms * 2)
+
+        _s1_types  = ("objection_signal", "objection_detected", "head_shake")
+        _s2_types  = ("vocal_stress_score", "interruption_event")
+        _s3_tones  = ("confrontational", "contemptuous", "aggressive")
+        _s3_faces  = ("angry", "contempt", "disgusted")
+
+        def _count(start_ms: int, end_ms: int,
+                   stypes: tuple, vtexts: Optional[tuple] = None,
+                   min_val: Optional[float] = None) -> int:
+            n = 0
+            for s in signals:
+                t = s.get("window_start_ms", 0)
+                if t < start_ms or t > end_ms:
+                    continue
+                if s.get("signal_type") not in stypes:
+                    continue
+                if vtexts and s.get("value_text") not in vtexts:
+                    continue
+                if min_val is not None and (s.get("value") or 0.0) < min_val:
+                    continue
+                n += 1
+            return n
+
+        # Count conflict signals in each chronological phase
+        early = (
+            _count(ss,         phase1_end, _s1_types) +
+            _count(ss,         phase1_end, ("vocal_stress_score",), min_val=0.55)
         )
-        stage2 = sum(
-            1 for s in signals
-            if (
-                s.get("signal_type") == "vocal_stress_score"
-                and (s.get("value") or 0.0) > 0.55
-            ) or (
-                s.get("signal_type") == "interruption_event"
-            )
+        mid = (
+            _count(phase1_end, phase2_end, _s1_types) +
+            _count(phase1_end, phase2_end, _s2_types)
         )
-        stage3 = sum(
-            1 for s in signals
-            if (
-                s.get("signal_type") == "tone_classification"
-                and s.get("value_text") in ("confrontational", "contemptuous")
-            ) or (
-                s.get("signal_type") == "facial_emotion"
-                and s.get("value_text") in ("angry", "contempt", "disgusted")
-            )
+        late = (
+            _count(phase2_end, se, _s1_types) +
+            _count(phase2_end, se, _s2_types) +
+            _count(phase2_end, se, ("tone_classification",), vtexts=_s3_tones) +
+            _count(phase2_end, se, ("facial_emotion",),      vtexts=_s3_faces)
         )
 
-        if stage3 >= 2:
-            stage_label = "escalation_stage_3_hostile"
-            stage_num   = 3
-        elif stage2 >= 2 or (stage2 >= 1 and stage1 >= 3):
-            stage_label = "escalation_stage_2_personal"
-            stage_num   = 2
-        elif stage1 >= 3:
-            stage_label = "escalation_stage_1_objective"
-            stage_num   = 1
+        # Glasl model requires escalation — later phases must have MORE conflict
+        if not (late > mid or mid > early):
+            return None
+
+        total = early + mid + late
+        if total < 5:  # minimum 5 conflict signals across session
+            return None
+
+        # Stage classification uses full-session counts (for label accuracy)
+        stage3_total = (
+            _count(ss, se, ("tone_classification",), vtexts=_s3_tones) +
+            _count(ss, se, ("facial_emotion",),      vtexts=_s3_faces)
+        )
+        stage2_total = _count(ss, se, _s2_types)
+
+        if stage3_total >= 2:
+            stage_label, stage_num = "escalation_stage_3_hostile",   3
+        elif stage2_total >= 3:
+            stage_label, stage_num = "escalation_stage_2_personal",  2
+        elif total >= 5:
+            stage_label, stage_num = "escalation_stage_1_objective", 1
         else:
             return None
 
-        total      = stage1 + stage2 + stage3
-        confidence = min(total * 0.06, 0.55)
+        confidence = min(total * 0.04, 0.55)
 
         return self._make_signal(
             "T-08", "escalation_ladder", speaker_id, float(stage_num), stage_label,
             confidence, ss, se, cap=0.55,
             metadata={
-                "stage_1_signals": stage1,
-                "stage_2_signals": stage2,
-                "stage_3_signals": stage3,
-                "glasl_stage":     stage_num,
+                "early_phase":   early,
+                "mid_phase":     mid,
+                "late_phase":    late,
+                "total_signals": total,
+                "glasl_stage":   stage_num,
+                "is_rising":     True,
             },
         )
