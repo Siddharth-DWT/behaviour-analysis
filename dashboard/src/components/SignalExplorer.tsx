@@ -75,8 +75,8 @@ const SIGNAL_TYPE_META: Record<string, SignalTypeMeta> = {
     interpret: (s) => {
       const txt = (s.value_text || "").toLowerCase();
       if (txt === "normal" || txt === "baseline") return null;
-      if (txt.includes("rapid") || txt.includes("fast")) return { label: `Rapid speech (${s.value != null ? Math.abs(s.value).toFixed(0) : ""}% dev)`, severity: "med" };
-      if (txt.includes("slow") || txt.includes("depress")) return { label: `Slow speech (${s.value != null ? Math.abs(s.value).toFixed(0) : ""}% dev)`, severity: "med" };
+      if (txt.includes("rapid") || txt.includes("fast")) return { label: `Rapid speech (${s.value != null ? Math.round(Math.abs(s.value) * 100) : ""}% dev)`, severity: "med" };
+      if (txt.includes("slow") || txt.includes("depress")) return { label: `Slow speech (${s.value != null ? Math.round(Math.abs(s.value) * 100) : ""}% dev)`, severity: "med" };
       return { label: s.value_text || "Anomaly", severity: "med" };
     },
   },

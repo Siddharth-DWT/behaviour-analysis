@@ -184,6 +184,98 @@ const SIGNAL_CONFIG: Record<string, SignalConfigEntry> = {
     color: "#EF4444",
     category: "compound",
   },
+  decision_engagement: {
+    icon: "★",
+    label: () => "Decision Ready",
+    color: "#10B981",
+    category: "compound",
+  },
+  verbal_nonverbal_discordance: {
+    icon: "≠",
+    label: () => "Words/Body Mismatch",
+    color: "#EF4444",
+    category: "compound",
+  },
+  rapport_building: {
+    icon: "♥",
+    label: () => "Strong Rapport",
+    color: "#10B981",
+    category: "compound",
+  },
+  dominance_display: {
+    icon: "▲",
+    label: () => "Dominance Display",
+    color: "#F59E0B",
+    category: "compound",
+  },
+  submission_signal: {
+    icon: "▽",
+    label: () => "Submission Signal",
+    color: "#6B7280",
+    category: "compound",
+  },
+  deception_cluster: {
+    icon: "⚠",
+    label: () => "Review Required",
+    color: "#EF4444",
+    category: "compound",
+  },
+  // ── Temporal patterns (T-01 through T-08) ───────────────────────────────────
+  stress_trajectory: {
+    icon: "↑",
+    label: (s) => `Stress ${s.value_text === "stress_trajectory_rising" ? "Rising" : "Falling"}`,
+    color: (s) => (s.value_text === "stress_trajectory_rising" ? "#EF4444" : "#10B981"),
+    category: "compound",
+  },
+  engagement_decay: {
+    icon: "↓",
+    label: () => "Engagement Declining",
+    color: "#F59E0B",
+    category: "compound",
+  },
+  rapport_evolution: {
+    icon: "↗",
+    label: (s) => `Rapport ${s.value_text?.includes("building") ? "Building" : "Declining"}`,
+    color: (s) => (s.value_text?.includes("building") ? "#10B981" : "#EF4444"),
+    category: "compound",
+  },
+  behavioral_shift: {
+    icon: "⇔",
+    label: () => "Behavioral Shift",
+    color: "#8B5CF6",
+    category: "compound",
+  },
+  adaptation_pattern: {
+    icon: "↗",
+    label: () => "Positive Adaptation",
+    color: "#10B981",
+    category: "compound",
+  },
+  fatigue_detection: {
+    icon: "↓",
+    label: () => "Energy Declining",
+    color: "#F59E0B",
+    category: "compound",
+  },
+  stress_recovery: {
+    icon: "↓",
+    label: () => "Stress Recovery",
+    color: "#10B981",
+    category: "compound",
+  },
+  escalation_ladder: {
+    icon: "▲",
+    label: (s) => `Escalation: ${(s.value_text || "").replace(/_/g, " ")}`,
+    color: "#EF4444",
+    category: "compound",
+  },
+  // ── Graph-based patterns ─────────────────────────────────────────────────────
+  tension_cluster: {
+    icon: "⊗",
+    label: (s) => `Tension: ${s.value_text === "high_tension" ? "High" : "Moderate"}`,
+    color: (s) => (s.value_text === "high_tension" ? "#EF4444" : "#F59E0B"),
+    category: "compound",
+  },
 };
 
 const CATEGORIES: { key: string; label: string }[] = [
@@ -217,7 +309,8 @@ interface Props {
 
 export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   const token = getAccessToken();
-  const videoUrl = `/api/sessions/${sessionId}/video${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+  const rawVideoUrl      = `/api/sessions/${sessionId}/video${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+  const annotatedVideoUrl = `/api/sessions/${sessionId}/video/annotated${token ? `?token=${encodeURIComponent(token)}` : ""}`;
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const animFrameRef = useRef<number | null>(null);
@@ -229,6 +322,30 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
     new Set(["face", "body", "gaze", "compound"])
   );
   const [selectedSpeaker, setSelectedSpeaker] = useState("all");
+  const [showAnnotated, setShowAnnotated] = useState(false);
+  const [annotatedAvailable, setAnnotatedAvailable] = useState(false);
+
+  // Poll until the annotated video is ready (video agent can take 30-90s)
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    const check = () => {
+      fetch(annotatedVideoUrl, { method: "HEAD" })
+        .then((r) => {
+          if (cancelled) return;
+          if (r.ok) {
+            setAnnotatedAvailable(true);
+          } else {
+            setTimeout(check, 5000);
+          }
+        })
+        .catch(() => { if (!cancelled) setTimeout(check, 5000); });
+    };
+    check();
+    return () => { cancelled = true; };
+  }, [annotatedVideoUrl, token]);
+
+  const videoUrl = showAnnotated && annotatedAvailable ? annotatedVideoUrl : rawVideoUrl;
 
   const speakers = [...new Set(signals.map((s) => s.speaker_id).filter(Boolean))];
 
@@ -323,42 +440,38 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
 
   return (
     <div className="w-full space-y-3">
-      {/* Video with overlay badges */}
-      <div className="relative overflow-hidden rounded-lg bg-black">
-        <video
-          ref={videoRef}
-          src={videoUrl}
-          controls
-          className="w-full max-h-[420px]"
-        />
+      {/* Video Playback — badges panel left, video right */}
+      <div className="flex overflow-hidden rounded-lg bg-black" style={{ minHeight: 360 }}>
 
-        {/* Active signal badges — top-left */}
-        {activeSignals.length > 0 && (
-          <div className="pointer-events-none absolute left-3 top-3 flex max-h-[55%] flex-col gap-1 overflow-hidden">
-            {Object.entries(bySpeaker).map(([speaker, sigs]) => (
+        {/* Left panel: signal badges in the black area */}
+        <div className="flex w-48 flex-shrink-0 flex-col justify-start gap-1 overflow-y-auto p-3">
+          {activeSignals.length === 0 ? (
+            <span className="mt-4 text-center text-[10px] text-white/20">No active signals</span>
+          ) : (
+            Object.entries(bySpeaker).map(([speaker, sigs]) => (
               <div key={speaker} className="flex flex-col gap-1">
                 {speakers.length > 1 && (
-                  <span className="text-[9px] font-semibold uppercase tracking-wider text-white/50">
+                  <span className="mb-0.5 text-[9px] font-semibold uppercase tracking-wider text-white/40">
                     {speaker}
                   </span>
                 )}
-                {sigs.slice(0, 5).map((s, i) => {
+                {sigs.slice(0, 6).map((s, i) => {
                   const cfg = SIGNAL_CONFIG[s.signal_type];
                   if (!cfg) return null;
                   const color = resolveColor(cfg, s);
                   return (
                     <div
                       key={`${s.signal_type}-${i}`}
-                      className="flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium text-white backdrop-blur-sm"
+                      className="flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium text-white"
                       style={{
-                        backgroundColor: `${color}28`,
+                        backgroundColor: `${color}22`,
                         border: `1px solid ${color}55`,
                       }}
                     >
                       <span className="font-mono text-[11px]">{cfg.icon}</span>
-                      <span>{cfg.label(s)}</span>
+                      <span className="truncate">{cfg.label(s)}</span>
                       {s.confidence >= 0.5 && (
-                        <span className="text-[10px] opacity-50">
+                        <span className="ml-auto shrink-0 text-[10px] opacity-50">
                           {Math.round(s.confidence * 100)}%
                         </span>
                       )}
@@ -366,16 +479,25 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                   );
                 })}
               </div>
-            ))}
-          </div>
-        )}
+            ))
+          )}
+        </div>
 
-        {/* Incongruence alert — top-right */}
-        {hasIncongruence && (
-          <div className="pointer-events-none absolute right-3 top-3 animate-pulse rounded-full bg-red-500/80 px-3 py-1.5 text-xs font-bold text-white backdrop-blur-sm">
-            ! Incongruence Detected
-          </div>
-        )}
+        {/* Right panel: video */}
+        <div className="relative flex flex-1 items-center justify-center">
+          <video
+            ref={videoRef}
+            src={videoUrl}
+            controls
+            className="max-h-[360px] max-w-full"
+          />
+          {hasIncongruence && (
+            <div className="pointer-events-none absolute right-2 top-2 animate-pulse rounded-full bg-red-500/80 px-3 py-1.5 text-xs font-bold text-white backdrop-blur-sm">
+              ! Incongruence Detected
+            </div>
+          )}
+        </div>
+
       </div>
 
       {/* Signal timeline bar */}
@@ -460,6 +582,32 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
 
       {/* Filter controls */}
       <div className="flex flex-wrap items-center gap-3">
+        {/* Raw / Annotated toggle */}
+        {annotatedAvailable && (
+          <div className="flex rounded-lg border border-nexus-border overflow-hidden">
+            <button
+              onClick={() => setShowAnnotated(false)}
+              className={`px-3 py-1 text-xs font-medium transition-colors ${
+                !showAnnotated
+                  ? "bg-blue-600 text-white"
+                  : "bg-nexus-surface text-nexus-text-muted hover:text-nexus-text-secondary"
+              }`}
+            >
+              Raw
+            </button>
+            <button
+              onClick={() => setShowAnnotated(true)}
+              className={`px-3 py-1 text-xs font-medium transition-colors ${
+                showAnnotated
+                  ? "bg-blue-600 text-white"
+                  : "bg-nexus-surface text-nexus-text-muted hover:text-nexus-text-secondary"
+              }`}
+            >
+              Landmarks
+            </button>
+          </div>
+        )}
+
         <div className="flex gap-1.5">
           {CATEGORIES.map((cat) => (
             <button

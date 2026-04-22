@@ -51,6 +51,7 @@ function signalCategory(sig: Signal): string {
   if (t.includes("pitch")) return "pitch";
   if (t.includes("tone")) return "tone";
   if (t.includes("filler")) return "filler";
+  if (t === "blink_rate_anomaly") return "other"; // gaze signal, not speech rate
   if (t.includes("rate")) return "rate";
   if (["tension_cluster", "momentum_shift", "persistent_incongruence", "verbal_incongruence"].includes(t))
     return "fusion";
