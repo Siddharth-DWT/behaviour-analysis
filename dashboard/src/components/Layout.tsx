@@ -1,6 +1,7 @@
 import { ReactNode, useState, useRef, useEffect } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
+  Activity,
   FolderOpen,
   ChevronLeft,
   ChevronRight,
