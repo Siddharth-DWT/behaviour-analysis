@@ -29,6 +29,7 @@ node_modules/
 # Docker volumes
 postgres_data/
 redis_data/
+data/overlays/
 
 # IDE
 .vscode/
