@@ -84,7 +84,10 @@ class GazeRuleEngine(BaseVideoRuleEngine):
         for w in windows:
             if w.face_detection_rate < self.MIN_GAZE_RATE:
                 continue
-            conf_mult = bl.screen_engagement_rate * w.face_detection_rate
+            # calibration_confidence reflects data quality (window count → baseline fit).
+            # screen_engagement_rate is a behavioural measurement, not a reliability proxy —
+            # a speaker who rarely looks at camera is still reliably detected by gaze tracking.
+            conf_mult = bl.calibration_confidence * w.face_detection_rate
 
             signals += self._rule_gaze_direction(w, bl, speaker_id, conf_mult)
             signals += self._rule_blink_rate(w, bl, speaker_id, conf_mult)

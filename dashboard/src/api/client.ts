@@ -240,6 +240,23 @@ export async function getTranscript(
   return request(`/sessions/${id}/transcript`);
 }
 
+export interface VideoSignal {
+  signal_type: string;
+  value: number;
+  value_text: string;
+  confidence: number;
+  speaker_id: string;
+  start_ms: number;
+  end_ms: number;
+  agent: string;
+}
+
+export async function getVideoSignals(
+  id: string
+): Promise<{ session_id: string; signals: VideoSignal[] }> {
+  return request(`/sessions/${id}/video-signals`);
+}
+
 export async function getReport(
   id: string,
   regenerate = false

@@ -21,7 +21,7 @@ import {
   Zap,
 } from "lucide-react";
 import { format } from "date-fns";
-import { getSession, getSignals, getTranscript, getReport } from "../api/client";
+import { getSession, getSignals, getTranscript, getReport, getVideoSignals } from "../api/client";
 import type { Signal, TranscriptSegment } from "../api/client";
 import TranscriptBlock from "../components/TranscriptBlock";
 import StressTimeline from "../components/StressTimeline";
@@ -37,6 +37,7 @@ import SwimlaneTimeline from "../components/SwimlaneTimeline";
 import TranscriptView from "../components/TranscriptView";
 import GraphInsightsCard from "../components/GraphInsightsCard";
 import BehavioralOverview from "../components/BehavioralOverview";
+import VideoSignalPlayer from "../components/VideoSignalPlayer";
 
 // ── Helpers ──
 
@@ -512,6 +513,12 @@ export default function SessionDetail() {
     queryKey: ["report", id],
     queryFn: () => getReport(id!),
     enabled: !!id && detail?.has_report === true,
+  });
+
+  const { data: videoSignalData } = useQuery({
+    queryKey: ["video-signals", id],
+    queryFn: () => getVideoSignals(id!),
+    enabled: !!id && !!detail?.session?.media_url,
   });
 
   if (loadingDetail) {
@@ -1025,6 +1032,19 @@ export default function SessionDetail() {
           </div>
         )}
       </section>
+
+      {/* 5b. VIDEO PLAYER with signal overlay */}
+      {session.media_url && videoSignalData && (
+        <div className="rounded-lg border border-nexus-border bg-nexus-surface p-4">
+          <h2 className="mb-3 text-sm font-medium text-nexus-text-secondary">
+            Video Playback
+          </h2>
+          <VideoSignalPlayer
+            sessionId={id!}
+            signals={videoSignalData.signals}
+          />
+        </div>
+      )}
 
       {/* 6. TRANSCRIPT with view toggle */}
       <div>

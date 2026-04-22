@@ -254,11 +254,15 @@ async def analyse_signals(request: AnalyseRequest):
                     segment_windows.add((ws_ms, we_ms))
 
             for seg_start, seg_end in sorted(segment_windows):
-                # Only include signals that co-occur within ±5s of this segment
+                # Overlap logic: include any signal whose window overlaps the ±5s zone.
+                # Containment (<=/>= both ends) excluded long signals like screen_contact
+                # (30s block windows) even when they clearly cover the segment.
+                zone_start = seg_start - COMPOUND_ALIGN_MS
+                zone_end   = seg_end   + COMPOUND_ALIGN_MS
                 seg_sigs = [
                     s for s in all_speaker_sigs
-                    if s.get("window_start_ms", 0) >= seg_start - COMPOUND_ALIGN_MS
-                    and s.get("window_end_ms", 0) <= seg_end + COMPOUND_ALIGN_MS
+                    if s.get("window_start_ms", 0) < zone_end
+                    and s.get("window_end_ms", 0)   > zone_start
                 ]
                 if len(seg_sigs) < 3:
                     continue

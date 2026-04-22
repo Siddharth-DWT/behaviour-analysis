@@ -19,6 +19,8 @@ Endpoints:
   GET  /sessions/{id}/signals   → Signals for a session (auth)
   GET  /sessions/{id}/report    → Get or generate narrative report (auth)
   GET  /sessions/{id}/transcript→ Get transcript segments (auth)
+  GET  /sessions/{id}/video-signals → Video + fusion signals for playback overlay (auth)
+  GET  /sessions/{id}/video    → Stream session media file; accepts ?token= for <video> elements (auth)
   GET  /health                  → Health check (public)
 """
 import os
@@ -33,6 +35,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends, BackgroundTasks
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
@@ -1548,6 +1551,150 @@ async def get_session_transcript(session_id: str, current_user: dict = Depends(g
         "segments": segments,
         "count": len(segments),
     }
+
+
+# ─────────────────────────────────────────────────────────
+# GET /sessions/{id}/video-signals — Video overlay signals
+# ─────────────────────────────────────────────────────────
+
+_VIDEO_OVERLAY_TYPES = [
+    "facial_emotion", "facial_stress", "facial_engagement",
+    "smile_type", "valence_arousal",
+    "head_nod", "head_shake", "posture", "body_lean",
+    "body_fidgeting", "self_touch", "shoulder_tension",
+    "gaze_direction_shift", "screen_contact", "sustained_distraction",
+    "attention_level", "blink_rate_anomaly",
+    "head_body_incongruence",
+    "tone_face_masking", "stress_suppression",
+    "genuine_engagement", "active_disengagement",
+    "peak_performance", "cognitive_overload",
+    "conflict_escalation", "emotional_suppression",
+]
+
+
+@app.get("/sessions/{session_id}/video-signals")
+async def get_video_signals(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return video + fusion signals for playback overlay, ordered by window start."""
+    import uuid as _uuid
+    try:
+        _uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(404, "Session not found")
+    session = await get_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+
+    if current_user["role"] != "admin" and str(session.get("user_id", "")) != current_user["id"]:
+        raise HTTPException(404, "Session not found")
+
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT s.signal_type, s.value, s.value_text, s.confidence,
+               s.window_start_ms, s.window_end_ms, s.agent,
+               sp.speaker_label
+        FROM signals s
+        LEFT JOIN speakers sp ON sp.id = s.speaker_id
+        WHERE s.session_id = $1
+          AND s.agent IN ('video', 'fusion')
+          AND s.signal_type = ANY($2::text[])
+        ORDER BY s.window_start_ms ASC
+        """,
+        session_id,
+        _VIDEO_OVERLAY_TYPES,
+    )
+
+    signals = [
+        {
+            "signal_type": r["signal_type"],
+            "value": float(r["value"]) if r["value"] is not None else 0.0,
+            "value_text": r["value_text"] or "",
+            "confidence": float(r["confidence"]) if r["confidence"] is not None else 0.0,
+            "speaker_id": r["speaker_label"] or "",
+            "start_ms": r["window_start_ms"],
+            "end_ms": r["window_end_ms"],
+            "agent": r["agent"] or "",
+        }
+        for r in rows
+    ]
+
+    return {"session_id": session_id, "signals": signals}
+
+
+# ─────────────────────────────────────────────────────────
+# GET /sessions/{id}/video — Stream session video file
+# ─────────────────────────────────────────────────────────
+
+_VIDEO_MIME_TYPES: dict[str, str] = {
+    ".mp4":  "video/mp4",
+    ".webm": "video/webm",
+    ".mov":  "video/quicktime",
+    ".avi":  "video/x-msvideo",
+    ".mkv":  "video/x-matroska",
+    ".mp3":  "audio/mpeg",
+    ".wav":  "audio/wav",
+    ".m4a":  "audio/mp4",
+    ".flac": "audio/flac",
+}
+
+
+@app.get("/sessions/{session_id}/video")
+async def get_session_video(
+    request: StarletteRequest,
+    session_id: str,
+    token: Optional[str] = Query(default=None),
+):
+    """
+    Stream the session media file.
+    Accepts JWT via Authorization: Bearer header OR ?token= query param.
+    The query param form is required for <video> elements which cannot set headers.
+    """
+    import uuid as _uuid
+    try:
+        _uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(404, "Session not found")
+
+    # Auth: prefer Authorization header, fall back to ?token= for video elements
+    auth_token = token
+    if not auth_token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            auth_token = auth_header[7:]
+    if not auth_token:
+        raise HTTPException(401, "Unauthorized")
+
+    payload = verify_access_token(auth_token)
+    if not payload:
+        raise HTTPException(401, "Invalid or expired token")
+
+    session = await get_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+
+    user_role = payload.get("role", "viewer")
+    user_id = payload.get("sub", "")
+    if user_role != "admin" and str(session.get("user_id", "")) != user_id:
+        raise HTTPException(404, "Session not found")
+
+    media_url = session.get("media_url")
+    if not media_url:
+        raise HTTPException(404, "No media file for this session")
+
+    video_path = Path(media_url)
+    if not video_path.exists():
+        raise HTTPException(404, "Media file not found on disk")
+
+    media_type = _VIDEO_MIME_TYPES.get(video_path.suffix.lower(), "application/octet-stream")
+
+    return FileResponse(
+        str(video_path),
+        media_type=media_type,
+        headers={"Accept-Ranges": "bytes"},
+    )
 
 
 # ─────────────────────────────────────────────────────────
