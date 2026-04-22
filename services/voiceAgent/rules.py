@@ -143,11 +143,12 @@ class VoiceRuleEngine:
         filler = self._rule_filler_01(features, baseline, noticeable_pct=noticeable_pct)
         if filler is not None:
             _add("VOICE-FILLER-01", "filler_detection",
-                 filler["filler_rate_pct"], filler["status"],
+                 filler["filler_rate_pct"] / 100.0, filler["status"],
                  0.90 * cal_conf, {
                      "filler_count": filler["filler_count"],
                      "um_count": filler["um_count"],
                      "uh_count": filler["uh_count"],
+                     "filler_rate_pct": filler["filler_rate_pct"],
                      "delta_from_baseline": filler.get("delta", 0),
                      "credibility_impact": filler.get("credibility_impact", "none"),
                  })
@@ -158,7 +159,7 @@ class VoiceRuleEngine:
         pitch = self._rule_pitch_01(features, baseline, mild_pct=mild_pct)
         if pitch is not None:
             _add("VOICE-PITCH-01", "pitch_elevation_flag",
-                 pitch["delta_pct"], pitch["level"],
+                 min(pitch["delta_pct"] / 100.0, 1.0), pitch["level"],
                  0.50 * cal_conf, {
                      "f0_current": pitch["f0_current"],
                      "f0_baseline": pitch["f0_baseline"],
@@ -179,10 +180,11 @@ class VoiceRuleEngine:
         rate = self._rule_rate_01(features, baseline, anomaly_pct=anomaly_pct)
         if rate is not None:
             _add("VOICE-RATE-01", "speech_rate_anomaly",
-                 rate["delta_pct"], rate["classification"],
+                 max(min(rate["delta_pct"] / 100.0, 1.0), -1.0), rate["classification"],
                  0.40 * cal_conf, {
                      "wpm_current": rate["wpm_current"],
                      "wpm_baseline": rate["wpm_baseline"],
+                     "delta_pct": rate["delta_pct"],
                      "sub_classification": rate.get("sub_classification", ""),
                  })
 
@@ -251,7 +253,7 @@ class VoiceRuleEngine:
         strategic = self._rule_pause_02(features, baseline)
         if strategic is not None:
             _add("VOICE-PAUSE-02", "strategic_pause",
-                 strategic["pause_ms"] / 1000.0, strategic["level"],
+                 min(strategic["pause_ms"] / 3000.0, 1.0), strategic["level"],
                  strategic["confidence_raw"] * cal_conf,
                  {
                      "pause_ms": strategic["pause_ms"],
@@ -1037,7 +1039,7 @@ class VoiceRuleEngine:
         if max_pause_ms > extended_pause_ms:
             confidence = min(max_pause_ms / 5000.0, 0.65)
             results.append({
-                "value": round(max_pause_ms / 1000.0, 4),
+                "value": round(min(max_pause_ms / 5000.0, 1.0), 4),
                 "value_text": "extended_hesitation",
                 "confidence_raw": confidence,
                 "evidence": {

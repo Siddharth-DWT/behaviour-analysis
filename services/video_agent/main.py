@@ -33,14 +33,14 @@ from pydantic import BaseModel
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 try:
-    from feature_extractor import VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures
+    from feature_extractor import VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures, OverlayRenderer
     from calibration import VideoCalibrationModule, FacialBaseline, BodyBaseline, GazeBaseline
     from facial_rules import FacialRuleEngine
     from gaze_rules import GazeRuleEngine
     from body_rules import BodyRuleEngine
 except ImportError:
     from services.video_agent.feature_extractor import (
-        VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures,
+        VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures, OverlayRenderer,
     )
     from services.video_agent.calibration import (
         VideoCalibrationModule, FacialBaseline, BodyBaseline, GazeBaseline,
@@ -144,14 +144,15 @@ class VideoAnalysisResponse(BaseModel):
     signals will be populated by rule engines (Phase 2B-D).
     window_features contains raw aggregated data for debugging.
     """
-    session_id:       str
-    duration_seconds: float
-    total_windows:    int
-    speakers:         list[str]
-    speaker_summaries: list[SpeakerVideoSummary]
-    signals:          list[dict]    # populated by Phase 2B-D rule engines
-    processing_time:  float
-    backend:          str = "mediapipe"
+    session_id:            str
+    duration_seconds:      float
+    total_windows:         int
+    speakers:              list[str]
+    speaker_summaries:     list[SpeakerVideoSummary]
+    signals:               list[dict]    # populated by Phase 2B-D rule engines
+    processing_time:       float
+    backend:               str = "mediapipe"
+    annotated_video_path:  Optional[str] = None    # path to landmark-overlay mp4
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -192,9 +193,15 @@ class VideoPipeline:
     ) -> VideoAnalysisResponse:
         start = time.time()
 
-        # ── Step 1: Extract frame-level features ──────────────────────────────
+        # ── Step 1: Extract frame-level features + write landmark overlay ─────
         logger.info(f"[{session_id}] Extracting video features from {Path(video_path).name}")
-        windows: list[WindowFeatures] = self._extractor.extract_all(video_path)
+        overlay_dir  = Path(os.getenv("OVERLAY_DIR", "data/overlays"))
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+        overlay_path = str(overlay_dir / f"{session_id}_annotated.webm")
+
+        windows: list[WindowFeatures] = self._extractor.extract_all(
+            video_path, overlay_output_path=overlay_path
+        )
         logger.info(f"[{session_id}] {len(windows)} windows extracted")
 
         if not windows:
@@ -231,7 +238,16 @@ class VideoPipeline:
         )
         all_signals: list[dict] = facial_signals + gaze_signals + body_signals
 
-        # ── Step 5: Build response ─────────────────────────────────────────────
+        # ── Step 5: Burn signal labels into overlay video ─────────────────────
+        final_overlay: Optional[str] = None
+        if Path(overlay_path).exists():
+            if all_signals:
+                logger.info(f"[{session_id}] Burning {len(all_signals)} signal labels into overlay")
+                OverlayRenderer().burn_signal_labels(overlay_path, all_signals)
+            final_overlay = overlay_path
+            logger.info(f"[{session_id}] Annotated video → {overlay_path}")
+
+        # ── Step 6: Build response ─────────────────────────────────────────────
         summaries = self._build_summaries(windows_by_speaker, baselines)
 
         elapsed = time.time() - start
@@ -248,6 +264,7 @@ class VideoPipeline:
             speaker_summaries=summaries,
             signals=all_signals,
             processing_time=round(elapsed, 2),
+            annotated_video_path=final_overlay,
         )
 
     def _build_summaries(

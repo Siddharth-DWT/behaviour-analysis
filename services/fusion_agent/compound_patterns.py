@@ -59,7 +59,7 @@ def _agent_diversity(hits: dict[str, Optional[dict]]) -> int:
         if not agent:
             continue
         if agent == "video":
-            rule_id = sig.get("rule_id", "")
+            rule_id = (sig.get("metadata") or {}).get("rule_id", "")
             if rule_id.startswith("FACE"):
                 modalities.add("video_facial")
             elif rule_id.startswith("GAZE"):
@@ -163,6 +163,7 @@ class CompoundPatternEngine:
             "warm_tone": (
                 _sig(signals, "tone_classification", "confident")
                 or _sig(signals, "tone_classification", "enthusiastic")
+                or _sig(signals, "tone_classification", "excited")
             ),
             "high_attention": _sig(signals, "attention_level", "high_attention"),
         }
@@ -170,7 +171,7 @@ class CompoundPatternEngine:
         if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
-        confidence = min(score * (len(hits) / 5.0) * 1.2, _CAPS["C-01"])
+        confidence = min(score * (len(hits) / 3.0) * 1.1, _CAPS["C-01"])
         return self._make_signal(
             "C-01", "genuine_engagement", speaker_id, score, "genuine_engagement",
             confidence, ws, we, {"components": list(hits.keys()), "hit_count": len(hits)},
@@ -200,7 +201,7 @@ class CompoundPatternEngine:
         if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
-        confidence = min(score * (len(hits) / 5.0) * 1.2, _CAPS["C-02"])
+        confidence = min(score * (len(hits) / 3.0) * 1.1, _CAPS["C-02"])
         return self._make_signal(
             "C-02", "active_disengagement", speaker_id, score, "active_disengagement",
             confidence, ws, we, {"components": list(hits.keys()), "hit_count": len(hits)},
@@ -264,10 +265,10 @@ class CompoundPatternEngine:
             "eye_contact":    _sig(signals, "screen_contact", "sustained_eye_contact"),
         }
         hits = {k: v for k, v in components.items() if v is not None}
-        if len(hits) < 4 or _agent_diversity(hits) < 2:
+        if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
-        confidence = min(score * (len(hits) / 4.0) * 1.1, _CAPS["C-04"])
+        confidence = min(score * (len(hits) / 3.0) * 1.1, _CAPS["C-04"])
         return self._make_signal(
             "C-04", "decision_engagement", speaker_id, score, "decision_ready",
             confidence, ws, we,
@@ -287,15 +288,15 @@ class CompoundPatternEngine:
                 _sig(signals, "gaze_direction_shift")
                 or _sig(signals, "sustained_distraction")
             ),
-            "slow_rate":        _sig(signals, "speech_rate_anomaly", "rate_suppressed"),
+            "slow_rate":        _sig(signals, "speech_rate_anomaly", "rate_depressed"),
             "self_touch":       _sig(signals, "self_touch"),
-            "response_latency": _sig(signals, "response_latency"),
+            "response_latency": _sig(signals, "response_latency_pattern"),
         }
         hits = {k: v for k, v in components.items() if v is not None}
         if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
-        confidence = min(score * (len(hits) / 5.0) * 1.2, _CAPS["C-05"])
+        confidence = min(score * (len(hits) / 3.0) * 1.1, _CAPS["C-05"])
         return self._make_signal(
             "C-05", "cognitive_overload", speaker_id, score, "cognitive_overload",
             confidence, ws, we, {"components": list(hits.keys()), "hit_count": len(hits)},
@@ -310,10 +311,14 @@ class CompoundPatternEngine:
         """
         components = {
             "high_stress":   _sig(signals, "vocal_stress_score", min_value=0.55),
-            "interruption":  _sig(signals, "interruption_event"),
+            "interruption": (
+                _sig(signals, "interruption_event")
+                or _sig(signals, "interruption_pattern")
+            ),
             "aggressive_tone": (
                 _sig(signals, "tone_classification", "confrontational")
                 or _sig(signals, "tone_classification", "dominant")
+                or _sig(signals, "tone_classification", "aggressive")
             ),
             "objection": (
                 _sig(signals, "objection_signal")
@@ -325,7 +330,7 @@ class CompoundPatternEngine:
         if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
-        confidence = min(score * (len(hits) / 5.0) * 1.3, _CAPS["C-06"])
+        confidence = min(score * (len(hits) / 3.0) * 1.1, _CAPS["C-06"])
         return self._make_signal(
             "C-06", "conflict_escalation", speaker_id, score, "conflict_escalation",
             confidence, ws, we, {"components": list(hits.keys()), "hit_count": len(hits)},
@@ -387,8 +392,9 @@ class CompoundPatternEngine:
             "confident_tone": (
                 _sig(signals, "tone_classification", "confident")
                 or _sig(signals, "tone_classification", "enthusiastic")
+                or _sig(signals, "tone_classification", "excited")
             ),
-            "power_language": _sig(signals, "power_language"),
+            "power_language": _sig(signals, "power_language_score"),
             "upright_posture": _sig(signals, "posture", "upright_power_posture"),
             "steady_gaze": (
                 _sig(signals, "attention_level", "high_attention")
@@ -399,7 +405,7 @@ class CompoundPatternEngine:
         if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
-        confidence = min(score * (len(hits) / 4.0) * 1.1, _CAPS["C-08"])
+        confidence = min(score * (len(hits) / 3.0) * 1.1, _CAPS["C-08"])
         return self._make_signal(
             "C-08", "peak_performance", speaker_id, score, "in_the_zone",
             confidence, ws, we, {"components": list(hits.keys()), "hit_count": len(hits)},
@@ -424,6 +430,7 @@ class CompoundPatternEngine:
                 _sig(signals, "tone_classification", "warm")
                 or _sig(signals, "tone_classification", "empathetic")
                 or _sig(signals, "tone_classification", "enthusiastic")
+                or _sig(signals, "tone_classification", "excited")
             ),
             "balanced_talk": _sig(signals, "conversation_balance", "well_balanced"),
         }
@@ -431,7 +438,7 @@ class CompoundPatternEngine:
         if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
-        confidence = min(score * (len(hits) / 5.0) * 1.2, _CAPS["C-09"])
+        confidence = min(score * (len(hits) / 3.0) * 1.1, _CAPS["C-09"])
         return self._make_signal(
             "C-09", "rapport_building", speaker_id, score, "strong_rapport",
             confidence, ws, we, {"components": list(hits.keys()), "hit_count": len(hits)},
@@ -445,14 +452,16 @@ class CompoundPatternEngine:
         High talk time + interruptions + dominant tone + forward lean + direct gaze.
         """
         components = {
-            "dominant_speaker": (
-                _sig(signals, "dominant_speaker")
-                or _sig(signals, "talk_time_dominance")
+            "dominant_speaker": _sig(signals, "dominance_score"),
+            "interruption": (
+                _sig(signals, "interruption_event")
+                or _sig(signals, "interruption_pattern")
             ),
-            "interruption": _sig(signals, "interruption_event"),
             "dominant_tone": (
                 _sig(signals, "tone_classification", "dominant")
                 or _sig(signals, "tone_classification", "assertive")
+                or _sig(signals, "tone_classification", "aggressive")
+                or _sig(signals, "tone_classification", "confident")
             ),
             "forward_lean":  _sig(signals, "body_lean", "forward_lean"),
             "direct_gaze":   _sig(signals, "screen_contact", "sustained_eye_contact"),
@@ -461,7 +470,7 @@ class CompoundPatternEngine:
         if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
-        confidence = min(score * (len(hits) / 5.0) * 1.1, _CAPS["C-10"])
+        confidence = min(score * (len(hits) / 3.0) * 1.1, _CAPS["C-10"])
         return self._make_signal(
             "C-10", "dominance_display", speaker_id, score, "dominance_display",
             confidence, ws, we, {"components": list(hits.keys()), "hit_count": len(hits)},
@@ -478,7 +487,7 @@ class CompoundPatternEngine:
         # low_engagement, letting the same signal satisfy two slots. Separated:
         # low_talk uses only the talk-time signal; low_engagement uses only attention.
         components = {
-            "low_talk": _sig(signals, "talk_time_imbalance"),
+            "low_talk": _sig(signals, "dominance_score"),
             "backward_lean":  _sig(signals, "body_lean", "backward_lean"),
             "gaze_avoidance": (
                 _sig(signals, "screen_contact", "low_screen_contact")
@@ -493,7 +502,7 @@ class CompoundPatternEngine:
         if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
-        confidence = min(score * (len(hits) / 4.0) * 0.9, _CAPS["C-11"])
+        confidence = min(score * (len(hits) / 3.0) * 0.95, _CAPS["C-11"])
         return self._make_signal(
             "C-11", "submission_signal", speaker_id, score, "submission_signal",
             confidence, ws, we, {"components": list(hits.keys()), "hit_count": len(hits)},
@@ -528,8 +537,8 @@ class CompoundPatternEngine:
         if len(hits) < 4 or _agent_diversity(hits) < 3:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
-        # No multiplier — keep it conservative; hard cap at 0.50
-        confidence = min(score * (len(hits) / 5.0), _CAPS["C-12"])
+        # Conservative: no boost multiplier; hard cap at 0.50
+        confidence = min(score * (len(hits) / 4.0), _CAPS["C-12"])
         return self._make_signal(
             "C-12", "deception_cluster", speaker_id, score,
             "multiple_inconsistency_indicators", confidence, ws, we,

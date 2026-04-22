@@ -84,10 +84,11 @@ class GazeRuleEngine(BaseVideoRuleEngine):
         for w in windows:
             if w.face_detection_rate < self.MIN_GAZE_RATE:
                 continue
-            # calibration_confidence reflects data quality (window count → baseline fit).
-            # screen_engagement_rate is a behavioural measurement, not a reliability proxy —
-            # a speaker who rarely looks at camera is still reliably detected by gaze tracking.
-            conf_mult = bl.calibration_confidence * w.face_detection_rate
+            # face_detection_rate is the per-window reliability gate (face visible this window).
+            # calibration_confidence is already enforced by MIN_GAZE_RATE above; using it as
+            # a direct multiplier here permanently halves all gaze confidence when baselines
+            # are sparse, pushing signals below the 0.30 display threshold.
+            conf_mult = w.face_detection_rate
 
             signals += self._rule_gaze_direction(w, bl, speaker_id, conf_mult)
             signals += self._rule_blink_rate(w, bl, speaker_id, conf_mult)
@@ -179,9 +180,11 @@ class GazeRuleEngine(BaseVideoRuleEngine):
         if ratio >= self.BLINK_FAST_THRESHOLD:
             label = "elevated_blink_rate"
             confidence = min((ratio - 1.0) * 0.3 * conf_mult, 0.60)
+            deviation = min(ratio - 1.0, 1.0)  # 0–1: how far above baseline
         elif ratio <= self.BLINK_SLOW_THRESHOLD and w.blink_rate_bpm > 0:
             label = "suppressed_blink_rate"
             confidence = min((1.0 - ratio) * 0.3 * conf_mult, 0.50)
+            deviation = min(1.0 - ratio, 1.0)  # 0–1: how far below baseline
         else:
             return []
 
@@ -189,7 +192,7 @@ class GazeRuleEngine(BaseVideoRuleEngine):
             rule_id="GAZE-BLINK-01",
             signal_type="blink_rate_anomaly",
             speaker_id=speaker_id,
-            value=round(w.blink_rate_bpm, 2),
+            value=round(deviation, 4),  # normalized 0-1 deviation from baseline
             value_text=label,
             confidence=confidence,
             window_start_ms=w.window_start_ms,

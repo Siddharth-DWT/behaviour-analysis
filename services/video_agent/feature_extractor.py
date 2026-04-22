@@ -439,6 +439,202 @@ class WindowAggregator:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# OverlayRenderer  — draws landmarks + signal labels on BGR frames
+# ══════════════════════════════════════════════════════════════════════════════
+
+class OverlayRenderer:
+    """
+    Draws MediaPipe landmark overlays and signal text onto BGR video frames.
+    Called from VideoFeatureExtractor._extract_frames when overlay_output_path
+    is supplied, and from VideoPipeline.run() for the signal burn-in pass.
+    """
+
+    # Face mesh contours (478-point MediaPipe model landmark indices)
+    _FACE_OVAL = [
+        10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+        397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+        172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109, 10,
+    ]
+    _LEFT_EYE = [
+        362, 382, 381, 380, 374, 373, 390, 249,
+        263, 466, 388, 387, 386, 385, 384, 398, 362,
+    ]
+    _RIGHT_EYE = [
+        33, 7, 163, 144, 145, 153, 154, 155,
+        133, 173, 157, 158, 159, 160, 161, 246, 33,
+    ]
+    _LIPS = [
+        61, 185, 40, 39, 37, 0, 267, 269, 270, 409,
+        291, 375, 321, 405, 314, 17, 84, 181, 91, 146, 61,
+    ]
+
+    # Pose skeleton connections (COCO 33-landmark body model)
+    _POSE_SEGS = [
+        (11, 12),            # shoulders
+        (11, 13), (13, 15),  # left arm
+        (12, 14), (14, 16),  # right arm
+        (11, 23), (12, 24),  # torso sides
+        (23, 24),            # hips
+        (23, 25), (25, 27),  # left leg
+        (24, 26), (26, 28),  # right leg
+        (0, 11), (0, 12),    # neck to shoulders
+    ]
+
+    # Hand skeleton connections (21-point hand model)
+    _HAND_SEGS = [
+        (0, 1), (1, 2), (2, 3), (3, 4),
+        (0, 5), (5, 6), (6, 7), (7, 8),
+        (0, 9), (9, 10), (10, 11), (11, 12),
+        (0, 13), (13, 14), (14, 15), (15, 16),
+        (0, 17), (17, 18), (18, 19), (19, 20),
+        (5, 9), (9, 13), (13, 17),
+    ]
+
+    def draw_frame(
+        self,
+        bgr: np.ndarray,
+        face_result,
+        pose_result,
+        hand_result,
+        ff: Optional["FrameFeatures"],
+        active_signals: Optional[list] = None,
+    ) -> np.ndarray:
+        """Return an annotated copy of bgr with all landmark overlays applied."""
+        out = bgr.copy()
+        h, w = out.shape[:2]
+
+        if face_result and getattr(face_result, "face_landmarks", None):
+            self._draw_face_mesh(out, face_result, h, w)
+        if pose_result and getattr(pose_result, "pose_landmarks", None):
+            self._draw_pose(out, pose_result, h, w)
+        if hand_result and getattr(hand_result, "hand_landmarks", None):
+            self._draw_hands(out, hand_result, h, w)
+        if ff and ff.face_detected and face_result and getattr(face_result, "face_landmarks", None):
+            self._draw_gaze_arrow(out, face_result, ff, h, w)
+        if active_signals:
+            self._draw_labels(out, active_signals, h)
+        return out
+
+    def _draw_face_mesh(self, bgr: np.ndarray, face_result, h: int, w: int) -> None:
+        import cv2
+        color = (0, 220, 50)
+        for face_lm in face_result.face_landmarks:
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in face_lm]
+            n = len(pts)
+            for contour in (self._FACE_OVAL, self._LEFT_EYE, self._RIGHT_EYE, self._LIPS):
+                for i in range(len(contour) - 1):
+                    a, b = contour[i], contour[i + 1]
+                    if a < n and b < n:
+                        cv2.line(bgr, pts[a], pts[b], color, 1, cv2.LINE_AA)
+
+    def _draw_pose(self, bgr: np.ndarray, pose_result, h: int, w: int) -> None:
+        import cv2
+        color_bone = (255, 100, 30)
+        color_dot  = (200, 200, 255)
+        for pose_lm in pose_result.pose_landmarks:
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in pose_lm]
+            n = len(pts)
+            for a, b in self._POSE_SEGS:
+                if a < n and b < n:
+                    cv2.line(bgr, pts[a], pts[b], color_bone, 2, cv2.LINE_AA)
+            for pt in pts[:33]:
+                cv2.circle(bgr, pt, 3, color_dot, -1)
+
+    def _draw_hands(self, bgr: np.ndarray, hand_result, h: int, w: int) -> None:
+        import cv2
+        color_seg = (0, 200, 220)
+        color_dot = (0, 255, 255)
+        for hand_lm in hand_result.hand_landmarks:
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lm]
+            n = len(pts)
+            for a, b in self._HAND_SEGS:
+                if a < n and b < n:
+                    cv2.line(bgr, pts[a], pts[b], color_seg, 2, cv2.LINE_AA)
+            for pt in pts:
+                cv2.circle(bgr, pt, 4, color_dot, -1)
+
+    def _draw_gaze_arrow(
+        self, bgr: np.ndarray, face_result, ff: "FrameFeatures", h: int, w: int
+    ) -> None:
+        """Cyan arrow from nose bridge showing gaze direction offset."""
+        import cv2
+        try:
+            lm = face_result.face_landmarks[0]
+            nose_x = int(lm[1].x * w)
+            nose_y = int(lm[1].y * h)
+            scale = min(w, h) * 0.12
+            end_x = int(nose_x + ff.gaze_x * scale)
+            end_y = int(nose_y + ff.gaze_y * scale)
+            cv2.arrowedLine(
+                bgr, (nose_x, nose_y), (end_x, end_y),
+                (255, 230, 0), 2, tipLength=0.35, line_type=cv2.LINE_AA,
+            )
+        except Exception:
+            pass
+
+    def _draw_labels(self, bgr: np.ndarray, signals: list, h: int) -> None:
+        """Up to 5 signal labels at bottom-left, sorted by confidence desc."""
+        import cv2
+        top = sorted(signals, key=lambda s: s.get("confidence", 0), reverse=True)[:5]
+        y = h - 12
+        for sig in top:
+            label = f"{sig.get('signal_type', '')[:18]}  {sig.get('confidence', 0.0):.2f}"
+            cv2.putText(
+                bgr, label, (8, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA,
+            )
+            y -= 16
+
+    def burn_signal_labels(self, video_path: str, signals: list) -> None:
+        """
+        Second-pass rewrite: adds per-frame signal text to an already-rendered
+        overlay video.  Replaces the file in-place via temp rename.
+        """
+        import cv2
+        import shutil
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            logger.warning(f"burn_signal_labels: cannot open {video_path}")
+            return
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        fw  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        fh  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        tmp = video_path + ".burn.webm"
+
+        fourcc = cv2.VideoWriter_fourcc(*"VP80")
+        writer = cv2.VideoWriter(tmp, fourcc, fps, (fw, fh))
+
+        frame_idx = 0
+        while cap.isOpened():
+            ret, bgr = cap.read()
+            if not ret:
+                break
+            ts_ms = int(frame_idx / fps * 1000)
+            active = [
+                s for s in signals
+                if s.get("window_start_ms", 0) <= ts_ms < s.get("window_end_ms", ts_ms + 1)
+            ]
+            if active:
+                self._draw_labels(bgr, active, fh)
+            writer.write(bgr)
+            frame_idx += 1
+
+        cap.release()
+        writer.release()
+
+        try:
+            shutil.move(tmp, video_path)
+        except Exception as exc:
+            logger.warning(f"burn_signal_labels rename failed: {exc}")
+            try:
+                Path(tmp).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # VideoFeatureExtractor  — main extractor
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -473,12 +669,17 @@ class VideoFeatureExtractor:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def extract_all(self, video_path: str) -> list[WindowFeatures]:
+    def extract_all(
+        self,
+        video_path: str,
+        overlay_output_path: Optional[str] = None,
+    ) -> list[WindowFeatures]:
         """
         Process video at target_fps and return aggregated window features.
 
         Args:
-            video_path: Path to mp4/webm/avi file.
+            video_path:           Path to mp4/webm/avi file.
+            overlay_output_path:  If set, write a landmark-annotated mp4 here.
 
         Returns:
             List of WindowFeatures, one per 2-second window.
@@ -488,7 +689,7 @@ class VideoFeatureExtractor:
             logger.error("MediaPipe not available — returning empty features.")
             return []
 
-        frames = self._extract_frames(video_path)
+        frames = self._extract_frames(video_path, overlay_output_path=overlay_output_path)
         return self._aggregator.aggregate(frames)
 
     # ── Private helpers ────────────────────────────────────────────────────────
@@ -505,11 +706,16 @@ class VideoFeatureExtractor:
             self._mp_available = False
         return self._mp_available
 
-    def _extract_frames(self, video_path: str) -> list[FrameFeatures]:
+    def _extract_frames(
+        self,
+        video_path: str,
+        overlay_output_path: Optional[str] = None,
+    ) -> list[FrameFeatures]:
         import cv2
         import mediapipe as mp
 
         face_lm, pose_lm, hand_lm = self._build_landmarkers(mp)
+        renderer = OverlayRenderer() if overlay_output_path else None
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -518,34 +724,78 @@ class VideoFeatureExtractor:
         video_fps: float = cap.get(cv2.CAP_PROP_FPS) or 30.0
         skip: int = max(1, round(video_fps / self._target_fps))
 
+        writer = None
+        if overlay_output_path and renderer:
+            fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            Path(overlay_output_path).parent.mkdir(parents=True, exist_ok=True)
+            fourcc = cv2.VideoWriter_fourcc(*"VP80")
+            writer = cv2.VideoWriter(overlay_output_path, fourcc, video_fps, (fw, fh))
+            logger.info(f"Overlay output: {overlay_output_path}")
+
         frames: list[FrameFeatures] = []
         frame_idx: int = 0
-        prev_pose_lm_data: Optional[list] = None    # for body_movement delta
+        prev_pose_lm_data: Optional[list] = None
+
+        # Cache last MediaPipe results — reused for overlay on non-sampled frames
+        last_face_result = None
+        last_pose_result = None
+        last_hand_result = None
+        last_ff: Optional[FrameFeatures] = None
 
         while cap.isOpened():
             ret, bgr = cap.read()
             if not ret:
                 break
 
-            if frame_idx % skip == 0:
-                timestamp_ms = int(frame_idx / video_fps * 1000)
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            timestamp_ms = int(frame_idx / video_fps * 1000)
 
-                ff = self._process_frame(
-                    mp, rgb, bgr, frame_idx, timestamp_ms,
-                    face_lm, pose_lm, hand_lm,
+            if frame_idx % skip == 0:
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+                try:
+                    last_face_result = face_lm.detect_for_video(mp_img, timestamp_ms)
+                except Exception as exc:
+                    logger.debug(f"Face detect error frame {frame_idx}: {exc}")
+                    last_face_result = None
+
+                try:
+                    last_pose_result = pose_lm.detect_for_video(mp_img, timestamp_ms)
+                except Exception as exc:
+                    logger.debug(f"Pose detect error frame {frame_idx}: {exc}")
+                    last_pose_result = None
+
+                try:
+                    last_hand_result = hand_lm.detect_for_video(mp_img, timestamp_ms)
+                except Exception as exc:
+                    logger.debug(f"Hand detect error frame {frame_idx}: {exc}")
+                    last_hand_result = None
+
+                ff = self._process_frame_from_results(
+                    bgr, rgb, frame_idx, timestamp_ms,
+                    last_face_result, last_pose_result, last_hand_result,
                     prev_pose_lm_data,
                 )
 
-                # Update prev pose landmarks for next movement delta
                 if ff.body_detected:
                     prev_pose_lm_data = getattr(ff, "_raw_pose_lm", None)
 
+                last_ff = ff
                 frames.append(ff)
+
+            # Write overlay on every original-fps frame using cached results
+            if writer is not None and renderer is not None:
+                annotated = renderer.draw_frame(
+                    bgr, last_face_result, last_pose_result, last_hand_result, last_ff
+                )
+                writer.write(annotated)
 
             frame_idx += 1
 
         cap.release()
+        if writer is not None:
+            writer.release()
         face_lm.close()
         pose_lm.close()
         hand_lm.close()
@@ -604,72 +854,62 @@ class VideoFeatureExtractor:
 
         return face_lm, pose_lm, hand_lm
 
-    def _process_frame(
-        self, mp, rgb: np.ndarray, bgr: np.ndarray,
-        frame_idx: int, timestamp_ms: int,
-        face_lm, pose_lm, hand_lm,
+    def _process_frame_from_results(
+        self,
+        bgr: np.ndarray,
+        rgb: np.ndarray,
+        frame_idx: int,
+        timestamp_ms: int,
+        face_result,
+        pose_result,
+        hand_result,
         prev_pose_lm_data: Optional[list],
     ) -> FrameFeatures:
-        """Extract all features from one frame."""
+        """Build FrameFeatures from pre-computed MediaPipe detector results."""
         h, w = rgb.shape[:2]
-        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
         ff = FrameFeatures(timestamp_ms=timestamp_ms, frame_idx=frame_idx)
 
-        # ── Face landmarks ────────────────────────────────────────────────────
-        try:
-            face_result = face_lm.detect_for_video(mp_img, timestamp_ms)
-            if face_result.face_landmarks:
-                lm = face_result.face_landmarks[0]   # dominant face
-                ff.face_detected = True
-                ff.face_box_area = self._face_box_area(lm)
-                ff.face_luminance = self._compute_face_luminance(lm, rgb, h, w)
+        # ── Face ──────────────────────────────────────────────────────────────
+        if face_result and face_result.face_landmarks:
+            lm = face_result.face_landmarks[0]
+            ff.face_detected = True
+            ff.face_box_area = self._face_box_area(lm)
+            ff.face_luminance = self._compute_face_luminance(lm, rgb, h, w)
 
-                if face_result.face_blendshapes:
-                    ff.blendshapes = {
-                        bs.category_name: round(float(bs.score), 5)
-                        for bs in face_result.face_blendshapes[0]
-                    }
+            if face_result.face_blendshapes:
+                ff.blendshapes = {
+                    bs.category_name: round(float(bs.score), 5)
+                    for bs in face_result.face_blendshapes[0]
+                }
 
-                if face_result.facial_transformation_matrixes:
-                    mat = np.array(
-                        face_result.facial_transformation_matrixes[0].data
-                    ).reshape(4, 4)
-                    ff.head_pitch, ff.head_yaw, ff.head_roll = self._matrix_to_euler(mat)
+            if face_result.facial_transformation_matrixes:
+                mat = np.array(
+                    face_result.facial_transformation_matrixes[0].data
+                ).reshape(4, 4)
+                ff.head_pitch, ff.head_yaw, ff.head_roll = self._matrix_to_euler(mat)
 
-                ff.ear_left, ff.ear_right, ff.ear_avg = self._compute_ear(lm)
+            ff.ear_left, ff.ear_right, ff.ear_avg = self._compute_ear(lm)
 
-                if len(lm) > _RIGHT_IRIS_IDX + 4:
-                    ff.gaze_x, ff.gaze_y = self._compute_gaze(lm)
-        except Exception as exc:
-            logger.debug(f"Face detection error at frame {frame_idx}: {exc}")
+            if len(lm) > _RIGHT_IRIS_IDX + 4:
+                ff.gaze_x, ff.gaze_y = self._compute_gaze(lm)
 
-        # ── Pose landmarks ────────────────────────────────────────────────────
-        try:
-            pose_result = pose_lm.detect_for_video(mp_img, timestamp_ms)
-            if pose_result.pose_landmarks:
-                plm = pose_result.pose_landmarks[0]
-                ff.body_detected = True
-                ff.shoulder_angle, ff.spine_angle, ff.head_shoulder_dist = (
-                    self._compute_body_angles(plm, h)
-                )
-                ff.body_movement = self._compute_body_movement(plm, prev_pose_lm_data)
-                # Store raw landmarks for next frame's delta
-                ff._raw_pose_lm = plm  # type: ignore[attr-defined]
-        except Exception as exc:
-            logger.debug(f"Pose detection error at frame {frame_idx}: {exc}")
+        # ── Pose ──────────────────────────────────────────────────────────────
+        if pose_result and pose_result.pose_landmarks:
+            plm = pose_result.pose_landmarks[0]
+            ff.body_detected = True
+            ff.shoulder_angle, ff.spine_angle, ff.head_shoulder_dist = (
+                self._compute_body_angles(plm, h)
+            )
+            ff.body_movement = self._compute_body_movement(plm, prev_pose_lm_data)
+            ff._raw_pose_lm = plm  # type: ignore[attr-defined]
 
-        # ── Hand landmarks ────────────────────────────────────────────────────
-        try:
-            hand_result = hand_lm.detect_for_video(mp_img, timestamp_ms)
-            if hand_result.hand_landmarks:
-                ff.hands_detected = len(hand_result.hand_landmarks)
-                ff.hand_near_face = self._check_hand_near_face(
-                    hand_result.hand_landmarks, ff, w, h
-                )
-                ff.hand_velocity = self._compute_hand_velocity(hand_result.hand_landmarks)
-        except Exception as exc:
-            logger.debug(f"Hand detection error at frame {frame_idx}: {exc}")
+        # ── Hands ─────────────────────────────────────────────────────────────
+        if hand_result and hand_result.hand_landmarks:
+            ff.hands_detected = len(hand_result.hand_landmarks)
+            ff.hand_near_face = self._check_hand_near_face(
+                hand_result.hand_landmarks, ff, w, h
+            )
+            ff.hand_velocity = self._compute_hand_velocity(hand_result.hand_landmarks)
 
         return ff
 

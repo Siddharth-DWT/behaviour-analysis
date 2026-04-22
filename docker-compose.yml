@@ -221,11 +221,13 @@ services:
     environment:
       - PYTHONPATH=/app
       - MEDIAPIPE_MODEL_DIR=/app/models/mediapipe
+      - OVERLAY_DIR=/app/data/overlays
     volumes:
       - ./services/video_agent:/app
       - ./shared:/app/shared
       - ./data:/app/data
       - ./models:/app/models
+      - video_overlays:/app/data/overlays
     networks:
       - nexus-network
 
@@ -299,10 +301,12 @@ services:
       - FROM_EMAIL=${FROM_EMAIL:-noreply@yourdomain.com}
       - FROM_NAME=${FROM_NAME:-NEXUS}
       - APP_URL=${APP_URL:-http://localhost:3006}
+      - OVERLAY_DIR=/app/data/overlays
     volumes:
       - ./services/api_gateway:/app
       - ./shared:/app/shared
       - ./data:/app/data
+      - video_overlays:/app/data/overlays
     depends_on:
       postgres:
         condition: service_healthy
@@ -343,6 +347,8 @@ volumes:
   neo4j_data:
     driver: local
   neo4j_logs:
+    driver: local
+  video_overlays:
     driver: local
 
 networks:

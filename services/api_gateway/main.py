@@ -21,6 +21,7 @@ Endpoints:
   GET  /sessions/{id}/transcript→ Get transcript segments (auth)
   GET  /sessions/{id}/video-signals → Video + fusion signals for playback overlay (auth)
   GET  /sessions/{id}/video    → Stream session media file; accepts ?token= for <video> elements (auth)
+  GET  /sessions/{id}/video/annotated → Stream landmark-annotated video; accepts ?token= (auth)
   GET  /health                  → Health check (public)
 """
 import os
@@ -108,6 +109,9 @@ VIDEO_AGENT_URL  = os.getenv("VIDEO_AGENT_URL",  "http://localhost:8012")
 # ── Upload directory ──
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/recordings"))
 RECORDING_RETENTION_DAYS = int(os.getenv("RECORDING_RETENTION_DAYS", "3"))
+
+# ── Landmark overlay directory (shared with video-agent via volume mount) ──
+OVERLAY_DIR = Path(os.getenv("OVERLAY_DIR", "data/overlays"))
 
 # ── HTTP client timeout (Voice Agent with Whisper can be slow) ──
 AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "1800"))  # 30 minutes
@@ -1558,17 +1562,29 @@ async def get_session_transcript(session_id: str, current_user: dict = Depends(g
 # ─────────────────────────────────────────────────────────
 
 _VIDEO_OVERLAY_TYPES = [
+    # Facial
     "facial_emotion", "facial_stress", "facial_engagement",
     "smile_type", "valence_arousal",
+    # Body
     "head_nod", "head_shake", "posture", "body_lean",
     "body_fidgeting", "self_touch", "shoulder_tension",
+    "head_body_incongruence", "gesture_animation", "body_mirroring",
+    # Gaze
     "gaze_direction_shift", "screen_contact", "sustained_distraction",
-    "attention_level", "blink_rate_anomaly",
-    "head_body_incongruence",
-    "tone_face_masking", "stress_suppression",
-    "genuine_engagement", "active_disengagement",
-    "peak_performance", "cognitive_overload",
-    "conflict_escalation", "emotional_suppression",
+    "attention_level", "blink_rate_anomaly", "gaze_synchrony",
+    # Fusion pairwise
+    "tone_face_masking", "stress_suppression", "rapport_confirmation",
+    # Compound patterns (C-01 through C-12)
+    "genuine_engagement", "active_disengagement", "emotional_suppression",
+    "decision_engagement", "cognitive_overload", "conflict_escalation",
+    "verbal_nonverbal_discordance", "peak_performance", "rapport_building",
+    "dominance_display", "submission_signal", "deception_cluster",
+    # Temporal patterns (T-01 through T-08)
+    "stress_trajectory", "engagement_decay", "rapport_evolution",
+    "behavioral_shift", "adaptation_pattern", "fatigue_detection",
+    "stress_recovery", "escalation_ladder",
+    # Graph-based
+    "tension_cluster",
 ]
 
 
@@ -1692,6 +1708,71 @@ async def get_session_video(
 
     return FileResponse(
         str(video_path),
+        media_type=media_type,
+        headers={"Accept-Ranges": "bytes"},
+    )
+
+
+# ─────────────────────────────────────────────────────────
+# GET /sessions/{id}/video/annotated — Landmark-overlay video
+# ─────────────────────────────────────────────────────────
+
+@app.api_route("/sessions/{session_id}/video/annotated", methods=["GET", "HEAD"])
+async def get_annotated_video(
+    request: StarletteRequest,
+    session_id: str,
+    token: Optional[str] = Query(default=None),
+):
+    """
+    Stream the landmark-annotated video produced by the video agent.
+    Accepts JWT via Authorization: Bearer header OR ?token= query param.
+    Returns 404 when no annotated video exists for this session yet.
+    """
+    import uuid as _uuid
+    try:
+        _uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(404, "Session not found")
+
+    auth_token = token
+    if not auth_token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            auth_token = auth_header[7:]
+    if not auth_token:
+        raise HTTPException(401, "Unauthorized")
+
+    payload = verify_access_token(auth_token)
+    if not payload:
+        raise HTTPException(401, "Invalid or expired token")
+
+    session = await get_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+
+    user_role = payload.get("role", "viewer")
+    user_id = payload.get("sub", "")
+    if user_role != "admin" and str(session.get("user_id", "")) != user_id:
+        raise HTTPException(404, "Session not found")
+
+    # Support both webm (new) and mp4 (legacy) annotated videos
+    overlay_path = OVERLAY_DIR / f"{session_id}_annotated.webm"
+    media_type = "video/webm"
+    if not overlay_path.exists():
+        overlay_path = OVERLAY_DIR / f"{session_id}_annotated.mp4"
+        media_type = "video/mp4"
+    if not overlay_path.exists():
+        raise HTTPException(404, "Annotated video not available for this session")
+
+    if request.method == "HEAD":
+        from starlette.responses import Response as StarletteResponse
+        return StarletteResponse(
+            status_code=200,
+            headers={"Content-Type": media_type, "Accept-Ranges": "bytes"},
+        )
+
+    return FileResponse(
+        str(overlay_path),
         media_type=media_type,
         headers={"Accept-Ranges": "bytes"},
     )
