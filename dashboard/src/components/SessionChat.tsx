@@ -118,10 +118,11 @@ export default function SessionChat({ sessionId, meetingType }: SessionChatProps
           ...prev,
           { role: "assistant", content: data.answer, sources: data.sources },
         ]);
-      } catch (e: any) {
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : "Unexpected error";
         setMessages((prev) => [
           ...prev,
-          { role: "assistant", content: `Error: ${e.message}` },
+          { role: "assistant", content: `Error: ${msg}` },
         ]);
       } finally {
         setLoading(false);

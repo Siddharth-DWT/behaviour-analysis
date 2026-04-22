@@ -46,7 +46,7 @@ const SKIP_VALUES = new Set([
  */
 export function toSmartBadge(signal: Signal): SmartBadge | null {
   const { signal_type, value, value_text, agent } = signal;
-  const conf = (signal as any).confidence ?? 0.5;
+  const conf = signal.confidence ?? 0.5;
 
   // Skip zero-value signals and known noise labels
   if (value === 0 || value === 0.0) return null;

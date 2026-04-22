@@ -377,18 +377,22 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
       tick();
     };
     const onSeeked = () => tick();
-    const onMeta = () => setDurationMs(video.duration * 1000);
+    const onMeta = () => { if (video.duration > 0) setDurationMs(video.duration * 1000); };
 
     video.addEventListener("play", onPlay);
     video.addEventListener("pause", onPause);
     video.addEventListener("seeked", onSeeked);
     video.addEventListener("loadedmetadata", onMeta);
+    video.addEventListener("loadeddata", onMeta);
+    video.addEventListener("canplay", onMeta);
 
     return () => {
       video.removeEventListener("play", onPlay);
       video.removeEventListener("pause", onPause);
       video.removeEventListener("seeked", onSeeked);
       video.removeEventListener("loadedmetadata", onMeta);
+      video.removeEventListener("loadeddata", onMeta);
+      video.removeEventListener("canplay", onMeta);
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     };
   }, [tick]);
@@ -434,7 +438,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   return (
     <div className="w-full space-y-3">
       {/* Video Playback — badges panel left, video right */}
-      <div className="flex overflow-hidden rounded-lg bg-black" style={{ minHeight: 360 }}>
+      <div className="flex overflow-hidden rounded-lg bg-black" style={{ minHeight: 410 }}>
 
         {/* Left panel: signal badges in the black area */}
         <div className="flex w-48 flex-shrink-0 flex-col justify-start gap-1 overflow-y-auto p-3">
@@ -478,7 +482,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
 
         {/* Right panel: video — 9:16 portrait */}
         <div className="relative flex flex-1 items-center justify-center">
-          <div className="relative" style={{ aspectRatio: "9/16", maxHeight: 360, width: "auto" }}>
+          <div className="relative" style={{ aspectRatio: "9/16", maxHeight: 410, width: "auto" }}>
           <video
             ref={videoRef}
             src={videoUrl}
@@ -514,10 +518,10 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
             );
             const active = enabledCategories.has(c.key);
             return (
-              <div key={c.key} className="flex items-center gap-2" style={{ height: 10 }}>
+              <div key={c.key} className="flex items-stretch gap-2" style={{ height: 12 }}>
                 {/* Label */}
                 <span
-                  className={`w-12 flex-shrink-0 text-[8px] leading-none ${
+                  className={`w-12 flex-shrink-0 self-center text-[8px] leading-none ${
                     active ? "text-nexus-text-muted" : "text-nexus-text-muted/30"
                   }`}
                 >
@@ -526,7 +530,8 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
 
                 {/* Bar for this lane */}
                 <div
-                  className="relative flex-1 h-full cursor-crosshair rounded-sm bg-nexus-bg"
+                  className="relative flex-1 overflow-hidden cursor-crosshair rounded-sm bg-nexus-bg"
+                  style={{ height: 12 }}
                   onClick={(e) => {
                     const rect = e.currentTarget.getBoundingClientRect();
                     const pct = (e.clientX - rect.left) / rect.width;
@@ -536,25 +541,24 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                   {/* Playhead */}
                   {durationMs > 0 && (
                     <div
-                      className="pointer-events-none absolute inset-y-0 w-px bg-white/80 z-10"
-                      style={{ left: `${playheadPct}%` }}
+                      className="pointer-events-none absolute z-10 w-px bg-white/80"
+                      style={{ top: 0, bottom: 0, left: `${playheadPct}%` }}
                     />
                   )}
                   {/* Signal segments */}
                   {laneDots.map((s, i) => {
                     const cfg = SIGNAL_CONFIG[s.signal_type];
-                    if (!cfg || durationMs === 0) return null;
+                    if (!cfg) return null;
+                    const effectiveDuration = durationMs > 0 ? durationMs : (signals.length > 0 ? Math.max(...signals.map(x => x.end_ms)) : 1);
                     const color = resolveColor(cfg, s);
-                    const left = (s.start_ms / durationMs) * 100;
-                    const width = Math.max(
-                      ((s.end_ms - s.start_ms) / durationMs) * 100,
-                      0.4
-                    );
+                    const left = Math.max(0, Math.min((s.start_ms / effectiveDuration) * 100, 100));
+                    const rawWidth = Math.max(((s.end_ms - s.start_ms) / effectiveDuration) * 100, 0.5);
+                    const width = Math.min(rawWidth, 100 - left);
                     return (
                       <div
                         key={`${s.signal_type}-${s.start_ms}-${i}`}
-                        className="absolute inset-y-0.5 rounded-full opacity-75 hover:opacity-100 transition-opacity"
-                        style={{ left: `${left}%`, width: `${width}%`, backgroundColor: color }}
+                        className="absolute rounded-full opacity-75 hover:opacity-100 transition-opacity"
+                        style={{ left: `${left}%`, width: `${width}%`, top: 2, bottom: 2, backgroundColor: color }}
                         title={`${cfg.label(s)} @ ${(s.start_ms / 1000).toFixed(1)}s`}
                         onClick={(e) => { e.stopPropagation(); seekTo(s.start_ms); }}
                       />

@@ -265,15 +265,12 @@ export async function getReport(
     `/sessions/${id}/report${regenerate ? "?regenerate=true" : ""}`
   );
   // API may return content as JSON string — parse it
-  if (result.report && typeof result.report.content === "string") {
+  if (result.report && typeof (result.report.content as unknown) === "string") {
+    const raw = result.report.content as unknown as string;
     try {
-      const parsed = JSON.parse(result.report.content as unknown as string);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (result.report as any).content = parsed;
+      result.report.content = JSON.parse(raw) as Report["content"];
     } catch {
-      // If parse fails, wrap raw string as executive_summary
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (result.report as any).content = { executive_summary: result.report.content };
+      result.report.content = { executive_summary: raw };
     }
   }
   return result;

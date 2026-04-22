@@ -104,14 +104,18 @@ const COMPUTATIONS: Record<string, (s: Signal[]) => number> = {
   },
 };
 
+const C_GREEN  = "var(--color-stress-low,  #22C55E)";
+const C_AMBER  = "var(--color-stress-med,  #F59E0B)";
+const C_RED    = "var(--color-stress-high, #EF4444)";
+
 function neutralGauge(pct: number): string {
-  return pct >= 70 ? "#22C55E" : pct >= 45 ? "#F59E0B" : "#EF4444";
+  return pct >= 70 ? C_GREEN : pct >= 45 ? C_AMBER : C_RED;
 }
 function stressGauge(pct: number): string {
-  return pct <= 30 ? "#22C55E" : pct <= 55 ? "#F59E0B" : "#EF4444";
+  return pct <= 30 ? C_GREEN : pct <= 55 ? C_AMBER : C_RED;
 }
 function riskGauge(pct: number): string {
-  return pct <= 30 ? "#22C55E" : pct <= 55 ? "#F59E0B" : "#EF4444";
+  return pct <= 30 ? C_GREEN : pct <= 55 ? C_AMBER : C_RED;
 }
 
 const GAUGE_SETS: Record<string, GaugeConfig[]> = {

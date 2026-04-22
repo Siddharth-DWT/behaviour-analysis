@@ -1,10 +1,7 @@
 import { ReactNode, useState, useRef, useEffect } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
-  BarChart3,
   FolderOpen,
-  Settings,
-  Activity,
   ChevronLeft,
   ChevronRight,
   Sun,
@@ -20,8 +17,6 @@ import { useAuth } from "../contexts/AuthContext";
 const NAV_ITEMS = [
   { path: "/upload", label: "Upload", icon: UploadCloud },
   { path: "/sessions", label: "Sessions", icon: FolderOpen },
-  { path: "/analytics", label: "Analytics", icon: BarChart3, disabled: true },
-  { path: "/settings", label: "Settings", icon: Settings, disabled: true },
 ];
 
 function UserInitials({ name }: { name: string }) {
