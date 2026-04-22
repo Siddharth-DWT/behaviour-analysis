@@ -112,6 +112,8 @@ class FrameFeatures:
     gaze_x: float = 0.0       # iris offset from eye centre, normalised by eye width
     gaze_y: float = 0.0       # positive = looking down
 
+    face_luminance: float = 0.5  # mean face-crop brightness (0-1); lower = darker skin
+
     # ── Body ──────────────────────────────────────────────────────────────────
     body_detected: bool = False
 
@@ -169,6 +171,13 @@ class WindowFeatures:
     gaze_x_std:         float = 0.0
     gaze_y_std:         float = 0.0
     gaze_on_screen_pct: float = 0.0    # estimated % of frames looking at screen
+
+    # ── Skin tone ─────────────────────────────────────────────────────────────
+    face_luminance: float = 0.5  # mean face-crop brightness (0-1); bias mitigation (F-2)
+    # Note: in the current single-camera architecture, SpeakerFaceMapper assigns each
+    # window to the dominant speaker (whoever is talking), so is_speaking is always True.
+    # The field exists for future multi-camera / full-session-face-tracking support.
+    is_speaking: bool = True
 
     # ── Body ──────────────────────────────────────────────────────────────────
     body_detection_rate:      float = 0.0
@@ -380,6 +389,10 @@ class WindowAggregator:
             wf.blink_count = detector.total_blinks
             duration_min   = (window_end_ms - window_start_ms) / 60_000
             wf.blink_rate_bpm = wf.blink_count / max(duration_min, 1e-6)
+
+        # ── Skin tone (luminance) ──────────────────────────────────────────────
+        if face_frames:
+            wf.face_luminance = float(np.mean([f.face_luminance for f in face_frames]))
 
         # ── Gaze ───────────────────────────────────────────────────────────────
         if face_frames:
@@ -610,6 +623,7 @@ class VideoFeatureExtractor:
                 lm = face_result.face_landmarks[0]   # dominant face
                 ff.face_detected = True
                 ff.face_box_area = self._face_box_area(lm)
+                ff.face_luminance = self._compute_face_luminance(lm, rgb, h, w)
 
                 if face_result.face_blendshapes:
                     ff.blendshapes = {
@@ -816,6 +830,26 @@ class VideoFeatureExtractor:
         except Exception:
             pass
         return False
+
+    @staticmethod
+    def _compute_face_luminance(landmarks, rgb: np.ndarray, h: int, w: int) -> float:
+        """
+        Mean brightness of the face crop normalised to [0, 1].
+        Used as skin-tone confidence modifier (Buolamwini & Gebru 2018 bias mitigation).
+        Lower luminance → darker skin → lower blendshape accuracy → reduce confidence.
+        """
+        try:
+            xs = [pt.x * w for pt in landmarks]
+            ys = [pt.y * h for pt in landmarks]
+            x1 = max(0, int(min(xs)))
+            x2 = min(w, int(max(xs)))
+            y1 = max(0, int(min(ys)))
+            y2 = min(h, int(max(ys)))
+            if x2 > x1 and y2 > y1:
+                return float(rgb[y1:y2, x1:x2].mean() / 255.0)
+        except Exception:
+            pass
+        return 0.5
 
     @staticmethod
     def _compute_hand_velocity(hand_lm_list) -> float:

@@ -10,6 +10,7 @@ Research anchors:
   Rayner 1998              — Sustained off-screen gaze > 8s = attention break
 """
 import logging
+import math
 
 from base_rule_engine import BaseVideoRuleEngine
 
@@ -91,6 +92,12 @@ class GazeRuleEngine(BaseVideoRuleEngine):
 
         return signals
 
+    # Approximate conversion: iris offset (normalised by eye width) → degrees.
+    # At a typical 60cm viewing distance, 1.0 normalised ≈ 45°. Rough but interpretable.
+    _GAZE_DEG_SCALE = 45.0
+    _DEAD_ZONE_DEG  = 5.0   # Angular error margin — genuinely ambiguous (Cai 2021: 3.11°)
+    _CLEAR_ZONE_DEG = 10.0  # Above this = clearly off-screen
+
     def _rule_gaze_direction(
         self,
         w: WindowFeatures,
@@ -99,37 +106,55 @@ class GazeRuleEngine(BaseVideoRuleEngine):
         conf_mult: float,
     ) -> list[dict]:
         """
-        GAZE-DIR-01: significant horizontal or vertical gaze shift from baseline offset.
-        Iris offset normalised by eye width; baseline corrects for camera-above-screen.
+        GAZE-DIR-01: Named zone classification with dead zone (G-2).
+        Zones: CAMERA (< 5°) → no signal, DEAD_ZONE (5-10°) → uncertain,
+               LEFT/RIGHT/DOWN/UP (> 10°) → confident directional shift.
+        Dead zone accounts for MediaPipe's 3-5° angular error.
+        Sigma guard still applied first to suppress noise below 2× baseline std.
         """
-        x_delta = abs(w.gaze_x_mean - bl.gaze_x_offset)
-        y_delta = abs(w.gaze_y_mean - bl.gaze_y_offset)
+        x_delta_raw = w.gaze_x_mean - bl.gaze_x_offset
+        y_delta_raw = w.gaze_y_mean - bl.gaze_y_offset
 
-        # Only fire if shift is substantial (>2σ from baseline gaze std)
-        x_sigma = x_delta / max(bl.gaze_x_std_mean, 0.01)
-        y_sigma = y_delta / max(bl.gaze_y_std_mean, 0.01)
-
+        # Sigma guard: suppress sub-noise shifts (keeps per-speaker calibration benefit)
+        x_sigma = abs(x_delta_raw) / max(bl.gaze_x_std_mean, 0.01)
+        y_sigma = abs(y_delta_raw) / max(bl.gaze_y_std_mean, 0.01)
         if x_sigma < 2.0 and y_sigma < 2.0:
             return []
 
-        dominant_axis = "horizontal" if x_sigma > y_sigma else "vertical"
-        magnitude = max(x_sigma, y_sigma)
-        confidence = min(magnitude * 0.15 * conf_mult, 0.60)
+        # Convert to approximate degrees for interpretable zone classification
+        x_deg = abs(x_delta_raw) * self._GAZE_DEG_SCALE
+        y_deg = abs(y_delta_raw) * self._GAZE_DEG_SCALE
+        max_deg = max(x_deg, y_deg)
+
+        if max_deg < self._DEAD_ZONE_DEG:
+            # Below angular error margin — do not emit (suppressed by sigma guard anyway)
+            return []
+        elif max_deg < self._CLEAR_ZONE_DEG:
+            zone = "gaze_shift_uncertain"
+            confidence = min(0.25 * conf_mult, 0.30)  # Dead zone: very low confidence
+        else:
+            # Clear shift — classify direction
+            if x_deg >= y_deg:
+                zone = "gaze_shift_left" if x_delta_raw < 0 else "gaze_shift_right"
+            else:
+                zone = "gaze_shift_down" if y_delta_raw > 0 else "gaze_shift_up"
+            confidence = min((max_deg / 30.0) * conf_mult, 0.65)
 
         return [self._make_signal(
             rule_id="GAZE-DIR-01",
             signal_type="gaze_direction_shift",
             speaker_id=speaker_id,
-            value=round(magnitude, 4),
-            value_text=f"gaze_shift_{dominant_axis}",
+            value=round(max_deg, 2),
+            value_text=zone,
             confidence=confidence,
             window_start_ms=w.window_start_ms,
             window_end_ms=w.window_end_ms,
             metadata={
-                "x_sigma": round(x_sigma, 2),
-                "y_sigma": round(y_sigma, 2),
-                "gaze_x_mean": round(w.gaze_x_mean, 4),
-                "gaze_y_mean": round(w.gaze_y_mean, 4),
+                "x_deg":       round(x_deg, 2),
+                "y_deg":       round(y_deg, 2),
+                "x_sigma":     round(x_sigma, 2),
+                "y_sigma":     round(y_sigma, 2),
+                "zone":        zone,
             },
         )]
 
@@ -145,7 +170,7 @@ class GazeRuleEngine(BaseVideoRuleEngine):
         Fast blinks > 1.5× baseline → autonomic stress response.
         Slow blinks < 0.5× baseline → fatigue or intense focus.
         """
-        baseline_bpm = max(bl.blink_rate_bpm, 5.0)
+        baseline_bpm = max(bl.blink_rate_bpm, 15.0)
         ratio = w.blink_rate_bpm / baseline_bpm
 
         if ratio >= self.BLINK_FAST_THRESHOLD:
@@ -181,21 +206,42 @@ class GazeRuleEngine(BaseVideoRuleEngine):
         conf_mult: float,
     ) -> list[dict]:
         """
-        GAZE-ATT-01: per-window screen engagement quality.
-        High attention: gaze on-screen > 80% + low gaze std.
-        Reduced attention: on-screen 30-50%.
+        GAZE-ATT-01: 4-factor composite attention score (G-4, Rayner 1998).
+          F1 screen_engagement (0.35) — on-screen gaze %
+          F2 gaze_stability    (0.20) — low variance = focused
+          F3 blink_normalcy    (0.20) — deviation from baseline penalises
+          F4 no_gaze_shift     (0.25) — inverse of directional shift magnitude
         """
-        on_screen = w.gaze_on_screen_pct
-        gaze_stability = 1.0 - min(w.gaze_x_std + w.gaze_y_std, 1.0)
+        # F1: screen engagement
+        f1_screen = w.gaze_on_screen_pct
 
-        if on_screen >= self.ATTENTION_HIGH_PCT:
+        # F2: gaze stability — Euclidean norm of std components (not sum, avoids double-counting)
+        f2_stability = 1.0 - min(math.sqrt(w.gaze_x_std ** 2 + w.gaze_y_std ** 2), 1.0)
+
+        # F3: blink rate normalcy — deviation from baseline penalises
+        baseline_bpm = max(bl.blink_rate_bpm, 15.0)
+        blink_ratio  = w.blink_rate_bpm / baseline_bpm if baseline_bpm > 0 else 1.0
+        f3_blink     = max(0.0, 1.0 - abs(blink_ratio - 1.0))
+
+        # F4: inverse gaze shift magnitude (less deviation = more on-task)
+        x_shift = abs(w.gaze_x_mean - bl.gaze_x_offset)
+        y_shift = abs(w.gaze_y_mean - bl.gaze_y_offset)
+        shift   = min(math.sqrt(x_shift ** 2 + y_shift ** 2) * 5.0, 1.0)
+        f4_no_shift = 1.0 - shift
+
+        composite = (
+            0.35 * f1_screen
+            + 0.20 * f2_stability
+            + 0.20 * f3_blink
+            + 0.25 * f4_no_shift
+        )
+
+        if composite >= self.ATTENTION_HIGH_PCT:
             label = "high_attention"
-            value = on_screen * gaze_stability
-            confidence = min(value * conf_mult * 0.8, 0.70)
-        elif on_screen < self.ATTENTION_LOW_PCT and on_screen >= self.GAZE_OFF_THRESHOLD:
+            confidence = min(composite * conf_mult * 0.8, 0.70)
+        elif composite < self.ATTENTION_LOW_PCT:
             label = "reduced_attention"
-            value = 1.0 - on_screen
-            confidence = min(value * conf_mult * 0.5, 0.55)
+            confidence = min((1.0 - composite) * conf_mult * 0.5, 0.55)
         else:
             return []
 
@@ -203,14 +249,17 @@ class GazeRuleEngine(BaseVideoRuleEngine):
             rule_id="GAZE-ATT-01",
             signal_type="attention_level",
             speaker_id=speaker_id,
-            value=round(on_screen, 4),
+            value=round(composite, 4),
             value_text=label,
             confidence=confidence,
             window_start_ms=w.window_start_ms,
             window_end_ms=w.window_end_ms,
             metadata={
-                "gaze_on_screen_pct": round(on_screen, 4),
-                "gaze_stability": round(gaze_stability, 4),
+                "f1_screen_engagement": round(f1_screen, 4),
+                "f2_gaze_stability":    round(f2_stability, 4),
+                "f3_blink_normalcy":    round(f3_blink, 4),
+                "f4_no_gaze_shift":     round(f4_no_shift, 4),
+                "composite":            round(composite, 4),
             },
         )]
 
@@ -222,8 +271,17 @@ class GazeRuleEngine(BaseVideoRuleEngine):
         speaker_id: str,
     ) -> list[dict]:
         """
-        GAZE-CONTACT-01: screen engagement aggregated over 30s blocks.
-        Argyle & Cook 1976: 60-70% mutual gaze normal; below 40% = low contact.
+        GAZE-CONTACT-01: screen engagement with speaking/listening split (G-1).
+        Argyle (1972): people gaze ~75% while listening, ~40% while speaking.
+        Thresholds are adjusted so normal speaking gaze-away is not flagged.
+
+        In the current single-camera architecture, SpeakerFaceMapper assigns each
+        window to the dominant speaker (the one talking), so is_speaking is always
+        True for windows in windows_by_speaker. The split is kept in the code to
+        support future multi-camera / full-session-face-tracking.
+
+        Speaking norms: 30-60% screen time normal → flag below 25%
+        Listening norms: 55-80% screen time normal → flag below 40%
         """
         signals: list[dict] = []
         block_size = self.CONTACT_BLOCK_WINDOWS
@@ -235,11 +293,23 @@ class GazeRuleEngine(BaseVideoRuleEngine):
                 continue
 
             avg_on_screen = sum(w.gaze_on_screen_pct for w in block) / len(block)
-            delta = avg_on_screen - bl.screen_engagement_rate
-            block_start = block[0].window_start_ms
-            block_end   = block[-1].window_end_ms
+            delta         = avg_on_screen - bl.screen_engagement_rate
+            block_start   = block[0].window_start_ms
+            block_end     = block[-1].window_end_ms
 
-            if avg_on_screen < 0.40:
+            # Speaking/listening context from WindowFeatures.is_speaking
+            speaking_frames  = sum(1 for w in block if getattr(w, "is_speaking", True))
+            speaking_ratio   = speaking_frames / len(block)
+            is_speaking      = speaking_ratio > 0.5
+
+            if is_speaking:
+                low_threshold  = 0.25   # < 25% while speaking = very low
+                high_threshold = 0.85
+            else:
+                low_threshold  = 0.40   # < 40% while listening = disengaged
+                high_threshold = 0.90
+
+            if avg_on_screen < low_threshold:
                 label = "low_screen_contact"
                 confidence = min(abs(delta) * 0.8, 0.65)
                 signals.append(self._make_signal(
@@ -252,12 +322,15 @@ class GazeRuleEngine(BaseVideoRuleEngine):
                     window_start_ms=block_start,
                     window_end_ms=block_end,
                     metadata={
-                        "avg_on_screen_pct": round(avg_on_screen, 4),
-                        "baseline_engagement": round(bl.screen_engagement_rate, 4),
-                        "block_windows": len(block),
+                        "avg_on_screen_pct":    round(avg_on_screen, 4),
+                        "baseline_engagement":  round(bl.screen_engagement_rate, 4),
+                        "context":              "speaking" if is_speaking else "listening",
+                        "speaking_ratio":       round(speaking_ratio, 2),
+                        "threshold_used":       low_threshold,
+                        "block_windows":        len(block),
                     },
                 ))
-            elif avg_on_screen > 0.85:
+            elif avg_on_screen > high_threshold:
                 label = "sustained_eye_contact"
                 confidence = min(avg_on_screen * 0.6, 0.60)
                 signals.append(self._make_signal(
@@ -270,9 +343,11 @@ class GazeRuleEngine(BaseVideoRuleEngine):
                     window_start_ms=block_start,
                     window_end_ms=block_end,
                     metadata={
-                        "avg_on_screen_pct": round(avg_on_screen, 4),
-                        "baseline_engagement": round(bl.screen_engagement_rate, 4),
-                        "block_windows": len(block),
+                        "avg_on_screen_pct":    round(avg_on_screen, 4),
+                        "baseline_engagement":  round(bl.screen_engagement_rate, 4),
+                        "context":              "speaking" if is_speaking else "listening",
+                        "speaking_ratio":       round(speaking_ratio, 2),
+                        "block_windows":        len(block),
                     },
                 ))
 

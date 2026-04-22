@@ -28,9 +28,9 @@ except ImportError:
 
 logger = logging.getLogger("nexus.video.body_rules")
 
-# Assume 2-second windows at 15 fps → 30 frames/window
-_DEFAULT_FPS = 15.0
-_DEFAULT_WINDOW_FRAMES = 30
+# Matches feature_extractor.TARGET_FPS = 10 → 2-second windows = 20 frames
+_DEFAULT_FPS = 10.0
+_DEFAULT_WINDOW_FRAMES = 20
 
 
 def _count_zero_crossings(seq: list[float]) -> int:
@@ -115,12 +115,19 @@ class BodyRuleEngine(BaseVideoRuleEngine):
                     continue
                 conf_mult = cal_conf * w.body_detection_rate
 
-                signals += self._rule_head_gesture(w, body_bl, speaker_id, conf_mult)
-                signals += self._rule_posture(w, body_bl, speaker_id, conf_mult)
-                signals += self._rule_lean(w, body_bl, speaker_id, conf_mult)
+                w_head    = self._rule_head_gesture(w, body_bl, speaker_id, conf_mult)
+                w_posture = self._rule_posture(w, body_bl, speaker_id, conf_mult)
+                w_lean    = self._rule_lean(w, body_bl, speaker_id, conf_mult)
+
+                signals += w_head
+                signals += w_posture
+                signals += w_lean
                 signals += self._rule_gesture(w, body_bl, speaker_id, conf_mult)
                 signals += self._rule_fidget(w, body_bl, speaker_id, conf_mult)
                 signals += self._rule_self_touch(w, body_bl, speaker_id, conf_mult)
+                signals += self._rule_head_body_incongruence(
+                    w, body_bl, speaker_id, conf_mult, w_head, w_posture + w_lean
+                )
 
         # Cross-speaker rule (needs all speakers simultaneously)
         signals += self._rule_mirror(windows_by_speaker, baselines)
@@ -431,6 +438,79 @@ class BodyRuleEngine(BaseVideoRuleEngine):
                 "blink_count_window": w.blink_count,
             },
         )]
+
+    # ── BODY-INCONG-01: Head-body incongruence ────────────────────────────────
+    def _rule_head_body_incongruence(
+        self,
+        w: WindowFeatures,
+        bl: BodyBaseline,
+        speaker_id: str,
+        conf_mult: float,
+        head_signals: list[dict],
+        body_signals: list[dict],
+    ) -> list[dict]:
+        """
+        BODY-INCONG-01: Head gesture contradicts body posture (Navarro 2008).
+        Nod + backward-lean / slump = possible false agreement.
+        Shake + forward-lean = disagreement with physical engagement.
+        Takes per-window head and body signals already computed in the same iteration.
+        """
+        has_nod   = any(s.get("signal_type") == "head_nod"   for s in head_signals)
+        has_shake = any(s.get("signal_type") == "head_shake"  for s in head_signals)
+
+        has_backward = any(
+            s.get("signal_type") == "body_lean" and s.get("value_text") == "backward_lean"
+            for s in body_signals
+        )
+        has_slump = any(
+            s.get("signal_type") == "posture" and s.get("value_text") == "forward_slump"
+            for s in body_signals
+        )
+        has_forward = any(
+            s.get("signal_type") == "body_lean" and s.get("value_text") == "forward_lean"
+            for s in body_signals
+        )
+
+        signals: list[dict] = []
+
+        if has_nod and (has_backward or has_slump):
+            posture_label = "backward_lean" if has_backward else "forward_slump"
+            confidence = min(0.45 * conf_mult, 0.55)
+            signals.append(self._make_signal(
+                rule_id="BODY-INCONG-01",
+                signal_type="head_body_incongruence",
+                speaker_id=speaker_id,
+                value=0.6,
+                value_text="nod_but_withdrawing",
+                confidence=confidence,
+                window_start_ms=w.window_start_ms,
+                window_end_ms=w.window_end_ms,
+                metadata={
+                    "head_gesture":    "nod",
+                    "body_posture":    posture_label,
+                    "interpretation":  "possible_false_agreement",
+                },
+            ))
+
+        if has_shake and has_forward:
+            confidence = min(0.40 * conf_mult, 0.50)
+            signals.append(self._make_signal(
+                rule_id="BODY-INCONG-01",
+                signal_type="head_body_incongruence",
+                speaker_id=speaker_id,
+                value=0.5,
+                value_text="shake_but_engaged",
+                confidence=confidence,
+                window_start_ms=w.window_start_ms,
+                window_end_ms=w.window_end_ms,
+                metadata={
+                    "head_gesture":   "shake",
+                    "body_posture":   "forward_lean",
+                    "interpretation": "disagreement_with_interest",
+                },
+            ))
+
+        return signals
 
     # ── BODY-MIRROR-01 (EXPERIMENTAL) ────────────────────────────────────────
     def _rule_mirror(self, windows_by_speaker: dict, baselines: dict) -> list[dict]:

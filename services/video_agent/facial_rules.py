@@ -110,19 +110,30 @@ class FacialRuleEngine(BaseVideoRuleEngine):
             )
             cal_conf = facial_bl.calibration_confidence
 
+            prev_w: Optional[WindowFeatures] = None
             for w in windows:
                 if w.face_detection_rate < self.MIN_FACE_RATE:
+                    prev_w = w
                     continue
                 if not w.blendshapes_mean:
+                    prev_w = w
                     continue
 
                 conf_mult = cal_conf * w.face_detection_rate
 
+                # F-2: Skin tone confidence modifier (Buolamwini & Gebru 2018).
+                # Lower face luminance → lower blendshape accuracy → reduce confidence.
+                face_lum = getattr(w, "face_luminance", 0.5)
+                if face_lum < 0.35:
+                    conf_mult *= 0.85
+
                 signals += self._rule_emotion(w, facial_bl, speaker_id, conf_mult)
-                signals += self._rule_smile(w, facial_bl, speaker_id, conf_mult)
+                signals += self._rule_smile(w, facial_bl, speaker_id, conf_mult, prev_w)
                 signals += self._rule_stress(w, facial_bl, speaker_id, conf_mult)
                 signals += self._rule_engagement(w, facial_bl, speaker_id, conf_mult)
                 signals += self._rule_valence_arousal(w, facial_bl, speaker_id, conf_mult)
+
+                prev_w = w
 
         logger.info(f"[{session_id}] FacialRuleEngine: {len(signals)} signals")
         return signals
@@ -177,16 +188,15 @@ class FacialRuleEngine(BaseVideoRuleEngine):
         bl: FacialBaseline,
         speaker_id: str,
         conf_mult: float,
+        prev_window: Optional[WindowFeatures] = None,
     ) -> list[dict]:
         """
-        Duchenne vs social smile discrimination (Ekman 2009).
-        Duchenne: mouthSmile delta AND cheekSquint delta both elevated.
-        Social:   mouthSmile delta elevated but cheekSquint at baseline.
+        Duchenne vs social smile with onset speed + symmetry (F-3).
+        Ekman 2009: Duchenne = AU6 + AU12; onset, symmetry, and cheek squint all count.
         """
-        smile_delta = (
-            _blendshape_delta(w.blendshapes_mean, bl.blendshapes_neutral, "mouthSmileLeft")
-            + _blendshape_delta(w.blendshapes_mean, bl.blendshapes_neutral, "mouthSmileRight")
-        ) / 2.0
+        smile_left  = _blendshape_delta(w.blendshapes_mean, bl.blendshapes_neutral, "mouthSmileLeft")
+        smile_right = _blendshape_delta(w.blendshapes_mean, bl.blendshapes_neutral, "mouthSmileRight")
+        smile_delta = (smile_left + smile_right) / 2.0
 
         cheek_delta = (
             _blendshape_delta(w.blendshapes_mean, bl.blendshapes_neutral, "cheekSquintLeft")
@@ -196,12 +206,44 @@ class FacialRuleEngine(BaseVideoRuleEngine):
         if smile_delta < self.SMILE_DUCHENNE_THRESHOLD:
             return []
 
+        # ── Symmetry: genuine smiles have < 25% left-right asymmetry (Ekman 1982) ──
+        asymmetry = abs(smile_left - smile_right) / max(smile_delta, 0.05)
+        is_symmetric = asymmetry < 0.25
+
+        # ── Onset speed: requires previous window for frame-to-frame delta ──────
+        onset_speed = "unknown"
+        if prev_window and prev_window.blendshapes_mean:
+            prev_smile = (
+                prev_window.blendshapes_mean.get("mouthSmileLeft", 0.0)
+                + prev_window.blendshapes_mean.get("mouthSmileRight", 0.0)
+            ) / 2.0
+            curr_smile = (
+                w.blendshapes_mean.get("mouthSmileLeft", 0.0)
+                + w.blendshapes_mean.get("mouthSmileRight", 0.0)
+            ) / 2.0
+            delta_per_window = curr_smile - prev_smile
+            # Gradual onset (300-500ms ramp) → likely genuine
+            # Abrupt onset (< 200ms snap) → likely social/posed
+            if delta_per_window > 0.25:
+                onset_speed = "abrupt"
+            elif delta_per_window > 0.05:
+                onset_speed = "gradual"
+
+        # ── Classify: each positive indicator supports Duchenne ──────────────
+        duchenne_count = 0
         if cheek_delta >= self.CHEEK_DUCHENNE_THRESHOLD:
+            duchenne_count += 1   # Eye crinkle (AU6 proxy)
+        if is_symmetric:
+            duchenne_count += 1   # Bilateral symmetry
+        if onset_speed == "gradual":
+            duchenne_count += 1   # Smooth onset
+
+        if duchenne_count >= 2:
             smile_type = "duchenne"
-            confidence = min(smile_delta * 0.8 * conf_mult, 0.55)
+            confidence = min(smile_delta * 0.8 * conf_mult, 0.65)
         elif smile_delta >= self.SMILE_SOCIAL_THRESHOLD:
             smile_type = "social"
-            confidence = min(smile_delta * 0.5 * conf_mult, 0.45)
+            confidence = min(smile_delta * 0.5 * conf_mult, 0.60)
         else:
             return []
 
@@ -215,8 +257,12 @@ class FacialRuleEngine(BaseVideoRuleEngine):
             window_start_ms=w.window_start_ms,
             window_end_ms=w.window_end_ms,
             metadata={
-                "smile_delta": round(smile_delta, 4),
-                "cheek_delta": round(cheek_delta, 4),
+                "smile_delta":        round(smile_delta, 4),
+                "cheek_delta":        round(cheek_delta, 4),
+                "asymmetry":          round(asymmetry, 3),
+                "is_symmetric":       is_symmetric,
+                "onset_speed":        onset_speed,
+                "duchenne_indicators": duchenne_count,
             },
         )]
 
@@ -274,19 +320,48 @@ class FacialRuleEngine(BaseVideoRuleEngine):
         conf_mult: float,
     ) -> list[dict]:
         """
-        Engagement from head-pose variance + overall blendshape expressivity.
-        High variance = active listening / animated expression.
-        Low variance = flat affect / disengagement.
+        5-factor engagement composite (F-5, Whitehill 2014):
+          F1 head-pose variance (0.30) — proxy for AU activity / animated response
+          F2 blendshape expressivity (0.25) — overall facial animation
+          F3 smile presence (0.20) — mouthSmile mean as smile-frequency proxy
+          F4 brow movement (0.15) — browDown/browInnerUp delta from neutral
+          F5 face visible % (0.10) — proxy for screen-facing orientation
         """
+        # F1: head-pose variance normalised to 0-1 (max meaningful delta ≈ 30°²)
         pose_var_delta = w.head_pose_variance - bl.head_pose_variance_baseline
-        bs_expressivity = (
+        f1_pose = max(0.0, min(abs(pose_var_delta) / 30.0, 1.0))
+
+        # F2: blendshape expressivity (std across all blendshapes)
+        f2_express = (
             sum(w.blendshapes_std.values()) / len(w.blendshapes_std)
             if w.blendshapes_std else 0.0
         )
 
-        # Normalise pose_var_delta to 0–1 range (assume max meaningful delta = 30°²)
-        norm_var = max(0.0, min(abs(pose_var_delta) / 30.0, 1.0))
-        combined = 0.6 * norm_var + 0.4 * bs_expressivity
+        # F3: smile presence (0.3 mean = 1.0 normalised)
+        smile_mean = (
+            w.blendshapes_mean.get("mouthSmileLeft", 0.0)
+            + w.blendshapes_mean.get("mouthSmileRight", 0.0)
+        ) / 2.0
+        f3_smile = min(smile_mean / 0.3, 1.0)
+
+        # F4: brow activity delta from neutral (more brow movement = more reactive)
+        brow_activity = (
+            abs(_blendshape_delta(w.blendshapes_mean, bl.blendshapes_neutral, "browDownLeft"))
+            + abs(_blendshape_delta(w.blendshapes_mean, bl.blendshapes_neutral, "browDownRight"))
+            + abs(_blendshape_delta(w.blendshapes_mean, bl.blendshapes_neutral, "browInnerUp"))
+        ) / 3.0
+        f4_brow = min(brow_activity / 0.15, 1.0)
+
+        # F5: face detection rate as screen-facing proxy
+        f5_visible = w.face_detection_rate
+
+        combined = (
+            0.30 * f1_pose
+            + 0.25 * f2_express
+            + 0.20 * f3_smile
+            + 0.15 * f4_brow
+            + 0.10 * f5_visible
+        )
 
         if combined >= self.ENGAGEMENT_HIGH:
             label = "high_engagement"
@@ -307,8 +382,11 @@ class FacialRuleEngine(BaseVideoRuleEngine):
             window_start_ms=w.window_start_ms,
             window_end_ms=w.window_end_ms,
             metadata={
-                "pose_variance_delta": round(pose_var_delta, 4),
-                "blendshape_expressivity": round(bs_expressivity, 4),
+                "f1_pose_variance":  round(f1_pose, 4),
+                "f2_expressivity":   round(f2_express, 4),
+                "f3_smile":          round(f3_smile, 4),
+                "f4_brow_activity":  round(f4_brow, 4),
+                "f5_face_visible":   round(f5_visible, 4),
             },
         )]
 

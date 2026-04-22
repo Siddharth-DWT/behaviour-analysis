@@ -44,6 +44,35 @@ def _sig(
     return None
 
 
+def _agent_diversity(hits: dict[str, Optional[dict]]) -> int:
+    """
+    Count distinct modality sources among matched signals.
+    For video signals, rule_id prefix discriminates facial/gaze/body sub-channels
+    so that compound patterns can fire from video-only signal combinations.
+    Enforces the cluster rule (Pease 2004): congruent signals must cross modalities.
+    """
+    modalities: set[str] = set()
+    for sig in hits.values():
+        if sig is None:
+            continue
+        agent = sig.get("agent")
+        if not agent:
+            continue
+        if agent == "video":
+            rule_id = sig.get("rule_id", "")
+            if rule_id.startswith("FACE"):
+                modalities.add("video_facial")
+            elif rule_id.startswith("GAZE"):
+                modalities.add("video_gaze")
+            elif rule_id.startswith("BODY"):
+                modalities.add("video_body")
+            else:
+                modalities.add(agent)
+        else:
+            modalities.add(agent)
+    return len(modalities)
+
+
 class CompoundPatternEngine:
     """
     Detects complex behavioral states from 3+ co-occurring signals.
@@ -138,7 +167,7 @@ class CompoundPatternEngine:
             "high_attention": _sig(signals, "attention_level", "high_attention"),
         }
         hits = {k: v for k, v in components.items() if v is not None}
-        if len(hits) < 3:
+        if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
         confidence = min(score * (len(hits) / 5.0) * 1.2, _CAPS["C-01"])
@@ -168,7 +197,7 @@ class CompoundPatternEngine:
             "low_contact": _sig(signals, "screen_contact", "low_screen_contact"),
         }
         hits = {k: v for k, v in components.items() if v is not None}
-        if len(hits) < 3:
+        if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
         confidence = min(score * (len(hits) / 5.0) * 1.2, _CAPS["C-02"])
@@ -204,7 +233,7 @@ class CompoundPatternEngine:
             "fillers":         _sig(signals, "filler_detection"),
         }
         hits = {k: v for k, v in components.items() if v is not None}
-        if len(hits) < 3:
+        if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
         confidence = min(score * 0.9, _CAPS["C-03"])
@@ -235,7 +264,7 @@ class CompoundPatternEngine:
             "eye_contact":    _sig(signals, "screen_contact", "sustained_eye_contact"),
         }
         hits = {k: v for k, v in components.items() if v is not None}
-        if len(hits) < 2:
+        if len(hits) < 4 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
         confidence = min(score * (len(hits) / 4.0) * 1.1, _CAPS["C-04"])
@@ -263,7 +292,7 @@ class CompoundPatternEngine:
             "response_latency": _sig(signals, "response_latency"),
         }
         hits = {k: v for k, v in components.items() if v is not None}
-        if len(hits) < 3:
+        if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
         confidence = min(score * (len(hits) / 5.0) * 1.2, _CAPS["C-05"])
@@ -293,7 +322,7 @@ class CompoundPatternEngine:
             "forward_lean":  _sig(signals, "body_lean", "forward_lean"),
         }
         hits = {k: v for k, v in components.items() if v is not None}
-        if len(hits) < 3:
+        if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
         confidence = min(score * (len(hits) / 5.0) * 1.3, _CAPS["C-06"])
@@ -326,7 +355,7 @@ class CompoundPatternEngine:
             ),
         }
         hits = {k: v for k, v in components.items() if v is not None}
-        if len(hits) < 3:
+        if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
         confidence = min(score * 0.9, _CAPS["C-07"])
@@ -367,7 +396,7 @@ class CompoundPatternEngine:
             ),
         }
         hits = {k: v for k, v in components.items() if v is not None}
-        if len(hits) < 3:
+        if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
         confidence = min(score * (len(hits) / 4.0) * 1.1, _CAPS["C-08"])
@@ -399,7 +428,7 @@ class CompoundPatternEngine:
             "balanced_talk": _sig(signals, "conversation_balance", "well_balanced"),
         }
         hits = {k: v for k, v in components.items() if v is not None}
-        if len(hits) < 3:
+        if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
         confidence = min(score * (len(hits) / 5.0) * 1.2, _CAPS["C-09"])
@@ -429,7 +458,7 @@ class CompoundPatternEngine:
             "direct_gaze":   _sig(signals, "screen_contact", "sustained_eye_contact"),
         }
         hits = {k: v for k, v in components.items() if v is not None}
-        if len(hits) < 3:
+        if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
         confidence = min(score * (len(hits) / 5.0) * 1.1, _CAPS["C-10"])
@@ -461,7 +490,7 @@ class CompoundPatternEngine:
             ),
         }
         hits = {k: v for k, v in components.items() if v is not None}
-        if len(hits) < 3:
+        if len(hits) < 3 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
         confidence = min(score * (len(hits) / 4.0) * 0.9, _CAPS["C-11"])
@@ -496,7 +525,7 @@ class CompoundPatternEngine:
             ),
         }
         hits = {k: v for k, v in components.items() if v is not None}
-        if len(hits) < 3:
+        if len(hits) < 4 or _agent_diversity(hits) < 3:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
         # No multiplier — keep it conservative; hard cap at 0.50
