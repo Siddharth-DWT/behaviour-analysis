@@ -91,15 +91,12 @@ export default function Layout({ children }: { children: ReactNode }) {
             return (
               <Link
                 key={item.path}
-                to={item.disabled ? "#" : item.path}
+                to={item.path}
                 className={`flex items-center gap-3 px-4 py-2.5 text-sm transition-colors ${
-                  item.disabled
-                    ? "cursor-not-allowed opacity-30"
-                    : active
+                  active
                     ? "bg-accent-blue-10 text-nexus-accent-blue"
                     : "text-nexus-text-secondary hover:bg-nexus-surface-hover hover:text-nexus-text-primary"
                 }`}
-                onClick={(e) => item.disabled && e.preventDefault()}
                 title={item.label}
               >
                 <Icon className="h-4 w-4 shrink-0" />
@@ -184,14 +181,6 @@ export default function Layout({ children }: { children: ReactNode }) {
                       <User className="h-3.5 w-3.5" />
                       Profile
                     </button>
-                    <button
-                      onClick={() => setMenuOpen(false)}
-                      className="flex w-full items-center gap-2 px-3 py-2 text-xs text-nexus-text-secondary hover:bg-nexus-surface-hover"
-                    >
-                      <Settings className="h-3.5 w-3.5" />
-                      Settings
-                    </button>
-
                     <div className="border-t border-nexus-border" />
 
                     <button
