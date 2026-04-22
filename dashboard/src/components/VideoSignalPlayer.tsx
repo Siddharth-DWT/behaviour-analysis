@@ -285,13 +285,6 @@ const CATEGORIES: { key: string; label: string }[] = [
   { key: "compound", label: "Patterns" },
 ];
 
-// y-offset per category lane in the timeline bar (px from top, bar height = 36px)
-const LANE_TOP: Record<string, number> = {
-  face: 2,
-  body: 10,
-  gaze: 18,
-  compound: 26,
-};
 
 function resolveColor(
   config: SignalConfigEntry,
@@ -483,19 +476,21 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
           )}
         </div>
 
-        {/* Right panel: video */}
+        {/* Right panel: video — 9:16 portrait */}
         <div className="relative flex flex-1 items-center justify-center">
+          <div className="relative" style={{ aspectRatio: "9/16", maxHeight: 360, width: "auto" }}>
           <video
             ref={videoRef}
             src={videoUrl}
             controls
-            className="max-h-[360px] max-w-full"
+            className="h-full w-full object-contain"
           />
           {hasIncongruence && (
             <div className="pointer-events-none absolute right-2 top-2 animate-pulse rounded-full bg-red-500/80 px-3 py-1.5 text-xs font-bold text-white backdrop-blur-sm">
               ! Incongruence Detected
             </div>
           )}
+          </div>
         </div>
 
       </div>
@@ -511,72 +506,64 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
           </span>
         </div>
 
-        {/* Lane labels + bar */}
-        <div className="flex gap-2">
-          {/* Y-axis labels */}
-          <div className="flex w-12 flex-shrink-0 flex-col justify-around py-0.5">
-            {CATEGORIES.map((c) => (
-              <span
-                key={c.key}
-                className={`text-[8px] leading-tight ${
-                  enabledCategories.has(c.key)
-                    ? "text-nexus-text-muted"
-                    : "text-nexus-text-muted/30"
-                }`}
-              >
-                {c.label}
-              </span>
-            ))}
-          </div>
+        {/* Lane rows — one per category, labels & bars perfectly aligned */}
+        <div className="flex flex-col gap-px">
+          {CATEGORIES.map((c) => {
+            const laneDots = timelineDots.filter(
+              (s) => SIGNAL_CONFIG[s.signal_type]?.category === c.key
+            );
+            const active = enabledCategories.has(c.key);
+            return (
+              <div key={c.key} className="flex items-center gap-2" style={{ height: 10 }}>
+                {/* Label */}
+                <span
+                  className={`w-12 flex-shrink-0 text-[8px] leading-none ${
+                    active ? "text-nexus-text-muted" : "text-nexus-text-muted/30"
+                  }`}
+                >
+                  {c.label}
+                </span>
 
-          {/* Timeline bar */}
-          <div
-            className="relative flex-1 cursor-crosshair rounded bg-nexus-bg"
-            style={{ height: 36 }}
-            onClick={(e) => {
-              const rect = e.currentTarget.getBoundingClientRect();
-              const pct = (e.clientX - rect.left) / rect.width;
-              seekTo(pct * durationMs);
-            }}
-          >
-            {/* Playhead */}
-            {durationMs > 0 && (
-              <div
-                className="pointer-events-none absolute bottom-0 top-0 w-px bg-white/80 z-10"
-                style={{ left: `${playheadPct}%` }}
-              />
-            )}
-
-            {/* Signal dots */}
-            {timelineDots.map((s, i) => {
-              const cfg = SIGNAL_CONFIG[s.signal_type];
-              if (!cfg || durationMs === 0) return null;
-              const color = resolveColor(cfg, s);
-              const left = (s.start_ms / durationMs) * 100;
-              const width = Math.max(
-                ((s.end_ms - s.start_ms) / durationMs) * 100,
-                0.4
-              );
-              const top = LANE_TOP[cfg.category] ?? 2;
-              return (
+                {/* Bar for this lane */}
                 <div
-                  key={`dot-${s.signal_type}-${s.start_ms}-${i}`}
-                  className="absolute h-1.5 rounded-full opacity-70 transition-opacity hover:opacity-100"
-                  style={{
-                    left: `${left}%`,
-                    width: `${width}%`,
-                    top,
-                    backgroundColor: color,
-                  }}
-                  title={`${cfg.label(s)} @ ${(s.start_ms / 1000).toFixed(1)}s`}
+                  className="relative flex-1 h-full cursor-crosshair rounded-sm bg-nexus-bg"
                   onClick={(e) => {
-                    e.stopPropagation();
-                    seekTo(s.start_ms);
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const pct = (e.clientX - rect.left) / rect.width;
+                    seekTo(pct * durationMs);
                   }}
-                />
-              );
-            })}
-          </div>
+                >
+                  {/* Playhead */}
+                  {durationMs > 0 && (
+                    <div
+                      className="pointer-events-none absolute inset-y-0 w-px bg-white/80 z-10"
+                      style={{ left: `${playheadPct}%` }}
+                    />
+                  )}
+                  {/* Signal segments */}
+                  {laneDots.map((s, i) => {
+                    const cfg = SIGNAL_CONFIG[s.signal_type];
+                    if (!cfg || durationMs === 0) return null;
+                    const color = resolveColor(cfg, s);
+                    const left = (s.start_ms / durationMs) * 100;
+                    const width = Math.max(
+                      ((s.end_ms - s.start_ms) / durationMs) * 100,
+                      0.4
+                    );
+                    return (
+                      <div
+                        key={`${s.signal_type}-${s.start_ms}-${i}`}
+                        className="absolute inset-y-0.5 rounded-full opacity-75 hover:opacity-100 transition-opacity"
+                        style={{ left: `${left}%`, width: `${width}%`, backgroundColor: color }}
+                        title={`${cfg.label(s)} @ ${(s.start_ms / 1000).toFixed(1)}s`}
+                        onClick={(e) => { e.stopPropagation(); seekTo(s.start_ms); }}
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
 
