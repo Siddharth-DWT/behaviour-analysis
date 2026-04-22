@@ -1316,9 +1316,8 @@ async def list_sessions_endpoint(
     session_type: Optional[str] = Query(default=None),
     current_user: dict = Depends(get_current_user),
 ):
-    """List sessions with pagination and optional filters. User-scoped (admin sees all).
-    Pass session_type=lightweight to get lightweight (transcript/diarize) sessions only."""
-    user_id = None if current_user["role"] == "admin" else current_user["id"]
+    """List sessions with pagination and optional filters."""
+    user_id = None
     try:
         sessions, total = await list_sessions(
             limit=limit,
@@ -1356,9 +1355,6 @@ async def get_session_detail(session_id: str, current_user: dict = Depends(get_c
     if not session:
         raise HTTPException(404, "Session not found")
 
-    # Ownership check: user can only see their own sessions (admin sees all)
-    if current_user["role"] != "admin" and str(session.get("user_id", "")) != current_user["id"]:
-        raise HTTPException(404, "Session not found")
 
     # Fetch related data in parallel-ish
     signals = await get_signals(session_id, limit=5000)
@@ -1396,7 +1392,7 @@ async def get_session_signals(
     signal_type: Optional[str] = Query(default=None),
     limit: int = Query(default=100, ge=1, le=5000),
     offset: int = Query(default=0, ge=0),
-    current_user: dict = Depends(get_current_user),
+    _: dict = Depends(get_current_user),
 ):
     """Get signals for a session with optional filtering by agent/type."""
     import uuid as _uuid
@@ -1408,8 +1404,6 @@ async def get_session_signals(
     if not session:
         raise HTTPException(404, "Session not found")
 
-    if current_user["role"] != "admin" and str(session.get("user_id", "")) != current_user["id"]:
-        raise HTTPException(404, "Session not found")
 
     signals = await get_signals(
         session_id,
@@ -1438,7 +1432,7 @@ async def get_session_signals(
 async def get_session_report(
     session_id: str,
     regenerate: bool = Query(default=False),
-    current_user: dict = Depends(get_current_user),
+    _: dict = Depends(get_current_user),
 ):
     """
     Get the narrative report for a session.
@@ -1453,8 +1447,6 @@ async def get_session_report(
     if not session:
         raise HTTPException(404, "Session not found")
 
-    if current_user["role"] != "admin" and str(session.get("user_id", "")) != current_user["id"]:
-        raise HTTPException(404, "Session not found")
 
     # Return existing report unless regenerate requested
     if not regenerate:
@@ -1534,7 +1526,7 @@ async def get_session_progress(session_id: str, current_user: dict = Depends(get
 # ─────────────────────────────────────────────────────────
 
 @app.get("/sessions/{session_id}/transcript")
-async def get_session_transcript(session_id: str, current_user: dict = Depends(get_current_user)):
+async def get_session_transcript(session_id: str, _: dict = Depends(get_current_user)):
     """Get transcript segments for a session."""
     import uuid as _uuid
     try:
@@ -1545,8 +1537,6 @@ async def get_session_transcript(session_id: str, current_user: dict = Depends(g
     if not session:
         raise HTTPException(404, "Session not found")
 
-    if current_user["role"] != "admin" and str(session.get("user_id", "")) != current_user["id"]:
-        raise HTTPException(404, "Session not found")
 
     segments = await get_transcript(session_id)
 
@@ -1591,7 +1581,7 @@ _VIDEO_OVERLAY_TYPES = [
 @app.get("/sessions/{session_id}/video-signals")
 async def get_video_signals(
     session_id: str,
-    current_user: dict = Depends(get_current_user),
+    _: dict = Depends(get_current_user),
 ):
     """Return video + fusion signals for playback overlay, ordered by window start."""
     import uuid as _uuid
@@ -1603,8 +1593,6 @@ async def get_video_signals(
     if not session:
         raise HTTPException(404, "Session not found")
 
-    if current_user["role"] != "admin" and str(session.get("user_id", "")) != current_user["id"]:
-        raise HTTPException(404, "Session not found")
 
     pool = await get_pool()
     rows = await pool.fetch(
@@ -1691,10 +1679,6 @@ async def get_session_video(
     if not session:
         raise HTTPException(404, "Session not found")
 
-    user_role = payload.get("role", "viewer")
-    user_id = payload.get("sub", "")
-    if user_role != "admin" and str(session.get("user_id", "")) != user_id:
-        raise HTTPException(404, "Session not found")
 
     media_url = session.get("media_url")
     if not media_url:
@@ -1750,10 +1734,6 @@ async def get_annotated_video(
     if not session:
         raise HTTPException(404, "Session not found")
 
-    user_role = payload.get("role", "viewer")
-    user_id = payload.get("sub", "")
-    if user_role != "admin" and str(session.get("user_id", "")) != user_id:
-        raise HTTPException(404, "Session not found")
 
     # Support both webm (new) and mp4 (legacy) annotated videos
     overlay_path = OVERLAY_DIR / f"{session_id}_annotated.webm"
@@ -2175,8 +2155,6 @@ async def chat_with_session(
     session = await get_session(session_id, current_user.get("org_id"))
     if not session:
         raise HTTPException(404, "Session not found")
-    if current_user["role"] != "admin" and str(session["user_id"]) != current_user["id"]:
-        raise HTTPException(403, "Access denied")
 
     question = body.question.strip()
     if not question:
@@ -2344,8 +2322,6 @@ async def get_chat_history(
     session = await get_session(session_id, current_user.get("org_id", ""))
     if not session:
         raise HTTPException(404, "Session not found")
-    if current_user["role"] != "admin" and str(session["user_id"]) != current_user["id"]:
-        raise HTTPException(403, "Access denied")
 
     rows = await pool.fetch(
         """
