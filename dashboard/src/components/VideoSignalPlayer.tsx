@@ -518,7 +518,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
             );
             const active = enabledCategories.has(c.key);
             return (
-              <div key={c.key} className="flex items-stretch gap-2" style={{ height: 12 }}>
+              <div key={c.key} className="flex items-stretch gap-2" style={{ height: 16 }}>
                 {/* Label */}
                 <span
                   className={`w-12 flex-shrink-0 self-center text-[8px] leading-none ${
@@ -531,7 +531,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                 {/* Bar for this lane */}
                 <div
                   className="relative flex-1 overflow-hidden cursor-crosshair rounded-sm bg-nexus-bg"
-                  style={{ height: 12 }}
+                  style={{ height: 16 }}
                   onClick={(e) => {
                     const rect = e.currentTarget.getBoundingClientRect();
                     const pct = (e.clientX - rect.left) / rect.width;
@@ -546,24 +546,26 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                     />
                   )}
                   {/* Signal segments */}
-                  {laneDots.map((s, i) => {
-                    const cfg = SIGNAL_CONFIG[s.signal_type];
-                    if (!cfg) return null;
+                  {(() => {
                     const effectiveDuration = durationMs > 0 ? durationMs : (signals.length > 0 ? Math.max(...signals.map(x => x.end_ms)) : 1);
-                    const color = resolveColor(cfg, s);
-                    const left = Math.max(0, Math.min((s.start_ms / effectiveDuration) * 100, 100));
-                    const rawWidth = Math.max(((s.end_ms - s.start_ms) / effectiveDuration) * 100, 0.5);
-                    const width = Math.min(rawWidth, 100 - left);
-                    return (
-                      <div
-                        key={`${s.signal_type}-${s.start_ms}-${i}`}
-                        className="absolute rounded-full opacity-75 hover:opacity-100 transition-opacity"
-                        style={{ left: `${left}%`, width: `${width}%`, top: 2, bottom: 2, backgroundColor: color }}
-                        title={`${cfg.label(s)} @ ${(s.start_ms / 1000).toFixed(1)}s`}
-                        onClick={(e) => { e.stopPropagation(); seekTo(s.start_ms); }}
-                      />
-                    );
-                  })}
+                    return laneDots.map((s, i) => {
+                      const cfg = SIGNAL_CONFIG[s.signal_type];
+                      if (!cfg) return null;
+                      const color = resolveColor(cfg, s);
+                      const left = Math.max(0, Math.min((s.start_ms / effectiveDuration) * 100, 100));
+                      const rawWidth = Math.max(((s.end_ms - s.start_ms) / effectiveDuration) * 100, 0.5);
+                      const width = Math.min(rawWidth, 100 - left);
+                      return (
+                        <div
+                          key={`${s.signal_type}-${s.start_ms}-${i}`}
+                          className="absolute rounded-sm opacity-80 hover:opacity-100 transition-opacity"
+                          style={{ left: `${left}%`, width: `${width}%`, minWidth: '3px', top: 1, bottom: 1, backgroundColor: color }}
+                          title={`${cfg.label(s)} @ ${(s.start_ms / 1000).toFixed(1)}s`}
+                          onClick={(e) => { e.stopPropagation(); seekTo(s.start_ms); }}
+                        />
+                      );
+                    });
+                  })()}
                 </div>
               </div>
             );
