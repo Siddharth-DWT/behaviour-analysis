@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useParams, Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -520,6 +520,31 @@ export default function SessionDetail() {
     queryFn: () => getVideoSignals(id!),
     enabled: !!id && !!detail?.session?.media_url,
   });
+
+  useEffect(() => {
+    if (!signalData) return;
+    const byAgent: Record<string, number> = {};
+    for (const s of signalData.signals) {
+      const a = s.agent ?? "unknown";
+      byAgent[a] = (byAgent[a] ?? 0) + 1;
+    }
+    console.log(`[SessionDetail] signals loaded: ${signalData.signals.length} total`, byAgent);
+  }, [signalData]);
+
+  useEffect(() => {
+    if (!videoSignalData) return;
+    const byAgent: Record<string, number> = {};
+    const byType: Record<string, number> = {};
+    for (const s of videoSignalData.signals) {
+      const a = s.agent ?? "unknown";
+      byAgent[a] = (byAgent[a] ?? 0) + 1;
+      byType[s.signal_type] = (byType[s.signal_type] ?? 0) + 1;
+    }
+    console.group(`[SessionDetail] video signals: ${videoSignalData.signals.length}`);
+    console.log("By agent:", byAgent);
+    console.log("By signal_type:", byType);
+    console.groupEnd();
+  }, [videoSignalData]);
 
   if (loadingDetail) {
     return (

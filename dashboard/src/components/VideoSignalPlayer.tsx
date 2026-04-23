@@ -435,6 +435,42 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
     return cfg && enabledCategories.has(cfg.category);
   });
 
+  useEffect(() => {
+    const byCategory: Record<string, number> = { face: 0, body: 0, gaze: 0, compound: 0 };
+    const noConfig: string[] = [];
+    for (const s of signals) {
+      const cfg = SIGNAL_CONFIG[s.signal_type];
+      if (cfg) byCategory[cfg.category]++;
+      else if (!noConfig.includes(s.signal_type)) noConfig.push(s.signal_type);
+    }
+    const dots = signals.filter((s) => {
+      const cfg = SIGNAL_CONFIG[s.signal_type];
+      return cfg && enabledCategories.has(cfg.category);
+    });
+    console.group(`[VideoSignalPlayer] signals=${signals.length} timelineDots=${dots.length}`);
+    console.log("All signals by category:", byCategory);
+    console.log("Timeline dots per lane:", {
+      face:     dots.filter((s) => SIGNAL_CONFIG[s.signal_type]?.category === "face").length,
+      body:     dots.filter((s) => SIGNAL_CONFIG[s.signal_type]?.category === "body").length,
+      gaze:     dots.filter((s) => SIGNAL_CONFIG[s.signal_type]?.category === "gaze").length,
+      compound: dots.filter((s) => SIGNAL_CONFIG[s.signal_type]?.category === "compound").length,
+    });
+    console.log("Enabled categories:", [...enabledCategories]);
+    console.log("Selected speaker:", selectedSpeaker);
+    if (noConfig.length) console.warn("Signal types with no SIGNAL_CONFIG entry (invisible):", noConfig);
+    console.groupEnd();
+  }, [signals, enabledCategories, selectedSpeaker]);
+
+  useEffect(() => {
+    if (durationMs > 0)
+      console.log(`[VideoSignalPlayer] video duration set: ${(durationMs / 1000).toFixed(1)}s`);
+  }, [durationMs]);
+
+  useEffect(() => {
+    if (annotatedAvailable)
+      console.log("[VideoSignalPlayer] annotated video is ready");
+  }, [annotatedAvailable]);
+
   return (
     <div className="w-full space-y-3">
       {/* Video Playback — badges panel left, video right */}
