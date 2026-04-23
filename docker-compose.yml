@@ -326,7 +326,7 @@ services:
     ports:
       - "3006:3000"
     environment:
-      - API_GATEWAY_URL=http://api:8000
+      - API_GATEWAY_URL=https://analysis-be.pathtodeal.com
     volumes:
       - ./dashboard:/app
       - /app/node_modules
