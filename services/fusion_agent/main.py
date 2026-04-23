@@ -176,12 +176,19 @@ async def analyse_signals(request: AnalyseRequest):
     )
 
     # ── Step 1: Buffer signals ──
+    t_step = time.time()
     buffer = SignalBuffer()
     buffer.add_many(pure_voice_dicts)
     buffer.add_many(language_dicts)
     buffer.add_many(video_dicts)
 
+    logger.info(
+        f"[{session_id}] Step 1 done: buffered {len(pure_voice_dicts)+len(language_dicts)+len(video_dicts)} signals "
+        f"for {len(buffer.speakers)} speakers in {time.time()-t_step:.2f}s"
+    )
+
     # ── Step 2: Run fusion per speaker (parallel via asyncio.gather) ──
+    t_step = time.time()
     speakers = buffer.speakers
     all_fusion_signals = []
     all_unified_states = []
@@ -335,7 +342,13 @@ async def analyse_signals(request: AnalyseRequest):
             all_unified_states.append(asdict(result["state"]))
         all_alerts.extend(result["alerts"])
 
+    logger.info(
+        f"[{session_id}] Step 2 done: pairwise+compound fusion "
+        f"{len(all_fusion_signals)} signals, {len(all_alerts)} alerts in {time.time()-t_step:.2f}s"
+    )
+
     # ── Step 2.5: Temporal patterns (Phase 2G) — session-level, full signal set ──
+    t_step = time.time()
     if temporal_engine is not None:
         all_source_sigs = pure_voice_dicts + language_dicts + video_dicts
         if all_source_sigs:
@@ -361,6 +374,8 @@ async def analyse_signals(request: AnalyseRequest):
                     f"[{session_id}] Speaker {sid}: {len(temporal_sigs)} temporal pattern signals"
                 )
             all_fusion_signals.extend(temporal_sigs)
+
+    logger.info(f"[{session_id}] Step 2.5 done: temporal patterns in {time.time()-t_step:.2f}s")
 
     # ── Step 3: Publish to Redis ──
     if HAS_MESSAGE_BUS:
@@ -410,6 +425,7 @@ async def analyse_signals(request: AnalyseRequest):
         conversation_summary = request.voice_summary.get("conversation", {})
 
     # ── Step 4: Build signal graph + analytics ──
+    t_step = time.time()
     graph_json = {}
     key_paths = []
     graph_insights = {}
@@ -449,10 +465,13 @@ async def analyse_signals(request: AnalyseRequest):
     except Exception as e:
         logger.warning(f"[{session_id}] Signal graph/analytics failed (non-fatal): {e}")
 
+    logger.info(f"[{session_id}] Step 4 done: signal graph built in {time.time()-t_step:.2f}s")
+
     # ── Step 5: Generate narrative report ──
     report = None
     if request.generate_report:
-        logger.info(f"[{session_id}] Generating narrative report...")
+        t_step = time.time()
+        logger.info(f"[{session_id}] Step 5: Generating narrative report...")
 
         all_timestamps = [
             _to_int(s.get("window_end_ms", 0))
@@ -475,10 +494,13 @@ async def analyse_signals(request: AnalyseRequest):
             conversation_summary=conversation_summary,
         )
 
+    if request.generate_report:
+        logger.info(f"[{session_id}] Step 5 done: narrative report in {time.time()-t_step:.2f}s")
+
     # ── Build summary ──
     elapsed = time.time() - start_time
     logger.info(
-        f"[{session_id}] Fusion complete: "
+        f"[{session_id}] Fusion Agent complete: "
         f"{len(all_fusion_signals)} fusion signals, "
         f"{len(all_alerts)} alerts, "
         f"{len(all_unified_states)} speaker states in {elapsed:.1f}s"

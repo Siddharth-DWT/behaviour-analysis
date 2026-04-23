@@ -146,8 +146,13 @@ app.add_middleware(
 # ── Request access logger (replaces missing --access-log) ──
 class AccessLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next):
+        t0 = time.time()
         response = await call_next(request)
-        logger.info(f"{request.method} {request.url.path} → {response.status_code}")
+        elapsed_ms = (time.time() - t0) * 1000
+        qs = f"?{request.url.query}" if request.url.query else ""
+        logger.info(
+            f"{request.method} {request.url.path}{qs} → {response.status_code} ({elapsed_ms:.0f}ms)"
+        )
         return response
 
 app.add_middleware(AccessLogMiddleware)
@@ -1324,6 +1329,10 @@ async def list_sessions_endpoint(
     current_user: dict = Depends(get_current_user),
 ):
     """List sessions with pagination and optional filters."""
+    logger.info(
+        f"GET /sessions user={current_user.get('email', 'unknown')} "
+        f"limit={limit} offset={offset} status={status} meeting_type={meeting_type} session_type={session_type}"
+    )
     user_id = None
     try:
         sessions, total = await list_sessions(
@@ -1353,6 +1362,7 @@ async def list_sessions_endpoint(
 @app.get("/sessions/{session_id}")
 async def get_session_detail(session_id: str, current_user: dict = Depends(get_current_user)):
     """Get session detail including signals, alerts, and unified states."""
+    logger.info(f"[{session_id}] GET /sessions/{{id}} user={current_user.get('email', 'unknown')}")
     import uuid as _uuid
     try:
         _uuid.UUID(session_id)
@@ -1402,6 +1412,10 @@ async def get_session_signals(
     _: dict = Depends(get_current_user),
 ):
     """Get signals for a session with optional filtering by agent/type."""
+    logger.info(
+        f"[{session_id}] GET /sessions/{{id}}/signals agent={agent} signal_type={signal_type} "
+        f"limit={limit} offset={offset}"
+    )
     import uuid as _uuid
     try:
         _uuid.UUID(session_id)
@@ -1445,6 +1459,7 @@ async def get_session_report(
     Get the narrative report for a session.
     If no report exists (or regenerate=True), triggers Fusion Agent to generate one.
     """
+    logger.info(f"[{session_id}] GET /sessions/{{id}}/report regenerate={regenerate}")
     import uuid as _uuid
     try:
         _uuid.UUID(session_id)
@@ -1535,6 +1550,7 @@ async def get_session_progress(session_id: str, current_user: dict = Depends(get
 @app.get("/sessions/{session_id}/transcript")
 async def get_session_transcript(session_id: str, _: dict = Depends(get_current_user)):
     """Get transcript segments for a session."""
+    logger.info(f"[{session_id}] GET /sessions/{{id}}/transcript")
     import uuid as _uuid
     try:
         _uuid.UUID(session_id)
@@ -1591,6 +1607,7 @@ async def get_video_signals(
     _: dict = Depends(get_current_user),
 ):
     """Return video + fusion signals for playback overlay, ordered by window start."""
+    logger.info(f"[{session_id}] GET /sessions/{{id}}/video-signals")
     import uuid as _uuid
     try:
         _uuid.UUID(session_id)
@@ -1818,6 +1835,8 @@ async def _call_voice_agent(
     analysis_config: Optional[dict] = None,
 ) -> dict:
     """Call Voice Agent POST /analyse with file path."""
+    t0 = time.time()
+    logger.info(f"[{session_id}] → Voice Agent /analyse ({Path(file_path).name}, meeting_type={meeting_type})")
     payload: dict[str, Any] = {
         "file_path": file_path,
         "session_id": session_id,
@@ -1835,7 +1854,12 @@ async def _call_voice_agent(
             json=payload,
         )
         resp.raise_for_status()
-        return resp.json()
+        result = resp.json()
+    logger.info(
+        f"[{session_id}] ← Voice Agent: {len(result.get('signals', []))} signals, "
+        f"{len(result.get('speakers', []))} speakers in {time.time()-t0:.1f}s"
+    )
+    return result
 
 
 async def _call_language_agent(
@@ -1844,6 +1868,8 @@ async def _call_language_agent(
     meeting_type: str,
 ) -> dict:
     """Call Language Agent POST /analyse with transcript segments."""
+    t0 = time.time()
+    logger.info(f"[{session_id}] → Language Agent /analyse ({len(segments)} segments, meeting_type={meeting_type})")
     async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
         resp = await client.post(
             f"{LANGUAGE_AGENT_URL}/analyse",
@@ -1855,7 +1881,9 @@ async def _call_language_agent(
             },
         )
         resp.raise_for_status()
-        return resp.json()
+        result = resp.json()
+    logger.info(f"[{session_id}] ← Language Agent: {len(result.get('signals', []))} signals in {time.time()-t0:.1f}s")
+    return result
 
 
 async def _call_conversation_agent(
@@ -1864,7 +1892,9 @@ async def _call_conversation_agent(
     meeting_type: str,
 ) -> dict:
     """Call Conversation Agent POST /analyse with transcript segments."""
+    t0 = time.time()
     speakers = list(set(seg.get("speaker", "unknown") for seg in segments))
+    logger.info(f"[{session_id}] → Conversation Agent /analyse ({len(segments)} segments, {len(speakers)} speakers)")
     async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
         resp = await client.post(
             f"{CONVERSATION_AGENT_URL}/analyse",
@@ -1876,7 +1906,9 @@ async def _call_conversation_agent(
             },
         )
         resp.raise_for_status()
-        return resp.json()
+        result = resp.json()
+    logger.info(f"[{session_id}] ← Conversation Agent: {len(result.get('signals', []))} signals in {time.time()-t0:.1f}s")
+    return result
 
 
 async def _call_video_agent(
@@ -1888,7 +1920,12 @@ async def _call_video_agent(
 ) -> dict:
     """Call Video Agent POST /analyse with the video file."""
     import json as _json
+    t0 = time.time()
     video_file = Path(video_path)
+    logger.info(
+        f"[{session_id}] → Video Agent /analyse "
+        f"({video_file.name}, {len(diar_segments)} diarization segments, num_speakers={num_speakers})"
+    )
     with open(video_file, "rb") as f:
         video_bytes = f.read()
     async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
@@ -1903,7 +1940,12 @@ async def _call_video_agent(
             },
         )
         resp.raise_for_status()
-        return resp.json()
+        result = resp.json()
+    logger.info(
+        f"[{session_id}] ← Video Agent: {len(result.get('signals', []))} signals, "
+        f"{result.get('participant_count', 0)} participants in {time.time()-t0:.1f}s"
+    )
+    return result
 
 
 async def _call_fusion_agent(
@@ -1916,6 +1958,12 @@ async def _call_fusion_agent(
     video_signals: Optional[list[dict]] = None,
 ) -> dict:
     """Call Fusion Agent POST /analyse with all signals."""
+    t0 = time.time()
+    logger.info(
+        f"[{session_id}] → Fusion Agent /analyse "
+        f"({len(voice_signals)} voice + {len(language_signals)} language"
+        f"{f' + {len(video_signals)} video' if video_signals else ''} signals)"
+    )
     # Convert signals to FusionSignalInput format
     def _to_fusion_input(signal: dict, agent: str) -> dict:
         return {
@@ -1949,7 +1997,12 @@ async def _call_fusion_agent(
             },
         )
         resp.raise_for_status()
-        return resp.json()
+        result = resp.json()
+    logger.info(
+        f"[{session_id}] ← Fusion Agent: {len(result.get('fusion_signals', []))} fusion signals, "
+        f"{len(result.get('alerts', []))} alerts in {time.time()-t0:.1f}s"
+    )
+    return result
 
 
 def _extract_transcript_segments(voice_result: dict) -> list[dict]:

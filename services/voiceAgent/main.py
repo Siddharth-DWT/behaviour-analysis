@@ -217,6 +217,7 @@ async def analyse_audio(request: AnalysisRequest):
     # ── Step 1: Transcribe + diarise ──
     tc = request.transcription_config
     ac = request.analysis_config
+    t_step = time.time()
     logger.info(
         f"[{session_id}] Step 1: Transcribing "
         f"(num_speakers={request.num_speakers}, meeting_type={meeting_type}, "
@@ -245,7 +246,10 @@ async def analyse_audio(request: AnalysisRequest):
 
     duration_sec = transcript["duration_seconds"]
     speakers = list(set(seg["speaker"] for seg in transcript["segments"]))
-    logger.info(f"[{session_id}] Transcribed: {duration_sec:.1f}s, {len(speakers)} speakers, {len(transcript['segments'])} segments")
+    logger.info(
+        f"[{session_id}] Step 1 done: {duration_sec:.1f}s audio, {len(speakers)} speakers, "
+        f"{len(transcript['segments'])} segments in {time.time()-t_step:.1f}s"
+    )
 
     # ── Early return: transcript-only mode (behavioural analysis disabled) ──
     run_behavioural = getattr(ac, "run_behavioural", True) if ac else True
@@ -281,7 +285,8 @@ async def analyse_audio(request: AnalysisRequest):
         )
 
     # ── Step 2: Extract acoustic features ──
-    logger.info(f"[{session_id}] Step 2: Extracting features...")
+    t_step = time.time()
+    logger.info(f"[{session_id}] Step 2: Extracting acoustic features...")
     try:
         features_by_speaker = feature_extractor.extract_all(
             str(file_path),
@@ -297,11 +302,17 @@ async def analyse_audio(request: AnalysisRequest):
     # ── Step 3: Build baselines ──
     # Compute true speaking time per speaker from transcript (not feature windows)
     # so calibration confidence isn't penalised by skipped short windows.
+    total_windows = sum(len(v) for v in features_by_speaker.values())
+    logger.info(
+        f"[{session_id}] Step 2 done: {len(features_by_speaker)} speakers, "
+        f"{total_windows} windows extracted in {time.time()-t_step:.1f}s"
+    )
     transcript_speech = {}
     for seg in transcript["segments"]:
         spk = seg["speaker"]
         transcript_speech[spk] = transcript_speech.get(spk, 0.0) + (seg["end_ms"] - seg["start_ms"]) / 1000.0
 
+    t_step = time.time()
     logger.info(f"[{session_id}] Step 3: Calibrating baselines...")
     calibration = CalibrationModule()
     baselines = {}
@@ -317,7 +328,10 @@ async def analyse_audio(request: AnalysisRequest):
             f"confidence={baseline.calibration_confidence:.2f}"
         )
 
+    logger.info(f"[{session_id}] Step 3 done: baselines built in {time.time()-t_step:.1f}s")
+
     # ── Step 4: Run rules ──
+    t_step = time.time()
     logger.info(f"[{session_id}] Step 4: Running rule engine...")
     all_signals = []
 
@@ -350,9 +364,11 @@ async def analyse_audio(request: AnalysisRequest):
     if talk_time_signals:
         logger.info(f"[{session_id}] Talk time: {len(talk_time_signals)} imbalance signals")
 
+    logger.info(f"[{session_id}] Step 4 done: {len(all_signals)} signals in {time.time()-t_step:.1f}s")
+
     # ── Step 5: Build summary ──
     elapsed = time.time() - start_time
-    logger.info(f"[{session_id}] Complete: {len(all_signals)} signals in {elapsed:.1f}s")
+    logger.info(f"[{session_id}] Voice Agent complete: {len(all_signals)} signals in {elapsed:.1f}s")
 
     summary = _build_summary(all_signals, baselines, transcript)
 

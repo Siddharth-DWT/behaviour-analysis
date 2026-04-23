@@ -174,7 +174,8 @@ async def analyse_transcript(request: AnalysisRequest):
     logger.info(f"[{session_id}] Extracted features for {len(features_list)} segments")
 
     # ── Step 2: Run LLM tasks in parallel (sentiment + intent + entities) ──
-    logger.info(f"[{session_id}] Step 2: Running LLM tasks in parallel...")
+    t_llm = time.time()
+    logger.info(f"[{session_id}] Step 2: Running LLM tasks in parallel (sentiment + intent + entities)...")
 
     async def _safe_sentiment():
         try:
@@ -201,6 +202,10 @@ async def analyse_transcript(request: AnalysisRequest):
 
     sentiments, intent_signals, entities = await asyncio.gather(
         _safe_sentiment(), _safe_intent(), _safe_entities()
+    )
+    logger.info(
+        f"[{session_id}] Step 2 done: {len(sentiments)} sentiments, "
+        f"{len(intent_signals)} intents, entities={bool(entities)} in {time.time()-t_llm:.1f}s"
     )
 
     # ── Step 3: Merge sentiment into features ──
@@ -258,7 +263,7 @@ async def analyse_transcript(request: AnalysisRequest):
     # ── Step 5: Build summary ──
     elapsed = time.time() - start_time
     speakers = list(set(f.get("speaker_id", "unknown") for f in features_list))
-    logger.info(f"[{session_id}] Complete: {len(all_signals)} signals in {elapsed:.1f}s")
+    logger.info(f"[{session_id}] Language Agent complete: {len(all_signals)} signals in {elapsed:.1f}s")
 
     summary = _build_summary(all_signals, features_list, speakers, profile=_profile)
     summary["entities"] = entities
