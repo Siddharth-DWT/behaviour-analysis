@@ -149,10 +149,11 @@ class VideoAnalysisResponse(BaseModel):
     total_windows:         int
     speakers:              list[str]
     speaker_summaries:     list[SpeakerVideoSummary]
-    signals:               list[dict]    # populated by Phase 2B-D rule engines
+    signals:               list[dict]
     processing_time:       float
+    participant_count:     int = 0        # max faces detected in any single frame
     backend:               str = "mediapipe"
-    annotated_video_path:  Optional[str] = None    # path to landmark-overlay mp4
+    annotated_video_path:  Optional[str] = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -197,10 +198,10 @@ class VideoPipeline:
         logger.info(f"[{session_id}] Extracting video features from {Path(video_path).name}")
         overlay_dir  = Path(os.getenv("OVERLAY_DIR", "data/overlays"))
         overlay_dir.mkdir(parents=True, exist_ok=True)
-        overlay_path = str(overlay_dir / f"{session_id}_annotated.webm")
+        overlay_path = str(overlay_dir / f"{session_id}_annotated.mp4")
 
         windows: list[WindowFeatures] = self._extractor.extract_all(
-            video_path, overlay_output_path=overlay_path
+            video_path, overlay_output_path=overlay_path, meeting_type=meeting_type
         )
         logger.info(f"[{session_id}] {len(windows)} windows extracted")
 
@@ -256,6 +257,11 @@ class VideoPipeline:
             f"{len(all_signals)} signals, {elapsed:.1f}s"
         )
 
+        # Max faces detected in any single frame = visible participant count
+        participant_count = max((w.face_count for w in windows if hasattr(w, "face_count")), default=len(speakers))
+
+        logger.info(f"[{session_id}] Participant count (max faces/frame): {participant_count}")
+
         return VideoAnalysisResponse(
             session_id=session_id,
             duration_seconds=round(duration_sec, 2),
@@ -264,6 +270,7 @@ class VideoPipeline:
             speaker_summaries=summaries,
             signals=all_signals,
             processing_time=round(elapsed, 2),
+            participant_count=participant_count,
             annotated_video_path=final_overlay,
         )
 

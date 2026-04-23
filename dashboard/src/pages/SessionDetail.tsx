@@ -613,7 +613,13 @@ export default function SessionDetail() {
               </span>
               <span className="flex items-center gap-1">
                 <Users className="h-3 w-3" />
-                {session.speaker_count ?? "--"} speakers
+                {session.speaker_count ?? "--"} audio speakers
+                {session.participant_count != null &&
+                  session.participant_count !== session.speaker_count && (
+                    <span className="text-nexus-accent-blue">
+                      · {session.participant_count} visible
+                    </span>
+                )}
               </span>
               <span>
                 {format(new Date(session.created_at), "MMM d, yyyy 'at' h:mm a")}

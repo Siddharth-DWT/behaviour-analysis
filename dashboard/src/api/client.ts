@@ -95,6 +95,7 @@ export interface Session {
   media_url: string | null;
   duration_ms: number | null;
   speaker_count: number | null;
+  participant_count: number | null;
   created_at: string;
   started_at: string | null;
   completed_at: string | null;

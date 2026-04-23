@@ -97,6 +97,7 @@ class FrameFeatures:
 
     # ── Face ──────────────────────────────────────────────────────────────────
     face_detected: bool = False
+    face_count: int = 0                   # number of faces detected in this frame
     face_box_area: float = 0.0            # bounding box area (normalised, proxy for proximity)
 
     blendshapes: dict[str, float] = field(default_factory=dict)   # 52 named scores
@@ -142,6 +143,7 @@ class WindowFeatures:
     # ── Face presence ─────────────────────────────────────────────────────────
     face_detection_rate: float = 0.0    # fraction of frames where face was detected
     face_box_area_mean: float = 0.0     # mean normalised bounding-box area
+    face_count: int = 0                 # max faces detected in any frame of this window
 
     # ── Blendshapes ───────────────────────────────────────────────────────────
     blendshapes_mean: dict[str, float] = field(default_factory=dict)
@@ -349,6 +351,7 @@ class WindowAggregator:
         wf.face_detection_rate = len(face_frames) / len(frames)
         if face_frames:
             wf.face_box_area_mean = float(np.mean([f.face_box_area for f in face_frames]))
+            wf.face_count = max(f.face_count for f in face_frames)
 
         # ── Blendshapes ────────────────────────────────────────────────────────
         if face_frames:
@@ -517,15 +520,32 @@ class OverlayRenderer:
 
     def _draw_face_mesh(self, bgr: np.ndarray, face_result, h: int, w: int) -> None:
         import cv2
-        color = (0, 220, 50)
+        try:
+            import mediapipe as mp
+            tesselation = [(c.start, c.end) for c in mp.solutions.face_mesh.FACEMESH_TESSELATION]
+            contours    = [(c.start, c.end) for c in mp.solutions.face_mesh.FACEMESH_CONTOURS]
+        except Exception:
+            tesselation = []
+            contours    = [(self._FACE_OVAL[i], self._FACE_OVAL[i+1]) for i in range(len(self._FACE_OVAL)-1)]
+
+        color_tess    = (0, 200, 60)    # green mesh lines
+        color_contour = (0, 255, 120)   # brighter green for outer contours
+        color_dot     = (50, 255, 50)   # landmark dots
+
         for face_lm in face_result.face_landmarks:
             pts = [(int(lm.x * w), int(lm.y * h)) for lm in face_lm]
             n = len(pts)
-            for contour in (self._FACE_OVAL, self._LEFT_EYE, self._RIGHT_EYE, self._LIPS):
-                for i in range(len(contour) - 1):
-                    a, b = contour[i], contour[i + 1]
-                    if a < n and b < n:
-                        cv2.line(bgr, pts[a], pts[b], color, 1, cv2.LINE_AA)
+            # Full tessellation mesh
+            for a, b in tesselation:
+                if a < n and b < n:
+                    cv2.line(bgr, pts[a], pts[b], color_tess, 1, cv2.LINE_AA)
+            # Contour lines on top (brighter)
+            for a, b in contours:
+                if a < n and b < n:
+                    cv2.line(bgr, pts[a], pts[b], color_contour, 1, cv2.LINE_AA)
+            # Landmark dots — radius 2 so they're visible at 1080p
+            for pt in pts[:468]:
+                cv2.circle(bgr, pt, 2, color_dot, -1, cv2.LINE_AA)
 
     def _draw_pose(self, bgr: np.ndarray, pose_result, h: int, w: int) -> None:
         import cv2
@@ -601,9 +621,9 @@ class OverlayRenderer:
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         fw  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         fh  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        tmp = video_path + ".burn.webm"
+        tmp = video_path + ".burn.mp4"
 
-        fourcc = cv2.VideoWriter_fourcc(*"VP80")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(tmp, fourcc, fps, (fw, fh))
 
         frame_idx = 0
@@ -653,12 +673,26 @@ class VideoFeatureExtractor:
     - Dependency injection: model_dir and fps configurable via __init__
     """
 
+    # Max participants per meeting type — drives num_faces/poses/hands budget
+    _MEETING_FACE_BUDGET: dict[str, int] = {
+        "sales_call":     4,   # seller + buyer, maybe 1-2 more
+        "client_meeting": 6,   # client team can be larger
+        "interview":      3,   # interviewer(s) + candidate
+        "internal":       8,   # team meetings, larger groups
+        "podcast":        4,   # host + guests
+    }
+    _DEFAULT_FACE_BUDGET = 6
+
+    @classmethod
+    def faces_for_meeting(cls, meeting_type: str) -> int:
+        return cls._MEETING_FACE_BUDGET.get(meeting_type, cls._DEFAULT_FACE_BUDGET)
+
     def __init__(
         self,
         model_dir: str = "models/mediapipe",
         target_fps: int = TARGET_FPS,
         window_ms: int = WINDOW_MS,
-        num_faces: int = 2,
+        num_faces: int = _DEFAULT_FACE_BUDGET,
     ) -> None:
         self._model_mgr  = MediaPipeModelManager(model_dir)
         self._target_fps = target_fps
@@ -673,6 +707,7 @@ class VideoFeatureExtractor:
         self,
         video_path: str,
         overlay_output_path: Optional[str] = None,
+        meeting_type: str = "",
     ) -> list[WindowFeatures]:
         """
         Process video at target_fps and return aggregated window features.
@@ -680,11 +715,15 @@ class VideoFeatureExtractor:
         Args:
             video_path:           Path to mp4/webm/avi file.
             overlay_output_path:  If set, write a landmark-annotated mp4 here.
+            meeting_type:         Used to set the face/pose/hand detection budget.
 
         Returns:
             List of WindowFeatures, one per 2-second window.
             Empty list if video cannot be read or MediaPipe unavailable.
         """
+        if meeting_type:
+            self._num_faces = self.faces_for_meeting(meeting_type)
+            logger.info(f"Face budget for '{meeting_type}': {self._num_faces}")
         if not self._check_mediapipe():
             logger.error("MediaPipe not available — returning empty features.")
             return []
@@ -729,7 +768,7 @@ class VideoFeatureExtractor:
             fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             Path(overlay_output_path).parent.mkdir(parents=True, exist_ok=True)
-            fourcc = cv2.VideoWriter_fourcc(*"VP80")
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             writer = cv2.VideoWriter(overlay_output_path, fourcc, video_fps, (fw, fh))
             logger.info(f"Overlay output: {overlay_output_path}")
 
@@ -820,9 +859,9 @@ class VideoFeatureExtractor:
                 num_faces=self._num_faces,
                 output_face_blendshapes=True,
                 output_facial_transformation_matrixes=True,
-                min_face_detection_confidence=0.5,
-                min_face_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
+                min_face_detection_confidence=0.3,
+                min_face_presence_confidence=0.3,
+                min_tracking_confidence=0.3,
             )
         )
 
@@ -833,9 +872,9 @@ class VideoFeatureExtractor:
                 ),
                 running_mode=RunningMode.VIDEO,
                 num_poses=self._num_faces,
-                min_pose_detection_confidence=0.5,
-                min_pose_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
+                min_pose_detection_confidence=0.3,
+                min_pose_presence_confidence=0.3,
+                min_tracking_confidence=0.3,
             )
         )
 
@@ -845,10 +884,10 @@ class VideoFeatureExtractor:
                     model_asset_path=self._model_mgr.get_hand_landmarker_path()
                 ),
                 running_mode=RunningMode.VIDEO,
-                num_hands=2,
-                min_hand_detection_confidence=0.5,
-                min_hand_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
+                num_hands=self._num_faces * 2,
+                min_hand_detection_confidence=0.3,
+                min_hand_presence_confidence=0.3,
+                min_tracking_confidence=0.3,
             )
         )
 
@@ -873,6 +912,7 @@ class VideoFeatureExtractor:
         if face_result and face_result.face_landmarks:
             lm = face_result.face_landmarks[0]
             ff.face_detected = True
+            ff.face_count = len(face_result.face_landmarks)
             ff.face_box_area = self._face_box_area(lm)
             ff.face_luminance = self._compute_face_luminance(lm, rgb, h, w)
 

@@ -62,7 +62,17 @@ async def _ensure_upload_config_column(pool: asyncpg.Pool):
             "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS upload_config JSONB DEFAULT '{}'"
         )
     except Exception:
-        pass  # Column already exists or DB doesn't support IF NOT EXISTS — safe to ignore
+        pass
+
+
+async def _ensure_participant_count_column(pool: asyncpg.Pool):
+    """Add participant_count column to sessions if it doesn't exist yet (idempotent)."""
+    try:
+        await pool.execute(
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS participant_count INT"
+        )
+    except Exception:
+        pass
 
 
 async def create_session(
@@ -77,12 +87,13 @@ async def create_session(
     """Create a new session record. Returns the created session."""
     pool = await get_pool()
     await _ensure_upload_config_column(pool)
+    await _ensure_participant_count_column(pool)
     row = await pool.fetchrow(
         """
         INSERT INTO sessions (org_id, title, session_type, meeting_type, media_url, status, user_id, upload_config)
         VALUES ($1, $2, $3, $4, $5, 'created', $6, $7::jsonb)
         RETURNING id, org_id, title, session_type, meeting_type, status,
-                  media_url, duration_ms, speaker_count, user_id,
+                  media_url, duration_ms, speaker_count, participant_count, user_id,
                   created_at, started_at, completed_at, upload_config
         """,
         _uuid.UUID(org_id) if isinstance(org_id, str) else org_id,
@@ -96,10 +107,11 @@ async def create_session(
 async def get_session(session_id: str, org_id: str = DEV_ORG_ID) -> Optional[dict]:
     """Get a single session by ID, scoped to org."""
     pool = await get_pool()
+    await _ensure_participant_count_column(pool)
     row = await pool.fetchrow(
         """
         SELECT id, org_id, title, session_type, meeting_type, status,
-               media_url, duration_ms, speaker_count, user_id,
+               media_url, duration_ms, speaker_count, participant_count, user_id,
                created_at, started_at, completed_at
         FROM sessions
         WHERE id = $1 AND org_id = $2
@@ -167,7 +179,7 @@ async def list_sessions(
     rows = await pool.fetch(
         f"""
         SELECT id, org_id, title, session_type, meeting_type, status,
-               media_url, duration_ms, speaker_count, user_id,
+               media_url, duration_ms, speaker_count, participant_count, user_id,
                created_at, started_at, completed_at
         FROM sessions
         WHERE {where}
@@ -185,9 +197,11 @@ async def update_session_status(
     org_id: str = DEV_ORG_ID,
     duration_ms: Optional[int] = None,
     speaker_count: Optional[int] = None,
+    participant_count: Optional[int] = None,
 ):
     """Update session status and optional fields."""
     pool = await get_pool()
+    await _ensure_participant_count_column(pool)
 
     sets = ["status = $3"]
     params: list = [session_id, org_id, status]
@@ -210,6 +224,11 @@ async def update_session_status(
     if speaker_count is not None:
         sets.append(f"speaker_count = ${idx}")
         params.append(speaker_count)
+        idx += 1
+
+    if participant_count is not None:
+        sets.append(f"participant_count = ${idx}")
+        params.append(participant_count)
         idx += 1
 
     set_clause = ", ".join(sets)

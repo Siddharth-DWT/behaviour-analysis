@@ -57,6 +57,12 @@ export default function SessionCard({ session }: { session: Session }) {
             <span className="flex items-center gap-1">
               <Users className="h-3 w-3" />
               {session.speaker_count ?? "--"} speakers
+              {session.participant_count != null &&
+                session.participant_count !== session.speaker_count && (
+                  <span className="text-nexus-accent-blue">
+                    · {session.participant_count} visible
+                  </span>
+              )}
             </span>
             <span className="rounded bg-nexus-surface-hover px-1.5 py-0.5 font-mono">
               {MEETING_TYPE_LABELS[session.meeting_type] ?? session.meeting_type}

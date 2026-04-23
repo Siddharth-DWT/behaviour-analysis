@@ -131,6 +131,9 @@ app = FastAPI(
     title="NEXUS API Gateway",
     description="Central API for the NEXUS multi-agent behavioural analysis system",
     version="0.1.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 app.add_middleware(
@@ -1144,6 +1147,7 @@ async def _run_pipeline(
                 logger.warning(f"[{session_id}] Conversation signal persist failed: {e}")
 
     # ── Step 4c: Video Agent result (ran in parallel above; await here) ──
+    video_participant_count: int = 0
     if video_task is not None:
         _set_step(session_id, "video")
         try:
@@ -1151,6 +1155,8 @@ async def _run_pipeline(
             video_signals = video_result.get("signals", [])
             agent_status["video"] = "completed"
             logger.info(f"[{session_id}] Video Agent: {len(video_signals)} signals")
+            video_participant_count = video_result.get("participant_count", 0)
+            logger.info(f"[{session_id}] Participant count from video: {video_participant_count}")
         except Exception as e:
             agent_status["video"] = "failed"
             logger.warning(f"[{session_id}] Video Agent failed (non-fatal): {e}")
@@ -1250,6 +1256,7 @@ async def _run_pipeline(
         session_id, final_status,
         duration_ms=int(duration_seconds * 1000),
         speaker_count=speaker_count,
+        participant_count=video_participant_count if video_participant_count > 0 else None,
     )
 
     logger.info(f"[{session_id}] Pipeline complete (status={final_status}, agents={agent_status})")
@@ -1998,6 +2005,7 @@ async def _try_update_status(
     status: str,
     duration_ms: int = None,
     speaker_count: int = None,
+    participant_count: int = None,
 ):
     """Try to update session status, log warning on failure."""
     try:
@@ -2005,6 +2013,7 @@ async def _try_update_status(
             session_id, status,
             duration_ms=duration_ms,
             speaker_count=speaker_count,
+            participant_count=participant_count,
         )
     except Exception as e:
         logger.warning(f"[{session_id}] Status update failed: {e}")

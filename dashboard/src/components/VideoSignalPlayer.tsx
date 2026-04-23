@@ -438,7 +438,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   return (
     <div className="w-full space-y-3">
       {/* Video Playback — badges panel left, video right */}
-      <div className="flex overflow-hidden rounded-lg bg-black" style={{ minHeight: 410 }}>
+      <div className="flex overflow-hidden rounded-lg bg-black" style={{ minHeight: 580 }}>
 
         {/* Left panel: signal badges in the black area */}
         <div className="flex w-48 flex-shrink-0 flex-col justify-start gap-1 overflow-y-auto p-3">
@@ -482,7 +482,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
 
         {/* Right panel: video — 9:16 portrait */}
         <div className="relative flex flex-1 items-center justify-center">
-          <div className="relative" style={{ aspectRatio: "9/16", maxHeight: 410, width: "auto" }}>
+          <div className="relative" style={{ aspectRatio: "9/16", maxHeight: 580, width: "auto" }}>
           <video
             ref={videoRef}
             src={videoUrl}
