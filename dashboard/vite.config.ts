@@ -11,11 +11,22 @@ export default defineConfig({
   },
   server: {
     port: 3000,
-    host: true, // Listen on 0.0.0.0 (needed for Docker)
-    allowedHosts: ["analysis.pathtodeal.com", "localhost"],
+    host: true,
     proxy: {
       "/api": {
         target: process.env.API_GATEWAY_URL || "http://localhost:8000",
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/api/, ""),
+      },
+    },
+  },
+  preview: {
+    port: 3000,
+    host: true,
+    allowedHosts: ["analysis.pathtodeal.com"],
+    proxy: {
+      "/api": {
+        target: process.env.API_GATEWAY_URL || "http://api:8000",
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api/, ""),
       },
