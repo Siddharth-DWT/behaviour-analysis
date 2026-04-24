@@ -14,7 +14,7 @@ export default defineConfig({
     host: true,
     proxy: {
       "/api": {
-        target: process.env.API_GATEWAY_URL || "http://localhost:8000",
+        target: process.env.API_GATEWAY_URL || "https://analysis-be.pathtodeal.com",
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api/, ""),
       },
