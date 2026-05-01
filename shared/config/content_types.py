@@ -60,6 +60,30 @@ CONTENT_TYPE_CONFIG = {
 }
 
 
+# Speaker count defaults and ranges per meeting type.
+# Single source of truth — imported by voiceAgent/transcriber.py and
+# video_agent/feature_extractor.py so both services stay aligned.
+SPEAKER_DEFAULTS: dict[str, dict] = {
+    "sales_call":            {"default": 2, "min": 2, "max": 3,  "turn_gap_ms": 400},
+    "interview":             {"default": 2, "min": 2, "max": 4,  "turn_gap_ms": 600},
+    "internal":              {"default": 4, "min": 2, "max": 10, "turn_gap_ms": 800},
+    "client_meeting":        {"default": 3, "min": 2, "max": 10, "turn_gap_ms": 600},
+    "meeting":               {"default": 4, "min": 2, "max": 10, "turn_gap_ms": 800},
+    "podcast":               {"default": 2, "min": 2, "max": 4,  "turn_gap_ms": 600},
+    "lecture":               {"default": 1, "min": 1, "max": 2,  "turn_gap_ms": 1000},
+    "presentation":          {"default": 1, "min": 1, "max": 3,  "turn_gap_ms": 1000},
+    "debate":                {"default": 2, "min": 2, "max": 4,  "turn_gap_ms": 400},
+    "casual_conversation":   {"default": 2, "min": 2, "max": 4,  "turn_gap_ms": 400},
+}
+
+_SPEAKER_DEFAULTS_FALLBACK = {"default": 2, "min": 2, "max": 8, "turn_gap_ms": 600}
+
+
+def get_speaker_defaults(meeting_type: str) -> dict:
+    """Return speaker count defaults for a meeting type."""
+    return SPEAKER_DEFAULTS.get(meeting_type, _SPEAKER_DEFAULTS_FALLBACK)
+
+
 def get_config(content_type: str) -> dict:
     """Return config for a content type, falling back to sales_call."""
     return CONTENT_TYPE_CONFIG.get(content_type, CONTENT_TYPE_CONFIG["sales_call"])

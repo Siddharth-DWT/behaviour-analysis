@@ -1338,20 +1338,8 @@ class Transcriber:
     # Diarization mode from environment
     DIARIZATION_MODE = os.getenv("DIARIZATION_MODE", "auto")  # auto|pyannote|kmeans
 
-    # Speaker count defaults and ranges per meeting type
-    # turn_gap_ms: gap threshold for that conversation style
-    SPEAKER_DEFAULTS = {
-        "sales_call":            {"default": 2, "min": 2, "max": 3, "turn_gap_ms": 400},
-        "interview":             {"default": 2, "min": 2, "max": 4, "turn_gap_ms": 600},
-        "internal":              {"default": 4, "min": 2, "max": 10, "turn_gap_ms": 800},
-        "client_meeting":        {"default": 3, "min": 2, "max": 10, "turn_gap_ms": 600},
-        "meeting":               {"default": 4, "min": 2, "max": 10, "turn_gap_ms": 800},
-        "podcast":               {"default": 2, "min": 2, "max": 4, "turn_gap_ms": 600},
-        "lecture":               {"default": 1, "min": 1, "max": 2, "turn_gap_ms": 1000},
-        "presentation":          {"default": 1, "min": 1, "max": 3, "turn_gap_ms": 1000},
-        "debate":                {"default": 2, "min": 2, "max": 4, "turn_gap_ms": 400},
-        "casual_conversation":   {"default": 2, "min": 2, "max": 4, "turn_gap_ms": 400},
-    }
+    # Single source of truth lives in shared/config/content_types.py
+    from shared.config.content_types import SPEAKER_DEFAULTS
 
     def _estimate_speaker_count(self, segments: list[dict]) -> int:
         """
