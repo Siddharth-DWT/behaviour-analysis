@@ -114,7 +114,9 @@ RECORDING_RETENTION_DAYS = int(os.getenv("RECORDING_RETENTION_DAYS", "3"))
 OVERLAY_DIR = Path(os.getenv("OVERLAY_DIR", "data/overlays"))
 
 # ── HTTP client timeout (Voice Agent with Whisper can be slow) ──
-AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "1800"))  # 30 minutes
+AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "1800"))        # 30 minutes
+# Video annotation runs frame-by-frame (CPU) and can take 45-90 min for long recordings.
+VIDEO_AGENT_TIMEOUT = float(os.getenv("VIDEO_AGENT_TIMEOUT", "10800"))  # 3 hours
 
 # ── CORS origins (comma-separated list) ──
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:3006,http://localhost:5173").split(",")
@@ -126,6 +128,16 @@ _pipeline_progress: dict[str, str] = {}
 
 def _set_step(session_id: str, step: str) -> None:
     _pipeline_progress[session_id] = step
+
+# ── Chunked upload config ──
+CHUNK_UPLOAD_DIR = Path(os.getenv("CHUNK_UPLOAD_DIR", "data/chunks"))
+CHUNK_SIZE_BYTES  = 10 * 1024 * 1024          # 10 MB per chunk
+MAX_UPLOAD_SIZE   = 2 * 1024 * 1024 * 1024    # 2 GB total file limit
+UPLOAD_EXPIRY_HOURS = 24                       # abandon incomplete uploads after 24 h
+
+# upload_id → { user_id, filename, file_size, chunk_size, total_chunks,
+#               received_chunks: set, created_at, meeting_type, title, config }
+_upload_sessions: dict[str, dict] = {}
 
 app = FastAPI(
     title="NEXUS API Gateway",
@@ -175,11 +187,27 @@ def _cleanup_old_recordings():
         logger.info(f"Cleaned up {removed} recording(s) older than {RECORDING_RETENTION_DAYS} days")
 
 
+def _cleanup_expired_uploads():
+    """Delete incomplete chunked upload sessions older than UPLOAD_EXPIRY_HOURS."""
+    import shutil
+    cutoff = time.time() - (UPLOAD_EXPIRY_HOURS * 3600)
+    expired = [uid for uid, s in _upload_sessions.items() if s["created_at"] < cutoff]
+    for uid in expired:
+        _upload_sessions.pop(uid, None)
+        chunk_dir = CHUNK_UPLOAD_DIR / uid
+        if chunk_dir.exists():
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+    if expired:
+        logger.info(f"Cleaned up {len(expired)} expired chunked upload session(s)")
+
+
 @app.on_event("startup")
 async def startup():
     logger.info("Starting NEXUS API Gateway...")
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    CHUNK_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     _cleanup_old_recordings()
+    _cleanup_expired_uploads()
 
     try:
         await get_pool()
@@ -292,6 +320,15 @@ class ResendVerificationRequest(BaseModel):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
+
+class ChunkedUploadInitRequest(BaseModel):
+    filename:     str
+    file_size:    int
+    chunk_size:   int           = CHUNK_SIZE_BYTES
+    meeting_type: str           = "sales_call"
+    title:        str           = ""
+    config:       str           = "{}"
+
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -818,10 +855,230 @@ async def quick_transcribe_endpoint(
             pass
 
 
-# POST /sessions — Upload + full pipeline
+# ─────────────────────────────────────────────────────────
+# Chunked upload endpoints  (/uploads/*)
 # ─────────────────────────────────────────────────────────
 
+@app.post("/uploads/init")
+async def init_chunked_upload(
+    body: ChunkedUploadInitRequest,
+    current_user: dict = Depends(require_role("member")),
+):
+    """
+    Step 1 of 3 — initialise a chunked upload session.
+    Returns upload_id + total_chunks so the client knows how many pieces to send.
+    """
+    import math
+    suffix = Path(body.filename).suffix.lower()
+    allowed = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm", ".mp4"}
+    if suffix not in allowed:
+        raise HTTPException(400, f"Unsupported file type: {suffix}. Allowed: {', '.join(sorted(allowed))}")
+    if body.file_size <= 0:
+        raise HTTPException(400, "Invalid file size")
+    if body.file_size > MAX_UPLOAD_SIZE:
+        raise HTTPException(413, f"File too large. Maximum {MAX_UPLOAD_SIZE // (1024**3)} GB.")
 
+    upload_id   = str(uuid.uuid4())
+    chunk_size  = max(1, body.chunk_size)
+    total_chunks = math.ceil(body.file_size / chunk_size)
+
+    (CHUNK_UPLOAD_DIR / upload_id).mkdir(parents=True, exist_ok=True)
+
+    _upload_sessions[upload_id] = {
+        "upload_id":       upload_id,
+        "user_id":         current_user["id"],
+        "filename":        body.filename,
+        "file_size":       body.file_size,
+        "chunk_size":      chunk_size,
+        "total_chunks":    total_chunks,
+        "received_chunks": set(),
+        "created_at":      time.time(),
+        "meeting_type":    body.meeting_type,
+        "title":           body.title or Path(body.filename).stem,
+        "config":          body.config,
+    }
+    logger.info(
+        f"[upload:{upload_id}] init: {body.filename} "
+        f"({body.file_size / 1024 / 1024:.1f} MB, {total_chunks} chunks)"
+    )
+    return {"upload_id": upload_id, "chunk_size": chunk_size, "total_chunks": total_chunks}
+
+
+@app.post("/uploads/{upload_id}/chunk")
+async def upload_chunk(
+    upload_id:    str,
+    chunk_number: int        = Form(...),
+    chunk:        UploadFile = File(...),
+    current_user: dict       = Depends(require_role("member")),
+):
+    """
+    Step 2 of 3 — upload one chunk. Chunks may arrive out of order.
+    Retry a chunk at any time; re-sending an already-received chunk is safe.
+    """
+    session = _upload_sessions.get(upload_id)
+    if not session:
+        raise HTTPException(404, "Upload session not found or expired")
+    if session["user_id"] != current_user["id"]:
+        raise HTTPException(403, "Not your upload session")
+    if chunk_number < 0 or chunk_number >= session["total_chunks"]:
+        raise HTTPException(400, f"Invalid chunk_number {chunk_number} (total={session['total_chunks']})")
+
+    data = await chunk.read()
+
+    # Every chunk except the last must be exactly chunk_size bytes
+    if chunk_number < session["total_chunks"] - 1:
+        if len(data) != session["chunk_size"]:
+            raise HTTPException(
+                400,
+                f"Chunk {chunk_number} size mismatch: got {len(data)}, expected {session['chunk_size']}"
+            )
+
+    chunk_path = CHUNK_UPLOAD_DIR / upload_id / f"chunk_{chunk_number:06d}"
+    with open(chunk_path, "wb") as f:
+        f.write(data)
+
+    session["received_chunks"].add(chunk_number)
+    received = len(session["received_chunks"])
+    logger.info(f"[upload:{upload_id}] chunk {chunk_number}/{session['total_chunks']-1} ({received}/{session['total_chunks']} total)")
+
+    return {
+        "chunk_number": chunk_number,
+        "received":     received,
+        "total":        session["total_chunks"],
+        "complete":     received == session["total_chunks"],
+    }
+
+
+@app.post("/uploads/{upload_id}/complete")
+async def complete_chunked_upload(
+    upload_id:        str,
+    background_tasks: BackgroundTasks,
+    current_user:     dict = Depends(require_role("member")),
+):
+    """
+    Step 3 of 3 — verify all chunks are present, assemble the file,
+    create the DB session, and launch the analysis pipeline.
+    Identical pipeline call to POST /sessions.
+    """
+    import shutil
+    session = _upload_sessions.get(upload_id)
+    if not session:
+        raise HTTPException(404, "Upload session not found or expired")
+    if session["user_id"] != current_user["id"]:
+        raise HTTPException(403, "Not your upload session")
+
+    missing = set(range(session["total_chunks"])) - session["received_chunks"]
+    if missing:
+        raise HTTPException(400, f"Missing {len(missing)} chunk(s): {sorted(missing)[:10]}")
+
+    # Assemble chunks → final file
+    suffix      = Path(session["filename"]).suffix.lower()
+    session_id  = str(uuid.uuid4())
+    file_name   = f"{session_id}{suffix}"
+    final_path  = UPLOAD_DIR / file_name
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    chunk_dir   = CHUNK_UPLOAD_DIR / upload_id
+
+    try:
+        with open(final_path, "wb") as out:
+            for i in range(session["total_chunks"]):
+                chunk_file_path = chunk_dir / f"chunk_{i:06d}"
+                with open(chunk_file_path, "rb") as cf:
+                    while block := cf.read(1024 * 1024):
+                        out.write(block)
+        assembled_size = final_path.stat().st_size
+        logger.info(
+            f"[upload:{upload_id}] assembled {session['total_chunks']} chunks "
+            f"→ {file_name} ({assembled_size / 1024 / 1024:.1f} MB)"
+        )
+    except Exception as exc:
+        final_path.unlink(missing_ok=True)
+        logger.error(f"[upload:{upload_id}] assembly failed: {exc}")
+        raise HTTPException(500, f"File assembly failed: {exc}")
+    finally:
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        _upload_sessions.pop(upload_id, None)
+
+    # Parse config — same logic as POST /sessions
+    try:
+        config_dict = json.loads(session.get("config", "{}"))
+    except json.JSONDecodeError:
+        config_dict = {}
+    transcription_config = config_dict.get("transcription", {})
+    analysis_config      = config_dict.get("analysis", {})
+    meeting_type  = session.get("meeting_type") or config_dict.get("meeting_type", "sales_call")
+    title         = session.get("title") or Path(session["filename"]).stem
+    num_speakers  = config_dict.get("num_speakers") or None
+
+    # Create DB session
+    try:
+        _is_lightweight = not analysis_config.get("run_behavioural", True)
+        db_session = await create_session(
+            title=title,
+            session_type="lightweight" if _is_lightweight else "recording",
+            meeting_type=meeting_type,
+            media_url=str(final_path.resolve()),
+            user_id=current_user["id"],
+            upload_config=config_dict,
+        )
+        session_id = str(db_session["id"])
+        await update_session_status(session_id, "processing")
+        logger.info(f"[{session_id}] DB session created (chunked upload)")
+    except Exception as exc:
+        logger.warning(f"[{session_id}] DB create failed (continuing): {exc}")
+
+    # Launch pipeline
+    _video_path = final_path if suffix in {".mp4", ".webm"} else None
+    background_tasks.add_task(
+        _run_pipeline,
+        session_id=session_id,
+        file_path=final_path,
+        title=title,
+        meeting_type=meeting_type,
+        transcription_config=transcription_config,
+        analysis_config=analysis_config,
+        video_path=_video_path,
+        user_email=current_user.get("email", ""),
+        num_speakers=num_speakers,
+    )
+
+    return {
+        "session_id":  session_id,
+        "status":      "processing",
+        "title":       title,
+        "meeting_type": meeting_type,
+        "file_size":   assembled_size,
+    }
+
+
+@app.get("/uploads/{upload_id}/status")
+async def get_upload_status(
+    upload_id:    str,
+    current_user: dict = Depends(require_role("member")),
+):
+    """
+    Resume support — returns which chunks have been received so far.
+    Frontend checks this after a reconnect and uploads only missing chunks.
+    """
+    session = _upload_sessions.get(upload_id)
+    if not session:
+        raise HTTPException(404, "Upload session not found or expired")
+    if session["user_id"] != current_user["id"]:
+        raise HTTPException(403, "Not your upload session")
+    received = len(session["received_chunks"])
+    return {
+        "upload_id":       upload_id,
+        "filename":        session["filename"],
+        "total_chunks":    session["total_chunks"],
+        "received_chunks": sorted(session["received_chunks"]),
+        "received_count":  received,
+        "progress_pct":    round(received / session["total_chunks"] * 100, 1),
+        "complete":        received == session["total_chunks"],
+    }
+
+
+# POST /sessions — Upload + full pipeline
+# ─────────────────────────────────────────────────────────
 
 @app.post("/sessions")
 async def create_session_endpoint(
@@ -829,7 +1086,6 @@ async def create_session_endpoint(
     file: UploadFile = File(...),
     title: str = Form(default=""),
     meeting_type: str = Form(default="sales_call"),
-    num_speakers: Optional[int] = Form(default=None),
     config: str = Form(default="{}"),
     current_user: dict = Depends(require_role("member")),
 ):
@@ -885,6 +1141,8 @@ async def create_session_endpoint(
     if not meeting_type or meeting_type == "sales_call":
         meeting_type = config_dict.get("meeting_type", meeting_type)
 
+    num_speakers = config_dict.get("num_speakers") or None
+
     # ── Step 2: Create session in DB ──
     try:
         # Lightweight sessions (transcript/diarize/entity only) stored separately
@@ -913,11 +1171,11 @@ async def create_session_endpoint(
         file_path=file_path,
         title=title,
         meeting_type=meeting_type,
-        num_speakers=num_speakers,
         transcription_config=transcription_config,
         analysis_config=analysis_config,
         video_path=_video_path,
         user_email=current_user.get("email", ""),
+        num_speakers=num_speakers,
     )
 
     return {
@@ -933,11 +1191,11 @@ async def _run_pipeline(
     file_path: Path,
     title: str,
     meeting_type: str,
-    num_speakers: Optional[int] = None,
     transcription_config: Optional[dict] = None,
     analysis_config: Optional[dict] = None,
     video_path: Optional[Path] = None,
     user_email: str = "",
+    num_speakers: Optional[int] = None,
 ):
     """
     Run the full analysis pipeline in the background.
@@ -962,10 +1220,10 @@ async def _run_pipeline(
         voice_result = await _call_with_retry(
             lambda: _call_voice_agent(
                 session_id, str(file_path.resolve()),
-                num_speakers=num_speakers,
                 meeting_type=meeting_type,
                 transcription_config=transcription_config,
                 analysis_config=analysis_config,
+                num_speakers=num_speakers,
             )
         )
         logger.info(
@@ -995,12 +1253,7 @@ async def _run_pipeline(
     except Exception as e:
         logger.warning(f"[{session_id}] Speaker upsert failed: {e}")
 
-    # Persist voice signals
-    try:
-        count = await insert_signals(session_id, voice_signals, speaker_map)
-        logger.info(f"[{session_id}] Persisted {count} voice signals")
-    except Exception as e:
-        logger.warning(f"[{session_id}] Voice signal persist failed: {e}")
+    await _persist_agent_signals(session_id, voice_signals, speaker_map, "voice")
 
     # ── Track agent statuses ──
     agent_status = {
@@ -1020,13 +1273,14 @@ async def _run_pipeline(
         except Exception as e:
             logger.warning(f"[{session_id}] Transcript persist failed: {e}")
 
-    # ── Start video agent in background (runs parallel with language+conversation) ──
+    # ── Steps 4 / 4b / 4c: Language + Conversation + Video (parallel) ──
+    # All three depend only on voice output — no inter-dependency.
+    # Video signals are awaited before Fusion so the report is fully multimodal.
+    _set_step(session_id, "language")
+
     video_signals: list[dict] = []
-    video_task: Optional[asyncio.Task] = None
-    run_video = (
-        video_path is not None
-        and run_behavioural
-    )
+    run_video = video_path is not None and run_behavioural
+    diar_segments_for_video: list[dict] = []
     if run_video:
         diar_segments_for_video = [
             {"speaker": seg.get("speaker", "unknown"),
@@ -1035,21 +1289,6 @@ async def _run_pipeline(
             for seg in transcript_segments
             if seg.get("start_ms") is not None
         ]
-        video_task = asyncio.create_task(
-            _call_video_agent(
-                session_id, str(video_path.resolve()),
-                diar_segments_for_video, meeting_type, num_speakers or 2,
-            )
-        )
-        logger.info(
-            f"[{session_id}] Video agent task started "
-            f"({len(diar_segments_for_video)} diar segments)"
-        )
-
-    # ── Steps 4 + 4b: Language Agent + Conversation Agent (parallel) ──
-    # Both depend only on transcript_segments — no dependency on each other.
-    # Video agent is already running as a background task started above.
-    _set_step(session_id, "language")
 
     language_result = None
     language_signals = []
@@ -1122,7 +1361,27 @@ async def _run_pipeline(
             logger.warning(f"[{session_id}] Conversation Agent failed (continuing): {e}")
             return {}
 
-    lang_outcome, conv_outcome = await asyncio.gather(_run_language(), _run_conversation())
+    async def _run_video() -> list[dict]:
+        if not run_video or video_path is None:
+            return []
+        try:
+            _set_step(session_id, "video")
+            result = await _call_video_agent(
+                session_id, str(video_path.resolve()),
+                diar_segments_for_video, meeting_type, speaker_count,
+            )
+            sigs = result.get("signals", [])
+            agent_status["video"] = "completed"
+            logger.info(f"[{session_id}] Video Agent: {len(sigs)} signals")
+            return sigs
+        except Exception as e:
+            agent_status["video"] = "failed"
+            logger.warning(f"[{session_id}] Video Agent failed (continuing without video): {e}")
+            return []
+
+    lang_outcome, conv_outcome, vid_signals = await asyncio.gather(
+        _run_language(), _run_conversation(), _run_video()
+    )
 
     # ── Unpack language result ──
     if lang_outcome:
@@ -1130,12 +1389,7 @@ async def _run_pipeline(
         language_signals = language_result.get("signals", [])
         language_summary = language_result.get("summary", {})
         logger.info(f"[{session_id}] Language Agent: {len(language_signals)} signals")
-        if language_signals:
-            try:
-                count = await insert_signals(session_id, language_signals, speaker_map)
-                logger.info(f"[{session_id}] Persisted {count} language signals")
-            except Exception as e:
-                logger.warning(f"[{session_id}] Language signal persist failed: {e}")
+        await _persist_agent_signals(session_id, language_signals, speaker_map, "language")
 
     # ── Unpack conversation result ──
     _set_step(session_id, "conversation")
@@ -1144,33 +1398,12 @@ async def _run_pipeline(
         conversation_signals = conversation_result.get("signals", [])
         conversation_summary = conversation_result.get("summary", {})
         logger.info(f"[{session_id}] Conversation Agent: {len(conversation_signals)} signals")
-        if conversation_signals:
-            try:
-                count = await insert_signals(session_id, conversation_signals, speaker_map)
-                logger.info(f"[{session_id}] Persisted {count} conversation signals")
-            except Exception as e:
-                logger.warning(f"[{session_id}] Conversation signal persist failed: {e}")
+        await _persist_agent_signals(session_id, conversation_signals, speaker_map, "conversation")
 
-    # ── Step 4c: Video Agent result (ran in parallel above; await here) ──
-    video_participant_count: int = 0
-    if video_task is not None:
-        _set_step(session_id, "video")
-        try:
-            video_result = await video_task
-            video_signals = video_result.get("signals", [])
-            agent_status["video"] = "completed"
-            logger.info(f"[{session_id}] Video Agent: {len(video_signals)} signals")
-            video_participant_count = video_result.get("participant_count", 0)
-            logger.info(f"[{session_id}] Participant count from video: {video_participant_count}")
-        except Exception as e:
-            agent_status["video"] = "failed"
-            logger.warning(f"[{session_id}] Video Agent failed (non-fatal): {e}")
-        if video_signals:
-            try:
-                count = await insert_signals(session_id, video_signals, speaker_map)
-                logger.info(f"[{session_id}] Persisted {count} video signals")
-            except Exception as e:
-                logger.warning(f"[{session_id}] Video signal persist failed: {e}")
+    # ── Unpack video result ──
+    if vid_signals:
+        video_signals = vid_signals
+        await _persist_agent_signals(session_id, video_signals, speaker_map, "video")
 
     # ── Step 5: Fusion Agent (only when behavioural analysis enabled) ──
     _set_step(session_id, "fusion")
@@ -1209,15 +1442,8 @@ async def _run_pipeline(
     else:
         logger.info(f"[{session_id}] Behavioural analysis disabled — skipping Fusion Agent")
 
-    # Persist fusion signals
-    if fusion_signals:
-        try:
-            count = await insert_signals(session_id, fusion_signals, speaker_map)
-            logger.info(f"[{session_id}] Persisted {count} fusion signals")
-        except Exception as e:
-            logger.warning(f"[{session_id}] Fusion signal persist failed: {e}")
+    await _persist_agent_signals(session_id, fusion_signals, speaker_map, "fusion")
 
-    # Persist alerts
     if alerts:
         try:
             count = await insert_alerts(session_id, alerts, speaker_map)
@@ -1261,44 +1487,22 @@ async def _run_pipeline(
         session_id, final_status,
         duration_ms=int(duration_seconds * 1000),
         speaker_count=speaker_count,
-        participant_count=video_participant_count if video_participant_count > 0 else None,
+        participant_count=speaker_count,
     )
 
     logger.info(f"[{session_id}] Pipeline complete (status={final_status}, agents={agent_status})")
 
-    # Store knowledge chunks for RAG chat (only for behavioural sessions — needs signals to be useful)
-    # Transcript+entity sessions store entities in the report but skip the embedding store
-    _set_step(session_id, "entity_extraction")
-    if run_behavioural:
-        try:
-            from knowledge_store import store_session_knowledge
-            _pool = await get_pool()
-            await store_session_knowledge(_pool, session_id, {
-                "transcript_segments": transcript_segments,
-                "signals": voice_signals + language_signals + conversation_signals + video_signals + fusion_signals,
-                "entities": entities,
-                "report": report_content or {},
-                "graph_analytics": graph_analytics or {},
-                "conversation_summary": conversation_summary or {},
-            })
-        except Exception as e:
-            logger.warning(f"[{session_id}] Knowledge store failed (non-fatal): {e}")
-    else:
-        logger.info(f"[{session_id}] Knowledge store skipped (behavioural analysis off)")
-
-    _set_step(session_id, "knowledge_graph")
-    # Sync session graph to Neo4j (non-blocking, non-fatal).
-    # Reads canonical data from PG and projects it as a graph for hybrid chat
-    # and exploration. Pipeline still completes if Neo4j is unreachable.
-    if analysis_config.get("run_knowledge_graph", True):
-        try:
-            from neo4j_sync import sync_session as neo4j_sync_session
-            _pool = await get_pool()
-            await neo4j_sync_session(_pool, session_id)
-        except Exception as e:
-            logger.warning(f"[{session_id}] Neo4j sync failed (non-fatal): {e}")
-    else:
-        logger.info(f"[{session_id}] Neo4j sync skipped (run_knowledge_graph=false)")
+    await _post_process_pipeline(
+        session_id=session_id,
+        run_behavioural=run_behavioural,
+        run_knowledge_graph=analysis_config.get("run_knowledge_graph", True),
+        transcript_segments=transcript_segments,
+        all_signals=voice_signals + language_signals + conversation_signals + video_signals + fusion_signals,
+        entities=entities,
+        report_content=report_content,
+        graph_analytics=graph_analytics,
+        conversation_summary=conversation_summary,
+    )
 
     # Cleanup old recordings in background
     _cleanup_old_recordings()
@@ -1360,9 +1564,9 @@ async def list_sessions_endpoint(
 # ─────────────────────────────────────────────────────────
 
 @app.get("/sessions/{session_id}")
-async def get_session_detail(session_id: str, current_user: dict = Depends(get_current_user)):
+async def get_session_detail(session_id: str, _: dict = Depends(get_current_user)):
     """Get session detail including signals, alerts, and unified states."""
-    logger.info(f"[{session_id}] GET /sessions/{{id}} user={current_user.get('email', 'unknown')}")
+    logger.info(f"[{session_id}] session call")
     import uuid as _uuid
     try:
         _uuid.UUID(session_id)
@@ -1374,7 +1578,7 @@ async def get_session_detail(session_id: str, current_user: dict = Depends(get_c
 
 
     # Fetch related data in parallel-ish
-    signals = await get_signals(session_id, limit=5000)
+    signals = [s for s in await get_signals(session_id, limit=5000) if _should_display_signal(s)]
     session_alerts = await get_alerts(session_id)
     report = await get_report(session_id)
     transcript = await get_transcript(session_id)
@@ -1396,6 +1600,65 @@ async def get_session_detail(session_id: str, current_user: dict = Depends(get_c
         "has_report": report is not None,
         "transcript_segment_count": len(transcript),
     }
+
+
+# ─────────────────────────────────────────────────────────
+# Signal display filter — thresholds matched to backend rule engines
+# ─────────────────────────────────────────────────────────
+
+def _should_display_signal(sig: dict) -> bool:
+    """
+    Return True if this signal is meaningful enough to show in the UI.
+    Thresholds are derived from each agent's rule-engine output ranges:
+
+    Voice:
+      vocal_stress_score — rule emits moderate(>0.30), elevated(>0.50), high(>0.70)
+                           Show elevated+ only (v > 0.50)
+      sentiment_score    — rule emits mild(|v|>0.35), pos/neg(|v|>0.55), strong(|v|>0.80)
+                           Show pos/neg+ only (|v| > 0.55)
+      All others         — backend already gates these; show everything emitted
+
+    Video facial (max conf 0.55–0.70)  → confidence >= 0.35
+    Video body   (max conf 0.25–0.65)  → confidence >= 0.25  (covers mirroring hard-cap 0.25)
+    Video gaze   (max conf 0.40–0.70)  → confidence >= 0.30  (covers synchrony hard-cap 0.40)
+
+    Fusion / language / conversation   → show all (already filtered at source)
+    """
+    stype = sig.get("signal_type", "")
+    value = sig.get("value") or 0.0
+    conf  = sig.get("confidence") or 0.0
+    agent = sig.get("agent", "")
+
+    if stype == "vocal_stress_score":
+        return value > 0.50
+
+    if stype == "sentiment_score":
+        return abs(value) > 0.55
+
+    if agent == "video":
+        # Facial agents: max cap 0.55–0.70
+        _facial = {"facial_stress", "facial_emotion", "facial_engagement",
+                   "smile_type", "valence_arousal"}
+        if stype in _facial:
+            return conf >= 0.35
+        # Gaze agents: gaze_synchrony hard-cap 0.40
+        _gaze = {"gaze_direction_shift", "screen_contact", "sustained_distraction",
+                 "attention_level", "blink_rate_anomaly", "gaze_synchrony"}
+        if stype in _gaze:
+            return conf >= 0.30
+        # Body agents: body_mirroring hard-cap 0.25
+        return conf >= 0.25
+
+    if agent == "fusion":
+        # Session-level temporal aggregates span the full recording — analytical
+        # summaries, not moment signals. Filter windows longer than 2 minutes.
+        duration_ms = (sig.get("window_end_ms") or 0) - (sig.get("window_start_ms") or 0)
+        if duration_ms > 120_000:
+            return False
+        # Minimum confidence floor for moment-level fusion signals
+        return conf >= 0.40
+
+    return True
 
 
 # ─────────────────────────────────────────────────────────
@@ -1433,6 +1696,7 @@ async def get_session_signals(
         limit=limit,
         offset=offset,
     )
+    signals = [s for s in signals if _should_display_signal(s)]
 
     return {
         "session_id": session_id,
@@ -1491,8 +1755,10 @@ async def get_session_report(
     duration_seconds = (session.get("duration_ms") or 0) / 1000.0
 
     # Build summaries from stored signals
+    video_signals_stored = [s for s in signals if s.get("agent") == "video"]
     voice_summary = _build_voice_summary(voice_signals)
     language_summary = _build_language_summary(language_signals)
+    video_summary = _build_video_summary(video_signals_stored) if video_signals_stored else None
 
     try:
         async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
@@ -1507,6 +1773,7 @@ async def get_session_report(
                     "fusion_signals": _serialise_signals(fusion_signals),
                     "unified_states": [],
                     "meeting_type": session.get("meeting_type", "sales_call"),
+                    "video_summary": video_summary,
                 },
             )
             resp.raise_for_status()
@@ -1768,17 +2035,24 @@ async def get_annotated_video(
     if not overlay_path.exists():
         raise HTTPException(404, "Annotated video not available for this session")
 
+    file_size = overlay_path.stat().st_size
+    logger.info(f"[{session_id}] serving annotated video: {overlay_path.name} ({file_size:,} bytes, {media_type})")
+
     if request.method == "HEAD":
         from starlette.responses import Response as StarletteResponse
         return StarletteResponse(
             status_code=200,
-            headers={"Content-Type": media_type, "Accept-Ranges": "bytes"},
+            headers={
+                "Content-Type": media_type,
+                "Content-Length": str(file_size),
+                "Accept-Ranges": "bytes",
+            },
         )
 
     return FileResponse(
         str(overlay_path),
         media_type=media_type,
-        headers={"Accept-Ranges": "bytes"},
+        headers={"Accept-Ranges": "bytes", "Content-Length": str(file_size)},
     )
 
 
@@ -1826,13 +2100,72 @@ def _format_assemblyai_entities(raw: list[dict]) -> dict:
     return result
 
 
+async def _persist_agent_signals(
+    session_id: str,
+    signals: list[dict],
+    speaker_map: dict,
+    label: str,
+) -> None:
+    """Persist a batch of signals and log the count. No-op if signals is empty."""
+    if not signals:
+        return
+    try:
+        count = await insert_signals(session_id, signals, speaker_map)
+        logger.info(f"[{session_id}] Persisted {count} {label} signals")
+    except Exception as e:
+        logger.warning(f"[{session_id}] {label} signal persist failed: {e}")
+
+
+
+async def _post_process_pipeline(
+    session_id: str,
+    run_behavioural: bool,
+    run_knowledge_graph: bool,
+    transcript_segments: list[dict],
+    all_signals: list[dict],
+    entities: dict,
+    report_content: dict,
+    graph_analytics: dict,
+    conversation_summary: dict,
+) -> None:
+    """Knowledge store embedding + Neo4j sync — both non-fatal."""
+    _set_step(session_id, "entity_extraction")
+    if run_behavioural:
+        try:
+            from knowledge_store import store_session_knowledge
+            _pool = await get_pool()
+            await store_session_knowledge(_pool, session_id, {
+                "transcript_segments": transcript_segments,
+                "signals": all_signals,
+                "entities": entities,
+                "report": report_content or {},
+                "graph_analytics": graph_analytics or {},
+                "conversation_summary": conversation_summary or {},
+            })
+        except Exception as e:
+            logger.warning(f"[{session_id}] Knowledge store failed (non-fatal): {e}")
+    else:
+        logger.info(f"[{session_id}] Knowledge store skipped (behavioural analysis off)")
+
+    _set_step(session_id, "knowledge_graph")
+    if run_knowledge_graph:
+        try:
+            from neo4j_sync import sync_session as neo4j_sync_session
+            _pool = await get_pool()
+            await neo4j_sync_session(_pool, session_id)
+        except Exception as e:
+            logger.warning(f"[{session_id}] Neo4j sync failed (non-fatal): {e}")
+    else:
+        logger.info(f"[{session_id}] Neo4j sync skipped (run_knowledge_graph=false)")
+
+
 async def _call_voice_agent(
     session_id: str,
     file_path: str,
-    num_speakers: Optional[int] = None,
     meeting_type: str = "sales_call",
     transcription_config: Optional[dict] = None,
     analysis_config: Optional[dict] = None,
+    num_speakers: Optional[int] = None,
 ) -> dict:
     """Call Voice Agent POST /analyse with file path."""
     t0 = time.time()
@@ -1842,7 +2175,7 @@ async def _call_voice_agent(
         "session_id": session_id,
         "meeting_type": meeting_type,
     }
-    if num_speakers is not None:
+    if num_speakers:
         payload["num_speakers"] = num_speakers
     if transcription_config:
         payload["transcription_config"] = transcription_config
@@ -1918,34 +2251,168 @@ async def _call_video_agent(
     meeting_type: str,
     num_speakers: int = 2,
 ) -> dict:
-    """Call Video Agent POST /analyse with the video file."""
+    """
+    Submit video to the Video Agent async job queue, then poll until done.
+
+    Protocol:
+      POST /analyse  → HTTP 202 {job_id, status="queued"}
+      GET  /jobs/{job_id} every POLL_INTERVAL seconds until status in {done, failed}
+    """
     import json as _json
+
+    POLL_INTERVAL = 10   # seconds between status checks
+    SUBMIT_TIMEOUT = 120 # seconds for the initial upload POST
+
     t0 = time.time()
     video_file = Path(video_path)
     logger.info(
-        f"[{session_id}] → Video Agent /analyse "
-        f"({video_file.name}, {len(diar_segments)} diarization segments, num_speakers={num_speakers})"
+        f"[{session_id}] → Video Agent /analyse (async) "
+        f"({video_file.name}, {len(diar_segments)} diar segments, num_speakers={num_speakers})"
     )
+
     with open(video_file, "rb") as f:
         video_bytes = f.read()
-    async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
+
+    # ── Step 1: Submit job ────────────────────────────────────────────────────
+    async with httpx.AsyncClient(timeout=SUBMIT_TIMEOUT) as client:
         resp = await client.post(
             f"{VIDEO_AGENT_URL}/analyse",
             files={"video": (video_file.name, video_bytes, "video/mp4")},
             data={
-                "session_id":          session_id,
-                "meeting_type":        meeting_type,
-                "diar_segments_json":  _json.dumps(diar_segments),
-                "num_speakers":        str(num_speakers),
+                "session_id":         session_id,
+                "meeting_type":       meeting_type,
+                "diar_segments_json": _json.dumps(diar_segments),
+                "num_speakers":       str(num_speakers),
             },
         )
         resp.raise_for_status()
-        result = resp.json()
-    logger.info(
-        f"[{session_id}] ← Video Agent: {len(result.get('signals', []))} signals, "
-        f"{result.get('participant_count', 0)} participants in {time.time()-t0:.1f}s"
-    )
-    return result
+        job_info = resp.json()
+
+    job_id = job_info["job_id"]
+    logger.info(f"[{session_id}] Video Agent job {job_id} queued — polling every {POLL_INTERVAL}s")
+
+    # ── Step 2: Poll until done or deadline ───────────────────────────────────
+    deadline = t0 + VIDEO_AGENT_TIMEOUT
+    async with httpx.AsyncClient(timeout=30) as poll_client:
+        while time.time() < deadline:
+            await asyncio.sleep(POLL_INTERVAL)
+            poll_resp = await poll_client.get(f"{VIDEO_AGENT_URL}/jobs/{job_id}")
+            poll_resp.raise_for_status()
+            poll_data = poll_resp.json()
+            status = poll_data["status"]
+
+            # Return as soon as signals are available — don't wait for overlay burn
+            if status in ("signals_ready", "annotating", "done"):
+                result = poll_data["result"]
+                logger.info(
+                    f"[{session_id}] ← Video Agent job {job_id} {status}: "
+                    f"{len(result.get('signals', []))} signals "
+                    f"in {time.time()-t0:.1f}s"
+                )
+                return result
+
+            if status == "failed":
+                error = poll_data.get("error", "unknown error")
+                logger.error(f"[{session_id}] Video Agent job {job_id} failed: {error}")
+                raise RuntimeError(f"Video Agent job failed: {error}")
+
+            elapsed = time.time() - t0
+            logger.info(f"[{session_id}] Video Agent job {job_id} status={status} ({elapsed:.0f}s)")
+
+    raise TimeoutError(f"Video Agent job {job_id} timed out after {VIDEO_AGENT_TIMEOUT}s")
+
+
+def _build_video_summary(video_signals: list[dict]) -> dict:
+    """
+    Aggregate raw video signals into a per-speaker summary dict for the LLM context.
+    Groups facial emotion, gaze, body, and gesture signals by speaker.
+    """
+    from collections import defaultdict
+
+    per_speaker: dict[str, dict] = defaultdict(lambda: {
+        "emotions": [],          # (emotion, confidence) tuples
+        "facial_stress": [],
+        "facial_engagement": [],
+        "gaze_on_screen": [],
+        "blink_anomalies": 0,
+        "head_nods": 0,
+        "head_shakes": 0,
+        "body_movement": [],
+        "posture_changes": 0,
+        "valence_arousal": [],
+        "hand_near_face": 0,
+        "gaze_breaks": 0,
+    })
+
+    for s in video_signals:
+        spk = s.get("speaker_id") or s.get("speaker_label") or "unknown"
+        st  = s.get("signal_type", "")
+        val = s.get("value")
+        vt  = s.get("value_text", "")
+        conf = s.get("confidence", 0.5)
+
+        sp = per_speaker[spk]
+        if st == "facial_emotion" and vt:
+            sp["emotions"].append((vt, conf))
+        elif st == "facial_stress" and val is not None:
+            sp["facial_stress"].append(val)
+        elif st == "facial_engagement" and val is not None:
+            sp["facial_engagement"].append(val)
+        elif st == "gaze_on_screen_pct" and val is not None:
+            sp["gaze_on_screen"].append(val)
+        elif st == "blink_rate_anomaly":
+            sp["blink_anomalies"] += 1
+        elif st == "head_nod":
+            sp["head_nods"] += 1
+        elif st == "head_shake":
+            sp["head_shakes"] += 1
+        elif st == "body_movement" and val is not None:
+            sp["body_movement"].append(val)
+        elif st in ("posture_shift", "posture_change"):
+            sp["posture_changes"] += 1
+        elif st == "valence_arousal" and vt:
+            sp["valence_arousal"].append((vt, val or 0))
+        elif st == "hand_near_face":
+            sp["hand_near_face"] += 1
+        elif st in ("gaze_direction_shift", "sustained_distraction"):
+            sp["gaze_breaks"] += 1
+
+    # Compress into readable summary per speaker
+    summary: dict[str, dict] = {}
+    for spk, data in per_speaker.items():
+        # Dominant emotion — most frequent by count then highest confidence
+        from collections import Counter
+        emotion_counts = Counter(e for e, _ in data["emotions"])
+        dominant_emotion = emotion_counts.most_common(1)[0][0] if emotion_counts else None
+        dominant_emotion_conf = (
+            max((c for e, c in data["emotions"] if e == dominant_emotion), default=0.0)
+            if dominant_emotion else 0.0
+        )
+
+        # Dominant valence_arousal
+        va_counts = Counter(vt for vt, _ in data["valence_arousal"])
+        dominant_valence = va_counts.most_common(1)[0][0] if va_counts else None
+
+        def _avg(lst):
+            return round(sum(lst) / len(lst), 3) if lst else None
+
+        summary[spk] = {
+            "dominant_emotion": dominant_emotion,
+            "dominant_emotion_confidence": round(dominant_emotion_conf, 3) if dominant_emotion else None,
+            "dominant_valence": dominant_valence,
+            "avg_facial_stress": _avg(data["facial_stress"]),
+            "avg_facial_engagement": _avg(data["facial_engagement"]),
+            "avg_gaze_on_screen_pct": _avg(data["gaze_on_screen"]),
+            "gaze_breaks": data["gaze_breaks"],
+            "blink_anomalies": data["blink_anomalies"],
+            "head_nods": data["head_nods"],
+            "head_shakes": data["head_shakes"],
+            "avg_body_movement": _avg(data["body_movement"]),
+            "posture_changes": data["posture_changes"],
+            "hand_near_face_events": data["hand_near_face"],
+        }
+
+    return {"per_speaker": summary}
 
 
 async def _call_fusion_agent(
@@ -1980,8 +2447,10 @@ async def _call_fusion_agent(
 
     # Merge video signals into the voice-side pool so fusion sees all modalities
     all_voice_side = [_to_fusion_input(s, "voice") for s in voice_signals]
+    video_summary: Optional[dict] = None
     if video_signals:
         all_voice_side += [_to_fusion_input(s, "video") for s in video_signals]
+        video_summary = _build_video_summary(video_signals)
 
     async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
         resp = await client.post(
@@ -1994,6 +2463,7 @@ async def _call_fusion_agent(
                 "generate_report": True,
                 "voice_summary": voice_summary,
                 "language_summary": language_summary,
+                "video_summary": video_summary,
             },
         )
         resp.raise_for_status()
