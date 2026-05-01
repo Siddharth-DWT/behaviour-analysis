@@ -307,6 +307,7 @@ services:
       - ./shared:/app/shared
       - ./data:/app/data
       - video_overlays:/app/data/overlays
+      - upload_chunks:/app/data/chunks
     depends_on:
       postgres:
         condition: service_healthy
@@ -346,6 +347,8 @@ volumes:
   neo4j_logs:
     driver: local
   video_overlays:
+    driver: local
+  upload_chunks:
     driver: local
 
 networks:
