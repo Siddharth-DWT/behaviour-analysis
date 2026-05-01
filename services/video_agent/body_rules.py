@@ -293,10 +293,11 @@ class BodyRuleEngine(BaseVideoRuleEngine):
 
         if dist_sigma < -2.0:
             label = "forward_lean"
-            confidence = min(abs(dist_sigma) * 0.1 * conf_mult, 0.60)
+            # Lean from head-shoulder distance has high variance; cap per RESEARCH.md (0.30-0.40)
+            confidence = min(abs(dist_sigma) * 0.1 * conf_mult, 0.38)
         elif dist_sigma > 2.0:
             label = "backward_lean"
-            confidence = min(dist_sigma * 0.1 * conf_mult, 0.55)
+            confidence = min(dist_sigma * 0.1 * conf_mult, 0.35)
         else:
             return []
 
@@ -377,10 +378,11 @@ class BodyRuleEngine(BaseVideoRuleEngine):
 
         if sigma >= self.FIDGET_SIGMA_HIGH:
             label = "high_fidgeting"
-            confidence = min(sigma * 0.08 * conf_mult, 0.60)
+            # Subtle fidgets below webcam resolution threshold — cap per RESEARCH.md (0.35-0.45)
+            confidence = min(sigma * 0.08 * conf_mult, 0.42)
         elif sigma >= self.FIDGET_SIGMA_MODERATE:
             label = "moderate_fidgeting"
-            confidence = min(sigma * 0.06 * conf_mult, 0.50)
+            confidence = min(sigma * 0.06 * conf_mult, 0.35)
         else:
             return []
 
