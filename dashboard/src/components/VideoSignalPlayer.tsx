@@ -318,21 +318,28 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   const [showAnnotated, setShowAnnotated] = useState(false);
   const [annotatedAvailable, setAnnotatedAvailable] = useState(false);
 
-  // Poll until the annotated video is ready (video agent can take 30-90s)
+  // Poll until the annotated video is ready.
+  // Landmark burn (full MediaPipe re-pass) takes several minutes for long videos.
+  // Schedule: first 3 checks every 10s, then every 30s up to 20 min total.
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 40; // 3×10s + 37×30s ≈ 18.5 min
     const check = () => {
+      if (cancelled || attempts >= MAX_ATTEMPTS) return;
+      const delay = attempts < 3 ? 10_000 : 30_000;
+      attempts++;
       fetch(annotatedVideoUrl, { method: "HEAD" })
         .then((r) => {
           if (cancelled) return;
           if (r.ok) {
             setAnnotatedAvailable(true);
-          } else {
-            setTimeout(check, 5000);
+          } else if (attempts < MAX_ATTEMPTS) {
+            setTimeout(check, delay);
           }
         })
-        .catch(() => { if (!cancelled) setTimeout(check, 5000); });
+        .catch(() => { if (!cancelled && attempts < MAX_ATTEMPTS) setTimeout(check, delay); });
     };
     check();
     return () => { cancelled = true; };
@@ -345,7 +352,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   const computeActive = useCallback(
     (ms: number): VideoSignal[] =>
       signals.filter((s) => {
-        if (ms < s.start_ms || ms > s.end_ms) return false;
+        if (ms < (s.start_ms ?? 0) || ms > (s.end_ms ?? s.start_ms ?? 0)) return false;
         const cfg = SIGNAL_CONFIG[s.signal_type];
         if (!cfg) return false;
         if (!enabledCategories.has(cfg.category)) return false;
@@ -435,41 +442,6 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
     return cfg && enabledCategories.has(cfg.category);
   });
 
-  useEffect(() => {
-    const byCategory: Record<string, number> = { face: 0, body: 0, gaze: 0, compound: 0 };
-    const noConfig: string[] = [];
-    for (const s of signals) {
-      const cfg = SIGNAL_CONFIG[s.signal_type];
-      if (cfg) byCategory[cfg.category]++;
-      else if (!noConfig.includes(s.signal_type)) noConfig.push(s.signal_type);
-    }
-    const dots = signals.filter((s) => {
-      const cfg = SIGNAL_CONFIG[s.signal_type];
-      return cfg && enabledCategories.has(cfg.category);
-    });
-    console.group(`[VideoSignalPlayer] signals=${signals.length} timelineDots=${dots.length}`);
-    console.log("All signals by category:", byCategory);
-    console.log("Timeline dots per lane:", {
-      face:     dots.filter((s) => SIGNAL_CONFIG[s.signal_type]?.category === "face").length,
-      body:     dots.filter((s) => SIGNAL_CONFIG[s.signal_type]?.category === "body").length,
-      gaze:     dots.filter((s) => SIGNAL_CONFIG[s.signal_type]?.category === "gaze").length,
-      compound: dots.filter((s) => SIGNAL_CONFIG[s.signal_type]?.category === "compound").length,
-    });
-    console.log("Enabled categories:", [...enabledCategories]);
-    console.log("Selected speaker:", selectedSpeaker);
-    if (noConfig.length) console.warn("Signal types with no SIGNAL_CONFIG entry (invisible):", noConfig);
-    console.groupEnd();
-  }, [signals, enabledCategories, selectedSpeaker]);
-
-  useEffect(() => {
-    if (durationMs > 0)
-      console.log(`[VideoSignalPlayer] video duration set: ${(durationMs / 1000).toFixed(1)}s`);
-  }, [durationMs]);
-
-  useEffect(() => {
-    if (annotatedAvailable)
-      console.log("[VideoSignalPlayer] annotated video is ready");
-  }, [annotatedAvailable]);
 
   return (
     <div className="w-full space-y-3">
@@ -518,7 +490,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
 
         {/* Right panel: video — 9:16 portrait */}
         <div className="relative flex flex-1 items-center justify-center">
-          <div className="relative" style={{ aspectRatio: "9/16", maxHeight: 580, width: "auto" }}>
+          <div className="relative w-full" style={{ aspectRatio: "16/9" }}>
           <video
             ref={videoRef}
             src={videoUrl}
@@ -583,7 +555,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                   )}
                   {/* Signal segments */}
                   {(() => {
-                    const effectiveDuration = durationMs > 0 ? durationMs : (signals.length > 0 ? Math.max(...signals.map(x => x.end_ms)) : 1);
+                    const effectiveDuration = durationMs > 0 ? durationMs : (signals.length > 0 ? Math.max(...signals.map(x => x.end_ms ?? 0)) : 1);
                     return laneDots.map((s, i) => {
                       const cfg = SIGNAL_CONFIG[s.signal_type];
                       if (!cfg) return null;
@@ -611,7 +583,12 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
 
       {/* Filter controls */}
       <div className="flex flex-wrap items-center gap-3">
-        {/* Raw / Annotated toggle */}
+        {/* Raw / Annotated toggle — or "processing" indicator while burn runs */}
+        {!annotatedAvailable && (
+          <span className="text-[10px] text-nexus-text-muted animate-pulse">
+            Landmark video processing…
+          </span>
+        )}
         {annotatedAvailable && (
           <div className="flex rounded-lg border border-nexus-border overflow-hidden">
             <button

@@ -9,7 +9,8 @@ import type { Signal, TranscriptSegment } from "../api/client";
 /* ------------------------------------------------------------------ */
 
 export interface BlockSignal {
-  type: "stress" | "buying" | "objection" | "sentiment" | "filler" | "pitch" | "fusion" | "tone" | "rate";
+  type: "stress" | "buying" | "objection" | "sentiment" | "filler" | "pitch" | "fusion" | "tone" | "rate"
+      | "face" | "body" | "gaze";
   value: number;
   label: string;
   confidence: number;
@@ -22,7 +23,7 @@ export interface SpeechBlock {
   segmentIds: string[];
   signals: BlockSignal[];
   /** Dominant border color key */
-  borderType: "stress" | "buying" | "objection" | "fusion" | "sentiment" | "normal";
+  borderType: "stress" | "buying" | "objection" | "fusion" | "sentiment" | "face" | "normal";
 }
 
 export interface SwimlaneSpaker {
@@ -78,6 +79,40 @@ const TOPIC_COLORS = [
 ];
 
 /* ------------------------------------------------------------------ */
+/* Video signal type maps                                              */
+/* ------------------------------------------------------------------ */
+
+const FACE_SIGNAL_LABELS: Record<string, (sig: Signal) => string> = {
+  facial_stress:     (s) => `Face stress: ${s.value_text === "high_facial_stress" ? "High" : "Moderate"}`,
+  facial_emotion:    (s) => `Emotion: ${s.value_text || ""}`,
+  facial_engagement: (s) => s.value_text === "high_engagement" ? "Engaged" : "Disengaged",
+  smile_type:        (s) => s.value_text === "duchenne" ? "Genuine smile" : "Social smile",
+  valence_arousal:   (s) => (s.value_text || "").replace(/_/g, " "),
+};
+
+const BODY_SIGNAL_LABELS: Record<string, (sig: Signal) => string> = {
+  head_nod:               () => "Head nod",
+  head_shake:             () => "Head shake",
+  posture:                (s) => `Posture: ${(s.value_text || "").replace(/_/g, " ")}`,
+  body_lean:              (s) => s.value_text === "forward_lean" ? "Forward lean" : "Back lean",
+  body_fidgeting:         () => "Fidgeting",
+  self_touch:             () => "Self-touch",
+  shoulder_tension:       () => "Shoulder tension",
+  head_body_incongruence: (s) => `Mismatch: ${(s.value_text || "").replace(/_/g, " ")}`,
+  gesture_animation:      () => "Gesturing",
+  body_mirroring:         () => "Mirroring",
+};
+
+const GAZE_SIGNAL_LABELS: Record<string, (sig: Signal) => string> = {
+  gaze_direction_shift: (s) => `Gaze: ${(s.value_text || "shift").replace(/_/g, " ")}`,
+  screen_contact:       (s) => s.value_text === "sustained_contact" ? "Eye contact" : "Gaze avoidance",
+  sustained_distraction:() => "Distracted",
+  attention_level:      (s) => `Attention: ${(s.value_text || "").replace(/_/g, " ")}`,
+  blink_rate_anomaly:   (s) => `Blink: ${(s.value_text || "anomaly").replace(/_/g, " ")}`,
+  gaze_synchrony:       () => "Gaze sync",
+};
+
+/* ------------------------------------------------------------------ */
 /* Signal classification                                               */
 /* ------------------------------------------------------------------ */
 
@@ -85,10 +120,10 @@ function classifySignal(sig: Signal): BlockSignal | null {
   const v = sig.value ?? 0;
   const c = sig.confidence ?? 0;
 
+  // ── Voice / Language signals ───────────────────────────────────────
   switch (sig.signal_type) {
     case "vocal_stress_score":
-      if (v > 0.3) return { type: "stress", value: v, label: `Stress ${Math.round(v * 100)}%`, confidence: c };
-      return null;
+      return { type: "stress", value: v, label: `Stress ${Math.round(v * 100)}%`, confidence: c };
     case "buying_signal":
       return { type: "buying", value: v, label: sig.value_text || "Buying signal", confidence: c };
     case "objection_signal":
@@ -106,31 +141,41 @@ function classifySignal(sig: Signal): BlockSignal | null {
         return { type: "tone", value: v, label: `Tone: ${sig.value_text}`, confidence: c };
       return null;
     case "sentiment_score":
-      if (Math.abs(v) > 0.4)
-        return { type: "sentiment", value: v, label: v > 0 ? "Positive" : "Negative", confidence: c };
-      return null;
+      return { type: "sentiment", value: v, label: v > 0 ? "Positive" : "Negative", confidence: c };
     case "tension_cluster":
     case "momentum_shift":
     case "persistent_incongruence":
     case "verbal_incongruence":
       return { type: "fusion", value: v, label: sig.value_text || sig.signal_type.replace(/_/g, " "), confidence: c };
-    default:
-      return null;
   }
+
+  // ── Video: Facial / Body / Gaze signals ──────────────────────────
+  // Confidence filtering is done by the API gateway; render whatever arrives.
+  if (sig.signal_type in FACE_SIGNAL_LABELS)
+    return { type: "face", value: v, label: FACE_SIGNAL_LABELS[sig.signal_type](sig), confidence: c };
+
+  if (sig.signal_type in BODY_SIGNAL_LABELS)
+    return { type: "body", value: v, label: BODY_SIGNAL_LABELS[sig.signal_type](sig), confidence: c };
+
+  if (sig.signal_type in GAZE_SIGNAL_LABELS)
+    return { type: "gaze", value: v, label: GAZE_SIGNAL_LABELS[sig.signal_type](sig), confidence: c };
+
+  return null;
 }
 
 function pickBorderType(signals: BlockSignal[]): SpeechBlock["borderType"] {
   for (const s of signals) {
-    if (s.type === "stress" && s.value > 0.5) return "stress";
+    if (s.type === "stress" && s.value > 0.65) return "stress";
     if (s.type === "objection") return "objection";
   }
   for (const s of signals) {
     if (s.type === "fusion") return "fusion";
     if (s.type === "buying") return "buying";
+    if (s.type === "face" && s.value > 0.7) return "face";
   }
   for (const s of signals) {
     if (s.type === "sentiment") return "sentiment";
-    if (s.type === "stress" && s.value > 0.3) return "stress";
+    if (s.type === "stress" && s.value > 0.55) return "stress";
   }
   return "normal";
 }

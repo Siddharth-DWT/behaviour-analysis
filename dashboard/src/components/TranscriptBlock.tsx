@@ -35,17 +35,32 @@ function getBorderColor(signals: Signal[]): string {
   return "border-l-transparent";
 }
 
-// ── Emotion emoji mapping ──
-const EMOTION_EMOJI: Record<string, string> = {
-  happy: "😊", joy: "😊", excited: "😄",
-  sad: "😢", sadness: "😢",
-  angry: "😠", anger: "😠",
-  fearful: "😨", fear: "😨",
-  disgusted: "😒", disgust: "😒",
-  surprised: "😲", surprise: "😲",
-  contempt: "🙄",
-  stressed: "😬",
+// ── Intensity-graded emotion emojis (3 tiers: mild → medium → high) ──
+const EMOTION_EMOJI: Record<string, [string, string, string]> = {
+  happy:     ["🙂", "😊", "😄"],
+  joy:       ["🙂", "😊", "😄"],
+  excited:   ["🙂", "😄", "🤩"],
+  sad:       ["😔", "😢", "😭"],
+  sadness:   ["😔", "😢", "😭"],
+  angry:     ["😤", "😠", "🤬"],
+  anger:     ["😤", "😠", "🤬"],
+  fearful:   ["😟", "😨", "😱"],
+  fear:      ["😟", "😨", "😱"],
+  disgusted: ["😒", "🤢", "🤮"],
+  disgust:   ["😒", "🤢", "🤮"],
+  surprised: ["😮", "😲", "🤯"],
+  surprise:  ["😮", "😲", "🤯"],
+  contempt:  ["🙄", "😏", "😤"],
+  stressed:  ["😬", "😬", "😰"],
 };
+
+function emotionEmoji(emotion: string, value: number): string | null {
+  const tiers = EMOTION_EMOJI[emotion];
+  if (!tiers) return null;
+  if (value > 0.65) return tiers[2];
+  if (value > 0.35) return tiers[1];
+  return tiers[0];
+}
 
 // ── Build inline video indicators for a segment ──
 interface VideoIndicators {
@@ -66,12 +81,25 @@ function getVideoIndicators(signals: Signal[]): VideoIndicators {
     return { emotionEmoji: null, stressLevel: null, incongruence: null, headGesture: null, gazeAway: false };
   }
 
-  // Dominant emotion (highest confidence)
+  // Dominant emotion — intensity-graded emoji, fallback to valence_arousal
   const emotionSigs = video
     .filter((s) => s.signal_type === "facial_emotion" && s.value_text)
     .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
-  const emotion = emotionSigs[0]?.value_text?.toLowerCase() ?? null;
-  const emotionEmoji = emotion ? (EMOTION_EMOJI[emotion] ?? null) : null;
+  const topEmotion = emotionSigs[0];
+  let emojiStr: string | null = topEmotion
+    ? emotionEmoji(topEmotion.value_text!.toLowerCase(), topEmotion.value ?? 0.3)
+    : null;
+
+  // Fallback: valence_arousal fires at a lower threshold than discrete emotion
+  if (!emojiStr) {
+    const vaSig = video.find((s) => s.signal_type === "valence_arousal" && s.value_text);
+    if (vaSig) {
+      const vt = vaSig.value_text?.toLowerCase() ?? "";
+      const val = vaSig.value ?? 0;
+      if (vt.startsWith("positive")) emojiStr = val > 0.35 ? "😊" : "🙂";
+      else if (vt.startsWith("negative")) emojiStr = val < -0.35 ? "😟" : "😐";
+    }
+  }
 
   // Combined stress (voice + face, take max)
   const voiceStress = signals.find((s) => s.signal_type === "vocal_stress_score")?.value ?? 0;
@@ -106,7 +134,7 @@ function getVideoIndicators(signals: Signal[]): VideoIndicators {
     (s) => s.signal_type === "gaze_direction_shift" || s.signal_type === "sustained_distraction"
   );
 
-  return { emotionEmoji, stressLevel, incongruence, headGesture, gazeAway };
+  return { emotionEmoji: emojiStr, stressLevel, incongruence, headGesture, gazeAway };
 }
 
 const STRESS_DOT_COLOR = { high: "#EF4444", med: "#F59E0B", low: "#22C55E" };

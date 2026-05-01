@@ -59,22 +59,29 @@ function signalCategory(sig: Signal): string {
 }
 
 function isNoteworthy(sig: Signal): boolean {
-  const cat = signalCategory(sig);
-  const v = sig.value ?? 0;
-  if (cat === "stress" && v <= 0.3) return false;
-  if (cat === "sentiment" && Math.abs(v) <= 0.35) return false;
-  if (cat === "other") return false;
+  // Data thresholds are enforced by the API gateway (_should_display_signal).
+  // Here we only exclude uncategorised signal types from the UI.
+  if (signalCategory(sig) === "other") return false;
   return true;
 }
 
+// Signals whose window spans more than 2 minutes are session-level summaries
+// (e.g. stress_trajectory, escalation_ladder, adaptation_pattern from the
+// fusion temporal engine). Attaching them to every segment floods the UI —
+// they should appear in the session summary panel instead.
+const SESSION_LEVEL_WINDOW_MS = 120_000;
+
 function matchSignalsToSegment(seg: TranscriptSegment, signals: Signal[]): Signal[] {
-  const raw = signals.filter(
-    (s) =>
+  const raw = signals.filter((s) => {
+    const windowDuration = (s.window_end_ms ?? s.window_start_ms ?? 0) - (s.window_start_ms ?? 0);
+    if (windowDuration > SESSION_LEVEL_WINDOW_MS) return false;
+    return (
       isNoteworthy(s) &&
       (s.speaker_label === seg.speaker_label || s.speaker_label === seg.speaker_id) &&
       (s.window_start_ms ?? 0) <= seg.end_ms &&
       (s.window_end_ms ?? s.window_start_ms ?? 0) >= seg.start_ms
-  );
+    );
+  });
 
   // Deduplicate: keep only the highest-value signal per category
   const bestByCategory = new Map<string, Signal>();
@@ -277,7 +284,7 @@ export default function TranscriptView({ segments, signals, speakerRoles, speake
             const isLeft = spkIdx % 2 === 0;
             const sigs = segmentSignals[i];
             const hasHighStress = sigs.some(
-              (s) => signalCategory(s) === "stress" && (s.value ?? 0) > 0.55
+              (s) => signalCategory(s) === "stress" && (s.value ?? 0) > 0.7
             );
             const isSelected = selectedIdx === i;
             const role = speakerRoles?.[spk];

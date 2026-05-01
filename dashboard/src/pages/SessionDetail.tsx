@@ -64,6 +64,10 @@ function matchSignalsToSegment(
     const overlapStart = Math.max(s.window_start_ms, segment.start_ms);
     const overlapEnd = Math.min(s.window_end_ms, segment.end_ms);
     if (overlapEnd <= overlapStart) return false;
+    // Video signals are keyed by face position (Face_N) which may not match
+    // diarization speaker labels. Match by time overlap only so emotion/gaze/
+    // gesture indicators always reach the transcript block.
+    if (s.agent === "video") return true;
     if (
       s.speaker_label &&
       segment.speaker_label &&
@@ -207,12 +211,24 @@ function computeSpeakerStats(signals: Signal[]): SpeakerStats[] {
 // ── Video Stats per speaker ──
 
 interface VideoStats {
-  screenEngagementPct: number;   // avg screen_contact value × 100
+  // Face
   dominantEmotion: string | null;
-  smileCount: number;
+  dominantEmotionIntensity: number;   // 0.0–1.0 peak value for emoji selection
+  facialEngagement: "high_engagement" | "disengaged" | null;
+  facialStress: "high_facial_stress" | "moderate" | null;
+  duchenneSmilesCount: number;
+  // Body
+  lean: "forward_lean" | "back_lean" | null;
+  posture: string | null;
   nodCount: number;
+  shakeCount: number;
   fidgetLevel: "low" | "moderate" | "high" | null;
-  voiceFaceAlignmentPct: number; // 0 = no data, else 0-100
+  // Gaze
+  screenEngagementPct: number;
+  attentionLevel: "high" | "reduced" | null;
+  distractionCount: number;
+  // Alignment — only populated when incongruence signals exist; null = no data
+  incongruenceLevel: "low" | "moderate" | "high" | null;
 }
 
 function computeVideoStats(signals: Signal[]): Record<string, VideoStats> {
@@ -226,65 +242,120 @@ function computeVideoStats(signals: Signal[]): Record<string, VideoStats> {
 
     if (video.length === 0) continue;
 
-    // Screen engagement
-    const screenVals = video
-      .filter((s) => s.signal_type === "screen_contact" && s.value != null)
-      .map((s) => s.value!);
-    const screenEngagementPct = screenVals.length > 0
-      ? Math.round((screenVals.reduce((a, b) => a + b, 0) / screenVals.length) * 100)
-      : 0;
+    // ── Face ──────────────────────────────────────────────────────────
 
-    // Dominant emotion
-    const emotionFreq = new Map<string, number>();
+    // Dominant non-neutral emotion (weighted by confidence × value)
+    const emotionScore = new Map<string, number>();
+    const emotionIntensity = new Map<string, number>();
     for (const s of video.filter((s) => s.signal_type === "facial_emotion" && s.value_text)) {
       const e = s.value_text!;
-      emotionFreq.set(e, (emotionFreq.get(e) ?? 0) + 1);
+      if (e === "neutral") continue;
+      const weight = (s.confidence ?? 0.5) * (s.value ?? 0.5);
+      emotionScore.set(e, (emotionScore.get(e) ?? 0) + weight);
+      emotionIntensity.set(e, Math.max(emotionIntensity.get(e) ?? 0, s.value ?? 0));
     }
     let dominantEmotion: string | null = null;
-    let maxFreq = 0;
-    for (const [e, freq] of emotionFreq) {
-      if (freq > maxFreq && e !== "neutral") { dominantEmotion = e; maxFreq = freq; }
+    let dominantEmotionIntensity = 0;
+    let maxScore = 0;
+    for (const [e, sc] of emotionScore) {
+      if (sc > maxScore) { dominantEmotion = e; maxScore = sc; dominantEmotionIntensity = emotionIntensity.get(e) ?? 0; }
     }
 
-    // Counts
-    const smileCount = video.filter((s) => s.signal_type === "smile_type").length;
-    const nodCount = video.filter((s) => s.signal_type === "head_nod").length;
+    // Facial engagement: pick highest-confidence window
+    const engSigs = video.filter((s) => s.signal_type === "facial_engagement" && s.value_text);
+    let facialEngagement: VideoStats["facialEngagement"] = null;
+    if (engSigs.length > 0) {
+      const top = engSigs.reduce((a, b) => (b.confidence ?? 0) > (a.confidence ?? 0) ? b : a);
+      if (top.value_text === "high_engagement") facialEngagement = "high_engagement";
+      else if (top.value_text === "disengaged") facialEngagement = "disengaged";
+    }
 
-    // Fidget level
+    // Facial stress level
+    const stressSigs = video.filter((s) => s.signal_type === "facial_stress" && s.value_text);
+    let facialStress: VideoStats["facialStress"] = null;
+    if (stressSigs.length > 0) {
+      const hasHigh = stressSigs.some((s) => s.value_text === "high_facial_stress");
+      facialStress = hasHigh ? "high_facial_stress" : "moderate";
+    }
+
+    // Duchenne (genuine) smiles only
+    const duchenneSmilesCount = video.filter(
+      (s) => s.signal_type === "smile_type" && s.value_text === "duchenne"
+    ).length;
+
+    // ── Body ──────────────────────────────────────────────────────────
+
+    // Lean direction (highest-confidence signal)
+    const leanSigs = video.filter((s) => s.signal_type === "body_lean" && s.value_text);
+    let lean: VideoStats["lean"] = null;
+    if (leanSigs.length > 0) {
+      const top = leanSigs.reduce((a, b) => (b.confidence ?? 0) > (a.confidence ?? 0) ? b : a);
+      lean = (top.value_text as VideoStats["lean"]) ?? null;
+    }
+
+    // Posture (most frequent non-upright state)
+    const postureFreq = new Map<string, number>();
+    for (const s of video.filter((s) => s.signal_type === "posture" && s.value_text)) {
+      const p = s.value_text!;
+      if (p === "upright") continue;
+      postureFreq.set(p, (postureFreq.get(p) ?? 0) + 1);
+    }
+    let posture: string | null = null;
+    let maxPFreq = 0;
+    for (const [p, f] of postureFreq) { if (f > maxPFreq) { posture = p; maxPFreq = f; } }
+
+    const nodCount = video.filter((s) => s.signal_type === "head_nod").length;
+    const shakeCount = video.filter((s) => s.signal_type === "head_shake").length;
+
+    // Fidget level from actual values
     const fidgetVals = video
       .filter((s) => s.signal_type === "body_fidgeting" && s.value != null)
       .map((s) => s.value!);
     const avgFidget = fidgetVals.length > 0
-      ? fidgetVals.reduce((a, b) => a + b, 0) / fidgetVals.length
-      : -1;
+      ? fidgetVals.reduce((a, b) => a + b, 0) / fidgetVals.length : -1;
     const fidgetLevel: VideoStats["fidgetLevel"] =
-      avgFidget < 0 ? null
-      : avgFidget > 0.6 ? "high"
-      : avgFidget > 0.3 ? "moderate"
-      : "low";
+      avgFidget < 0 ? null : avgFidget > 0.6 ? "high" : avgFidget > 0.3 ? "moderate" : "low";
 
-    // Voice-face alignment (inverse of incongruence confidence × score)
-    const incongSigs = fusion.filter(
-      (s) => ["tone_face_masking", "smile_sentiment_incongruence", "stress_suppression"].includes(s.signal_type)
+    // ── Gaze ──────────────────────────────────────────────────────────
+
+    // Screen engagement: only meaningful when contact was actually low.
+    // The gaze rule only fires for low (<40%) or sustained high (>90%) contact.
+    // High values (99%) just mean "looking at camera" — normal video-call behavior.
+    // Show the chip only when low_screen_contact signals exist (the anomaly case).
+    const lowContactSigs = video.filter(
+      (s) => s.signal_type === "screen_contact" && s.value_text === "low_screen_contact" && s.value != null
     );
-    let voiceFaceAlignmentPct = 0;
-    if (video.length > 0) {
-      if (incongSigs.length === 0) {
-        voiceFaceAlignmentPct = 88; // No incongruence detected → high alignment
-      } else {
-        const avgIncon =
-          incongSigs.reduce((a, s) => a + (s.value ?? 0) * (s.confidence ?? 0), 0) / incongSigs.length;
-        voiceFaceAlignmentPct = Math.round(Math.max(0, 1 - avgIncon) * 100);
-      }
+    const screenEngagementPct = lowContactSigs.length > 0
+      ? Math.round((lowContactSigs.reduce((a, b) => a + (b.value ?? 0), 0) / lowContactSigs.length) * 100) : 0;
+
+    // Attention level from attention_level signals
+    const attSigs = video.filter((s) => s.signal_type === "attention_level" && s.value_text);
+    let attentionLevel: VideoStats["attentionLevel"] = null;
+    if (attSigs.length > 0) {
+      const top = attSigs.reduce((a, b) => (b.confidence ?? 0) > (a.confidence ?? 0) ? b : a);
+      if (top.value_text?.includes("high")) attentionLevel = "high";
+      else if (top.value_text?.includes("reduced") || top.value_text?.includes("low")) attentionLevel = "reduced";
+    }
+
+    const distractionCount = video.filter((s) => s.signal_type === "sustained_distraction").length;
+
+    // ── Alignment — real data only ─────────────────────────────────────
+    const incongSigs = fusion.filter((s) =>
+      ["tone_face_masking", "smile_sentiment_incongruence", "stress_suppression",
+       "head_body_incongruence", "verbal_incongruence"].includes(s.signal_type)
+    );
+    let incongruenceLevel: VideoStats["incongruenceLevel"] = null;
+    if (incongSigs.length > 0) {
+      const avgIncon =
+        incongSigs.reduce((a, s) => a + (s.value ?? 0) * (s.confidence ?? 0.5), 0) / incongSigs.length;
+      incongruenceLevel = avgIncon > 0.6 ? "high" : avgIncon > 0.35 ? "moderate" : "low";
     }
 
     result[label] = {
-      screenEngagementPct,
-      dominantEmotion,
-      smileCount,
-      nodCount,
-      fidgetLevel,
-      voiceFaceAlignmentPct,
+      dominantEmotion, dominantEmotionIntensity, facialEngagement, facialStress, duchenneSmilesCount,
+      lean, posture, nodCount, shakeCount, fidgetLevel,
+      screenEngagementPct, attentionLevel, distractionCount,
+      incongruenceLevel,
     };
   }
 
@@ -519,32 +590,13 @@ export default function SessionDetail() {
     queryKey: ["video-signals", id],
     queryFn: () => getVideoSignals(id!),
     enabled: !!id && !!detail?.session?.media_url,
+    // Poll every 30 s until Face/Body/Gaze signals arrive, then stop
+    refetchInterval: (query) => {
+      const d = query.state.data as { signals?: { agent: string }[] } | undefined;
+      return d?.signals?.some((s) => s.agent === "video") ? false : 30_000;
+    },
   });
 
-  useEffect(() => {
-    if (!signalData) return;
-    const byAgent: Record<string, number> = {};
-    for (const s of signalData.signals) {
-      const a = s.agent ?? "unknown";
-      byAgent[a] = (byAgent[a] ?? 0) + 1;
-    }
-    console.log(`[SessionDetail] signals loaded: ${signalData.signals.length} total`, byAgent);
-  }, [signalData]);
-
-  useEffect(() => {
-    if (!videoSignalData) return;
-    const byAgent: Record<string, number> = {};
-    const byType: Record<string, number> = {};
-    for (const s of videoSignalData.signals) {
-      const a = s.agent ?? "unknown";
-      byAgent[a] = (byAgent[a] ?? 0) + 1;
-      byType[s.signal_type] = (byType[s.signal_type] ?? 0) + 1;
-    }
-    console.group(`[SessionDetail] video signals: ${videoSignalData.signals.length}`);
-    console.log("By agent:", byAgent);
-    console.log("By signal_type:", byType);
-    console.groupEnd();
-  }, [videoSignalData]);
 
   if (loadingDetail) {
     return (
@@ -892,11 +944,27 @@ export default function SessionDetail() {
                       {/* VISUAL section — only shown when video signals exist for this speaker */}
                       {hasVideoSignals && videoStats[speaker.label] && (() => {
                         const vs = videoStats[speaker.label];
-                        const EMOTION_LABEL: Record<string, string> = {
-                          happy: "😊 happy", joy: "😊 joyful", excited: "😄 excited",
-                          sad: "😢 sad", angry: "😠 angry", fearful: "😨 fearful",
-                          disgusted: "😒 disgusted", surprised: "😲 surprised",
-                          contempt: "🙄 contempt", stressed: "😬 stressed",
+                        // Intensity-graded emoji: low → medium → high
+                        const EMOTION_EMOJI: Record<string, [string, string, string]> = {
+                          happy:     ["🙂 happy",      "😊 happy",     "😄 happy"],
+                          sad:       ["😔 sad",         "😢 sad",       "😭 sad"],
+                          angry:     ["😤 angry",       "😠 angry",     "🤬 angry"],
+                          surprised: ["😮 surprised",   "😲 surprised", "🤯 surprised"],
+                          disgusted: ["😒 disgusted",   "🤢 disgusted", "🤮 disgusted"],
+                          contempt:  ["🙄 contempt",    "😏 contempt",  "😤 contempt"],
+                          fearful:   ["😟 fearful",     "😨 fearful",   "😱 fearful"],
+                        };
+                        const EMOTION_COLOR: Record<string, string> = {
+                          happy: "#22C55E", sad: "#3B82F6", angry: "#EF4444",
+                          surprised: "#F59E0B", disgusted: "#6B7280",
+                          contempt: "#EF4444", fearful: "#8B5CF6",
+                        };
+                        const emotionLabel = (emotion: string, intensity: number) => {
+                          const tiers = EMOTION_EMOJI[emotion];
+                          if (!tiers) return emotion;
+                          if (intensity > 0.65) return tiers[2];
+                          if (intensity > 0.35) return tiers[1];
+                          return tiers[0];
                         };
                         return (
                           <div className="mt-3 rounded-md bg-nexus-surface-hover p-2.5">
@@ -904,26 +972,77 @@ export default function SessionDetail() {
                               Visual
                             </div>
                             <div className="flex flex-wrap gap-1.5">
-                              {vs.screenEngagementPct > 0 && (
-                                <StatChip label="Screen" value={`${vs.screenEngagementPct}%`} color={vs.screenEngagementPct >= 70 ? "#22C55E" : vs.screenEngagementPct >= 45 ? "#F59E0B" : "#EF4444"} />
+                              {/* Facial engagement */}
+                              {vs.facialEngagement && (
+                                <StatChip
+                                  label="Engagement"
+                                  value={vs.facialEngagement === "high_engagement" ? "engaged" : "disengaged"}
+                                  color={vs.facialEngagement === "high_engagement" ? "#22C55E" : "#EF4444"}
+                                />
                               )}
+                              {/* Facial stress */}
+                              {vs.facialStress && (
+                                <StatChip
+                                  label="Face stress"
+                                  value={vs.facialStress === "high_facial_stress" ? "high" : "moderate"}
+                                  color={vs.facialStress === "high_facial_stress" ? "#EF4444" : "#F59E0B"}
+                                />
+                              )}
+                              {/* Dominant emotion */}
                               {vs.dominantEmotion && (
-                                <StatChip label="Emotion" value={EMOTION_LABEL[vs.dominantEmotion] ?? vs.dominantEmotion} />
+                                <StatChip
+                                  label="Emotion"
+                                  value={emotionLabel(vs.dominantEmotion, vs.dominantEmotionIntensity)}
+                                  color={EMOTION_COLOR[vs.dominantEmotion] ?? "#8B5CF6"}
+                                />
                               )}
-                              {vs.smileCount > 0 && (
-                                <StatChip label="Smiles" value={vs.smileCount} color="#22C55E" />
+                              {/* Duchenne smiles */}
+                              {vs.duchenneSmilesCount > 0 && (
+                                <StatChip label="Genuine smiles" value={vs.duchenneSmilesCount} color="#22C55E" />
                               )}
+                              {/* Body lean */}
+                              {vs.lean && (
+                                <StatChip
+                                  label="Lean"
+                                  value={vs.lean === "forward_lean" ? "forward" : "back"}
+                                  color={vs.lean === "forward_lean" ? "#22C55E" : "#F59E0B"}
+                                />
+                              )}
+                              {/* Posture */}
+                              {vs.posture && (
+                                <StatChip label="Posture" value={vs.posture.replace(/_/g, " ")} color="#F59E0B" />
+                              )}
+                              {/* Head gestures */}
                               {vs.nodCount > 0 && (
                                 <StatChip label="Nods" value={vs.nodCount} color="#4F8BFF" />
                               )}
-                              {vs.fidgetLevel && (
-                                <StatChip label="Fidget" value={vs.fidgetLevel} color={vs.fidgetLevel === "high" ? "#EF4444" : vs.fidgetLevel === "moderate" ? "#F59E0B" : "#22C55E"} />
+                              {vs.shakeCount > 0 && (
+                                <StatChip label="Shakes" value={vs.shakeCount} color="#F97316" />
                               )}
-                              {vs.voiceFaceAlignmentPct > 0 && (
+                              {/* Fidget */}
+                              {vs.fidgetLevel && vs.fidgetLevel !== "low" && (
+                                <StatChip label="Fidget" value={vs.fidgetLevel} color={vs.fidgetLevel === "high" ? "#EF4444" : "#F59E0B"} />
+                              )}
+                              {/* Gaze */}
+                              {vs.screenEngagementPct > 0 && (
+                                <StatChip label="Eye contact" value={`${vs.screenEngagementPct}%`} color={vs.screenEngagementPct >= 70 ? "#22C55E" : vs.screenEngagementPct >= 45 ? "#F59E0B" : "#EF4444"} />
+                              )}
+                              {vs.attentionLevel && (
                                 <StatChip
-                                  label="Alignment"
-                                  value={`${vs.voiceFaceAlignmentPct}%`}
-                                  color={vs.voiceFaceAlignmentPct >= 75 ? "#22C55E" : vs.voiceFaceAlignmentPct >= 55 ? "#F59E0B" : "#EF4444"}
+                                  label="Attention"
+                                  value={vs.attentionLevel}
+                                  color={vs.attentionLevel === "high" ? "#22C55E" : "#EF4444"}
+                                />
+                              )}
+                              {vs.distractionCount > 0 && (
+                                <StatChip label="Distracted" value={`${vs.distractionCount}×`} color="#EF4444" />
+                              )}
+                              {/* Incongruence — only from real fusion signals */}
+                              {vs.incongruenceLevel && (
+                                <StatChip
+                                  label="Mismatch"
+                                  value={vs.incongruenceLevel}
+                                  color={vs.incongruenceLevel === "high" ? "#EF4444" : vs.incongruenceLevel === "moderate" ? "#F59E0B" : "#22C55E"}
                                 />
                               )}
                             </div>

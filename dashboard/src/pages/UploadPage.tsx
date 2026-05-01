@@ -15,6 +15,8 @@ import {
 } from "lucide-react";
 import { uploadSession, quickTranscribe, getSession, getTranscript, getSessionProgress, getReport, listSessions } from "../api/client";
 import type { TranscriptSegment, QuickSegment, Session } from "../api/client";
+import { uploadFileChunked } from "../api/chunkedUpload";
+import type { ChunkProgress } from "../api/chunkedUpload";
 import { DEFAULT_CONFIG, type UploadConfig } from "../components/UploadSettings";
 
 // ─── Option lists ──────────────────────────────────────────────────────────────
@@ -498,7 +500,7 @@ function QuickDoneView({
 
 function buildSteps(cfg: UploadConfig, hasVideo?: boolean): string[] {
   const steps = [
-    "Uploading audio file",
+    hasVideo ? "Uploading video file" : "Uploading audio file",
     "Transcribing speech",
   ];
   if (cfg.run_diarization) {
@@ -645,6 +647,9 @@ export default function UploadPage() {
     companies: Array<{ name: string }>;
   } | null>(null);
 
+  // Chunked upload progress (large files > 20 MB)
+  const [chunkProgress, setChunkProgress] = useState<ChunkProgress | null>(null);
+
   // Lightweight session history (transcript/diarize/entity sessions stored in DB)
   const [lightSessions, setLightSessions] = useState<Session[]>([]);
   const [lightLoading, setLightLoading] = useState(false);
@@ -777,6 +782,7 @@ export default function UploadPage() {
 
     const configPayload = {
       meeting_type: cfg.meeting_type,
+      num_speakers: cfg.num_speakers,
       transcription: {
         language: cfg.language,
         model_preference: cfg.model_preference,
@@ -823,15 +829,30 @@ export default function UploadPage() {
     }
 
     // ── Full path: create session + background pipeline ──
+    const CHUNKED_THRESHOLD = 50 * 1024 * 1024; // 50 MB
     try {
-      const result = await uploadSession(
-        file,
-        title || file.name.replace(/\.[^.]+$/, ""),
-        cfg.meeting_type,
-        configPayload
-      );
-      setSessionId(result.session_id);
-      startPolling(result.session_id);
+      let sid: string;
+      if (file.size > CHUNKED_THRESHOLD) {
+        // Large file — split into 10 MB chunks
+        setChunkProgress(null);
+        sid = await uploadFileChunked(file, {
+          title: title || file.name.replace(/\.[^.]+$/, ""),
+          meetingType: cfg.meeting_type,
+          config: configPayload,
+          onProgress: setChunkProgress,
+        });
+      } else {
+        // Small file — single request (existing behaviour)
+        const result = await uploadSession(
+          file,
+          title || file.name.replace(/\.[^.]+$/, ""),
+          cfg.meeting_type,
+          configPayload,
+        );
+        sid = result.session_id;
+      }
+      setSessionId(sid);
+      startPolling(sid);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Upload failed");
       setPhase("error");
@@ -1007,12 +1028,48 @@ export default function UploadPage() {
                       </div>
                     </div>
                     <div>
-                      <p className="text-xs font-semibold text-nexus-text-primary">Analysing Recording</p>
+                      <p className="text-xs font-semibold text-nexus-text-primary">
+                        {chunkProgress && chunkProgress.phase !== "done"
+                          ? chunkProgress.phase === "initializing" ? "Preparing upload…"
+                          : chunkProgress.phase === "assembling"   ? "Assembling file…"
+                          : "Uploading…"
+                          : "Analysing Recording"}
+                      </p>
                       <p className="text-[10px] text-nexus-text-muted truncate">{file?.name}</p>
                     </div>
                   </div>
-                  {/* Step list — built from config */}
-                  <InlineStepList cfg={cfg} pipelineStep={pipelineStep} hasVideo={file ? /\.(mp4|webm)$/i.test(file.name) : false} />
+
+                  {/* Chunk upload progress bar (visible only during chunked upload) */}
+                  {chunkProgress && chunkProgress.phase !== "done" && (
+                    <div className="mb-4">
+                      <div className="flex justify-between text-[10px] text-nexus-text-muted mb-1">
+                        <span>
+                          {chunkProgress.phase === "uploading"
+                            ? `${chunkProgress.chunksUploaded} / ${chunkProgress.totalChunks} chunks`
+                            : chunkProgress.phase === "assembling"
+                            ? "Assembling on server…"
+                            : "Preparing…"}
+                        </span>
+                        <span>{chunkProgress.progressPct}%</span>
+                      </div>
+                      <div className="w-full bg-nexus-border rounded-full h-1.5">
+                        <div
+                          className="bg-nexus-accent-blue h-1.5 rounded-full transition-all duration-300"
+                          style={{ width: `${chunkProgress.progressPct}%` }}
+                        />
+                      </div>
+                      <p className="text-[10px] text-nexus-text-muted mt-1">
+                        {(chunkProgress.bytesUploaded / 1024 / 1024).toFixed(1)} MB
+                        {" / "}
+                        {(chunkProgress.totalBytes / 1024 / 1024).toFixed(1)} MB
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Step list — shown once upload is done and pipeline is running */}
+                  {(!chunkProgress || chunkProgress.phase === "done") && (
+                    <InlineStepList cfg={cfg} pipelineStep={pipelineStep} hasVideo={file ? /\.(mp4|webm)$/i.test(file.name) : false} />
+                  )}
                 </div>
               )}
 

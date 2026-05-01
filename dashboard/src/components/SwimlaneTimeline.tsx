@@ -54,6 +54,7 @@ const BORDER_COLORS: Record<string, string> = {
   buying: "#22C55E",
   fusion: "#F97316",
   sentiment: "#8B5CF6",
+  face: "#EC4899",
   normal: "#4B5563",
 };
 
@@ -67,6 +68,10 @@ const SIGNAL_DOTS: Record<string, { color: string; symbol: string }> = {
   pitch:     { color: "#F59E0B", symbol: "P" },
   tone:      { color: "#3B82F6", symbol: "T" },
   rate:      { color: "#F59E0B", symbol: "R" },
+  // Video signals
+  face:      { color: "#EC4899", symbol: "F" },
+  body:      { color: "#10B981", symbol: "B" },
+  gaze:      { color: "#06B6D4", symbol: "G" },
 };
 
 const SEVERITY_COLORS: Record<string, string> = {

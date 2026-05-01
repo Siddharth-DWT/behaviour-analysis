@@ -56,10 +56,11 @@ const COMPUTATIONS: Record<string, (s: Signal[]) => number> = {
     return Math.round(avg([...v, ...f]) * 100);
   },
   alignment: (s) => {
+    // Requires actual cross-modal fusion signals — never fake a default.
     const masking = s.filter(
       (x) => x.agent === "fusion" && ["tone_face_masking", "smile_sentiment_incongruence", "stress_suppression"].includes(x.signal_type)
     );
-    if (masking.length === 0) return sigVals(s, "vocal_stress_score").length > 0 ? 85 : 0;
+    if (masking.length === 0) return 0;
     const avgIncon = avg(masking.map((x) => (x.value ?? 0) * (x.confidence ?? 0)));
     return Math.round(Math.max(0, 1 - avgIncon) * 100);
   },

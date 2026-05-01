@@ -281,7 +281,7 @@ export async function uploadSession(
   file: File,
   title: string,
   meetingType: string,
-  config?: Record<string, unknown>
+  config?: Record<string, unknown>,
 ): Promise<{
   session_id: string;
   status: string;
@@ -332,12 +332,7 @@ export async function getHealth(): Promise<{
 }
 
 export async function verifyEmail(token: string): Promise<{ success: boolean; message: string }> {
-  const res = await fetch(`${API_BASE}/auth/verify-email?token=${token}`);
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({ detail: "Verification failed" }));
-    throw new Error(data.detail || "Verification failed");
-  }
-  return res.json();
+  return request(`/auth/verify-email?token=${encodeURIComponent(token)}`);
 }
 
 export async function getProfile(): Promise<{
@@ -364,42 +359,15 @@ export async function changePassword(
 }
 
 export async function forgotPassword(email: string): Promise<{ message: string }> {
-  const res = await fetch(`${API_BASE}/auth/forgot-password`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email }),
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({ detail: "Request failed" }));
-    throw new Error(data.detail || "Request failed");
-  }
-  return res.json();
+  return request("/auth/forgot-password", { method: "POST", body: JSON.stringify({ email }) });
 }
 
 export async function resetPassword(
   token: string, new_password: string
 ): Promise<{ success: boolean; message: string }> {
-  const res = await fetch(`${API_BASE}/auth/reset-password`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token, new_password }),
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({ detail: "Reset failed" }));
-    throw new Error(data.detail || "Reset failed");
-  }
-  return res.json();
+  return request("/auth/reset-password", { method: "POST", body: JSON.stringify({ token, new_password }) });
 }
 
 export async function resendVerification(email: string): Promise<{ message: string }> {
-  const res = await fetch(`${API_BASE}/auth/resend-verification`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email }),
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({ detail: "Failed to resend" }));
-    throw new Error(data.detail || "Failed to resend");
-  }
-  return res.json();
+  return request("/auth/resend-verification", { method: "POST", body: JSON.stringify({ email }) });
 }
