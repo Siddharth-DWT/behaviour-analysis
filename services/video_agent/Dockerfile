@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# OpenCV + MediaPipe system deps
+# OpenCV + MediaPipe system deps + ffmpeg for H.264 re-encoding
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 \
         libglib2.0-0 \
@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxrender1 \
         libgles2 \
         libegl1 \
+        ffmpeg \
     && ldconfig \
     && rm -rf /var/lib/apt/lists/*
 
