@@ -116,6 +116,7 @@ class FusionAnalyseRequest(BaseModel):
     generate_report: Optional[bool] = True
     voice_summary: Optional[dict] = None
     language_summary: Optional[dict] = None
+    video_summary: Optional[dict] = None
 
 
 class FusionSessionAnalyseRequest(BaseModel):
@@ -126,6 +127,7 @@ class FusionSessionAnalyseRequest(BaseModel):
     generate_report: Optional[bool] = True
     voice_summary: Optional[dict] = None
     language_summary: Optional[dict] = None
+    video_summary: Optional[dict] = None
 
 
 class ReportRequest(BaseModel):
@@ -138,6 +140,7 @@ class ReportRequest(BaseModel):
     fusion_signals: list[dict] = []
     unified_states: list[dict] = []
     meeting_type: Optional[str] = "sales_call"
+    video_summary: Optional[dict] = None
 
 
 class FusionAnalyseResponse(BaseModel):
