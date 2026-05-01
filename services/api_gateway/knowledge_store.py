@@ -46,6 +46,8 @@ async def store_session_knowledge(pool, session_id: str, session_data: dict):
         })
 
     # ── 2. Signal summaries (group by type + speaker) ──
+    # value_text is included in chunk text so vector search for outcome words
+    # (e.g. "disengaged", "forward_lean", "nervous") finds the right chunks.
     signals = session_data.get("signals", [])
     signal_groups: dict[str, list] = {}
     for s in signals:
@@ -61,16 +63,35 @@ async def store_session_knowledge(pool, session_id: str, session_data: dict):
         avg_conf = sum(confs) / len(confs) if confs else 0
         top_vals = sorted(values, reverse=True)[:5]
 
+        # Count occurrences of each outcome label (value_text)
+        outcome_counts: dict[str, int] = {}
+        for s in group:
+            vt = (s.get("value_text") or "").strip()
+            if vt:
+                outcome_counts[vt] = outcome_counts.get(vt, 0) + 1
+
+        # Build outcome phrase so semantic search matches the actual words
+        if outcome_counts:
+            outcome_parts = [
+                f"{label.replace('_', ' ')} ({count}×)"
+                for label, count in sorted(outcome_counts.items(), key=lambda x: -x[1])
+            ]
+            outcome_phrase = "Outcomes: " + ", ".join(outcome_parts) + ". "
+        else:
+            outcome_phrase = ""
+
         text = (
             f"{speaker}'s {sig_type.replace('_', ' ')}: "
-            f"{len(group)} signals, average value {avg_value:.2f}, "
-            f"average confidence {avg_conf:.2f}. "
-            f"Notable values: {', '.join(f'{v:.2f}' for v in top_vals)}"
+            f"{len(group)} occurrence(s). "
+            f"{outcome_phrase}"
+            f"Average value {avg_value:.2f}, average confidence {avg_conf:.2f}. "
+            f"Peak values: {', '.join(f'{v:.2f}' for v in top_vals)}"
         )
         chunks.append({
             "type": "signal_summary",
             "text": text,
-            "metadata": {"signal_type": sig_type, "speaker": speaker, "count": len(group)},
+            "metadata": {"signal_type": sig_type, "speaker": speaker, "count": len(group),
+                         "outcomes": outcome_counts},
         })
 
     # ── 3. Entity chunks ──
