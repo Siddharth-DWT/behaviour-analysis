@@ -21,8 +21,10 @@ import os
 import sys
 import time
 import uuid
+import asyncio
 import logging
 import tempfile
+import concurrent.futures
 from pathlib import Path
 from typing import Optional
 
@@ -33,14 +35,14 @@ from pydantic import BaseModel
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 try:
-    from feature_extractor import VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures, OverlayRenderer
+    from feature_extractor import VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures
     from calibration import VideoCalibrationModule, FacialBaseline, BodyBaseline, GazeBaseline
     from facial_rules import FacialRuleEngine
     from gaze_rules import GazeRuleEngine
     from body_rules import BodyRuleEngine
 except ImportError:
     from services.video_agent.feature_extractor import (
-        VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures, OverlayRenderer,
+        VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures,
     )
     from services.video_agent.calibration import (
         VideoCalibrationModule, FacialBaseline, BodyBaseline, GazeBaseline,
@@ -70,6 +72,14 @@ app.add_middleware(
 _extractor:   Optional[VideoFeatureExtractor]   = None
 _mapper:      Optional[SpeakerFaceMapper]       = None
 _calibrator:  Optional[VideoCalibrationModule]  = None
+
+# ─── Async job state ──────────────────────────────────────────────────────────
+# job_id → {status, result, error, created_at}
+# Status lifecycle: "queued" → "running" → "done" | "failed"
+_video_jobs: dict[str, dict] = {}
+
+# CPU-bound pipeline.run() runs in this thread pool so the event loop stays free
+_thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="video-pipeline")
 
 
 def _get_extractor() -> VideoFeatureExtractor:
@@ -156,6 +166,14 @@ class VideoAnalysisResponse(BaseModel):
     annotated_video_path:  Optional[str] = None
 
 
+class VideoJobResponse(BaseModel):
+    """Returned immediately by POST /analyse; polled via GET /jobs/{job_id}."""
+    job_id:  str
+    status:  str                              # queued | running | done | failed
+    result:  Optional[VideoAnalysisResponse] = None
+    error:   Optional[str]                   = None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Pipeline
 # ══════════════════════════════════════════════════════════════════════════════
@@ -185,23 +203,27 @@ class VideoPipeline:
         self._gaze_rules   = GazeRuleEngine()
         self._body_rules   = BodyRuleEngine()
 
-    def run(
+    def run_analysis(
         self,
-        video_path:     str,
-        session_id:     str,
-        diar_segments:  list[dict],
-        meeting_type:   str = "general",
-    ) -> VideoAnalysisResponse:
+        video_path:    str,
+        session_id:    str,
+        diar_segments: list[dict],
+        meeting_type:  str = "general",
+    ) -> tuple["VideoAnalysisResponse", str]:
+        """
+        Phase 1 — MediaPipe extraction + calibration + rule engines.
+
+        Returns (VideoAnalysisResponse with signals, video_path).
+        Extraction runs WITHOUT overlay so signals are available as fast
+        as possible. Phase 2 (burn_overlay) burns labels onto the original
+        video in the background without blocking signal return.
+        """
         start = time.time()
 
-        # ── Step 1: Extract frame-level features + write landmark overlay ─────
+        # ── Step 1: Frame extraction (no overlay — fast path) ─────────────────
         logger.info(f"[{session_id}] Extracting video features from {Path(video_path).name}")
-        overlay_dir  = Path(os.getenv("OVERLAY_DIR", "data/overlays"))
-        overlay_dir.mkdir(parents=True, exist_ok=True)
-        overlay_path = str(overlay_dir / f"{session_id}_annotated.mp4")
-
         windows: list[WindowFeatures] = self._extractor.extract_all(
-            video_path, overlay_output_path=overlay_path, meeting_type=meeting_type
+            video_path, overlay_output_path=None, meeting_type=meeting_type
         )
         logger.info(f"[{session_id}] {len(windows)} windows extracted")
 
@@ -210,14 +232,14 @@ class VideoPipeline:
 
         duration_sec = (windows[-1].window_end_ms - windows[0].window_start_ms) / 1000.0
 
-        # ── Step 2: Map windows to speakers ────────────────────────────────────
+        # ── Step 2: Map windows → speakers ────────────────────────────────────
         windows_by_speaker: dict[str, list[WindowFeatures]] = self._mapper.assign(
             windows, diar_segments
         )
         speakers = sorted(windows_by_speaker.keys())
         logger.info(f"[{session_id}] Speakers detected: {speakers}")
 
-        # ── Step 3: Build per-speaker baselines ────────────────────────────────
+        # ── Step 3: Per-speaker baselines ─────────────────────────────────────
         baselines: dict[str, tuple[FacialBaseline, BodyBaseline, GazeBaseline]] = {}
         for speaker_id, spk_windows in windows_by_speaker.items():
             facial, body, gaze = self._calibrator.build_all_baselines(
@@ -227,7 +249,7 @@ class VideoPipeline:
             )
             baselines[speaker_id] = (facial, body, gaze)
 
-        # ── Step 4: Run rule engines ───────────────────────────────────────────
+        # ── Step 4: Rule engines ──────────────────────────────────────────────
         facial_signals = self._facial_rules.evaluate(
             windows_by_speaker, baselines, session_id, meeting_type
         )
@@ -239,28 +261,16 @@ class VideoPipeline:
         )
         all_signals: list[dict] = facial_signals + gaze_signals + body_signals
 
-        # ── Step 5: Burn signal labels into overlay video ─────────────────────
-        final_overlay: Optional[str] = None
-        if Path(overlay_path).exists():
-            if all_signals:
-                logger.info(f"[{session_id}] Burning {len(all_signals)} signal labels into overlay")
-                OverlayRenderer().burn_signal_labels(overlay_path, all_signals)
-            final_overlay = overlay_path
-            logger.info(f"[{session_id}] Annotated video → {overlay_path}")
-
-        # ── Step 6: Build response ─────────────────────────────────────────────
-        summaries = self._build_summaries(windows_by_speaker, baselines)
-
-        elapsed = time.time() - start
-        logger.info(
-            f"[{session_id}] Video pipeline complete: "
-            f"{len(all_signals)} signals, {elapsed:.1f}s"
+        summaries    = self._build_summaries(windows_by_speaker, baselines)
+        participant_count = max(
+            (w.face_count for w in windows if hasattr(w, "face_count")),
+            default=len(speakers),
         )
+        elapsed = time.time() - start
 
-        # Max faces detected in any single frame = visible participant count
-        participant_count = max((w.face_count for w in windows if hasattr(w, "face_count")), default=len(speakers))
-
-        logger.info(f"[{session_id}] Participant count (max faces/frame): {participant_count}")
+        logger.info(
+            f"[{session_id}] Analysis complete: {len(all_signals)} signals in {elapsed:.1f}s"
+        )
 
         return VideoAnalysisResponse(
             session_id=session_id,
@@ -271,8 +281,37 @@ class VideoPipeline:
             signals=all_signals,
             processing_time=round(elapsed, 2),
             participant_count=participant_count,
-            annotated_video_path=final_overlay,
-        )
+            annotated_video_path=None,   # Phase 2 fills this in
+        ), video_path
+
+    def burn_overlay(
+        self,
+        session_id:  str,
+        video_path:  str,
+        all_signals: list[dict],
+    ) -> Optional[str]:
+        """
+        Phase 2 — Burn signal text labels onto the original video.
+
+        Purely cosmetic. Runs after signals are already available in the job store.
+        Writes {overlay_dir}/{session_id}_annotated.mp4. Returns that path on
+        success, None on any failure (non-fatal — signals are already persisted).
+        """
+        overlay_dir = Path(os.getenv("OVERLAY_DIR", "data/overlays"))
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+        output_path = str(overlay_dir / f"{session_id}_annotated.mp4")
+
+        try:
+            logger.info(
+                f"[{session_id}] Burning landmarks + {len(all_signals)} signal labels onto video "
+                f"→ {output_path}"
+            )
+            self._extractor.burn_landmarks_and_labels(video_path, all_signals, output_path=output_path)
+            logger.info(f"[{session_id}] Annotated video ready → {output_path}")
+            return output_path
+        except Exception as exc:
+            logger.warning(f"[{session_id}] Landmark burn failed (non-fatal): {exc}")
+            return None
 
     def _build_summaries(
         self,
@@ -313,6 +352,70 @@ class VideoPipeline:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Background job runner
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _run_video_job(
+    job_id: str,
+    video_path: str,
+    session_id: str,
+    diar_segments: list[dict],
+    meeting_type: str,
+) -> None:
+    """
+    Coroutine launched as an asyncio background task.
+    Runs the CPU-bound pipeline in the thread pool so the event loop stays free
+    for health checks and job-status polling during processing.
+    """
+    loop = asyncio.get_event_loop()
+    pipeline = VideoPipeline(
+        extractor=_get_extractor(),
+        mapper=_get_mapper(),
+        calibrator=_get_calibrator(),
+    )
+
+    # ── Phase 1: Frame extraction ─────────────────────────────────────────────
+    _video_jobs[job_id]["status"] = "extracting"
+    try:
+        analysis, src_video_path = await loop.run_in_executor(
+            _thread_pool,
+            lambda: pipeline.run_analysis(
+                video_path=video_path,
+                session_id=session_id,
+                diar_segments=diar_segments,
+                meeting_type=meeting_type,
+            ),
+        )
+    except Exception as exc:
+        logger.exception(f"[{session_id}] Video job {job_id} analysis failed: {exc}")
+        _video_jobs[job_id]["status"] = "failed"
+        _video_jobs[job_id]["error"] = str(exc)
+        return
+
+    # ── Signals ready — gateway can return results immediately ────────────────
+    _video_jobs[job_id]["status"] = "signals_ready"
+    _video_jobs[job_id]["result"] = analysis.model_dump()
+    logger.info(
+        f"[{session_id}] Video job {job_id} signals_ready: {len(analysis.signals)} signals"
+    )
+
+    # ── Phase 2: Burn signal labels onto original video (cosmetic) ────────────
+    _video_jobs[job_id]["status"] = "annotating"
+    try:
+        annotated_path = await loop.run_in_executor(
+            _thread_pool,
+            lambda: pipeline.burn_overlay(session_id, src_video_path, analysis.signals),
+        )
+        if annotated_path:
+            _video_jobs[job_id]["result"]["annotated_video_path"] = annotated_path
+    except Exception as exc:
+        logger.warning(f"[{session_id}] Overlay burn failed (non-fatal): {exc}")
+
+    _video_jobs[job_id]["status"] = "done"
+    logger.info(f"[{session_id}] Video job {job_id} done")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Startup
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -348,28 +451,33 @@ async def health():
     }
 
 
-@app.post("/analyse", response_model=VideoAnalysisResponse)
+@app.post("/analyse", response_model=VideoJobResponse, status_code=202)
 async def analyse(
     video: UploadFile = File(...),
     session_id: str = Form(default=""),
     meeting_type: str = Form(default="general"),
     diar_segments_json: str = Form(default="[]"),
-    num_speakers: int = Form(default=2),
+    num_speakers: int = Form(default=2),  # noqa: ARG001 — reserved for future face-budget tuning
 ):
     """
-    Process an uploaded video file.
+    Submit a video file for async analysis.
+
+    Returns immediately with a job_id (HTTP 202).
+    Poll GET /jobs/{job_id} until status == "done" or "failed".
 
     Form fields:
       video               — mp4 / webm / avi file
       session_id          — UUID from API Gateway (generated if blank)
       meeting_type        — sales | interview | general | etc.
       diar_segments_json  — JSON array of {speaker,start_ms,end_ms} from voice agent
-      num_speakers        — expected speaker count (helps face detection)
+      num_speakers        — expected speaker count (reserved for Phase 2B face budget)
     """
     import json
 
     if not session_id:
         session_id = str(uuid.uuid4())
+
+    job_id = str(uuid.uuid4())
 
     # Parse diarization segments
     try:
@@ -382,33 +490,47 @@ async def analyse(
     if suffix not in {".mp4", ".webm", ".avi", ".mov", ".mkv"}:
         raise HTTPException(status_code=400, detail=f"Unsupported video format: {suffix}")
 
-    # Write to temp file (MediaPipe / OpenCV needs a file path, not a stream)
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp_path = tmp.name
-        content = await video.read()
-        tmp.write(content)
+    # Write to a persistent staging dir — background task owns cleanup
+    staging_dir = Path(tempfile.gettempdir()) / "nexus_video_jobs"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    video_path = str(staging_dir / f"{job_id}{suffix}")
 
-    try:
-        pipeline = VideoPipeline(
-            extractor=_get_extractor(),
-            mapper=_get_mapper(),
-            calibrator=_get_calibrator(),
-        )
-        result = pipeline.run(
-            video_path=tmp_path,
-            session_id=session_id,
-            diar_segments=raw_segs,
-            meeting_type=meeting_type,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-    except Exception as exc:
-        logger.exception(f"[{session_id}] Video pipeline failed: {exc}")
-        raise HTTPException(status_code=500, detail="Video analysis failed.")
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+    content = await video.read()
+    with open(video_path, "wb") as fh:
+        fh.write(content)
 
-    return result
+    # Register job entry before creating task (avoids a race on GET /jobs)
+    _video_jobs[job_id] = {
+        "status": "queued",
+        "session_id": session_id,
+        "result": None,
+        "error": None,
+        "created_at": time.time(),
+    }
+
+    asyncio.create_task(
+        _run_video_job(job_id, video_path, session_id, raw_segs, meeting_type),
+        name=f"video-job-{job_id[:8]}",
+    )
+
+    logger.info(f"[{session_id}] Video job {job_id} queued")
+    return VideoJobResponse(job_id=job_id, status="queued")
+
+
+@app.get("/jobs/{job_id}", response_model=VideoJobResponse)
+async def get_job(job_id: str):
+    """Poll the status of an async video analysis job."""
+    job = _video_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    result: Optional[VideoAnalysisResponse] = None
+    if job["result"] is not None:
+        result = VideoAnalysisResponse(**job["result"])
+
+    return VideoJobResponse(
+        job_id=job_id,
+        status=job["status"],
+        result=result,
+        error=job.get("error"),
+    )
