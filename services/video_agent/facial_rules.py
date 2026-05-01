@@ -85,7 +85,7 @@ class FacialRuleEngine(BaseVideoRuleEngine):
     AGENT_NAME = "video"
 
     # Thresholds (overridable via rule_config in Phase 3)
-    EMOTION_DELTA_THRESHOLD  = 0.08   # min blendshape delta above neutral to fire
+    EMOTION_DELTA_THRESHOLD  = 0.04   # min blendshape delta above neutral to fire
     SMILE_DUCHENNE_THRESHOLD = 0.05   # min mouthSmile delta for Duchenne candidacy
     CHEEK_DUCHENNE_THRESHOLD = 0.05   # min cheekSquint delta to confirm Duchenne
     SMILE_SOCIAL_THRESHOLD   = 0.08   # higher bar for social smile (no eye crinkling)
@@ -297,7 +297,9 @@ class FacialRuleEngine(BaseVideoRuleEngine):
             return []
 
         label = "high_facial_stress" if normalised >= self.STRESS_HIGH_THRESHOLD else "moderate_facial_stress"
-        confidence = min(normalised * conf_mult, 0.55)
+        # AU23/24 (lip tightening) have F1 ≈ 40-55% in webcam conditions — cap lowered
+        # from 0.55 to 0.38 per RESEARCH.md (FACE-STRESS-01 note)
+        confidence = min(normalised * conf_mult, 0.38)
 
         return [self._make_signal(
             rule_id="FACE-STRESS-01",
