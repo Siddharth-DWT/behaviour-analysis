@@ -424,6 +424,9 @@ async def analyse_signals(request: AnalyseRequest):
     if request.voice_summary:
         conversation_summary = request.voice_summary.get("conversation", {})
 
+    # Video summary (per-speaker facial/gaze/body aggregates)
+    video_summary = request.video_summary or {}
+
     # ── Step 4: Build signal graph + analytics ──
     t_step = time.time()
     graph_json = {}
@@ -492,6 +495,7 @@ async def analyse_signals(request: AnalyseRequest):
             entities=entities,
             graph_analytics=graph_insights,
             conversation_summary=conversation_summary,
+            video_summary=video_summary,
         )
 
     if request.generate_report:
@@ -587,6 +591,7 @@ async def generate_report(request: ReportRequest):
         fusion_signals=request.fusion_signals,
         unified_states=request.unified_states,
         meeting_type=request.meeting_type,
+        video_summary=request.video_summary,
     )
 
     if report is None:

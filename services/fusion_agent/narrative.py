@@ -55,6 +55,7 @@ async def generate_session_narrative(
     entities: Optional[dict] = None,
     graph_analytics: Optional[dict] = None,
     conversation_summary: Optional[dict] = None,
+    video_summary: Optional[dict] = None,
 ) -> Optional[dict]:
     """
     Generate a structured narrative report for the session using the LLM.
@@ -96,6 +97,7 @@ async def generate_session_narrative(
         session_id, duration_seconds, speakers,
         voice_summary, language_summary, fusion_signals, unified_states,
         entities, graph_analytics, conversation_summary,
+        video_summary=video_summary,
     )
 
     system_prompt, user_prompt = _build_prompt(context, meeting_type)
@@ -153,6 +155,7 @@ def _build_context(
     entities: Optional[dict] = None,
     graph_analytics: Optional[dict] = None,
     conversation_summary: Optional[dict] = None,
+    video_summary: Optional[dict] = None,
 ) -> str:
     """Build a structured text context block for the LLM."""
     entities = entities or {}
@@ -197,6 +200,44 @@ def _build_context(
                 f"  {time_s:.0f}s — {_display(p.get('speaker', '?'), name_map)}: "
                 f"stress={p.get('stress_score', 0):.3f}"
             )
+
+    # Video analysis per speaker
+    if video_summary and video_summary.get("per_speaker"):
+        lines.append("\n=== VIDEO ANALYSIS (Facial · Gaze · Body) ===")
+        for speaker_id, data in video_summary["per_speaker"].items():
+            lines.append(f"\n[{_display(speaker_id, name_map)}]")
+            if data.get("dominant_emotion"):
+                conf = data.get("dominant_emotion_confidence", 0)
+                lines.append(
+                    f"  Dominant facial emotion: {data['dominant_emotion']} "
+                    f"(confidence={conf:.2f})"
+                )
+            if data.get("dominant_valence"):
+                lines.append(f"  Valence/arousal: {data['dominant_valence']}")
+            if data.get("avg_facial_stress") is not None:
+                lines.append(f"  Avg facial stress: {data['avg_facial_stress']:.3f}")
+            if data.get("avg_facial_engagement") is not None:
+                lines.append(f"  Avg facial engagement: {data['avg_facial_engagement']:.3f}")
+            if data.get("avg_gaze_on_screen_pct") is not None:
+                lines.append(f"  Gaze on screen: {data['avg_gaze_on_screen_pct']:.1%}")
+            gaze_breaks = data.get("gaze_breaks", 0)
+            if gaze_breaks:
+                lines.append(f"  Gaze breaks (distraction events): {gaze_breaks}")
+            blink = data.get("blink_anomalies", 0)
+            if blink:
+                lines.append(f"  Blink rate anomalies: {blink}")
+            nods  = data.get("head_nods", 0)
+            shakes = data.get("head_shakes", 0)
+            if nods or shakes:
+                lines.append(f"  Head gestures: {nods} nods, {shakes} shakes")
+            if data.get("avg_body_movement") is not None:
+                lines.append(f"  Avg body movement: {data['avg_body_movement']:.3f}")
+            posture = data.get("posture_changes", 0)
+            if posture:
+                lines.append(f"  Posture shifts: {posture}")
+            hnf = data.get("hand_near_face_events", 0)
+            if hnf:
+                lines.append(f"  Hand-near-face events (self-soothing): {hnf}")
 
     # Language summary per speaker
     lines.append("\n=== LANGUAGE ANALYSIS ===")
