@@ -1,11 +1,16 @@
 """
 Shared audio loading utility for NEXUS agents.
 
-Handles librosa (WAV/FLAC/OGG) with pyav fallback (MP3/M4A/WebM/MP4).
-Correct int16/int32 normalisation to [-1, 1] float32.
+Handles librosa (WAV/FLAC/OGG) with ffmpeg fallback for container formats
+(MP3, M4A, WebM, MP4).  ffmpeg is more reliable than pyav for mixed-codec
+containers and avoids dependency on the av wheel.
 """
-import numpy as np
 import logging
+import os
+import subprocess
+import tempfile
+
+import numpy as np
 
 logger = logging.getLogger("nexus.audio_loader")
 
@@ -14,19 +19,20 @@ def load_audio(path: str, sr: int = 16000) -> tuple[np.ndarray, int]:
     """
     Load an audio file as mono float32 at the target sample rate.
 
-    Tries librosa/soundfile first (fast, native).
-    Falls back to pyav for container formats (MP3, M4A, WebM, MP4).
+    Tries librosa/soundfile first (fast, native for WAV/FLAC/OGG).
+    Falls back to ffmpeg for container formats (MP3, M4A, WebM, MP4, etc.)
+    by extracting a temporary WAV and reloading it with librosa.
 
     Returns:
         (samples, sample_rate) — samples normalised to [-1.0, 1.0]
 
     Raises:
-        ValueError: if no audio frames could be decoded.
+        ValueError: if no audio could be decoded.
     """
     import librosa
+    import warnings
 
     # Fast path: librosa handles WAV, FLAC, OGG natively via soundfile
-    import warnings
     try:
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="PySoundFile failed")
@@ -36,51 +42,33 @@ def load_audio(path: str, sr: int = 16000) -> tuple[np.ndarray, int]:
     except Exception:
         pass
 
-    # Slow path: pyav decodes any ffmpeg-supported container
-    import av
+    # Slow path: ffmpeg extracts audio to a temp WAV, then librosa loads it
+    logger.info(f"librosa failed, falling back to ffmpeg extraction for {path}")
 
-    logger.info(f"librosa failed, falling back to pyav for {path}")
-    container = av.open(path)
-    stream = container.streams.audio[0]
-    native_sr = stream.sample_rate
-
-    samples = []
-    skipped_frames = 0
-    total_packets = 0
-    for packet in container.demux(stream):
-        if packet.dts is None:
-            continue
-        total_packets += 1
-        try:
-            for frame in packet.decode():
-                arr = frame.to_ndarray()
-                if arr.ndim > 1:
-                    arr = arr.mean(axis=0)       # mix to mono
-                arr = arr.astype(np.float32)
-                # Correct normalisation per bit depth
-                if frame.format.name in ("s16", "s16p"):
-                    arr = arr / 32768.0          # 2^15
-                elif frame.format.name in ("s32", "s32p"):
-                    arr = arr / 2147483648.0     # 2^31
-                samples.append(arr)
-        except Exception as e:
-            skipped_frames += 1
-            continue
-
-    container.close()
-
-    if skipped_frames > 0:
-        logger.warning(
-            f"pyav skipped {skipped_frames}/{total_packets} packets "
-            f"while decoding {path}"
+    tmp_fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
+    os.close(tmp_fd)
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", path,
+                "-ac", "1",                     # mono
+                "-ar", str(sr),                 # target sample rate
+                "-vn",                          # no video
+                "-f", "wav",
+                tmp_wav,
+            ],
+            capture_output=True, text=True, timeout=120,
         )
+        if result.returncode != 0:
+            raise ValueError(
+                f"ffmpeg audio extraction failed (rc={result.returncode}): "
+                f"{result.stderr[-300:]}"
+            )
 
-    if not samples:
-        raise ValueError(f"pyav decoded no audio frames from {path}")
-
-    y = np.concatenate(samples).astype(np.float32)
-
-    if native_sr != sr:
-        y = librosa.resample(y, orig_sr=native_sr, target_sr=sr)
-
-    return y, sr
+        y, out_sr = librosa.load(tmp_wav, sr=sr, mono=True)
+        return y, out_sr
+    finally:
+        try:
+            os.remove(tmp_wav)
+        except OSError:
+            pass
