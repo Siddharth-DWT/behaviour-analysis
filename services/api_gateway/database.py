@@ -75,6 +75,101 @@ async def _ensure_participant_count_column(pool: asyncpg.Pool):
         pass
 
 
+async def _ensure_speaker_registry_tables(pool: asyncpg.Pool) -> None:
+    """
+    Create speakers_registry and speaker_appearances tables if they don't exist.
+    Idempotent — safe to call on every startup.
+
+    speakers_registry  — persistent cross-session speaker identities with voice/face embeddings.
+    speaker_appearances — per-session link from a registry entry to a session speaker record.
+    """
+    try:
+        # pgvector must be present for the voice_embedding / face_embedding columns.
+        await pool.execute("CREATE EXTENSION IF NOT EXISTS vector")
+
+        await pool.execute("""
+            CREATE TABLE IF NOT EXISTS speakers_registry (
+                id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                org_id            UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                display_name      VARCHAR(255) NOT NULL,
+                role              VARCHAR(100) DEFAULT '',
+                company           VARCHAR(255) DEFAULT '',
+                email             VARCHAR(255) DEFAULT '',
+                notes             TEXT DEFAULT '',
+
+                -- Voice identity (pyannote embedding)
+                voice_embedding   vector(256),
+                voice_sample_count INT DEFAULT 0,
+
+                -- Face identity (future: InsightFace/ArcFace embedding)
+                face_embedding    vector(512),
+                face_sample_count INT DEFAULT 0,
+
+                -- Stats updated after each session
+                session_count        INT DEFAULT 0,
+                total_talk_time_ms   BIGINT DEFAULT 0,
+                first_seen_at        TIMESTAMPTZ DEFAULT NOW(),
+                last_seen_at         TIMESTAMPTZ DEFAULT NOW(),
+
+                created_at  TIMESTAMPTZ DEFAULT NOW(),
+                updated_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+
+        await pool.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sr_org   ON speakers_registry(org_id)"
+        )
+        await pool.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sr_name  ON speakers_registry(org_id, display_name)"
+        )
+        # ivfflat index for fast cosine-similarity lookups on voice embeddings.
+        # Wrapped in a separate try so a missing embedding row doesn't block startup.
+        try:
+            await pool.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sr_voice ON speakers_registry "
+                "USING ivfflat (voice_embedding vector_cosine_ops) WITH (lists = 10)"
+            )
+        except Exception as e:
+            logger.warning(f"Could not create ivfflat index on speakers_registry (non-fatal): {e}")
+
+        await pool.execute("""
+            CREATE TABLE IF NOT EXISTS speaker_appearances (
+                id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                registry_id      UUID NOT NULL REFERENCES speakers_registry(id) ON DELETE CASCADE,
+                session_id       UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                speaker_id       UUID REFERENCES speakers(id) ON DELETE SET NULL,
+                speaker_label    VARCHAR(50) NOT NULL,
+
+                -- Per-session stats for this speaker
+                talk_time_pct    FLOAT DEFAULT 0,
+                word_count       INT DEFAULT 0,
+                avg_stress       FLOAT DEFAULT 0,
+                avg_rapport      FLOAT DEFAULT 0,
+                avg_engagement   FLOAT DEFAULT 0,
+                filler_rate      FLOAT DEFAULT 0,
+
+                -- Match method and confidence
+                match_method     VARCHAR(50) DEFAULT 'manual',
+                match_confidence FLOAT DEFAULT 1.0,
+
+                created_at  TIMESTAMPTZ DEFAULT NOW(),
+
+                UNIQUE(registry_id, session_id, speaker_label)
+            )
+        """)
+
+        await pool.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sa_registry ON speaker_appearances(registry_id)"
+        )
+        await pool.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sa_session  ON speaker_appearances(session_id)"
+        )
+
+        logger.info("Speaker registry tables ensured.")
+    except Exception as e:
+        logger.warning(f"Speaker registry table init failed (non-fatal): {e}")
+
+
 async def create_session(
     title: str,
     session_type: str = "recording",

@@ -56,13 +56,13 @@ const COMPUTATIONS: Record<string, (s: Signal[]) => number> = {
     return Math.round(avg([...v, ...f]) * 100);
   },
   alignment: (s) => {
-    // Requires actual cross-modal fusion signals — never fake a default.
-    const masking = s.filter(
-      (x) => x.agent === "fusion" && ["tone_face_masking", "smile_sentiment_incongruence", "stress_suppression"].includes(x.signal_type)
+    if (!s.some((x) => x.agent === "fusion")) return 0;
+    const incongruence = s.filter((x) =>
+      ["tone_face_masking", "stress_suppression", "verbal_nonverbal_discordance",
+       "head_body_incongruence", "smile_sentiment_incongruence"].includes(x.signal_type)
     );
-    if (masking.length === 0) return 0;
-    const avgIncon = avg(masking.map((x) => (x.value ?? 0) * (x.confidence ?? 0)));
-    return Math.round(Math.max(0, 1 - avgIncon) * 100);
+    if (incongruence.length === 0) return 100;
+    return Math.round((1 - incongruence.length / s.length) * 100);
   },
   attention: (s) => {
     const screen = sigVals(s, "screen_contact", "video");

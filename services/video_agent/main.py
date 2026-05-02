@@ -11,7 +11,7 @@ Endpoints:
 
 Pipeline:
   1. Save uploaded video to temp file
-  2. VideoFeatureExtractor.extract_all()  → list[WindowFeatures]
+  2. VideoFeatureExtractor.extract_all()  → (list[WindowFeatures], lip_activity_map)
   3. SpeakerFaceMapper.assign()           → dict[str, list[WindowFeatures]]
   4. VideoCalibrationModule.build_all_baselines() per speaker
   5. Rule engines (Phase 2B-D placeholder — returns empty signals for now)
@@ -222,7 +222,7 @@ class VideoPipeline:
 
         # ── Step 1: Frame extraction (no overlay — fast path) ─────────────────
         logger.info(f"[{session_id}] Extracting video features from {Path(video_path).name}")
-        windows: list[WindowFeatures] = self._extractor.extract_all(
+        windows, lip_activity_map = self._extractor.extract_all(
             video_path, overlay_output_path=None, meeting_type=meeting_type
         )
         logger.info(f"[{session_id}] {len(windows)} windows extracted")
@@ -232,9 +232,9 @@ class VideoPipeline:
 
         duration_sec = (windows[-1].window_end_ms - windows[0].window_start_ms) / 1000.0
 
-        # ── Step 2: Map windows → speakers ────────────────────────────────────
+        # ── Step 2: Map windows → speakers (lip-sync correlation) ─────────────
         windows_by_speaker: dict[str, list[WindowFeatures]] = self._mapper.assign(
-            windows, diar_segments
+            windows, diar_segments, lip_activity_map
         )
         speakers = sorted(windows_by_speaker.keys())
         logger.info(f"[{session_id}] Speakers detected: {speakers}")
@@ -257,7 +257,8 @@ class VideoPipeline:
             windows_by_speaker, baselines, session_id, meeting_type
         )
         body_signals = self._body_rules.evaluate(
-            windows_by_speaker, baselines, session_id, meeting_type
+            windows_by_speaker, baselines, session_id, meeting_type,
+            extra_signals=facial_signals + gaze_signals,
         )
         all_signals: list[dict] = facial_signals + gaze_signals + body_signals
 

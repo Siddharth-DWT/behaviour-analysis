@@ -276,6 +276,122 @@ const SIGNAL_CONFIG: Record<string, SignalConfigEntry> = {
     color: (s) => (s.value_text === "high_tension" ? "#EF4444" : "#F59E0B"),
     category: "compound",
   },
+  // ── New body signals (Phase 2E) ───────────────────────────────────────────────
+  face_region_touch: {
+    icon: "✋",
+    label: (s) => {
+      const zoneLabels: Record<string, string> = {
+        chin_touch_evaluation:     "Chin Touch: Evaluating",
+        mouth_cover_suppression:   "Mouth Cover: Holding Back",
+        nose_touch_discomfort:     "Nose Touch: Discomfort",
+        cheek_touch_listening:     "Cheek Touch: Listening",
+        cheek_rest_fatigue:        "Head Resting: Fatigue",
+        ear_touch_soothing:        "Ear Touch: Self-Soothing",
+        neck_touch_vulnerability:  "Neck Touch: Feeling Exposed",
+        forehead_touch_frustration:"Forehead: Frustration",
+      };
+      return zoneLabels[s.value_text] || `Touch: ${s.value_text}`;
+    },
+    color: "#F59E0B",
+    category: "body",
+  },
+  arms_crossed: {
+    icon: "⊠",
+    label: () => "Arms Crossed",
+    color: "#F59E0B",
+    category: "body",
+  },
+  finger_steepling: {
+    icon: "△",
+    label: () => "Steepling: Confidence",
+    color: "#10B981",
+    category: "body",
+  },
+  head_supported: {
+    icon: "🤲",
+    label: (s) =>
+      s.value_text === "head_resting_disengagement"
+        ? "Head Resting: Disengaged"
+        : "Head Resting: Thinking",
+    color: (s) =>
+      s.value_text === "head_resting_disengagement" ? "#EF4444" : "#F59E0B",
+    category: "body",
+  },
+  hands_clasped: {
+    icon: "🤝",
+    label: (s) =>
+      s.value_text === "hands_clasped_waiting"
+        ? "Hands Clasped: Waiting"
+        : "Hands Clasped: Restraint",
+    color: "#6B7280",
+    category: "body",
+  },
+  cross_speaker_interaction: {
+    icon: "🔗",
+    label: (s) => {
+      const labels: Record<string, string> = {
+        agreement_reaction:    "Agreeing with speaker",
+        disagreement_reaction: "Disagreeing with speaker",
+        discomfort_reaction:   "Uncomfortable",
+        incongruent_reaction:  "Mixed signals",
+        disengagement_reaction: "Checked out",
+      };
+      return labels[s.value_text ?? ""] ?? s.value_text ?? "Interaction";
+    },
+    color: (s) => {
+      if (s.value_text === "agreement_reaction")    return "#10B981";
+      if (s.value_text === "disagreement_reaction") return "#EF4444";
+      if (s.value_text === "incongruent_reaction")  return "#F59E0B";
+      return "#6B7280";
+    },
+    category: "body",
+  },
+  lip_pursing: {
+    icon: "◑",
+    label: () => "Lip Pursing: Holding Back",
+    color: "#F59E0B",
+    category: "face",
+  },
+  posture_transition: {
+    icon: "⇄",
+    label: (s) => {
+      const labels: Record<string, string> = {
+        closing_up:       "Closing Up",
+        opening_up:       "Opening Up",
+        disengaging:      "Disengaging",
+        re_engaging:      "Re-Engaging",
+        defensive_shift:  "Defensive Shift",
+        losing_interest:  "Losing Interest",
+      };
+      return labels[s.value_text] || s.value_text;
+    },
+    color: (s) =>
+      ["opening_up", "re_engaging"].includes(s.value_text)
+        ? "#10B981"
+        : ["closing_up", "defensive_shift", "losing_interest"].includes(s.value_text)
+        ? "#EF4444"
+        : "#F59E0B",
+    category: "body",
+  },
+  body_language_cluster: {
+    icon: "◉",
+    label: (s) => {
+      const labels: Record<string, string> = {
+        skepticism_cluster:           "Skepticism Detected",
+        stress_anxiety_cluster:       "Stress Indicators",
+        confidence_authority_cluster: "Confidence Display",
+        disengagement_boredom_cluster:"Disengagement Pattern",
+      };
+      return labels[s.value_text] || s.value_text;
+    },
+    color: (s) =>
+      s.value_text === "confidence_authority_cluster"
+        ? "#10B981"
+        : s.value_text === "skepticism_cluster"
+        ? "#F59E0B"
+        : "#EF4444",
+    category: "compound",
+  },
 };
 
 const CATEGORIES: { key: string; label: string }[] = [

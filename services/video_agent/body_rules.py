@@ -1,15 +1,17 @@
 """
-Body Rule Engine — Phase 2D
+Body Rule Engine — Phase 2D + 2E
 Implements BODY-HEAD-01, BODY-POST-01, BODY-LEAN-01, BODY-GEST-01,
-BODY-FIDG-01, BODY-TOUCH-01.
+BODY-FIDG-01, BODY-TOUCH-01, BODY-TOUCH-02, BODY-ARMS-01, BODY-STEEPLE-01,
+BODY-STATE-01, BODY-CLUSTER-01.
 BODY-MIRROR-01 is experimental (requires simultaneous multi-speaker pose data).
 
 Research anchors:
   Mehrabian 1972     — Body lean as approach/avoidance indicator
-  Navarro 2008       — Head nod clusters: agreement (≥2Hz), pacifying
-  Pease & Pease 2004 — Posture and power: upright spine = confidence
+  Navarro 2008       — Head nod clusters: agreement (≥2Hz), pacifying; steepling = confidence
+  Pease & Pease 2004 — Posture and power: upright spine = confidence; 3-cue cluster rule
   Ekman 1985         — Self-touch / adaptor gestures as stress indicator
   Soukupova 2016     — EAR-based blink detection (used in feature_extractor.py)
+  Chartrand 1999     — Chameleon Effect (mirroring → rapport)
 """
 import logging
 import math
@@ -45,6 +47,76 @@ def _count_zero_crossings(seq: list[float]) -> int:
         if seq[i - 1] * seq[i] < 0:
             crossings += 1
     return crossings
+
+
+class PostureStateMachine:
+    """
+    Tracks posture state transitions across windows for a single speaker.
+
+    States: open, closed, engaged, withdrawn, neutral.
+    Transitions between non-neutral states emit BODY-STATE-01 signals.
+    State scores are derived from arm/lean/gesture features per window.
+    """
+
+    def classify_state(self, w: "WindowFeatures", bl: Optional[object] = None) -> str:
+        score_open = 0
+        score_closed = 0
+        score_engaged = 0
+        score_withdrawn = 0
+
+        if w.arms_crossed_pct > 0.30:
+            score_closed += 2
+        elif w.hands_detected_rate > 0.50:
+            score_open += 1
+
+        if bl is not None:
+            dist_delta = w.head_shoulder_dist_mean - getattr(bl, "head_shoulder_dist_mean", 0.0)
+            if dist_delta < -0.03:
+                score_engaged += 2
+                score_open += 1
+            elif dist_delta > 0.03:
+                score_withdrawn += 2
+                score_closed += 1
+
+        if w.spine_angle_mean > 10:
+            score_withdrawn += 1
+        elif abs(w.spine_angle_mean) < 5:
+            score_engaged += 1
+
+        if w.hand_velocity_mean > 0.5:
+            score_engaged += 1
+            score_open += 1
+        elif w.hand_velocity_mean < 0.1:
+            score_withdrawn += 1
+
+        scores = {
+            "open": score_open, "closed": score_closed,
+            "engaged": score_engaged, "withdrawn": score_withdrawn,
+        }
+        best = max(scores, key=lambda k: scores[k])
+        return "neutral" if scores[best] < 2 else best
+
+    def __init__(self) -> None:
+        self._history: list[tuple[int, str]] = []
+
+    def update(self, timestamp_ms: int, state: str) -> Optional[dict]:
+        """Record new state; return a transition dict if the state changed meaningfully."""
+        self._history.append((timestamp_ms, state))
+        if len(self._history) < 2:
+            return None
+        prev_state = self._history[-2][1]
+        if prev_state == state or prev_state == "neutral" or state == "neutral":
+            return None
+        labels = {
+            ("open",     "closed"):    "closing_up",
+            ("closed",   "open"):      "opening_up",
+            ("engaged",  "withdrawn"): "disengaging",
+            ("withdrawn","engaged"):   "re_engaging",
+            ("engaged",  "closed"):    "defensive_shift",
+            ("open",     "withdrawn"): "losing_interest",
+        }
+        label = labels.get((prev_state, state), f"{prev_state}_to_{state}")
+        return {"from_state": prev_state, "to_state": state, "label": label, "timestamp_ms": timestamp_ms}
 
 
 class BodyRuleEngine(BaseVideoRuleEngine):
@@ -101,33 +173,79 @@ class BodyRuleEngine(BaseVideoRuleEngine):
         baselines: dict,
         session_id: str = "",
         meeting_type: str = "general",
+        extra_signals: Optional[list[dict]] = None,
     ) -> list[dict]:
         signals: list[dict] = []
+        state_machines: dict[str, PostureStateMachine] = {}
+        _extra = extra_signals or []
+
         for speaker_id, windows in windows_by_speaker.items():
             _, body_bl, _ = baselines.get(
                 speaker_id,
                 (None, BodyBaseline(speaker_id=speaker_id), None),
             )
             cal_conf = body_bl.calibration_confidence
+            state_machines[speaker_id] = PostureStateMachine()
 
-            for w in windows:
+            for w in sorted(windows, key=lambda x: x.window_start_ms):
                 if w.body_detection_rate < self.MIN_BODY_RATE:
                     continue
                 conf_mult = cal_conf * w.body_detection_rate
+
+                # Collect all signals for this window before running cluster rule
+                window_signals: list[dict] = []
 
                 w_head    = self._rule_head_gesture(w, body_bl, speaker_id, conf_mult)
                 w_posture = self._rule_posture(w, body_bl, speaker_id, conf_mult)
                 w_lean    = self._rule_lean(w, body_bl, speaker_id, conf_mult)
 
-                signals += w_head
-                signals += w_posture
-                signals += w_lean
-                signals += self._rule_gesture(w, body_bl, speaker_id, conf_mult)
-                signals += self._rule_fidget(w, body_bl, speaker_id, conf_mult)
-                signals += self._rule_self_touch(w, body_bl, speaker_id, conf_mult)
-                signals += self._rule_head_body_incongruence(
+                window_signals += w_head + w_posture + w_lean
+                window_signals += self._rule_gesture(w, body_bl, speaker_id, conf_mult)
+                window_signals += self._rule_fidget(w, body_bl, speaker_id, conf_mult)
+                window_signals += self._rule_self_touch(w, body_bl, speaker_id, conf_mult)
+                window_signals += self._rule_head_body_incongruence(
                     w, body_bl, speaker_id, conf_mult, w_head, w_posture + w_lean
                 )
+                window_signals += self._rule_touch_classified(w, body_bl, speaker_id, conf_mult)
+                window_signals += self._rule_head_supported(w, body_bl, speaker_id, conf_mult)
+                window_signals += self._rule_hands_clasped(w, body_bl, speaker_id, conf_mult)
+                window_signals += self._rule_crossed_arms(w, body_bl, speaker_id, conf_mult)
+                window_signals += self._rule_steepling(w, body_bl, speaker_id, conf_mult)
+                window_signals += self._rule_cross_speaker_interaction(w, speaker_id, conf_mult)
+
+                # Cross-modal context: facial + gaze signals overlapping this window
+                window_extra = [
+                    s for s in _extra
+                    if s.get("speaker_id") == speaker_id
+                    and s.get("window_start_ms", 0) < w.window_end_ms
+                    and s.get("window_end_ms", 0) > w.window_start_ms
+                ]
+
+                # Cluster rule reads body + facial + gaze signals for co-occurrence
+                window_signals += self._rule_body_language_cluster(
+                    window_signals + window_extra, w, speaker_id, conf_mult
+                )
+
+                # Posture state machine — emit transition when state changes
+                state = state_machines[speaker_id].classify_state(w, body_bl)
+                transition = state_machines[speaker_id].update(w.window_start_ms, state)
+                if transition:
+                    window_signals.append(self._make_signal(
+                        rule_id="BODY-STATE-01",
+                        signal_type="posture_transition",
+                        speaker_id=speaker_id,
+                        value=0.5,
+                        value_text=transition["label"],
+                        confidence=min(0.50 * conf_mult, 0.55),
+                        window_start_ms=w.window_start_ms,
+                        window_end_ms=w.window_end_ms,
+                        metadata={
+                            "from_state": transition["from_state"],
+                            "to_state":   transition["to_state"],
+                        },
+                    ))
+
+                signals += window_signals
 
         # Cross-speaker rule (needs all speakers simultaneously)
         signals += self._rule_mirror(windows_by_speaker, baselines)
@@ -417,14 +535,22 @@ class BodyRuleEngine(BaseVideoRuleEngine):
         """
         pct = w.hand_near_face_pct
 
+        if pct < self.TOUCH_BRIEF_THRESHOLD:
+            # Secondary path: zone classification confirmed a specific face region
+            # even though hand_near_face_pct is below the threshold. At 5fps a
+            # 3-second touch may only land in 1-2 sampled frames per window (10%).
+            # The zone classifier's own distance threshold independently validates
+            # the touch, so treat a confirmed zone as a brief touch.
+            if not w.dominant_touch_zone:
+                return []
+            pct = self.TOUCH_BRIEF_THRESHOLD  # floor to threshold for confidence calc
+
         if pct >= self.TOUCH_SUSTAINED_THRESHOLD:
             label = "sustained_self_touch"
             confidence = min(pct * conf_mult * 0.9, 0.65)
-        elif pct >= self.TOUCH_BRIEF_THRESHOLD:
+        else:
             label = "brief_self_touch"
             confidence = min(pct * conf_mult * 0.6, 0.50)
-        else:
-            return []
 
         return [self._make_signal(
             rule_id="BODY-TOUCH-01",
@@ -510,6 +636,325 @@ class BodyRuleEngine(BaseVideoRuleEngine):
                     "body_posture":   "forward_lean",
                     "interpretation": "disagreement_with_interest",
                 },
+            ))
+
+        return signals
+
+    # ── BODY-TOUCH-02: Classified face-region touch ───────────────────────────
+    def _rule_touch_classified(
+        self,
+        w: WindowFeatures,
+        bl: BodyBaseline,
+        speaker_id: str,
+        conf_mult: float,
+    ) -> list[dict]:
+        """
+        BODY-TOUCH-02: Zone-aware face-region touch classification.
+        Navarro 2008: neck = vulnerability/stress; Pease 2004: chin = evaluation,
+        mouth = suppression; Ekman 1985: nose = discomfort/self-soothing.
+        """
+        zone = w.dominant_touch_zone
+        if not zone:
+            return []
+
+        zone_pct_map = {
+            "chin":     w.touch_zone_chin_pct,
+            "mouth":    w.touch_zone_mouth_pct,
+            "nose":     w.touch_zone_nose_pct,
+            "cheek":    w.touch_zone_cheek_pct,
+            "ear":      w.touch_zone_ear_pct,
+            "neck":     w.touch_zone_neck_pct,
+            "forehead": w.touch_zone_forehead_pct,
+        }
+        zone_pct = zone_pct_map.get(zone, 0.0)
+        baseline_touch = getattr(bl, "self_touch_rate", 0.0)
+        min_pct = max(baseline_touch + 0.10, 0.15)
+        if zone_pct < min_pct:
+            return []
+
+        zone_labels = {
+            "chin":     "chin_touch_evaluation",
+            "mouth":    "mouth_cover_suppression",
+            "nose":     "nose_touch_discomfort",
+            "cheek":    "cheek_touch_listening" if zone_pct < 0.40 else "cheek_rest_fatigue",
+            "ear":      "ear_touch_soothing",
+            "neck":     "neck_touch_vulnerability",
+            "forehead": "forehead_touch_frustration",
+        }
+        label = zone_labels.get(zone, f"{zone}_touch")
+        confidence = min(zone_pct * conf_mult, 0.50)
+
+        return [self._make_signal(
+            rule_id="BODY-TOUCH-02",
+            signal_type="face_region_touch",
+            speaker_id=speaker_id,
+            value=round(zone_pct, 4),
+            value_text=label,
+            confidence=confidence,
+            window_start_ms=w.window_start_ms,
+            window_end_ms=w.window_end_ms,
+            metadata={
+                "zone": zone,
+                "zone_pct": round(zone_pct, 4),
+                "all_zones": {k: round(v, 4) for k, v in zone_pct_map.items() if v > 0.01},
+                "interpretation_caveat": "single_cue_only_meaningful_in_cluster",
+            },
+        )]
+
+    # ── BODY-SUPPORT-01: Head resting on hand ────────────────────────────────
+    def _rule_head_supported(
+        self,
+        w: WindowFeatures,
+        bl: BodyBaseline,
+        speaker_id: str,
+        conf_mult: float,
+    ) -> list[dict]:
+        """
+        BODY-SUPPORT-01: Head resting on hand (sustained chin/cheek touch +
+        head tilted + low facial activity).
+        Navarro 2008: palm-supporting-chin = boredom or deep evaluation.
+        Listening context → disengagement; speaking context → contemplation.
+        """
+        if w.head_supported_pct < 0.30:
+            return []
+        label = "head_resting_disengagement" if not w.is_speaking else "head_resting_contemplation"
+        return [self._make_signal(
+            rule_id="BODY-SUPPORT-01",
+            signal_type="head_supported",
+            speaker_id=speaker_id,
+            value=round(w.head_supported_pct, 4),
+            value_text=label,
+            confidence=min(w.head_supported_pct * 0.7 * conf_mult, 0.50),
+            window_start_ms=w.window_start_ms,
+            window_end_ms=w.window_end_ms,
+            metadata={
+                "head_supported_pct": round(w.head_supported_pct, 4),
+                "is_speaking": w.is_speaking,
+                "dominant_touch_zone": w.dominant_touch_zone,
+            },
+        )]
+
+    # ── BODY-CLASP-01: Hands clasped / interlaced ─────────────────────────────
+    def _rule_hands_clasped(
+        self,
+        w: WindowFeatures,
+        bl: BodyBaseline,
+        speaker_id: str,
+        conf_mult: float,
+    ) -> list[dict]:
+        """
+        BODY-CLASP-01: Hands clasped/interlaced (both hands together, fingers
+        folded — distinct from steepling). Pease 2004: clasped hands = restraint
+        or neutral waiting. Listening → waiting; speaking → self-restraint.
+        """
+        if w.hands_clasped_pct < 0.25:
+            return []
+        label = "hands_clasped_waiting" if not w.is_speaking else "hands_clasped_restraint"
+        return [self._make_signal(
+            rule_id="BODY-CLASP-01",
+            signal_type="hands_clasped",
+            speaker_id=speaker_id,
+            value=round(w.hands_clasped_pct, 4),
+            value_text=label,
+            confidence=min(w.hands_clasped_pct * 0.6 * conf_mult, 0.40),
+            window_start_ms=w.window_start_ms,
+            window_end_ms=w.window_end_ms,
+            metadata={
+                "hands_clasped_pct": round(w.hands_clasped_pct, 4),
+                "is_speaking": w.is_speaking,
+            },
+        )]
+
+    # ── BODY-ARMS-01: Crossed arms ────────────────────────────────────────────
+    def _rule_crossed_arms(
+        self,
+        w: WindowFeatures,
+        bl: BodyBaseline,
+        speaker_id: str,
+        conf_mult: float,
+    ) -> list[dict]:
+        """
+        BODY-ARMS-01: Crossed-arms posture — flagged only when it's a change from
+        baseline. Pease 2004: arms crossed CAN indicate defensiveness but also
+        comfort/cold/habitual rest; baseline-delta is required before flagging.
+        """
+        if w.arms_crossed_pct < 0.30:
+            return []
+        baseline_crossed = getattr(bl, "arms_crossed_rate", 0.0)
+        delta = w.arms_crossed_pct - baseline_crossed
+        if delta < 0.15:
+            return []
+        confidence = min(delta * conf_mult, 0.45)
+        return [self._make_signal(
+            rule_id="BODY-ARMS-01",
+            signal_type="arms_crossed",
+            speaker_id=speaker_id,
+            value=round(w.arms_crossed_pct, 4),
+            value_text="closed_posture",
+            confidence=confidence,
+            window_start_ms=w.window_start_ms,
+            window_end_ms=w.window_end_ms,
+            metadata={
+                "arms_crossed_pct": round(w.arms_crossed_pct, 4),
+                "baseline_rate": round(baseline_crossed, 4),
+                "delta_from_baseline": round(delta, 4),
+                "caveat": "may_indicate_comfort_or_cold_not_only_defensiveness",
+            },
+        )]
+
+    # ── BODY-STEEPLE-01: Finger steepling ────────────────────────────────────
+    def _rule_steepling(
+        self,
+        w: WindowFeatures,
+        bl: BodyBaseline,
+        speaker_id: str,
+        conf_mult: float,
+    ) -> list[dict]:
+        """
+        BODY-STEEPLE-01: Finger steepling — confidence / authority indicator.
+        Navarro 2008: one of the most reliable confidence gestures; both hands with
+        fingertips pressed together ≥20% of window.
+        """
+        if w.finger_steepling_pct < 0.20:
+            return []
+        confidence = min(w.finger_steepling_pct * 0.8 * conf_mult, 0.55)
+        return [self._make_signal(
+            rule_id="BODY-STEEPLE-01",
+            signal_type="finger_steepling",
+            speaker_id=speaker_id,
+            value=round(w.finger_steepling_pct, 4),
+            value_text="confidence_posture",
+            confidence=confidence,
+            window_start_ms=w.window_start_ms,
+            window_end_ms=w.window_end_ms,
+            metadata={"steepling_pct": round(w.finger_steepling_pct, 4)},
+        )]
+
+    # ── BODY-CLUSTER-01: Multi-cue body language interpretation ───────────────
+    def _rule_body_language_cluster(
+        self,
+        speaker_signals: list[dict],
+        w: WindowFeatures,
+        speaker_id: str,
+        conf_mult: float,
+    ) -> list[dict]:
+        """
+        BODY-CLUSTER-01: Only emit an interpretation when 3+ independent cues
+        within the same window align. Pease 2004: "Look for clusters of three or
+        more cues before drawing conclusions."
+        """
+        signals: list[dict] = []
+        signal_types = {s.get("signal_type") for s in speaker_signals}
+        signal_texts = {s.get("value_text") for s in speaker_signals}
+
+        def _avg_conf() -> float:
+            if not speaker_signals:
+                return 0.3
+            return sum(s.get("confidence", 0.3) for s in speaker_signals) / len(speaker_signals)
+
+        # ── Skepticism / Critical Evaluation ──────────────────────────────────
+        skep = 0
+        skep_ev: list[str] = []
+        if any("chin" in s.get("value_text", "") for s in speaker_signals
+               if s.get("signal_type") == "face_region_touch"):
+            skep += 1; skep_ev.append("chin_touch")
+        if "backward_lean" in signal_texts:
+            skep += 1; skep_ev.append("backward_lean")
+        if "lip_pursing" in signal_types:
+            skep += 1; skep_ev.append("lip_pursing")
+        if "low_engagement" in signal_texts or "reduced_attention" in signal_texts:
+            skep += 1; skep_ev.append("low_engagement")
+        if "head_shake" in signal_types:
+            skep += 1; skep_ev.append("head_shake")
+        if skep >= 3:
+            signals.append(self._make_signal(
+                rule_id="BODY-CLUSTER-01", signal_type="body_language_cluster",
+                speaker_id=speaker_id, value=round(skep / 5.0, 2),
+                value_text="skepticism_cluster",
+                confidence=min(_avg_conf() * (skep / 3.0) * conf_mult, 0.60),
+                window_start_ms=w.window_start_ms, window_end_ms=w.window_end_ms,
+                metadata={"cluster_type": "skepticism", "cue_count": skep, "evidence": skep_ev},
+            ))
+
+        # ── Stress / Anxiety ──────────────────────────────────────────────────
+        stress = 0
+        stress_ev: list[str] = []
+        if any("neck" in s.get("value_text", "") for s in speaker_signals
+               if s.get("signal_type") == "face_region_touch"):
+            stress += 1; stress_ev.append("neck_touch")
+        if "body_fidgeting" in signal_types:
+            stress += 1; stress_ev.append("fidgeting")
+        if "facial_stress" in signal_types:
+            stress += 1; stress_ev.append("facial_stress")
+        if "elevated_blink_rate" in signal_texts:
+            stress += 1; stress_ev.append("elevated_blink")
+        if any(z in s.get("value_text", "") for s in speaker_signals
+               for z in ("nose", "ear")
+               if s.get("signal_type") == "face_region_touch"):
+            stress += 1; stress_ev.append("self_soothing_touch")
+        if stress >= 3:
+            signals.append(self._make_signal(
+                rule_id="BODY-CLUSTER-01", signal_type="body_language_cluster",
+                speaker_id=speaker_id, value=round(stress / 5.0, 2),
+                value_text="stress_anxiety_cluster",
+                confidence=min(_avg_conf() * (stress / 3.0) * conf_mult, 0.55),
+                window_start_ms=w.window_start_ms, window_end_ms=w.window_end_ms,
+                metadata={"cluster_type": "stress_anxiety", "cue_count": stress, "evidence": stress_ev},
+            ))
+
+        # ── Confidence / Authority ─────────────────────────────────────────────
+        conf = 0
+        conf_ev: list[str] = []
+        if "finger_steepling" in signal_types:
+            conf += 1; conf_ev.append("finger_steepling")
+        if "upright_power_posture" in signal_texts:
+            conf += 1; conf_ev.append("upright_posture")
+        if "high_attention" in signal_texts or "sustained_eye_contact" in signal_texts:
+            conf += 1; conf_ev.append("steady_gaze")
+        if "forward_lean" in signal_texts:
+            conf += 1; conf_ev.append("forward_lean")
+        if w.hand_velocity_mean > 0.3:
+            conf += 1; conf_ev.append("active_gestures")
+        if w.open_palms_pct > 0.40:
+            conf += 1; conf_ev.append("open_palms")
+        if conf >= 3:
+            signals.append(self._make_signal(
+                rule_id="BODY-CLUSTER-01", signal_type="body_language_cluster",
+                speaker_id=speaker_id, value=round(conf / 5.0, 2),
+                value_text="confidence_authority_cluster",
+                confidence=min(_avg_conf() * (conf / 3.0) * conf_mult, 0.60),
+                window_start_ms=w.window_start_ms, window_end_ms=w.window_end_ms,
+                metadata={"cluster_type": "confidence_authority", "cue_count": conf, "evidence": conf_ev},
+            ))
+
+        # ── Disengagement / Boredom ────────────────────────────────────────────
+        bored = 0
+        bored_ev: list[str] = []
+        if any("cheek_rest_fatigue" in s.get("value_text", "") for s in speaker_signals):
+            bored += 1; bored_ev.append("head_resting_on_hand")
+        elif any("head_resting_disengagement" in s.get("value_text", "") for s in speaker_signals):
+            # elif: cheek_rest_fatigue and head_resting_disengagement both describe head-on-hand;
+            # counting both from the same gesture would inflate bored past the 3-cue threshold
+            # on a single cue, violating the cluster rule.
+            bored += 1; bored_ev.append("head_supported_disengaged")
+        if "backward_lean" in signal_texts:
+            bored += 1; bored_ev.append("backward_lean")
+        if "low_engagement" in signal_texts:
+            bored += 1; bored_ev.append("low_engagement")
+        if "sustained_distraction" in signal_types:
+            bored += 1; bored_ev.append("distracted")
+        if w.hand_velocity_mean < 0.1 and w.hands_detected_rate > 0.3:
+            bored += 1; bored_ev.append("no_gestures")
+        if "arms_crossed" in signal_types:
+            bored += 1; bored_ev.append("arms_crossed")
+        if bored >= 3:
+            signals.append(self._make_signal(
+                rule_id="BODY-CLUSTER-01", signal_type="body_language_cluster",
+                speaker_id=speaker_id, value=round(bored / 6.0, 2),
+                value_text="disengagement_boredom_cluster",
+                confidence=min(_avg_conf() * (bored / 3.0) * conf_mult, 0.55),
+                window_start_ms=w.window_start_ms, window_end_ms=w.window_end_ms,
+                metadata={"cluster_type": "disengagement_boredom", "cue_count": bored, "evidence": bored_ev},
             ))
 
         return signals
@@ -610,4 +1055,68 @@ class BodyRuleEngine(BaseVideoRuleEngine):
                         },
                     ))
 
+        return signals
+
+    # ── BODY-INTERACT-01: Cross-speaker interaction detection ─────────────────
+    def _rule_cross_speaker_interaction(
+        self,
+        w: "WindowFeatures",
+        speaker_id: str,
+        conf_mult: float,
+    ) -> list[dict]:
+        """
+        BODY-INTERACT-01: Emit a signal when a listener shows a sustained
+        reaction (3+ interaction frames in the window) while another speaker
+        is active.  Confidence scales with frame count, capped at 0.55.
+        """
+        signals: list[dict] = []
+
+        interaction = getattr(w, "dominant_interaction", "")
+        count = getattr(w, "interaction_count", 0)
+
+        if not interaction or count < 3:
+            return signals
+
+        # dominant_interaction format: "{reactor_id}_{interaction_type}"
+        parts = interaction.rsplit("_", 1)
+        if len(parts) != 2:
+            return signals
+
+        reactor_id, interaction_type = parts
+
+        # reactor_id is "Face_N" (face-index format from frame-level detection).
+        # speaker_id is a diarization label like "Speaker_2" — the two namespaces
+        # don't match, so compare using the window's face_index instead.
+        our_face_id = f"Face_{w.face_index}"
+        if our_face_id != reactor_id:
+            return signals
+
+        label_map = {
+            "agrees":        "agreement_reaction",
+            "disagrees":     "disagreement_reaction",
+            "uncomfortable": "discomfort_reaction",
+            "incongruent":   "incongruent_reaction",
+            "disengaged":    "disengagement_reaction",
+        }
+        label = label_map.get(interaction_type)
+        if not label:
+            return signals
+
+        confidence = min(count / 15.0 * conf_mult, 0.55)
+
+        signals.append(self._make_signal(
+            rule_id="BODY-INTERACT-01",
+            signal_type="cross_speaker_interaction",
+            speaker_id=speaker_id,
+            value=round(min(count / 10.0, 1.0), 2),
+            value_text=label,
+            confidence=confidence,
+            window_start_ms=w.window_start_ms,
+            window_end_ms=w.window_end_ms,
+            metadata={
+                "interaction_type": interaction_type,
+                "frame_count": count,
+                "reactor": reactor_id,
+            },
+        ))
         return signals

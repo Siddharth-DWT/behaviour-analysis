@@ -1,16 +1,21 @@
 # services/api_gateway/neo4j_semantic_layer.py
 """
-NEXUS Neo4j Semantic Layer — 10 pre-built Cypher tools.
+NEXUS Neo4j Semantic Layer — 12 pre-built Cypher tools.
 
 Architecture:
   User question
-    → select_tool()                   : GPT-4o picks 1 of 10 tools + extracts params
+    → select_tool()                   : GPT-4o picks 1 of 12 tools + extracts params
     → execute_tool()                  : runs hardcoded, tested Cypher for that tool
     → search_graph_context_fallback() : GPT-5 generates Cypher when no tool fits
 
 Model Tiers:
   Tool selection:  gpt-4o  (MEDIUM — reliable structured output, ~$0.002/call)
   Cypher fallback: gpt-5   (HEAVY  — best Cypher reasoning, ~$0.02/call, ~10% of questions)
+
+Tools 1-10 are per-session (require session_id scope).
+Tools 11-12 are cross-session (traverse PersistentSpeaker → APPEARED_AS → Speaker):
+  get_speaker_trend        — performance trajectory for a named speaker over time
+  get_session_comparison   — side-by-side metrics for a speaker across recent sessions
 """
 import json
 import logging
@@ -45,6 +50,7 @@ async def fetch_session_speakers(session_id: str) -> list[dict]:
 
 
 _SIGNAL_TYPE_MAP = {
+    # ── Audio: Voice ──
     "stress": "vocal_stress_score",
     "stressed": "vocal_stress_score",
     "anxiety": "vocal_stress_score",
@@ -61,11 +67,11 @@ _SIGNAL_TYPE_MAP = {
     "monotone": "monotone_flag",
     "interruption": "interruption_event",
     "interrupting": "interruption_event",
+    # ── Audio: Language ──
     "buying": "buying_signal",
     "buy": "buying_signal",
     "objection": "objection_signal",
     "sentiment": "sentiment_score",
-    "emotion": "sentiment_score",
     "rapport": "rapport_indicator",
     "engagement": "conversation_engagement",
     "dominance": "dominance_score",
@@ -73,8 +79,56 @@ _SIGNAL_TYPE_MAP = {
     "conflict": "conflict_score",
     "energy": "energy_level",
     "persuasion": "persuasion_technique",
-    "credibility": "credibility_assessment",
+    "credibility": "stress_sentiment_incongruence",
+    "incongruence": "stress_sentiment_incongruence",
     "urgency": "urgency_authenticity",
+    # ── Video: Facial ──
+    "emotion": "facial_emotion",
+    "expression": "facial_emotion",
+    "face": "facial_emotion",
+    "facial": "facial_emotion",
+    "smile": "smile_type",
+    "smiling": "smile_type",
+    "duchenne": "smile_type",
+    "facial stress": "facial_stress",
+    "face stress": "facial_stress",
+    "visual stress": "facial_stress",
+    "facial engagement": "facial_engagement",
+    "visual engagement": "facial_engagement",
+    "lip pursing": "lip_pursing",
+    "pursed lips": "lip_pursing",
+    # ── Video: Body ──
+    "nod": "head_nod",
+    "nodding": "head_nod",
+    "shake": "head_shake",
+    "head shake": "head_shake",
+    "posture": "posture",
+    "lean": "body_lean",
+    "leaning": "body_lean",
+    "fidget": "body_fidgeting",
+    "fidgeting": "body_fidgeting",
+    "self-touch": "self_touch",
+    "touch": "self_touch",
+    "chin touch": "face_region_touch",
+    "neck touch": "face_region_touch",
+    "gesture": "gesture_animation",
+    "shoulder": "shoulder_tension",
+    "crossed arms": "arms_crossed",
+    "arms crossed": "arms_crossed",
+    "steepling": "finger_steepling",
+    "body language": "body_language_cluster",
+    # ── Video: Gaze ──
+    "gaze": "gaze_direction_shift",
+    "eye contact": "screen_contact",
+    "screen": "screen_contact",
+    "distraction": "sustained_distraction",
+    "distracted": "sustained_distraction",
+    "attention": "attention_level",
+    "blink": "blink_rate_anomaly",
+    "blinking": "blink_rate_anomaly",
+    # ── Fusion ──
+    "masking": "tone_face_masking",
+    "suppression": "stress_suppression",
 }
 
 # ─────────────────────────────────────────────────────────
@@ -288,12 +342,35 @@ OPTIONAL MATCH (stress:Signal {session_id: $session_id, signal_type: 'vocal_stre
                                 speaker_label: spk.label})
 OPTIONAL MATCH (tone:Signal {session_id: $session_id, signal_type: 'tone_classification',
                                speaker_label: spk.label})
-WHERE tone.value_text <> 'neutral'
-WITH spk, round(avg(stress.value)*100)/100 AS avg_stress, max(stress.value) AS peak_stress,
-     collect(DISTINCT tone.value_text) AS tones
+  WHERE tone.value_text <> 'neutral'
+OPTIONAL MATCH (fstress:Signal {session_id: $session_id, signal_type: 'facial_stress',
+                                 speaker_label: spk.label})
+OPTIONAL MATCH (femo:Signal {session_id: $session_id, signal_type: 'facial_emotion',
+                               speaker_label: spk.label})
+  WHERE femo.value_text <> 'neutral'
+OPTIONAL MATCH (nod:Signal {session_id: $session_id, signal_type: 'head_nod',
+                              speaker_label: spk.label})
+OPTIONAL MATCH (shake:Signal {session_id: $session_id, signal_type: 'head_shake',
+                                speaker_label: spk.label})
+OPTIONAL MATCH (att:Signal {session_id: $session_id, signal_type: 'attention_level',
+                              speaker_label: spk.label})
+OPTIONAL MATCH (gaze:Signal {session_id: $session_id, signal_type: 'screen_contact',
+                               speaker_label: spk.label})
+WITH spk,
+     round(avg(stress.value)*100)/100 AS avg_vocal_stress,
+     max(stress.value) AS peak_vocal_stress,
+     collect(DISTINCT tone.value_text) AS tones,
+     round(avg(fstress.value)*100)/100 AS avg_facial_stress,
+     collect(DISTINCT femo.value_text) AS expressions,
+     count(DISTINCT nod) AS nod_count,
+     count(DISTINCT shake) AS shake_count,
+     round(avg(att.value)*100)/100 AS avg_attention,
+     round(avg(gaze.value)*100)/100 AS avg_screen_engagement
 RETURN spk.label AS speaker, spk.name AS name, spk.role AS role,
        spk.talk_time_pct AS talk_pct, spk.word_count AS words,
-       avg_stress, peak_stress, tones
+       avg_vocal_stress, peak_vocal_stress, tones,
+       avg_facial_stress, expressions, nod_count, shake_count,
+       avg_attention, avg_screen_engagement
 ORDER BY spk.label
 """,
     },
@@ -307,7 +384,12 @@ ORDER BY spk.label
             "signal_type": {
                 "description": "vocal_stress_score, tone_classification, buying_signal, "
                                "objection_signal, filler_detection, pitch_elevation_flag, "
-                               "sentiment_score, speech_rate_anomaly, interruption_event",
+                               "sentiment_score, speech_rate_anomaly, interruption_event, "
+                               "facial_emotion, facial_stress, smile_type, head_nod, "
+                               "head_shake, posture, body_lean, attention_level, "
+                               "screen_contact, gaze_direction_shift, sustained_distraction, "
+                               "body_fidgeting, face_region_touch, arms_crossed, "
+                               "finger_steepling, lip_pursing, body_language_cluster",
                 "required": True,
                 "default": None,
             },
@@ -352,6 +434,132 @@ RETURN labels(e) AS types, e.name AS name,
 ORDER BY e.timestamp_ms LIMIT 20
 """,
     },
+
+    {
+        "name": "get_video_behavioral_summary",
+        "description": (
+            "Get visual behavioral summary — facial expressions, body language, gaze patterns, "
+            "posture, gestures, touch zones. Use when user asks about body language, "
+            "facial expressions, eye contact, nonverbal behavior, how someone looked, "
+            "gestures, posture, fidgeting, or visual cues."
+        ),
+        "parameters": {
+            "speaker_label": {
+                "description": "Speaker_0, Speaker_1, or omit for all speakers",
+                "required": False,
+                "default": None,
+            },
+        },
+        "cypher": """
+MATCH (sig:Signal {session_id: $session_id})
+WHERE sig.agent = 'video'
+  AND ($speaker_label IS NULL OR sig.speaker_label = $speaker_label)
+WITH sig.speaker_label AS speaker, sig.signal_type AS type,
+     count(sig) AS occurrences,
+     round(avg(sig.value)*100)/100 AS avg_value,
+     collect(DISTINCT sig.value_text) AS labels
+RETURN speaker, type, occurrences, avg_value, labels
+ORDER BY speaker, occurrences DESC
+""",
+    },
+    {
+        "name": "get_incongruence_moments",
+        "description": (
+            "Find moments where voice and face disagree — masking, suppression, "
+            "verbal-nonverbal mismatch, skepticism clusters. Use when user asks about "
+            "inconsistency, hiding something, fake, masking, sincerity, mismatch, "
+            "or whether someone was being honest."
+        ),
+        "parameters": {
+            "speaker_label": {
+                "description": "Optional speaker filter",
+                "required": False,
+                "default": None,
+            },
+        },
+        "cypher": """
+MATCH (a:Signal {session_id: $session_id})-[r:CONTRADICTS]->(b:Signal {session_id: $session_id})
+WHERE ($speaker_label IS NULL OR a.speaker_label = $speaker_label)
+OPTIONAL MATCH (a)-[:OCCURRED_DURING]->(seg:Segment)
+RETURN a.signal_type AS signal_a, a.value_text AS detail_a,
+       b.signal_type AS signal_b, b.value_text AS detail_b,
+       r.correlation AS relationship,
+       a.timestamp_ms / 1000.0 AS time_sec, a.speaker_label AS speaker,
+       left(seg.text, 80) AS context
+ORDER BY a.timestamp_ms LIMIT 20
+""",
+    },
+
+    # ── Cross-session tools (Phase 3B) ───────────────────────────────────────
+    # These traverse PersistentSpeaker → APPEARED_AS → Speaker across sessions.
+    # $session_id is injected by execute_tool but not used in the Cypher —
+    # that is intentional; these queries are org-wide, not session-scoped.
+    {
+        "name": "get_speaker_trend",
+        "description": (
+            "Get a speaker's performance trend across sessions ordered chronologically. "
+            "Use when user asks about improvement, progress, trajectory, "
+            "or how someone has changed over time. Requires a speaker name."
+        ),
+        "parameters": {
+            "speaker_name": {
+                "description": "Display name of the speaker (e.g. 'Saad', 'Sarah'). Required.",
+                "required": True,
+                "default": None,
+            },
+        },
+        "cypher": """
+MATCH (ps:PersistentSpeaker)
+WHERE $speaker_name IS NULL
+   OR toLower(ps.display_name) CONTAINS toLower($speaker_name)
+MATCH (ps)-[:APPEARED_AS]->(spk:Speaker)-[:PARTICIPATED_IN]->(sess:Session)
+OPTIONAL MATCH (sig:Signal)-[:EMITTED_BY]->(spk)
+WITH ps.display_name AS speaker, sess,
+     round(avg(CASE WHEN sig.signal_type = 'vocal_stress_score'      THEN sig.value END) * 100) / 100 AS avg_stress,
+     round(avg(CASE WHEN sig.signal_type = 'conversation_engagement'  THEN sig.value END) * 100) / 100 AS avg_engagement,
+     round(avg(CASE WHEN sig.signal_type = 'rapport_indicator'        THEN sig.value END) * 100) / 100 AS avg_rapport,
+     round(avg(CASE WHEN sig.signal_type = 'filler_detection'         THEN sig.value END) * 100) / 100 AS filler_rate,
+     count(CASE WHEN sig.signal_type = 'buying_signal'                THEN 1 END)                AS buying_signals
+ORDER BY sess.created_at ASC
+RETURN speaker, sess.title AS session, toString(sess.created_at) AS date,
+       sess.meeting_type AS meeting_type,
+       avg_stress, avg_engagement, avg_rapport, filler_rate, buying_signals
+LIMIT 20
+""",
+    },
+    {
+        "name": "get_session_comparison",
+        "description": (
+            "Compare a speaker's metrics side-by-side across their most recent sessions. "
+            "Use when user asks to compare calls, see differences between sessions, "
+            "or benchmark one session against another."
+        ),
+        "parameters": {
+            "speaker_name": {
+                "description": "Speaker to compare across sessions (e.g. 'Saad', 'Sarah'). Required.",
+                "required": True,
+                "default": None,
+            },
+        },
+        "cypher": """
+MATCH (ps:PersistentSpeaker)
+WHERE $speaker_name IS NULL
+   OR toLower(ps.display_name) CONTAINS toLower($speaker_name)
+MATCH (ps)-[:APPEARED_AS]->(spk:Speaker)-[:PARTICIPATED_IN]->(sess:Session)
+OPTIONAL MATCH (sig:Signal)-[:EMITTED_BY]->(spk)
+WITH ps.display_name AS speaker, sess, spk,
+     round(avg(CASE WHEN sig.signal_type = 'vocal_stress_score'      THEN sig.value END) * 100) / 100 AS avg_stress,
+     round(avg(CASE WHEN sig.signal_type = 'conversation_engagement'  THEN sig.value END) * 100) / 100 AS avg_engagement,
+     count(CASE WHEN sig.signal_type = 'head_nod'                    THEN 1 END)                AS nods,
+     count(CASE WHEN sig.signal_type = 'buying_signal'               THEN 1 END)                AS buying_signals,
+     count(CASE WHEN sig.signal_type = 'objection_signal'            THEN 1 END)                AS objections
+ORDER BY sess.created_at DESC
+LIMIT 10
+RETURN speaker, sess.title AS session, toString(sess.created_at) AS date,
+       avg_stress AS stress, avg_engagement AS engagement,
+       nods, buying_signals, objections
+""",
+    },
 ]
 
 # Build lookup index by name
@@ -369,7 +577,7 @@ Available tools:
 Rules:
 1. Pick exactly ONE tool, or "none" if no tool fits.
 2. Speaker mapping: "seller"/"rep"/"agent"/"caller" = "Speaker_0", "buyer"/"prospect"/"customer" = "Speaker_1". Interviews: "interviewer" = "Speaker_0", "candidate" = "Speaker_1". Use real speaker labels from the session info below when available.
-3. Signal mapping: "stress" = "vocal_stress_score", "buying" = "buying_signal", "objection" = "objection_signal", "tension" = "tension_cluster", "rapport" = "rapport_indicator", "engagement" = "conversation_engagement", "conflict" = "conflict_score", "dominance" = "dominance_score", "pitch" = "pitch_elevation_flag", "filler"/"ums" = "filler_detection", "tone" = "tone_classification", "pace" = "speech_rate_anomaly"
+3. Signal mapping: "stress" = "vocal_stress_score", "buying" = "buying_signal", "objection" = "objection_signal", "tension" = "tension_cluster", "rapport" = "rapport_indicator", "engagement" = "conversation_engagement", "conflict" = "conflict_score", "dominance" = "dominance_score", "pitch" = "pitch_elevation_flag", "filler"/"ums" = "filler_detection", "tone" = "tone_classification", "pace" = "speech_rate_anomaly", "nod" = "head_nod", "shake" = "head_shake", "posture" = "posture", "lean" = "body_lean", "gaze" = "gaze_direction_shift", "eye contact" = "screen_contact", "attention" = "attention_level", "smile" = "smile_type", "facial stress" = "facial_stress", "expression"/"emotion"/"face" = "facial_emotion", "body language" = "body_language_cluster", "masking" = "tone_face_masking", "touch" = "face_region_touch", "steepling" = "finger_steepling", "crossed arms" = "arms_crossed"
 4. Timestamps: "at 2:30" = 150, "minute 5" = 300. Omit if not mentioned.
 5. Set params to null if not mentioned in the question.
 

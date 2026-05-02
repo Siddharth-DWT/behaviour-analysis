@@ -265,10 +265,10 @@ class CompoundPatternEngine:
             "eye_contact":    _sig(signals, "screen_contact", "sustained_eye_contact"),
         }
         hits = {k: v for k, v in components.items() if v is not None}
-        if len(hits) < 3 or _agent_diversity(hits) < 2:
+        if len(hits) < 4 or _agent_diversity(hits) < 2:
             return None
         score = sum(h.get("confidence", 0.5) for h in hits.values()) / len(hits)
-        confidence = min(score * (len(hits) / 3.0) * 1.1, _CAPS["C-04"])
+        confidence = min(score * (len(hits) / 4.0) * 1.1, _CAPS["C-04"])
         return self._make_signal(
             "C-04", "decision_engagement", speaker_id, score, "decision_ready",
             confidence, ws, we,

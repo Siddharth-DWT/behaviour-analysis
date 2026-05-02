@@ -9,6 +9,7 @@ projection used for causal queries, RAG-graph hybrid chat, and exploration.
 
 Node types:
   Session, Speaker, Segment, Topic, Signal, FusionInsight, Entity, Alert
+  PersistentSpeaker  ← Phase 3B cross-session identity node
 
 Relationship types built today (Phase 3A):
   Attribution / structural:
@@ -32,6 +33,9 @@ Relationship types built today (Phase 3A):
     (Signal)-[:REINFORCES]->(Signal)       (confident tone + power language ≤3s)
     (Signal)-[:TRIGGERED]->(Signal)        (stress spike → tension cluster ≤5s)
     (Signal)-[:INFLUENCED]->(Signal)       (cross-speaker temporal causality ≤30s)
+
+Phase 3B cross-session (sync_speaker_registry_to_neo4j):
+    (PersistentSpeaker)-[:APPEARED_AS]->(Speaker)
 
 Sync is non-fatal: if Neo4j is unreachable or any step fails, the pipeline
 still completes. Old session graphs can be rebuilt by re-invoking sync_session.
@@ -149,6 +153,7 @@ async def sync_session(pool, session_id: str) -> bool:
             await _build_temporal_edges(nsession, session_id)
             await _build_containment_edges(nsession, session_id)
             await _build_causal_edges(nsession, session_id)
+            await _build_video_causal_edges(nsession, session_id)
             await _build_influence_edges(nsession, session_id)
             await _link_fusion_to_signals(nsession, session_id)
 
@@ -1038,6 +1043,100 @@ async def _link_fusion_to_signals(nsession, session_id: str):
     )
 
 
+async def _build_video_causal_edges(nsession, session_id: str):
+    """
+    Cross-modal causal edges between video and audio signals.
+    Same speaker, within 5s temporal window.
+    """
+    # Voice stress REINFORCES facial stress
+    await nsession.run("""
+        MATCH (vs:Signal {session_id: $sid, signal_type: 'vocal_stress_score'})
+        WHERE vs.value > 0.35
+        MATCH (fs:Signal {session_id: $sid, signal_type: 'facial_stress'})
+        WHERE fs.value > 0.30
+          AND vs.speaker_label = fs.speaker_label
+          AND abs(vs.timestamp_ms - fs.timestamp_ms) < 5000
+        MERGE (vs)-[r:REINFORCES]->(fs)
+        SET r.correlation = 'voice_face_stress'
+    """, sid=session_id)
+
+    # Warm/confident tone CONTRADICTS negative facial emotion
+    await nsession.run("""
+        MATCH (tone:Signal {session_id: $sid, signal_type: 'tone_classification'})
+        WHERE tone.value_text IN ['warm', 'confident', 'enthusiastic']
+        MATCH (face:Signal {session_id: $sid, signal_type: 'facial_emotion'})
+        WHERE face.value_text IN ['angry', 'sad', 'disgusted']
+          AND tone.speaker_label = face.speaker_label
+          AND abs(tone.timestamp_ms - face.timestamp_ms) < 5000
+        MERGE (tone)-[r:CONTRADICTS]->(face)
+        SET r.correlation = 'tone_face_incongruence'
+    """, sid=session_id)
+
+    # Head nod CONTRADICTS objection (same speaker nods while objecting)
+    await nsession.run("""
+        MATCH (nod:Signal {session_id: $sid, signal_type: 'head_nod'})
+        MATCH (obj:Signal {session_id: $sid, signal_type: 'objection_signal'})
+        WHERE nod.speaker_label = obj.speaker_label
+          AND abs(nod.timestamp_ms - obj.timestamp_ms) < 5000
+        MERGE (nod)-[r:CONTRADICTS]->(obj)
+        SET r.correlation = 'nod_objection_conflict'
+    """, sid=session_id)
+
+    # Head shake CONTRADICTS positive sentiment
+    await nsession.run("""
+        MATCH (shake:Signal {session_id: $sid, signal_type: 'head_shake'})
+        MATCH (sent:Signal {session_id: $sid, signal_type: 'sentiment_score'})
+        WHERE shake.speaker_label = sent.speaker_label
+          AND sent.value > 0.3
+          AND abs(shake.timestamp_ms - sent.timestamp_ms) < 5000
+        MERGE (shake)-[r:CONTRADICTS]->(sent)
+        SET r.correlation = 'shake_positive_conflict'
+    """, sid=session_id)
+
+    # Forward lean REINFORCES buying signal
+    await nsession.run("""
+        MATCH (lean:Signal {session_id: $sid, signal_type: 'body_lean'})
+        WHERE lean.value_text = 'forward_lean'
+        MATCH (buy:Signal {session_id: $sid, signal_type: 'buying_signal'})
+        WHERE lean.speaker_label = buy.speaker_label
+          AND abs(lean.timestamp_ms - buy.timestamp_ms) < 5000
+        MERGE (lean)-[r:REINFORCES]->(buy)
+        SET r.correlation = 'lean_buying_confirmation'
+    """, sid=session_id)
+
+    # Sustained distraction CONTRADICTS engagement
+    await nsession.run("""
+        MATCH (gaze:Signal {session_id: $sid, signal_type: 'sustained_distraction'})
+        MATCH (eng:Signal {session_id: $sid, signal_type: 'conversation_engagement'})
+        WHERE gaze.speaker_label = eng.speaker_label
+          AND abs(gaze.timestamp_ms - eng.timestamp_ms) < 10000
+        MERGE (gaze)-[r:CONTRADICTS]->(eng)
+        SET r.correlation = 'distraction_engagement_conflict'
+    """, sid=session_id)
+
+    # Finger steepling REINFORCES confident tone
+    await nsession.run("""
+        MATCH (st:Signal {session_id: $sid, signal_type: 'finger_steepling'})
+        MATCH (tone:Signal {session_id: $sid, signal_type: 'tone_classification'})
+        WHERE tone.value_text IN ['confident', 'enthusiastic']
+          AND st.speaker_label = tone.speaker_label
+          AND abs(st.timestamp_ms - tone.timestamp_ms) < 5000
+        MERGE (st)-[r:REINFORCES]->(tone)
+        SET r.correlation = 'steepling_confidence'
+    """, sid=session_id)
+
+    # Body language cluster REINFORCES objection when skepticism
+    await nsession.run("""
+        MATCH (cl:Signal {session_id: $sid, signal_type: 'body_language_cluster'})
+        WHERE cl.value_text = 'skepticism_cluster'
+        MATCH (obj:Signal {session_id: $sid, signal_type: 'objection_signal'})
+        WHERE cl.speaker_label = obj.speaker_label
+          AND abs(cl.timestamp_ms - obj.timestamp_ms) < 10000
+        MERGE (cl)-[r:REINFORCES]->(obj)
+        SET r.correlation = 'skepticism_confirms_objection'
+    """, sid=session_id)
+
+
 async def _build_influence_edges(nsession, session_id: str):
     """INFLUENCED: cross-speaker causality, constrained to adjacent segments (1-3 NEXT hops).
 
@@ -1088,6 +1187,9 @@ NODE LABELS and their PROPERTIES:
 (:Speaker)
   id, label (e.g. "Speaker_0"), name, role, talk_time_ms, talk_time_pct, word_count
 
+(:PersistentSpeaker)   -- cross-session identity (Phase 3B)
+  id, display_name, role, company, session_count, first_seen, last_seen
+
 (:Segment)
   id, segment_index, start_ms, end_ms, text, speaker_label,
   sentiment, sentiment_score, word_count
@@ -1108,7 +1210,9 @@ NODE LABELS and their PROPERTIES:
 (:Alert)
   id, alert_type, severity, title, description, timestamp_ms, evidence
 
-Every node has a session_id property — ALWAYS filter with {session_id: $session_id}.
+Every per-session node has a session_id property — ALWAYS filter with {session_id: $session_id}
+for single-session queries.  PersistentSpeaker nodes have NO session_id — do NOT add that filter
+when traversing cross-session identity paths.
 
 RELATIONSHIP TYPES (these are the ONLY valid relationships):
 
@@ -1123,6 +1227,8 @@ RELATIONSHIP TYPES (these are the ONLY valid relationships):
                  COMBINES (fusionInsight→signal, component signals that produced the fusion output)
   Causal:        CONTRADICTS, REINFORCES, TRIGGERED  (all signal→signal)
   Cross-speaker: INFLUENCED  (signal→signal, has lag_ms property)
+  Cross-session: APPEARED_AS (PersistentSpeaker→Speaker) — links persistent identity to
+                 each session-level Speaker node the person appeared as
 
 CRITICAL DISTINCTIONS:
   - Signal TYPES (like 'vocal_stress_score', 'tension_cluster', 'buying_signal',
@@ -1235,6 +1341,22 @@ PATTERN G — "biggest stress / loudest moment / most nervous moment"
   RETURN s.timestamp_ms, s.speaker_label, s.value, s.value_text,
          s.confidence, seg.text
   ORDER BY s.value DESC LIMIT 5
+
+PATTERN I — "how has Speaker X improved?" / "compare this speaker across sessions"
+  Cross-session query via PersistentSpeaker. Do NOT add {session_id: $session_id} here —
+  PersistentSpeaker nodes span all sessions.
+
+  MATCH (ps:PersistentSpeaker)
+  WHERE toLower(ps.display_name) CONTAINS toLower("saad")
+  MATCH (ps)-[:APPEARED_AS]->(spk:Speaker)-[:PARTICIPATED_IN]->(sess:Session)
+  OPTIONAL MATCH (sig:Signal)-[:EMITTED_BY]->(spk)
+  WITH ps.display_name AS speaker, sess,
+       round(avg(CASE WHEN sig.signal_type = 'vocal_stress_score' THEN sig.value END)*100)/100 AS avg_stress,
+       round(avg(CASE WHEN sig.signal_type = 'conversation_engagement' THEN sig.value END)*100)/100 AS avg_engagement
+  ORDER BY sess.created_at ASC
+  RETURN speaker, sess.title AS session, toString(sess.created_at) AS date,
+         avg_stress, avg_engagement
+  LIMIT 20
 
 ═══════════════════════════════════════════════════════════════
 BEHAVIOURAL RULES — these matter more than the patterns
@@ -1358,3 +1480,86 @@ async def search_graph_context(question: str, session_id: str, max_rows: int = 1
             parts.append(f"{k}={v_str}")
         lines.append("  - " + ", ".join(parts))
     return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 3B — Cross-session identity sync
+# ─────────────────────────────────────────────────────────
+
+async def sync_speaker_registry_to_neo4j(pool, registry_id: str) -> bool:
+    """
+    Create/update a PersistentSpeaker node in Neo4j for a registry entry
+    and link it to every session-level Speaker node the person has appeared as.
+
+    Called by _run_pipeline in main.py immediately after sync_session so all
+    session Speaker nodes already exist when APPEARED_AS edges are built.
+
+    Returns True on success, False on any failure (caller treats as non-fatal).
+    """
+    driver = _get_driver()
+    if driver is None:
+        return False
+
+    try:
+        speaker = await pool.fetchrow(
+            "SELECT * FROM speakers_registry WHERE id = $1",
+            registry_id,
+        )
+        if not speaker:
+            logger.warning(f"sync_speaker_registry_to_neo4j: registry_id {registry_id} not found")
+            return False
+
+        appearances = await pool.fetch(
+            "SELECT session_id, speaker_label FROM speaker_appearances WHERE registry_id = $1",
+            registry_id,
+        )
+
+        async with driver.session() as nsession:
+            # Create/update the PersistentSpeaker node (MERGE = idempotent)
+            await nsession.run(
+                """
+                MERGE (ps:PersistentSpeaker {id: $id})
+                SET ps.display_name  = $name,
+                    ps.role          = $role,
+                    ps.company       = $company,
+                    ps.session_count = $count,
+                    ps.first_seen    = $first,
+                    ps.last_seen     = $last
+                """,
+                id=str(speaker["id"]),
+                name=speaker["display_name"] or "",
+                role=speaker["role"] or "",
+                company=speaker["company"] or "",
+                count=int(speaker["session_count"] or 0),
+                first=str(speaker["first_seen_at"]),
+                last=str(speaker["last_seen_at"]),
+            )
+
+            # Link PersistentSpeaker to each session-level Speaker node via APPEARED_AS.
+            # Speaker nodes are keyed on {session_id, label} — both are stored in
+            # speaker_appearances so we can target them without extra PG queries.
+            for app in appearances:
+                sid = str(app["session_id"])
+                label = app["speaker_label"]
+                await nsession.run(
+                    """
+                    MATCH (ps:PersistentSpeaker {id: $ps_id})
+                    MATCH (spk:Speaker {session_id: $sid, label: $label})
+                    MERGE (ps)-[:APPEARED_AS]->(spk)
+                    """,
+                    ps_id=str(speaker["id"]),
+                    sid=sid,
+                    label=label,
+                )
+
+        logger.info(
+            "Neo4j registry sync: PersistentSpeaker %r (%s) — %d appearance(s)",
+            speaker["display_name"],
+            registry_id,
+            len(appearances),
+        )
+        return True
+
+    except Exception as e:
+        logger.warning(f"sync_speaker_registry_to_neo4j failed (non-fatal): {e}")
+        return False

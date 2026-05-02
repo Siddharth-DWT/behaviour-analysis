@@ -15,6 +15,7 @@ import ProfilePage from "./pages/ProfilePage";
 import ForgotPasswordPage from "./pages/ForgotPasswordPage";
 import ResetPasswordPage from "./pages/ResetPasswordPage";
 
+
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, isLoading } = useAuth();
 
@@ -142,6 +143,7 @@ export default function App() {
           </ProtectedRoute>
         }
       />
+
 
       {/* Default → Upload */}
       <Route path="*" element={<Navigate to="/upload" replace />} />

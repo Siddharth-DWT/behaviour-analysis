@@ -57,6 +57,7 @@ class VoiceAnalysisResponse(BaseModel):
     signals: list[dict]                         # List of Signal.to_dict()
     summary: dict                               # Per-speaker stress / filler / tone stats
     transcript_segments: Optional[list[dict]] = None  # Diarised segments for Language Agent
+    speaker_embeddings: Optional[dict] = None   # {speaker_label: [float, ...]} L2-normalised voice embeddings
 
 
 # ─────────────────────────────────────────────────────────

@@ -300,12 +300,78 @@ CREATE TABLE speaker_profiles (
 );
 
 CREATE INDEX idx_speaker_profiles_org ON speaker_profiles(org_id);
-CREATE INDEX idx_speaker_voice_embed ON speaker_profiles 
+CREATE INDEX idx_speaker_voice_embed ON speaker_profiles
     USING ivfflat (voice_embedding vector_cosine_ops) WITH (lists = 10);
 
 
 -- ========================
--- 8. REPORTS
+-- 8. SPEAKER REGISTRY
+-- ========================
+
+-- Persistent cross-session speaker identities with voice/face embeddings.
+CREATE TABLE IF NOT EXISTS speakers_registry (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id            UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    display_name      VARCHAR(255) NOT NULL,
+    role              VARCHAR(100) DEFAULT '',
+    company           VARCHAR(255) DEFAULT '',
+    email             VARCHAR(255) DEFAULT '',
+    notes             TEXT DEFAULT '',
+
+    -- Voice identity (pyannote embedding)
+    voice_embedding   vector(256),
+    voice_sample_count INT DEFAULT 0,
+
+    -- Face identity (future: InsightFace/ArcFace embedding)
+    face_embedding    vector(512),
+    face_sample_count INT DEFAULT 0,
+
+    -- Stats updated after each session
+    session_count        INT DEFAULT 0,
+    total_talk_time_ms   BIGINT DEFAULT 0,
+    first_seen_at        TIMESTAMPTZ DEFAULT NOW(),
+    last_seen_at         TIMESTAMPTZ DEFAULT NOW(),
+
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_sr_org   ON speakers_registry(org_id);
+CREATE INDEX IF NOT EXISTS idx_sr_name  ON speakers_registry(org_id, display_name);
+CREATE INDEX IF NOT EXISTS idx_sr_voice ON speakers_registry
+    USING ivfflat (voice_embedding vector_cosine_ops) WITH (lists = 10);
+
+-- Per-session link: registry entry → session speaker record.
+CREATE TABLE IF NOT EXISTS speaker_appearances (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    registry_id      UUID NOT NULL REFERENCES speakers_registry(id) ON DELETE CASCADE,
+    session_id       UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    speaker_id       UUID REFERENCES speakers(id) ON DELETE SET NULL,
+    speaker_label    VARCHAR(50) NOT NULL,
+
+    -- Per-session stats for this speaker
+    talk_time_pct    FLOAT DEFAULT 0,
+    word_count       INT DEFAULT 0,
+    avg_stress       FLOAT DEFAULT 0,
+    avg_rapport      FLOAT DEFAULT 0,
+    avg_engagement   FLOAT DEFAULT 0,
+    filler_rate      FLOAT DEFAULT 0,
+
+    -- Match method and confidence
+    match_method     VARCHAR(50) DEFAULT 'manual',
+    match_confidence FLOAT DEFAULT 1.0,
+
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+
+    UNIQUE(registry_id, session_id, speaker_label)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sa_registry ON speaker_appearances(registry_id);
+CREATE INDEX IF NOT EXISTS idx_sa_session  ON speaker_appearances(session_id);
+
+
+-- ========================
+-- 10. REPORTS
 -- ========================
 
 CREATE TABLE session_reports (
@@ -322,7 +388,7 @@ CREATE INDEX idx_reports_session ON session_reports(session_id);
 
 
 -- ========================
--- 9. FEEDBACK LOOP
+-- 11. FEEDBACK LOOP
 -- ========================
 
 -- Human feedback on signal accuracy (for threshold calibration)
@@ -341,7 +407,7 @@ CREATE INDEX idx_feedback_session ON signal_feedback(session_id);
 
 
 -- ========================
--- 10. SEED: Initial Rule Config (VOICE Agent - 5 core rules for vertical slice)
+-- 12. SEED: Initial Rule Config (VOICE Agent - 5 core rules for vertical slice)
 -- ========================
 
 -- VOICE-STRESS-01 weights

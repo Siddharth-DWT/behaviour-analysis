@@ -440,11 +440,12 @@ async def analyse_signals(request: AnalyseRequest):
             conversation_signals_for_graph = conversation_summary["signals"]
 
         graph.build_from_session(
-            voice_signals=voice_dicts,
+            voice_signals=pure_voice_dicts,
             language_signals=language_dicts + conversation_signals_for_graph,
             fusion_signals=all_fusion_signals,
             transcript_segments=[],
             entities=entities,
+            video_signals=video_dicts,
         )
         graph_json = graph.to_json()
         key_paths = graph.get_key_paths(max_paths=5)

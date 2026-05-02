@@ -282,6 +282,7 @@ async def analyse_audio(request: AnalysisRequest):
             signals=[],
             summary={},
             transcript_segments=transcript["segments"],
+            speaker_embeddings=getattr(transcriber, "_last_speaker_embeddings", None) or None,
         )
 
     # ── Step 2: Extract acoustic features ──
@@ -403,6 +404,7 @@ async def analyse_audio(request: AnalysisRequest):
         signals=[s if isinstance(s, dict) else s.to_dict() for s in all_signals],
         summary=summary,
         transcript_segments=transcript["segments"],
+        speaker_embeddings=getattr(transcriber, "_last_speaker_embeddings", None) or None,
     )
 
 

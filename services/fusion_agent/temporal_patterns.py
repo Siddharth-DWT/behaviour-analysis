@@ -573,7 +573,7 @@ class TemporalPatternEngine:
         phase1_end = ss + int(phase_ms)
         phase2_end = ss + int(phase_ms * 2)
 
-        _s1_types  = ("objection_signal", "objection_detected", "head_shake")
+        _s1_types  = ("objection_signal", "objection_detected")
         _s2_types  = ("vocal_stress_score", "interruption_event")
         _s3_tones  = ("confrontational", "contemptuous", "aggressive")
         _s3_faces  = ("angry", "contempt", "disgusted")
@@ -611,8 +611,8 @@ class TemporalPatternEngine:
             _count(phase2_end, se, ("facial_emotion",),      vtexts=_s3_faces)
         )
 
-        # Glasl model requires escalation — later phases must have MORE conflict
-        if not (late > mid or mid > early):
+        # Glasl model requires escalation — BOTH phase transitions must trend upward
+        if not (late > mid and mid > early):
             return None
 
         total = early + mid + late

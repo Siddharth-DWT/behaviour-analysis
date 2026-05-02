@@ -44,6 +44,7 @@ class SignalGraph:
         fusion_signals: list[dict],
         transcript_segments: list[dict],
         entities: Optional[dict] = None,
+        video_signals: Optional[list[dict]] = None,
     ) -> None:
         """Build the complete signal relationship graph for a session."""
         self.nodes.clear()
@@ -51,7 +52,8 @@ class SignalGraph:
         self._edge_set.clear()
 
         # 1. Speaker nodes
-        all_signals = voice_signals + language_signals + fusion_signals
+        video_signals = video_signals or []
+        all_signals = voice_signals + language_signals + fusion_signals + video_signals
         speakers = set()
         for s in all_signals:
             sid = s.get("speaker_id") or "unknown"
@@ -63,6 +65,7 @@ class SignalGraph:
         voice_nodes = self._add_voice_signal_nodes(voice_signals)
         lang_nodes = self._add_language_signal_nodes(language_signals)
         fusion_nodes = self._add_fusion_signal_nodes(fusion_signals)
+        video_nodes = self._add_video_signal_nodes(video_signals)
 
         # 3. Topic nodes (from entity extraction)
         topic_nodes = []
@@ -70,7 +73,7 @@ class SignalGraph:
             topic_nodes = self._add_topic_nodes(entities["topics"])
 
         # 4. Edges
-        all_sig_nodes = voice_nodes + lang_nodes + fusion_nodes
+        all_sig_nodes = voice_nodes + lang_nodes + fusion_nodes + video_nodes
 
         # a) speaker_produced
         for nid in all_sig_nodes:
@@ -81,12 +84,15 @@ class SignalGraph:
 
         # b) co_occurred — cross-agent signals within 10s window
         self._build_co_occurrence_edges(voice_nodes, lang_nodes)
+        self._build_co_occurrence_edges(voice_nodes, video_nodes)
+        self._build_co_occurrence_edges(lang_nodes, video_nodes)
 
-        # c) triggered — fusion ← voice + language
-        self._build_triggered_edges(fusion_nodes, voice_nodes + lang_nodes)
+        # c) triggered — fusion ← voice + language + video
+        self._build_triggered_edges(fusion_nodes, voice_nodes + lang_nodes + video_nodes)
 
         # d) contradicts — high stress + positive sentiment
         self._build_contradiction_edges(voice_nodes, lang_nodes)
+        self._build_video_contradiction_edges(voice_nodes, video_nodes)
 
         # e) preceded — temporal ordering within 30s
         self._build_temporal_edges(all_sig_nodes)
@@ -294,6 +300,47 @@ class SignalGraph:
             ids.append(nid)
         return ids
 
+    def _add_video_signal_nodes(self, signals: list[dict]) -> list[str]:
+        """Add nodes for noteworthy video signals only."""
+        ids = []
+        for i, s in enumerate(signals):
+            sig_type = s.get("signal_type", "")
+            value = s.get("value")
+            value_text = s.get("value_text", "")
+
+            # Filter out unremarkable video signals
+            if sig_type == "facial_emotion" and value_text == "neutral":
+                continue
+            if sig_type == "facial_engagement" and value_text not in ("high_engagement", "low_engagement"):
+                continue
+            if sig_type == "facial_stress" and (value is None or value < 0.30):
+                continue
+            if sig_type == "attention_level" and value_text not in ("high_attention", "reduced_attention"):
+                continue
+            if sig_type == "posture" and value_text not in ("upright_power_posture", "forward_slump"):
+                continue
+            if sig_type == "blink_rate_anomaly" and value_text not in ("elevated_blink_rate", "low_blink_rate"):
+                continue
+            # Always include: head_nod, head_shake, self_touch, sustained_distraction,
+            # body_lean, head_body_incongruence, smile_type, gaze_direction_shift,
+            # face_region_touch, arms_crossed, finger_steepling, lip_pursing,
+            # posture_transition, body_language_cluster
+
+            label = self._signal_label(sig_type, value, value_text)
+            nid = f"vid_{i}"
+            self._add_node(
+                nid, "video_signal", label, agent="video",
+                value=value, value_text=value_text,
+                confidence=s.get("confidence"),
+                timestamp_ms=s.get("window_start_ms", 0),
+                end_ms=s.get("window_end_ms", 0),
+                speaker_id=s.get("speaker_id", ""),
+                signal_type=sig_type,
+                metadata=s.get("metadata", {}),
+            )
+            ids.append(nid)
+        return ids
+
     def _add_topic_nodes(self, topics: list[dict]) -> list[str]:
         ids = []
         for i, t in enumerate(topics):
@@ -370,6 +417,55 @@ class SignalGraph:
                     continue
                 if abs(vn["timestamp_ms"] - ln["timestamp_ms"]) <= CO_OCCUR_WINDOW_MS:
                     self._add_edge(vid, lid, "contradicts", 0.8)
+
+    def _build_video_contradiction_edges(
+        self, voice_ids: list[str], video_ids: list[str]
+    ) -> None:
+        """Cross-modal contradiction edges: voice vs face/body signals."""
+        for vid in voice_ids:
+            vn = self.nodes[vid]
+            for vvid in video_ids:
+                vvn = self.nodes[vvid]
+                # Same speaker only
+                if vn["speaker_id"] and vvn["speaker_id"] and vn["speaker_id"] != vvn["speaker_id"]:
+                    continue
+                # Within temporal window
+                if abs(vn["timestamp_ms"] - vvn["timestamp_ms"]) > CO_OCCUR_WINDOW_MS:
+                    continue
+
+                # Confident/warm tone + facial stress
+                if (vn["signal_type"] == "tone_classification"
+                    and vn.get("value_text") in ("confident", "warm", "enthusiastic")
+                    and vvn["signal_type"] == "facial_stress"
+                    and (vvn.get("value") or 0) > 0.35):
+                    self._add_edge(vid, vvid, "contradicts", 0.7)
+
+                # Low voice stress + high facial stress
+                if (vn["signal_type"] == "vocal_stress_score"
+                    and (vn.get("value") or 0) < 0.25
+                    and vvn["signal_type"] == "facial_stress"
+                    and (vvn.get("value") or 0) > 0.40):
+                    self._add_edge(vid, vvid, "contradicts", 0.6)
+
+                # Warm/confident tone + head shake
+                if (vn["signal_type"] == "tone_classification"
+                    and vn.get("value_text") in ("warm", "confident", "enthusiastic")
+                    and vvn["signal_type"] == "head_shake"):
+                    self._add_edge(vid, vvid, "contradicts", 0.65)
+
+                # High voice stress + high facial stress = reinforces
+                if (vn["signal_type"] == "vocal_stress_score"
+                    and (vn.get("value") or 0) > 0.50
+                    and vvn["signal_type"] == "facial_stress"
+                    and (vvn.get("value") or 0) > 0.35):
+                    self._add_edge(vid, vvid, "reinforces", 0.6)
+
+                # Positive sentiment + negative face
+                if (vn["signal_type"] == "sentiment_score"
+                    and (vn.get("value") or 0) > 0.30
+                    and vvn["signal_type"] == "facial_emotion"
+                    and vvn.get("value_text") in ("angry", "sad", "disgusted")):
+                    self._add_edge(vid, vvid, "contradicts", 0.6)
 
     def _build_temporal_edges(self, node_ids: list[str]):
         if len(node_ids) < 2:

@@ -132,6 +132,7 @@ class FacialRuleEngine(BaseVideoRuleEngine):
                 signals += self._rule_stress(w, facial_bl, speaker_id, conf_mult)
                 signals += self._rule_engagement(w, facial_bl, speaker_id, conf_mult)
                 signals += self._rule_valence_arousal(w, facial_bl, speaker_id, conf_mult)
+                signals += self._rule_lip_pursing(w, facial_bl, speaker_id, conf_mult)
 
                 prev_w = w
 
@@ -454,5 +455,53 @@ class FacialRuleEngine(BaseVideoRuleEngine):
             metadata={
                 "valence": round(valence, 4),
                 "arousal": round(arousal, 4),
+            },
+        )]
+
+    # ── FACE-LIPS-01: Lip pursing ─────────────────────────────────────────────
+    def _rule_lip_pursing(
+        self,
+        w: WindowFeatures,
+        bl: FacialBaseline,
+        speaker_id: str,
+        conf_mult: float,
+    ) -> list[dict]:
+        """
+        FACE-LIPS-01: Elevated mouthPucker while NOT speaking and NOT smiling.
+        Only meaningful when lips are pursed during listening — during speech it
+        is normal articulation. Pease 2004: pursed lips often signal disagreement
+        the speaker is not voicing.
+        """
+        mouth_pucker = w.blendshapes_mean.get("mouthPucker", 0.0)
+        mouth_smile = (
+            w.blendshapes_mean.get("mouthSmileLeft", 0.0)
+            + w.blendshapes_mean.get("mouthSmileRight", 0.0)
+        ) / 2.0
+
+        baseline_pucker = bl.blendshapes_neutral.get("mouthPucker", 0.05)
+        delta = mouth_pucker - baseline_pucker
+
+        if delta < 0.10:
+            return []
+        if mouth_smile > 0.15:
+            return []
+        if getattr(w, "is_speaking", True):
+            return []
+
+        confidence = min(delta * 2.0 * conf_mult, 0.45)
+        return [self._make_signal(
+            rule_id="FACE-LIPS-01",
+            signal_type="lip_pursing",
+            speaker_id=speaker_id,
+            value=round(delta, 4),
+            value_text="suppressed_disagreement",
+            confidence=confidence,
+            window_start_ms=w.window_start_ms,
+            window_end_ms=w.window_end_ms,
+            metadata={
+                "mouth_pucker": round(mouth_pucker, 4),
+                "baseline_pucker": round(baseline_pucker, 4),
+                "delta": round(delta, 4),
+                "is_listening": not getattr(w, "is_speaking", True),
             },
         )]

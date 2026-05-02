@@ -11,6 +11,9 @@ import {
   User,
   ChevronDown,
   UploadCloud,
+  Users,
+  BarChart2,
+  MessageSquare,
 } from "lucide-react";
 import { useTheme } from "../contexts/ThemeContext";
 import { useAuth } from "../contexts/AuthContext";
@@ -18,6 +21,9 @@ import { useAuth } from "../contexts/AuthContext";
 const NAV_ITEMS = [
   { path: "/upload", label: "Upload", icon: UploadCloud },
   { path: "/sessions", label: "Sessions", icon: FolderOpen },
+  { path: "/speakers", label: "People", icon: Users },
+  { path: "/team", label: "Team", icon: BarChart2 },
+  { path: "/chat", label: "Chat", icon: MessageSquare },
 ];
 
 function UserInitials({ name }: { name: string }) {

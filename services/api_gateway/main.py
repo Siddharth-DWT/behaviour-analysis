@@ -22,7 +22,21 @@ Endpoints:
   GET  /sessions/{id}/video-signals → Video + fusion signals for playback overlay (auth)
   GET  /sessions/{id}/video    → Stream session media file; accepts ?token= for <video> elements (auth)
   GET  /sessions/{id}/video/annotated → Stream landmark-annotated video; accepts ?token= (auth)
+  POST /sessions/{id}/identify-speaker → Manually assign a speaker label to a registry entry (auth)
   GET  /health                  → Health check (public)
+
+  Speaker Registry (cross-session identity):
+  GET  /speakers                → List all registered speakers with aggregate stats (auth)
+  GET  /speakers/{id}           → Speaker profile with cross-session trend data (auth)
+  PUT  /speakers/{id}           → Update speaker display_name, role, company, notes (auth)
+  POST /speakers/{id}/merge     → Merge two speaker identities (auth)
+
+  Team Dashboard:
+  GET  /team                    → All speakers with aggregate metrics for last N days (auth)
+  GET  /team/compare            → Side-by-side metric comparison for two speakers (auth)
+
+  Global Chat:
+  POST /chat/global             → Cross-session LLM chat with team + speaker context (auth)
 """
 import os
 import sys
@@ -238,6 +252,13 @@ async def startup():
         await _pool.execute("CREATE INDEX IF NOT EXISTS idx_prt_user_id ON password_reset_tokens(user_id)")
     except Exception as e:
         logger.warning(f"Password reset table init failed (non-fatal): {e}")
+
+    try:
+        from database import _ensure_speaker_registry_tables
+        _pool = await get_pool()
+        await _ensure_speaker_registry_tables(_pool)
+    except Exception as e:
+        logger.warning(f"Speaker registry table init failed (non-fatal): {e}")
 
     logger.info("API Gateway ready.")
 
@@ -1040,6 +1061,7 @@ async def complete_chunked_upload(
         video_path=_video_path,
         user_email=current_user.get("email", ""),
         num_speakers=num_speakers,
+        org_id=current_user.get("org_id", DEV_ORG_ID),
     )
 
     return {
@@ -1176,6 +1198,7 @@ async def create_session_endpoint(
         video_path=_video_path,
         user_email=current_user.get("email", ""),
         num_speakers=num_speakers,
+        org_id=current_user.get("org_id", DEV_ORG_ID),
     )
 
     return {
@@ -1196,6 +1219,7 @@ async def _run_pipeline(
     video_path: Optional[Path] = None,
     user_email: str = "",
     num_speakers: Optional[int] = None,
+    org_id: str = DEV_ORG_ID,
 ):
     """
     Run the full analysis pipeline in the background.
@@ -1254,6 +1278,24 @@ async def _run_pipeline(
         logger.warning(f"[{session_id}] Speaker upsert failed: {e}")
 
     await _persist_agent_signals(session_id, voice_signals, speaker_map, "voice")
+
+    # ── Speaker registry: match voice embeddings → persistent identities ──
+    speaker_embeddings = voice_result.get("speaker_embeddings") or {}
+    if speaker_embeddings:
+        try:
+            from speaker_registry import match_or_create_speakers
+            pool = await get_pool()
+            speaker_identity_map = await match_or_create_speakers(
+                pool=pool,
+                session_id=session_id,
+                speaker_embeddings=speaker_embeddings,
+                voice_speakers=voice_speakers,
+                speaker_map=speaker_map,
+                org_id=org_id,
+            )
+            logger.info(f"[{session_id}] Speaker identity: {speaker_identity_map}")
+        except Exception as e:
+            logger.warning(f"[{session_id}] Speaker registry match failed (non-fatal): {e}")
 
     # ── Track agent statuses ──
     agent_status = {
@@ -1444,6 +1486,16 @@ async def _run_pipeline(
 
     await _persist_agent_signals(session_id, fusion_signals, speaker_map, "fusion")
 
+    # ── Back-fill speaker_appearances stats now all signals are persisted ──
+    if speaker_embeddings:
+        try:
+            from speaker_registry import update_appearance_stats
+            pool = await get_pool()
+            await update_appearance_stats(pool, session_id)
+            logger.info(f"[{session_id}] Appearance stats updated")
+        except Exception as e:
+            logger.warning(f"[{session_id}] Appearance stats update failed (non-fatal): {e}")
+
     if alerts:
         try:
             count = await insert_alerts(session_id, alerts, speaker_map)
@@ -1512,7 +1564,8 @@ async def _run_pipeline(
     logger.info(
         f"[{session_id}] Pipeline finished: status={final_status}, "
         f"voice={len(voice_signals)}, lang={len(language_signals)}, "
-        f"convo={len(conversation_signals)}, fusion={len(fusion_signals)}, "
+        f"convo={len(conversation_signals)}, video={len(video_signals)}, "
+        f"fusion={len(fusion_signals)}, "
         f"alerts={len(alerts)}, report={'yes' if report_generated else 'no'}"
     )
 
@@ -1849,6 +1902,11 @@ _VIDEO_OVERLAY_TYPES = [
     "head_nod", "head_shake", "posture", "body_lean",
     "body_fidgeting", "self_touch", "shoulder_tension",
     "head_body_incongruence", "gesture_animation", "body_mirroring",
+    "face_region_touch", "arms_crossed", "finger_steepling",
+    "head_supported", "hands_clasped", "cross_speaker_interaction",
+    "posture_transition", "body_language_cluster",
+    # Facial (extended)
+    "lip_pursing",
     # Gaze
     "gaze_direction_shift", "screen_contact", "sustained_distraction",
     "attention_level", "blink_rate_anomaly", "gaze_synchrony",
@@ -2155,6 +2213,20 @@ async def _post_process_pipeline(
             await neo4j_sync_session(_pool, session_id)
         except Exception as e:
             logger.warning(f"[{session_id}] Neo4j sync failed (non-fatal): {e}")
+
+        # Phase 3B — sync PersistentSpeaker nodes for every registry entry that
+        # appeared in this session (runs after sync_session so Speaker nodes exist)
+        try:
+            from neo4j_sync import sync_speaker_registry_to_neo4j
+            _pool = await get_pool()
+            reg_rows = await _pool.fetch(
+                "SELECT DISTINCT registry_id FROM speaker_appearances WHERE session_id = $1",
+                uuid.UUID(session_id),
+            )
+            for row in reg_rows:
+                await sync_speaker_registry_to_neo4j(_pool, str(row["registry_id"]))
+        except Exception as e:
+            logger.warning(f"[{session_id}] Speaker registry Neo4j sync failed (non-fatal): {e}")
     else:
         logger.info(f"[{session_id}] Neo4j sync skipped (run_knowledge_graph=false)")
 
@@ -2738,6 +2810,11 @@ async def chat_with_session(
             "get_unresolved_objections", "get_conversation_arc", "get_signal_decomposition",
             "get_convergent_moments", "get_speaker_summary", "get_signal_timeline",
             "get_entity_network",
+            # Phase 3B cross-session tools
+            "get_speaker_trend", "get_session_comparison",
+            # Video behavioral tools
+            "get_video_behavioral_summary",
+            "get_incongruence_moments",
         ]:
             # Path A: pre-built tool (gpt-4o selected it, ~$0.002)
             params = tool_selection.get("params", {})
@@ -2874,3 +2951,509 @@ async def get_chat_history(
         messages.append(msg)
 
     return {"messages": messages}
+
+
+# ─────────────────────────────────────────────────────────
+# SPEAKER REGISTRY — CRUD + Team Dashboard + Global Chat
+# ─────────────────────────────────────────────────────────
+
+_SPEAKER_SORT_COLS = frozenset(
+    {"last_seen_at", "first_seen_at", "session_count", "display_name"}
+)
+
+
+@app.get("/speakers")
+async def list_speakers(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    sort_by: str = Query(default="last_seen_at"),
+    current_user: dict = Depends(get_current_user),
+):
+    """List all registered speakers for this org with aggregate stats."""
+    if sort_by not in _SPEAKER_SORT_COLS:
+        sort_by = "last_seen_at"
+
+    pool = await get_pool()
+    org_id = current_user.get("org_id", DEV_ORG_ID)
+
+    rows = await pool.fetch(
+        f"""
+        SELECT sr.id, sr.display_name, sr.role, sr.company,
+               sr.session_count, sr.first_seen_at, sr.last_seen_at,
+               COALESCE(AVG(sa.avg_stress),      0) AS avg_stress,
+               COALESCE(AVG(sa.avg_engagement),  0) AS avg_engagement,
+               COALESCE(AVG(sa.filler_rate),     0) AS avg_filler_rate
+        FROM   speakers_registry sr
+        LEFT JOIN speaker_appearances sa ON sa.registry_id = sr.id
+        WHERE  sr.org_id = $1
+        GROUP  BY sr.id
+        ORDER  BY sr.{sort_by} DESC
+        LIMIT  $2 OFFSET $3
+        """,
+        uuid.UUID(str(org_id)),
+        limit,
+        offset,
+    )
+
+    total = await pool.fetchval(
+        "SELECT COUNT(*) FROM speakers_registry WHERE org_id = $1",
+        uuid.UUID(str(org_id)),
+    )
+
+    return {
+        "speakers": [dict(r) for r in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/speakers/{registry_id}")
+async def get_speaker_profile(
+    registry_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Get speaker profile with cross-session performance trends."""
+    pool = await get_pool()
+    org_id = current_user.get("org_id", DEV_ORG_ID)
+
+    try:
+        reg_uuid = uuid.UUID(registry_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid registry_id")
+
+    speaker = await pool.fetchrow(
+        "SELECT * FROM speakers_registry WHERE id = $1 AND org_id = $2",
+        reg_uuid, uuid.UUID(str(org_id)),
+    )
+    if not speaker:
+        raise HTTPException(404, "Speaker not found")
+
+    appearances = await pool.fetch(
+        """
+        SELECT sa.*, s.title, s.meeting_type, s.created_at AS session_date,
+               s.duration_ms, s.status
+        FROM   speaker_appearances sa
+        JOIN   sessions s ON s.id = sa.session_id
+        WHERE  sa.registry_id = $1
+        ORDER  BY s.created_at DESC
+        """,
+        reg_uuid,
+    )
+
+    trends = await pool.fetch(
+        """
+        SELECT
+            s.id           AS session_id,
+            s.created_at   AS session_date,
+            s.title,
+            s.meeting_type,
+            AVG(CASE WHEN sig.signal_type = 'vocal_stress_score'      THEN sig.value END) AS avg_stress,
+            AVG(CASE WHEN sig.signal_type = 'conversation_engagement'  THEN sig.value END) AS avg_engagement,
+            AVG(CASE WHEN sig.signal_type = 'rapport_indicator'        THEN sig.value END) AS avg_rapport,
+            AVG(CASE WHEN sig.signal_type = 'filler_detection'         THEN sig.value END) AS filler_rate,
+            AVG(CASE WHEN sig.signal_type = 'power_language_score'     THEN sig.value END) AS avg_power,
+            COUNT(CASE WHEN sig.signal_type = 'facial_stress'          THEN 1 END) AS facial_stress_count,
+            COUNT(CASE WHEN sig.signal_type = 'head_nod'               THEN 1 END) AS nod_count,
+            COUNT(CASE WHEN sig.signal_type = 'head_shake'             THEN 1 END) AS shake_count,
+            AVG(CASE WHEN sig.signal_type = 'attention_level'          THEN sig.value END) AS avg_attention
+        FROM   speaker_appearances sa
+        JOIN   sessions s  ON s.id  = sa.session_id
+        JOIN   speakers sp ON sp.id = sa.speaker_id
+        LEFT JOIN signals sig ON sig.session_id = s.id AND sig.speaker_id = sp.id
+        WHERE  sa.registry_id = $1
+        GROUP  BY s.id, s.created_at, s.title, s.meeting_type
+        ORDER  BY s.created_at ASC
+        """,
+        reg_uuid,
+    )
+
+    return {
+        "speaker":       dict(speaker),
+        "appearances":   [dict(a) for a in appearances],
+        "trends":        [dict(t) for t in trends],
+        "session_count": len(appearances),
+    }
+
+
+@app.put("/speakers/{registry_id}")
+async def update_speaker(
+    registry_id: str,
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+):
+    """Update speaker display_name, role, company, email, or notes."""
+    pool = await get_pool()
+    org_id = current_user.get("org_id", DEV_ORG_ID)
+
+    try:
+        reg_uuid = uuid.UUID(registry_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid registry_id")
+
+    sets: list[str] = []
+    params: list[Any] = []
+    idx = 1
+
+    for field in ("display_name", "role", "company", "email", "notes"):
+        if field in body and body[field] is not None:
+            sets.append(f"{field} = ${idx}")
+            params.append(body[field])
+            idx += 1
+
+    if not sets:
+        raise HTTPException(422, "No updatable fields provided")
+
+    sets.append(f"updated_at = ${idx}")
+    params.append(datetime.now(timezone.utc))
+    idx += 1
+    params.append(reg_uuid)
+    params.append(uuid.UUID(str(org_id)))
+
+    await pool.execute(
+        f"UPDATE speakers_registry SET {', '.join(sets)} WHERE id = ${idx} AND org_id = ${idx + 1}",
+        *params,
+    )
+    return {"success": True}
+
+
+@app.post("/speakers/{registry_id}/merge")
+async def merge_speakers(
+    registry_id: str,
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Merge another speaker into this one.  All appearances from source are
+    re-pointed to target; source registry entry is deleted.
+    """
+    pool = await get_pool()
+    org_id = current_user.get("org_id", DEV_ORG_ID)
+    org_uuid = uuid.UUID(str(org_id))
+
+    try:
+        target_uuid = uuid.UUID(registry_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid registry_id")
+
+    source_id = body.get("merge_from_id")
+    if not source_id:
+        raise HTTPException(400, "merge_from_id required")
+
+    try:
+        source_uuid = uuid.UUID(str(source_id))
+    except ValueError:
+        raise HTTPException(400, "Invalid merge_from_id")
+
+    # Verify both speakers belong to the caller's org before merging
+    target_check = await pool.fetchval(
+        "SELECT id FROM speakers_registry WHERE id = $1 AND org_id = $2",
+        target_uuid, org_uuid,
+    )
+    if not target_check:
+        raise HTTPException(404, "Target speaker not found")
+
+    source_check = await pool.fetchval(
+        "SELECT id FROM speakers_registry WHERE id = $1 AND org_id = $2",
+        source_uuid, org_uuid,
+    )
+    if not source_check:
+        raise HTTPException(404, "Source speaker not found")
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE speaker_appearances SET registry_id = $1 WHERE registry_id = $2",
+                target_uuid, source_uuid,
+            )
+            source_row = await conn.fetchrow(
+                "SELECT session_count, total_talk_time_ms FROM speakers_registry WHERE id = $1",
+                source_uuid,
+            )
+            if source_row:
+                await conn.execute(
+                    """
+                    UPDATE speakers_registry
+                    SET    session_count      = session_count      + $2,
+                           total_talk_time_ms = total_talk_time_ms + $3,
+                           updated_at         = NOW()
+                    WHERE  id = $1
+                    """,
+                    target_uuid,
+                    source_row["session_count"],
+                    source_row["total_talk_time_ms"],
+                )
+            await conn.execute("DELETE FROM speakers_registry WHERE id = $1", source_uuid)
+
+    return {"success": True, "merged_from": str(source_uuid), "merged_into": str(target_uuid)}
+
+
+@app.post("/sessions/{session_id}/identify-speaker")
+async def identify_speaker(
+    session_id: str,
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Manually link a session speaker label to a registry entry.
+    Body: { speaker_label, registry_id }  — OR —
+          { speaker_label, display_name, role }  to create a new entry.
+    """
+    pool = await get_pool()
+    org_id = current_user.get("org_id", DEV_ORG_ID)
+
+    speaker_label = body.get("speaker_label")
+    if not speaker_label:
+        raise HTTPException(400, "speaker_label required")
+
+    try:
+        sess_uuid = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid session_id")
+
+    registry_id = body.get("registry_id")
+    if registry_id:
+        try:
+            reg_uuid = uuid.UUID(str(registry_id))
+        except ValueError:
+            raise HTTPException(400, "Invalid registry_id")
+    else:
+        display_name = body.get("display_name", speaker_label)
+        row = await pool.fetchrow(
+            """
+            INSERT INTO speakers_registry (org_id, display_name, role, session_count)
+            VALUES ($1, $2, $3, 1)
+            RETURNING id
+            """,
+            uuid.UUID(str(org_id)),
+            display_name,
+            body.get("role", ""),
+        )
+        reg_uuid = row["id"]
+
+    speaker_row = await pool.fetchrow(
+        "SELECT id FROM speakers WHERE session_id = $1 AND speaker_label = $2",
+        sess_uuid, speaker_label,
+    )
+    speaker_db_id = speaker_row["id"] if speaker_row else None
+
+    await pool.execute(
+        """
+        INSERT INTO speaker_appearances
+            (registry_id, session_id, speaker_id, speaker_label, match_method, match_confidence)
+        VALUES ($1, $2, $3, $4, 'manual', 1.0)
+        ON CONFLICT (registry_id, session_id, speaker_label) DO UPDATE
+            SET match_method    = 'manual',
+                match_confidence = 1.0
+        """,
+        reg_uuid, sess_uuid, speaker_db_id, speaker_label,
+    )
+
+    return {"success": True, "registry_id": str(reg_uuid)}
+
+
+@app.get("/team")
+async def get_team_dashboard(
+    days: int = Query(default=30, ge=7, le=365),
+    current_user: dict = Depends(get_current_user),
+):
+    """Team performance dashboard — all speakers with aggregate metrics for the last N days."""
+    pool = await get_pool()
+    org_id = current_user.get("org_id", DEV_ORG_ID)
+
+    rows = await pool.fetch(
+        """
+        WITH recent_appearances AS (
+            SELECT sa.registry_id, sa.session_id, sa.speaker_label, sa.speaker_id
+            FROM   speaker_appearances sa
+            JOIN   sessions s ON s.id = sa.session_id
+            WHERE  s.created_at > NOW() - make_interval(days => $2)
+        ),
+        speaker_metrics AS (
+            SELECT
+                ra.registry_id,
+                COUNT(DISTINCT ra.session_id)                                                      AS session_count,
+                AVG(CASE WHEN sig.signal_type = 'vocal_stress_score'      THEN sig.value END)      AS avg_stress,
+                AVG(CASE WHEN sig.signal_type = 'conversation_engagement'  THEN sig.value END)     AS avg_engagement,
+                AVG(CASE WHEN sig.signal_type = 'rapport_indicator'        THEN sig.value END)     AS avg_rapport,
+                AVG(CASE WHEN sig.signal_type = 'filler_detection'         THEN sig.value END)     AS avg_filler_rate,
+                AVG(CASE WHEN sig.signal_type = 'power_language_score'     THEN sig.value END)     AS avg_power,
+                AVG(CASE WHEN sig.signal_type = 'attention_level'          THEN sig.value END)     AS avg_attention
+            FROM   recent_appearances ra
+            JOIN   signals sig ON sig.session_id = ra.session_id AND sig.speaker_id = ra.speaker_id
+            GROUP  BY ra.registry_id
+        )
+        SELECT sr.id, sr.display_name, sr.role, sr.company,
+               sr.first_seen_at, sr.last_seen_at,
+               sm.*
+        FROM   speakers_registry sr
+        JOIN   speaker_metrics sm ON sm.registry_id = sr.id
+        WHERE  sr.org_id = $1
+        ORDER  BY sm.session_count DESC
+        """,
+        uuid.UUID(str(org_id)),
+        days,
+    )
+
+    return {"team": [dict(r) for r in rows], "period_days": days}
+
+
+@app.get("/team/compare")
+async def compare_speakers(
+    speaker_a: str = Query(...),
+    speaker_b: str = Query(...),
+    days: int = Query(default=90, ge=7, le=365),
+    current_user: dict = Depends(get_current_user),
+):
+    """Compare two speakers' metrics side by side."""
+    pool = await get_pool()
+    org_id = current_user.get("org_id", DEV_ORG_ID)
+    org_uuid = uuid.UUID(str(org_id))
+
+    for sid in (speaker_a, speaker_b):
+        try:
+            uuid.UUID(sid)
+        except ValueError:
+            raise HTTPException(400, f"Invalid speaker id: {sid}")
+
+    _metrics_sql = """
+        SELECT
+            COUNT(DISTINCT sa.session_id)                                                      AS session_count,
+            AVG(CASE WHEN sig.signal_type = 'vocal_stress_score'      THEN sig.value END)      AS avg_stress,
+            AVG(CASE WHEN sig.signal_type = 'conversation_engagement'  THEN sig.value END)     AS avg_engagement,
+            AVG(CASE WHEN sig.signal_type = 'rapport_indicator'        THEN sig.value END)     AS avg_rapport,
+            AVG(CASE WHEN sig.signal_type = 'filler_detection'         THEN sig.value END)     AS avg_filler_rate,
+            AVG(CASE WHEN sig.signal_type = 'power_language_score'     THEN sig.value END)     AS avg_power,
+            COUNT(CASE WHEN sig.signal_type = 'head_nod'               THEN 1 END)             AS total_nods,
+            COUNT(CASE WHEN sig.signal_type = 'head_shake'             THEN 1 END)             AS total_shakes,
+            AVG(CASE WHEN sig.signal_type = 'attention_level'          THEN sig.value END)     AS avg_attention
+        FROM   speaker_appearances sa
+        JOIN   sessions s  ON s.id = sa.session_id
+        JOIN   signals sig ON sig.session_id = s.id AND sig.speaker_id = sa.speaker_id
+        WHERE  sa.registry_id = $1
+          AND  s.created_at > NOW() - make_interval(days => $2)
+    """
+
+    _info_sql = "SELECT display_name, role FROM speakers_registry WHERE id = $1 AND org_id = $2"
+
+    metrics_a_row, metrics_b_row, info_a, info_b = await asyncio.gather(
+        pool.fetchrow(_metrics_sql, uuid.UUID(speaker_a), days),
+        pool.fetchrow(_metrics_sql, uuid.UUID(speaker_b), days),
+        pool.fetchrow(_info_sql, uuid.UUID(speaker_a), org_uuid),
+        pool.fetchrow(_info_sql, uuid.UUID(speaker_b), org_uuid),
+    )
+
+    return {
+        "speaker_a": {
+            "info":    dict(info_a)    if info_a    else {},
+            "metrics": dict(metrics_a_row) if metrics_a_row else {},
+        },
+        "speaker_b": {
+            "info":    dict(info_b)    if info_b    else {},
+            "metrics": dict(metrics_b_row) if metrics_b_row else {},
+        },
+        "period_days": days,
+    }
+
+
+@app.post("/chat/global")
+async def global_chat(
+    body: ChatRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Ask questions across ALL sessions — team comparisons, trends,
+    speaker performance, and coaching insights.
+    """
+    pool = await get_pool()
+    org_id = current_user.get("org_id", DEV_ORG_ID)
+
+    question = body.question.strip()
+    if not question:
+        raise HTTPException(400, "Question cannot be empty")
+
+    # Cross-session speaker aggregate context
+    speakers = await pool.fetch(
+        """
+        SELECT sr.display_name, sr.role, sr.session_count, sr.last_seen_at,
+               AVG(sa.avg_stress)      AS avg_stress,
+               AVG(sa.avg_engagement)  AS avg_engagement,
+               AVG(sa.filler_rate)     AS avg_filler_rate
+        FROM   speakers_registry sr
+        LEFT JOIN speaker_appearances sa ON sa.registry_id = sr.id
+        WHERE  sr.org_id = $1
+        GROUP  BY sr.id
+        ORDER  BY sr.session_count DESC
+        LIMIT  20
+        """,
+        uuid.UUID(str(org_id)),
+    )
+
+    recent_sessions = await pool.fetch(
+        """
+        SELECT s.id, s.title, s.meeting_type, s.created_at, s.duration_ms,
+               array_agg(DISTINCT sp.speaker_label) AS speakers
+        FROM   sessions s
+        LEFT JOIN speakers sp ON sp.session_id = s.id
+        WHERE  s.status = 'completed'
+          AND  s.org_id = $1
+        GROUP  BY s.id
+        ORDER  BY s.created_at DESC
+        LIMIT  15
+        """,
+        uuid.UUID(str(org_id)),
+    )
+
+    speaker_context = "Registered speakers:\n"
+    for s in speakers:
+        speaker_context += (
+            f"- {s['display_name']} ({s['role'] or 'unknown role'}): "
+            f"{s['session_count']} sessions, "
+            f"avg stress {round(float(s['avg_stress'] or 0) * 100)}%, "
+            f"avg engagement {round(float(s['avg_engagement'] or 0) * 100)}%\n"
+        )
+
+    session_context = "\nRecent sessions:\n"
+    for s in recent_sessions:
+        session_context += (
+            f"- {s['title']} ({s['meeting_type']}, "
+            f"{s['created_at'].strftime('%b %d')}): "
+            f"speakers {list(s['speakers'])}\n"
+        )
+
+    system_prompt = (
+        "You are NEXUS, a behavioural analysis assistant. "
+        "Answer questions about team performance and speaker trends "
+        "using the provided cross-session data.\n\n"
+        "Rules:\n"
+        "- Reference specific speakers by name and cite their metrics.\n"
+        "- For trend questions, describe direction (improving/declining/stable) and magnitude.\n"
+        "- For comparison questions, highlight specific metric differences.\n"
+        "- Frame observations as data-driven insights, not judgments.\n"
+        "- If asked about a specific session, suggest opening that session for details.\n"
+        "- Never claim certainty about emotions — describe behavioral indicators."
+    )
+
+    user_prompt = f"{speaker_context}\n{session_context}\n\nQuestion: {question}"
+
+    if body.history:
+        history_text = "\n".join(
+            f"{m.get('role', 'user').title()}: {m.get('content', '')}"
+            for m in body.history[-4:]
+        )
+        user_prompt = f"Previous conversation:\n{history_text}\n\n{user_prompt}"
+
+    from shared.utils.llm_client import acomplete
+
+    try:
+        answer = await acomplete(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=600,
+            model="gpt-4o",
+        )
+    except Exception as e:
+        logger.error(f"Global chat LLM call failed: {e}")
+        raise HTTPException(502, f"LLM generation failed: {e}")
+
+    return {"answer": answer, "speakers_in_context": len(speakers)}

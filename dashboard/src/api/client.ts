@@ -371,3 +371,128 @@ export async function resetPassword(
 export async function resendVerification(email: string): Promise<{ message: string }> {
   return request("/auth/resend-verification", { method: "POST", body: JSON.stringify({ email }) });
 }
+
+// ── Speaker Registry ──
+
+export interface SpeakerRegistry {
+  id: string;
+  org_id: string;
+  display_name: string;
+  canonical_name: string | null;
+  role: string | null;
+  company: string | null;
+  email: string | null;
+  phone: string | null;
+  notes: string | null;
+  session_count: number;
+  first_seen_at: string | null;
+  last_seen_at: string | null;
+  avg_stress: number | null;
+  avg_engagement: number | null;
+  avg_rapport: number | null;
+}
+
+export interface SpeakerAppearance {
+  session_id: string;
+  session_title: string;
+  speaker_label: string;
+  created_at: string;
+  avg_stress: number | null;
+  avg_engagement: number | null;
+  avg_rapport: number | null;
+  filler_rate: number | null;
+  buying_signals: number | null;
+  objections: number | null;
+}
+
+export interface TeamMember {
+  registry_id: string;
+  display_name: string;
+  role: string | null;
+  company: string | null;
+  session_count: number;
+  avg_stress: number | null;
+  avg_engagement: number | null;
+  avg_rapport: number | null;
+  last_seen_at: string | null;
+}
+
+export async function listSpeakers(params?: {
+  limit?: number;
+  offset?: number;
+  sort_by?: string;
+  search?: string;
+}): Promise<{ speakers: SpeakerRegistry[]; total: number; limit: number; offset: number }> {
+  const search = new URLSearchParams();
+  if (params?.limit) search.set("limit", String(params.limit));
+  if (params?.offset) search.set("offset", String(params.offset));
+  if (params?.sort_by) search.set("sort_by", params.sort_by);
+  if (params?.search) search.set("search", params.search);
+  const qs = search.toString();
+  return request(`/speakers${qs ? `?${qs}` : ""}`);
+}
+
+export async function getSpeakerProfile(id: string): Promise<{
+  speaker: SpeakerRegistry;
+  appearances: SpeakerAppearance[];
+}> {
+  return request(`/speakers/${id}`);
+}
+
+export async function updateSpeaker(
+  id: string,
+  data: Partial<Pick<SpeakerRegistry, "display_name" | "canonical_name" | "role" | "company" | "email" | "phone" | "notes">>
+): Promise<{ updated: SpeakerRegistry }> {
+  return request(`/speakers/${id}`, { method: "PUT", body: JSON.stringify(data) });
+}
+
+export async function mergeSpeakers(
+  targetId: string,
+  sourceId: string
+): Promise<{ merged: boolean; retained_id: string }> {
+  return request(`/speakers/${targetId}/merge`, {
+    method: "POST",
+    body: JSON.stringify({ source_id: sourceId }),
+  });
+}
+
+export async function identifySpeaker(
+  sessionId: string,
+  data: { speaker_label: string; registry_id?: string; display_name?: string }
+): Promise<{ registry_id: string; created: boolean }> {
+  return request(`/sessions/${sessionId}/identify-speaker`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+}
+
+export async function getTeamDashboard(days?: number): Promise<{
+  team: TeamMember[];
+  period_days: number;
+}> {
+  const qs = days ? `?days=${days}` : "";
+  return request(`/team${qs}`);
+}
+
+export interface SpeakerCompareResult {
+  speaker_a: { info: { display_name: string; role: string | null }; metrics: Record<string, number | null> };
+  speaker_b: { info: { display_name: string; role: string | null }; metrics: Record<string, number | null> };
+  period_days: number;
+}
+
+export async function compareSpeakers(
+  speakerA: string,
+  speakerB: string
+): Promise<SpeakerCompareResult> {
+  return request(`/team/compare?speaker_a=${speakerA}&speaker_b=${speakerB}`);
+}
+
+export async function globalChat(data: {
+  question: string;
+  history?: { role: "user" | "assistant"; content: string }[];
+}): Promise<{
+  answer: string;
+  sources?: { type: string; text: string; similarity: number }[];
+}> {
+  return request("/chat/global", { method: "POST", body: JSON.stringify(data) });
+}
