@@ -140,6 +140,7 @@ class Transcriber:
         self._num_speakers = None  # Speaker count hint (2-10), None = auto
         self._audio_data = None    # Pre-loaded (y, sr) tuple, avoids redundant disk reads
         self._last_diarization_backend = "uninitialized"
+        self._last_speaker_embeddings: dict = {}  # {speaker_label: [float, ...]} — set by _diarize_pyannote
 
         backend = TRANSCRIPTION_BACKEND.lower()
 
@@ -451,6 +452,19 @@ class Transcriber:
                 for seg in result.get("segments", []):
                     seg["speaker"] = "Speaker_0"
                 result["speakers"] = ["Speaker_0"] if result.get("segments") else []
+
+            # ── Fallback: compute MFCC embeddings for non-pyannote backends ──
+            # pyannote sets _last_speaker_embeddings as a side-effect of diarization.
+            # AssemblyAI / Deepgram / Parakeet don't run pyannote, so we compute
+            # 256-dim MFCC-based embeddings here to enable cross-session identity.
+            if result and not self._last_speaker_embeddings:
+                try:
+                    self._compute_mfcc_embeddings(
+                        result.get("segments", []),
+                        effective_path,
+                    )
+                except Exception as _emb_err:
+                    logger.warning("MFCC embedding fallback failed (non-fatal): %s", _emb_err)
 
             return result
         finally:
@@ -3050,6 +3064,81 @@ class Transcriber:
             logger.error(f"External diarization failed: {e}. Falling back to local.")
             return self._diarize_simple(segments, self._num_speakers, audio_path)
 
+    def _compute_mfcc_embeddings(self, segments: list[dict], audio_path: str) -> None:
+        """
+        Compute 256-dim MFCC-based voice embeddings for each speaker and
+        store them in self._last_speaker_embeddings.
+
+        Called as a fallback when pyannote is not used (AssemblyAI, Deepgram, etc.)
+        so the speaker registry can still do cross-session identity matching.
+
+        Embedding layout (256 dims):
+          [0:64]   mean of 64 MFCCs over speaker's audio
+          [64:128] std  of 64 MFCCs
+          [128:192] mean of delta-64 MFCCs
+          [192:256] std  of delta-64 MFCCs
+        """
+        import librosa
+
+        self._last_speaker_embeddings = {}
+
+        # Load audio once
+        if self._audio_data is not None:
+            y, sr = self._audio_data
+        else:
+            y, sr = librosa.load(audio_path, sr=16000, mono=True)
+
+        # Group segments by speaker → collect time ranges
+        speaker_segments: dict[str, list[tuple[int, int]]] = {}
+        for seg in segments:
+            label = seg.get("speaker") or seg.get("speaker_id") or "Speaker_0"
+            start_ms = int(seg.get("start_ms", 0))
+            end_ms   = int(seg.get("end_ms", 0))
+            if end_ms > start_ms:
+                speaker_segments.setdefault(label, []).append((start_ms, end_ms))
+
+        for label, ranges in speaker_segments.items():
+            # Concatenate up to 60s of audio for this speaker
+            chunks = []
+            total_dur = 0.0
+            for start_ms, end_ms in sorted(ranges, key=lambda r: r[1] - r[0], reverse=True):
+                if total_dur >= 60.0:
+                    break
+                s = int(start_ms / 1000 * sr)
+                e = int(end_ms   / 1000 * sr)
+                chunk = y[s:e]
+                if len(chunk) < sr:  # skip <1 s
+                    continue
+                chunks.append(chunk)
+                total_dur += (end_ms - start_ms) / 1000.0
+
+            if not chunks:
+                continue
+
+            audio_cat = np.concatenate(chunks)
+
+            # 256-dim embedding
+            mfcc   = librosa.feature.mfcc(y=audio_cat, sr=sr, n_mfcc=64)
+            delta  = librosa.feature.delta(mfcc)
+            vec = np.concatenate([
+                mfcc.mean(axis=1),   # 64
+                mfcc.std(axis=1),    # 64
+                delta.mean(axis=1),  # 64
+                delta.std(axis=1),   # 64
+            ])  # 256 total
+
+            # L2-normalise
+            norm = np.linalg.norm(vec)
+            vec  = vec / (norm + 1e-8)
+
+            self._last_speaker_embeddings[label] = vec.tolist()
+
+        if self._last_speaker_embeddings:
+            logger.info(
+                "MFCC embeddings computed for: %s",
+                list(self._last_speaker_embeddings.keys()),
+            )
+
     def _diarize_pyannote(self, audio_path: str, segments: list[dict]) -> list[dict]:
         """
         Full speaker diarization using pyannote.audio.
@@ -3129,6 +3218,54 @@ class Transcriber:
 
             logger.info(f"Running pyannote diarization: {diarize_params}")
             diarization = self._diarization_pipeline(audio_input, **diarize_params)
+
+            # Extract per-speaker voice embeddings from pyannote's internal model.
+            # pyannote 3.x computes embeddings during diarization — we reuse the
+            # already-loaded model rather than running a second inference pass.
+            # Stored as a side-effect so the diarization return type stays list[dict].
+            self._last_speaker_embeddings = {}
+            try:
+                embedding_model = getattr(self._diarization_pipeline, "_embedding", None)
+                if embedding_model is not None:
+                    # Load waveform for embedding extraction
+                    if self._audio_data is not None:
+                        y, sr = self._audio_data
+                        waveform = torch.from_numpy(y).unsqueeze(0).float()
+                        sample_rate = sr
+                    else:
+                        waveform, sample_rate = _ta.load(audio_path)
+
+                    for spk_label in diarization.labels():
+                        timeline = diarization.label_timeline(spk_label)
+                        sorted_segs = sorted(timeline, key=lambda s: s.duration, reverse=True)
+
+                        embeddings_list = []
+                        total_dur = 0.0
+                        for seg in sorted_segs:
+                            if total_dur >= 30.0:
+                                break
+                            s_samp = int(seg.start * sample_rate)
+                            e_samp = int(seg.end * sample_rate)
+                            if e_samp - s_samp < sample_rate:  # skip <1 s chunks
+                                continue
+                            chunk = waveform[:, s_samp:e_samp]
+                            with torch.no_grad():
+                                emb = embedding_model(chunk.unsqueeze(0))
+                            embeddings_list.append(emb.squeeze().cpu().numpy())
+                            total_dur += seg.duration
+
+                        if embeddings_list:
+                            mean_emb = np.mean(embeddings_list, axis=0)
+                            mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-8)
+                            norm_label = self._normalize_speaker_label(spk_label)
+                            self._last_speaker_embeddings[norm_label] = mean_emb.tolist()
+
+                    logger.info(
+                        "Speaker embeddings extracted for: %s",
+                        list(self._last_speaker_embeddings.keys()),
+                    )
+            except Exception as _emb_err:
+                logger.warning("Speaker embedding extraction failed (non-fatal): %s", _emb_err)
 
             # Create speaker timeline (normalize SPEAKER_00 → Speaker_0)
             speaker_timeline = []
