@@ -907,6 +907,7 @@ class TiledFrameProcessor:
         all_face_bs:  list = []
         all_face_mat: list = []
         all_pose_lm:  list = []
+        wrist_crops:  list[tuple[int, int, int, int]] = []  # (x1,y1,x2,y2) full-frame px
 
         for fx, fy, fbw, fbh in face_boxes:
             px = int(fbw * self._FACE_PAD)
@@ -975,44 +976,83 @@ class TiledFrameProcessor:
                         for lm in bc_res.pose_landmarks[0]
                     ]
                     all_pose_lm.append(remapped_pose)
+
+                    # ── Collect wrist positions for pose-guided hand crops ─────
+                    _WRIST_L, _WRIST_R = 15, 16
+                    _INDEX_MCP_L, _PINKY_MCP_L = 17, 19
+                    _INDEX_MCP_R, _PINKY_MCP_R = 18, 20
+                    plm_raw = bc_res.pose_landmarks[0]
+                    for wrist_idx in (_WRIST_L, _WRIST_R):
+                        if wrist_idx >= len(plm_raw):
+                            continue
+                        if getattr(plm_raw[wrist_idx], "visibility", 0) < 0.3:
+                            continue
+                        wx_px = int(bc_x1 + plm_raw[wrist_idx].x * bc_w)
+                        wy_px = int(bc_y1 + plm_raw[wrist_idx].y * bc_h)
+                        hand_size = max(int(fbw * 1.5), 80)
+                        mcp_pair = (_INDEX_MCP_L, _PINKY_MCP_L) if wrist_idx == _WRIST_L else (_INDEX_MCP_R, _PINKY_MCP_R)
+                        for mcp_idx in mcp_pair:
+                            if mcp_idx < len(plm_raw) and getattr(plm_raw[mcp_idx], "visibility", 0) > 0.3:
+                                mx = int(bc_x1 + plm_raw[mcp_idx].x * bc_w)
+                                my = int(bc_y1 + plm_raw[mcp_idx].y * bc_h)
+                                wrist_to_mcp = int(((wx_px - mx) ** 2 + (wy_px - my) ** 2) ** 0.5)
+                                if wrist_to_mcp > 10:
+                                    hand_size = max(int(wrist_to_mcp * 2.7), hand_size)
+                                break
+                        hx1_w = max(0, wx_px - hand_size)
+                        hy1_w = max(0, wy_px - hand_size)
+                        hx2_w = min(fw, wx_px + hand_size)
+                        hy2_w = min(fh, wy_px + hand_size)
+                        if (hx2_w - hx1_w) > 40 and (hy2_w - hy1_w) > 40:
+                            wrist_crops.append((hx1_w, hy1_w, hx2_w, hy2_w))
             except Exception as exc:
                 logger.debug(f"[tiled] pose crop error: {exc}")
 
-            # ── Hand detection on the SAME body crop ──────────────────────────
-            if body_crop.size >= 64:
-                try:
-                    bc_h, bc_w = body_crop.shape[:2]
-                    bc_mp_hand = mp.Image(
-                        image_format=mp.ImageFormat.SRGB,
-                        data=np.ascontiguousarray(body_crop),
-                    )
-                    hand_raw_crop = self._hand_lm_img.detect(bc_mp_hand)
-                    if hand_raw_crop and hand_raw_crop.hand_landmarks:
-                        for hlm in hand_raw_crop.hand_landmarks:
-                            remapped_hand = [
-                                _Pt(
-                                    x=(bc_x1 + lm.x * bc_w) / fw,
-                                    y=(bc_y1 + lm.y * bc_h) / fh,
-                                    z=lm.z,
-                                )
-                                for lm in hlm
-                            ]
+        # ── Pose-guided hand detection (full-res crops around each wrist) ────
+        # Crops are tight ROIs from the original frame — hand occupies ~200×200px
+        # instead of ~60×60px in body crops, matching HandLandmarker's 256×256 sweet spot.
+        for hx1_c, hy1_c, hx2_c, hy2_c in wrist_crops:
+            hand_crop = rgb[hy1_c:hy2_c, hx1_c:hx2_c]
+            if hand_crop.size < 64:
+                continue
+            try:
+                hc_h, hc_w = hand_crop.shape[:2]
+                hc_mp = mp.Image(
+                    image_format=mp.ImageFormat.SRGB,
+                    data=np.ascontiguousarray(hand_crop),
+                )
+                hand_raw = self._hand_lm_img.detect(hc_mp)
+                if hand_raw and hand_raw.hand_landmarks:
+                    for hlm in hand_raw.hand_landmarks:
+                        remapped_hand = [
+                            _Pt(
+                                x=(hx1_c + lm.x * hc_w) / fw,
+                                y=(hy1_c + lm.y * hc_h) / fh,
+                                z=lm.z,
+                            )
+                            for lm in hlm
+                        ]
+                        dup = any(
+                            ((remapped_hand[0].x - ex[0].x) ** 2 +
+                             (remapped_hand[0].y - ex[0].y) ** 2) ** 0.5 < 0.05
+                            for ex in all_hand_lm
+                        )
+                        if not dup:
                             all_hand_lm.append(remapped_hand)
-                except Exception as exc:
-                    logger.debug(f"[tiled] hand crop error: {exc}")
+            except Exception as exc:
+                logger.debug(f"[tiled] pose-guided hand crop error: {exc}")
 
-        # ── Full-frame VIDEO-mode fallback for hands crossing tile boundaries ──
+        # ── Full-frame fallback (catches hands where pose wrist is not visible) ──
         try:
             mp_full = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             hand_raw_full = self._hand_lm.detect_for_video(mp_full, ts_ms)
             if hand_raw_full and hand_raw_full.hand_landmarks:
                 for hlm in hand_raw_full.hand_landmarks:
-                    wrist_x, wrist_y = hlm[0].x, hlm[0].y
-                    already_found = any(
-                        ((wrist_x - ex[0].x) ** 2 + (wrist_y - ex[0].y) ** 2) ** 0.5 < 0.05
+                    dup = any(
+                        ((hlm[0].x - ex[0].x) ** 2 + (hlm[0].y - ex[0].y) ** 2) ** 0.5 < 0.05
                         for ex in all_hand_lm
                     )
-                    if not already_found:
+                    if not dup:
                         all_hand_lm.append(hlm)
         except Exception:
             pass
@@ -1626,6 +1666,7 @@ class VideoFeatureExtractor:
         self._num_faces  = num_faces
         self._aggregator = WindowAggregator(window_ms, target_fps)
         self._mp_available: Optional[bool] = None    # lazy probe
+        self._diar_segments: list[dict] = []         # set by caller before extract_all for interaction detection
 
     # ── Public API ─────────────────────────────────────────────────────────────
 

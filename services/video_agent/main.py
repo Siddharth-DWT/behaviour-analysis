@@ -6,16 +6,16 @@ and builds per-speaker baselines.  Rule engines (Phase 2B-D) slot in
 after calibration without changing this service's API contract.
 
 Endpoints:
-  POST /analyse  → Full video analysis pipeline (feature extraction + calibration)
-  GET  /health   → Liveness check
+POST /analyse  → Full video analysis pipeline (feature extraction + calibration)
+GET  /health   → Liveness check
 
 Pipeline:
-  1. Save uploaded video to temp file
-  2. VideoFeatureExtractor.extract_all()  → (list[WindowFeatures], lip_activity_map)
-  3. SpeakerFaceMapper.assign()           → dict[str, list[WindowFeatures]]
-  4. VideoCalibrationModule.build_all_baselines() per speaker
-  5. Rule engines (Phase 2B-D placeholder — returns empty signals for now)
-  6. Return VideoAnalysisResponse
+1. Save uploaded video to temp file
+2. VideoFeatureExtractor.extract_all()  → (list[WindowFeatures], lip_activity_map)
+3. SpeakerFaceMapper.assign()           → dict[str, list[WindowFeatures]]
+4. VideoCalibrationModule.build_all_baselines() per speaker
+5. Rule engines (Phase 2B-D placeholder — returns empty signals for now)
+6. Return VideoAnalysisResponse
 """
 import os
 import sys
@@ -222,9 +222,13 @@ class VideoPipeline:
 
         # ── Step 1: Frame extraction (no overlay — fast path) ─────────────────
         logger.info(f"[{session_id}] Extracting video features from {Path(video_path).name}")
-        windows, lip_activity_map = self._extractor.extract_all(
-            video_path, overlay_output_path=None, meeting_type=meeting_type
-        )
+        self._extractor._diar_segments = diar_segments  # active-speaker fallback in InteractionDetector
+        try:
+            windows, lip_activity_map = self._extractor.extract_all(
+                video_path, overlay_output_path=None, meeting_type=meeting_type
+            )
+        finally:
+            self._extractor._diar_segments = []  # prevent leaking into next request
         logger.info(f"[{session_id}] {len(windows)} windows extracted")
 
         if not windows:
@@ -287,9 +291,10 @@ class VideoPipeline:
 
     def burn_overlay(
         self,
-        session_id:  str,
-        video_path:  str,
-        all_signals: list[dict],
+        session_id:    str,
+        video_path:    str,
+        all_signals:   list[dict],
+        diar_segments: list[dict] | None = None,
     ) -> Optional[str]:
         """
         Phase 2 — Burn signal text labels onto the original video.
@@ -307,6 +312,7 @@ class VideoPipeline:
                 f"[{session_id}] Burning landmarks + {len(all_signals)} signal labels onto video "
                 f"→ {output_path}"
             )
+            self._extractor._diar_segments = diar_segments or []
             self._extractor.burn_landmarks_and_labels(video_path, all_signals, output_path=output_path)
             logger.info(f"[{session_id}] Annotated video ready → {output_path}")
             return output_path
@@ -405,7 +411,7 @@ async def _run_video_job(
     try:
         annotated_path = await loop.run_in_executor(
             _thread_pool,
-            lambda: pipeline.burn_overlay(session_id, src_video_path, analysis.signals),
+            lambda: pipeline.burn_overlay(session_id, src_video_path, analysis.signals, diar_segments),
         )
         if annotated_path:
             _video_jobs[job_id]["result"]["annotated_video_path"] = annotated_path
@@ -467,11 +473,11 @@ async def analyse(
     Poll GET /jobs/{job_id} until status == "done" or "failed".
 
     Form fields:
-      video               — mp4 / webm / avi file
-      session_id          — UUID from API Gateway (generated if blank)
-      meeting_type        — sales | interview | general | etc.
-      diar_segments_json  — JSON array of {speaker,start_ms,end_ms} from voice agent
-      num_speakers        — expected speaker count (reserved for Phase 2B face budget)
+    video               — mp4 / webm / avi file
+    session_id          — UUID from API Gateway (generated if blank)
+    meeting_type        — sales | interview | general | etc.
+    diar_segments_json  — JSON array of {speaker,start_ms,end_ms} from voice agent
+    num_speakers        — expected speaker count (reserved for Phase 2B face budget)
     """
     import json
 
