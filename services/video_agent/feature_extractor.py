@@ -2343,7 +2343,7 @@ class VideoFeatureExtractor:
 
         centroid_tracker = CentroidTracker(
             max_disappeared=90,   # ~18s at 5fps — faces in calls don't physically leave
-            match_threshold=0.12, # slightly wider to tolerate head rotation / detection jitter
+            match_threshold=0.20, # wide enough to survive head turns and fast leans
         )
 
         # Cache last MediaPipe results — reused for overlay on non-sampled frames
@@ -2510,7 +2510,7 @@ class VideoFeatureExtractor:
         # ── Filter transient face tracks before identity merge ─────────────────
         # Tracks with very few frames are avatar images in shared screen content
         # or momentary false-positive detections — discard before running ArcFace.
-        MIN_FRAMES_FOR_IDENTITY = 5  # at 5 fps this is 1 second of detection
+        MIN_FRAMES_FOR_IDENTITY = 3  # at 5 fps this is 0.6 seconds of detection
         frame_counts: dict[int, int] = {}
         for ff in frames:
             if ff.face_detected:
@@ -2563,7 +2563,11 @@ class VideoFeatureExtractor:
                             f"Adaptive merge threshold: {merge_threshold:.3f} "
                             f"(duration={duration_s:.0f}s, avg_face_h={avg_face_h:.3f})"
                         )
-                        canonical = self._merge_tracks_by_embedding(track_embs, threshold=merge_threshold)
+                        canonical = self._merge_tracks_by_embedding(
+                            track_embs,
+                            threshold=merge_threshold,
+                            frame_counts=frame_counts,
+                        )
                         merges = {k: v for k, v in canonical.items() if k != v}
 
                         if merges:
@@ -3519,6 +3523,7 @@ class VideoFeatureExtractor:
     def _merge_tracks_by_embedding(
         track_embeddings: dict[int, "np.ndarray"],
         threshold: float = 0.65,
+        frame_counts: dict[int, int] | None = None,
     ) -> dict[int, int]:
         """
         Merge CentroidTracker track_ids that belong to the same physical person.
@@ -3527,13 +3532,11 @@ class VideoFeatureExtractor:
         equals cosine similarity in [-1, 1].  Threshold is computed adaptively
         by _compute_merge_threshold based on video duration and face size.
 
-        This is the primary deduplication for layout-change scenarios: screen
-        share toggling, grid rearrangement, spotlight view switches.
-        CentroidTracker handles frame-to-frame continuity within stable layouts;
-        this method resolves cross-layout identity after all frames are processed.
+        Tracks are processed dominant-first (most frames → canonical anchor),
+        so fragment tracks are always compared against the highest-quality
+        embedding rather than an arbitrary earlier track.
 
         Returns {track_id: canonical_track_id} for ALL input track_ids.
-        canonical_track_id = lowest ID in each merge group (first detected).
         Tracks that match nothing keep their own ID as canonical.
         """
         import logging as _logging
@@ -3542,7 +3545,10 @@ class VideoFeatureExtractor:
         canonical: dict[int, int] = {}
         canon_embs: dict[int, "np.ndarray"] = {}
 
-        for tid in sorted(track_embeddings.keys()):
+        counts = frame_counts or {}
+        # Dominant tracks (most frames) become canonical anchors first so that
+        # fragment tracks are always merged into the best-quality embedding.
+        for tid in sorted(track_embeddings.keys(), key=lambda t: counts.get(t, 0), reverse=True):
             emb = track_embeddings[tid]
             matched_canon: int | None = None
             best_sim = 0.0

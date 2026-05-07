@@ -675,16 +675,22 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
 
   const videoUrl = showAnnotated && annotatedAvailable ? annotatedVideoUrl : rawVideoUrl;
 
-  const speakers = [...new Set(signals.map((s) => s.speaker_id).filter(Boolean))];
+  // Holds the non-canonical→canonical face-track mapping so computeActive can
+  // include signals from all fragmented tracks when a canonical speaker is selected.
+  const toCanonicalRef = useRef<Record<string, string>>({});
 
   const computeActive = useCallback(
     (ms: number): VideoSignal[] => {
+      const canon = toCanonicalRef.current;
       const filtered = signals.filter((s) => {
         if (ms < (s.start_ms ?? 0) || ms > (s.end_ms ?? s.start_ms ?? 0)) return false;
         const cfg = SIGNAL_CONFIG[s.signal_type];
         if (!cfg) return false;
         if (!enabledCategories.has(cfg.category)) return false;
-        if (selectedSpeaker !== "all" && s.speaker_id !== selectedSpeaker) return false;
+        if (selectedSpeaker !== "all") {
+          const resolvedId = canon[s.speaker_id ?? ""] ?? s.speaker_id ?? "";
+          if (resolvedId !== selectedSpeaker && s.speaker_id !== selectedSpeaker) return false;
+        }
         if (s.confidence < 0.3) return false;
         return true;
       });
@@ -760,23 +766,57 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
     });
   };
 
-  function getSpeakerLabel(s: VideoSignal): string {
-    return s.speaker_id || "Unknown";
-  }
+  // ── Speaker deduplication ────────────────────────────────────────────────────
+  // Three-pass approach:
+  //   1. Ghost filter  — Face_N with no thumbnail = no ArcFace embedding, junk track
+  //   2. Registry merge — multiple Face_N entries with the same registry_id are the
+  //      same real person seen at different angles; collapse to the dominant track
+  //      (most signals). This is the primary fix for the crowded sidebar.
+  //   3. Appear-gate   — only show a speaker after their earliest signal starts,
+  //      so participants aren't listed before they join the call.
 
-  function getDisplayLabel(s: VideoSignal): string {
-    if (s.speaker_name) return s.speaker_name;
-    const entry = speakerRoster[s.speaker_id];
-    if (entry?.display_name) return entry.display_name;
-    return s.speaker_id || "Unknown";
-  }
+  const rosterLoaded = Object.keys(speakerRoster).length > 0;
+  const isGhostTrack = (spkId: string) =>
+    rosterLoaded &&
+    /^Face_\d+$/.test(spkId) &&
+    !speakerRoster[spkId]?.thumbnail_url;
 
-  // Seed bySpeaker from ALL known speakers in the full signals array so face-only
-  // participants (Face_N) are always visible regardless of whether they have an
-  // active signal at the current playback position.
-  const bySpeaker: Record<string, { label: string; rawId: string; signals: VideoSignal[] }> = {};
   const allSpeakerIds = [...new Set(signals.map((s) => s.speaker_id).filter(Boolean))] as string[];
-  for (const spkId of allSpeakerIds) {
+
+  // Pass 1 — group by registry_id (only once the roster is loaded)
+  const registryGroups: Record<string, string[]> = {};
+  for (const spkId of allSpeakerIds.filter((id) => !isGhostTrack(id))) {
+    const regId = rosterLoaded ? speakerRoster[spkId]?.registry_id : undefined;
+    if (regId) (registryGroups[regId] ??= []).push(spkId);
+  }
+
+  // Pass 2 — pick canonical (most signals) per registry group; build toCanonical map
+  const toCanonical: Record<string, string> = {};
+  for (const spkIds of Object.values(registryGroups)) {
+    if (spkIds.length <= 1) continue;
+    const sigCount = (id: string) => signals.filter((s) => s.speaker_id === id).length;
+    const canonical = [...spkIds].sort((a, b) => sigCount(b) - sigCount(a))[0];
+    for (const id of spkIds) {
+      if (id !== canonical) toCanonical[id] = canonical;
+    }
+  }
+  // Keep the ref in sync so computeActive can use it without being a dependency
+  toCanonicalRef.current = toCanonical;
+
+  // Pass 3 — first appearance per canonical speaker (min across all merged tracks)
+  const canonicalFirstMs: Record<string, number> = {};
+  for (const s of signals) {
+    if (!s.speaker_id || isGhostTrack(s.speaker_id)) continue;
+    const canonId = toCanonical[s.speaker_id] ?? s.speaker_id;
+    const prev = canonicalFirstMs[canonId];
+    if (prev === undefined || s.start_ms < prev) canonicalFirstMs[canonId] = s.start_ms;
+  }
+
+  // Seed bySpeaker with canonical speakers only, after they've appeared
+  const bySpeaker: Record<string, { label: string; rawId: string; signals: VideoSignal[] }> = {};
+  for (const spkId of allSpeakerIds.filter((id) => !isGhostTrack(id) && !toCanonical[id])) {
+    const firstMs = canonicalFirstMs[spkId] ?? Infinity;
+    if (firstMs > currentTimeMs) continue;
     const rosterEntry = speakerRoster[spkId];
     bySpeaker[spkId] = {
       label: rosterEntry?.display_name || spkId,
@@ -784,12 +824,14 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
       signals: [],
     };
   }
+
+  // Inject active signals — map non-canonical tracks to their canonical entry
   for (const s of activeSignals) {
-    const key = s.speaker_id || ("_noid_" + getSpeakerLabel(s));
-    if (!bySpeaker[key]) {
-      bySpeaker[key] = { label: getDisplayLabel(s), rawId: s.speaker_id || "", signals: [] };
+    if (isGhostTrack(s.speaker_id || "")) continue;
+    const canonId = toCanonical[s.speaker_id || ""] ?? s.speaker_id ?? "";
+    if (canonId && bySpeaker[canonId]) {
+      bySpeaker[canonId].signals.push(s);
     }
-    bySpeaker[key].signals.push(s);
   }
 
   const hasIncongruence = activeSignals.some((s) =>
@@ -1048,14 +1090,14 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
           ))}
         </div>
 
-        {speakers.length > 1 && (
+        {Object.keys(bySpeaker).length > 1 && (
           <select
             value={selectedSpeaker}
             onChange={(e) => setSelectedSpeaker(e.target.value)}
             className="rounded-lg border border-nexus-border bg-nexus-surface px-3 py-1 text-xs text-nexus-text-primary"
           >
             <option value="all">All Speakers</option>
-            {speakers.map((spk) => (
+            {Object.keys(bySpeaker).map((spk) => (
               <option key={spk} value={spk}>
                 {speakerRoster[spk]?.display_name || spk}
               </option>
