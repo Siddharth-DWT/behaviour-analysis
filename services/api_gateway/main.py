@@ -1927,7 +1927,7 @@ async def get_session_detail(session_id: str, _: dict = Depends(get_current_user
 
 
     # Fetch related data in parallel-ish
-    signals = [s for s in await get_signals(session_id, limit=5000) if _should_display_signal(s)]
+    signals = [s for s in await get_signals(session_id, limit=50000) if _should_display_signal(s)]
     session_alerts = await get_alerts(session_id)
     report = await get_report(session_id)
     transcript = await get_transcript(session_id)
@@ -2013,7 +2013,7 @@ async def get_session_signals(
     session_id: str,
     agent: Optional[str] = Query(default=None),
     signal_type: Optional[str] = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=5000),
+    limit: int = Query(default=100, ge=1, le=50000),
     offset: int = Query(default=0, ge=0),
     _: dict = Depends(get_current_user),
 ):
@@ -2084,7 +2084,7 @@ async def get_session_report(
             return {"session_id": session_id, "report": existing}
 
     # Generate new report via Fusion Agent
-    signals = await get_signals(session_id, limit=5000)
+    signals = await get_signals(session_id, limit=50000)
 
     voice_signals = [s for s in signals if s.get("agent") == "voice"]
     language_signals = [s for s in signals if s.get("agent") == "language"]

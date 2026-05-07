@@ -2552,7 +2552,18 @@ class VideoFeatureExtractor:
                             tid: np.array(emb_list)
                             for tid, (emb_list, _) in emb_results.items()
                         }
-                        canonical = self._merge_tracks_by_embedding(track_embs)
+                        face_areas = [
+                            ff.face_box_area for ff in frames
+                            if ff.face_detected and ff.face_box_area > 0.001
+                        ]
+                        avg_face_h = float(np.mean([a ** 0.5 for a in face_areas])) if face_areas else 0.10
+                        duration_s = max((ff.timestamp_ms for ff in frames), default=60000) / 1000.0
+                        merge_threshold = self._compute_merge_threshold(duration_s, avg_face_h)
+                        logger.info(
+                            f"Adaptive merge threshold: {merge_threshold:.3f} "
+                            f"(duration={duration_s:.0f}s, avg_face_h={avg_face_h:.3f})"
+                        )
+                        canonical = self._merge_tracks_by_embedding(track_embs, threshold=merge_threshold)
                         merges = {k: v for k, v in canonical.items() if k != v}
 
                         if merges:
@@ -3480,6 +3491,31 @@ class VideoFeatureExtractor:
             return 0.0
 
     @staticmethod
+    def _compute_merge_threshold(duration_s: float, avg_face_height_ratio: float) -> float:
+        """
+        Adaptive ArcFace cosine-similarity threshold for track deduplication.
+
+        avg_face_height_ratio = mean sqrt(face_box_area) across detected frames.
+          > 0.20  → grid / video-call  (large faces filling boxes)
+          ≤ 0.20  → in-person room     (small faces around a table)
+
+        Grid calls:  different-person ceiling ≈ 0.25–0.30, floor = 0.42.
+        In-person:   different-person ceiling ≈ 0.40–0.42, floor = 0.48.
+        Longer videos accumulate more track fragments so same-person scores drop;
+        decay reduces the threshold to catch those lower-scoring pairs.
+        """
+        duration_min = duration_s / 60.0
+        if avg_face_height_ratio > 0.20:
+            base  = min(0.65, max(0.50, 0.35 + avg_face_height_ratio * 1.5))
+            decay = duration_min * 0.012
+            floor = 0.42
+        else:
+            base  = 0.58
+            decay = duration_min * 0.005
+            floor = 0.48
+        return round(max(floor, base - decay), 3)
+
+    @staticmethod
     def _merge_tracks_by_embedding(
         track_embeddings: dict[int, "np.ndarray"],
         threshold: float = 0.65,
@@ -3488,9 +3524,8 @@ class VideoFeatureExtractor:
         Merge CentroidTracker track_ids that belong to the same physical person.
 
         Embeddings are L2-normalised in extract_from_crops so np.dot() here
-        equals cosine similarity in [-1, 1].  Same-person pairs score > 0.65;
-        0.65 is the threshold — different people in grid calls typically score
-        0.20–0.25, so this should not cause cross-person merges.
+        equals cosine similarity in [-1, 1].  Threshold is computed adaptively
+        by _compute_merge_threshold based on video duration and face size.
 
         This is the primary deduplication for layout-change scenarios: screen
         share toggling, grid rearrangement, spotlight view switches.

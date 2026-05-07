@@ -576,7 +576,7 @@ export default function SessionDetail() {
 
   const { data: signalData } = useQuery({
     queryKey: ["signals", id],
-    queryFn: () => getSignals(id!, { limit: 5000 }),
+    queryFn: () => getSignals(id!, { limit: 50000 }),
     enabled: !!id,
   });
 
