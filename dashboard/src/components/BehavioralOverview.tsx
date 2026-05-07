@@ -48,7 +48,19 @@ const COMPUTATIONS: Record<string, (s: Signal[]) => number> = {
       .map((x) => x.confidence ?? 0);
     const base = r?.value ?? 0;
     const boost = avg(rapportConf) * 0.15;
-    return Math.round(Math.min(base + boost, 1) * 100);
+    const computed = Math.round(Math.min(base + boost, 1) * 100);
+    if (computed > 0) return computed;
+    // Fallback: derive from conversation_engagement when no rapport signal exists.
+    // engagement_level is a reasonable proxy for relational warmth in team meetings.
+    const engVals = s
+      .filter((x) => x.signal_type === "conversation_engagement")
+      .map((x) =>
+        x.value_text === "highly_engaged" ? 0.85
+        : x.value_text === "engaged" ? 0.70
+        : x.value_text === "passive" ? 0.35
+        : 0.20
+      );
+    return engVals.length > 0 ? Math.round(avg(engVals) * 100) : 0;
   },
   stress: (s) => {
     const v = sigVals(s, "vocal_stress_score", "voice");
@@ -62,7 +74,10 @@ const COMPUTATIONS: Record<string, (s: Signal[]) => number> = {
        "head_body_incongruence", "smile_sentiment_incongruence"].includes(x.signal_type)
     );
     if (incongruence.length === 0) return 100;
-    return Math.round((1 - incongruence.length / s.length) * 100);
+    // Sum confidence of incongruence signals as penalty.
+    // Scale: 3 fully-confident signals (3 × 0.85 ≈ 2.55) = full misalignment (0%).
+    const totalPenalty = incongruence.reduce((sum, x) => sum + (x.confidence ?? 0.5), 0);
+    return Math.round(Math.max(0, 1 - totalPenalty / 3) * 100);
   },
   attention: (s) => {
     const screen = sigVals(s, "screen_contact", "video");

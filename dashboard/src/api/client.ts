@@ -247,15 +247,36 @@ export interface VideoSignal {
   value_text: string;
   confidence: number;
   speaker_id: string;
+  speaker_name?: string;
+  registry_id?: string;
   start_ms: number;
   end_ms: number;
   agent: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface SpeakerInfo {
+  speaker_label: string;
+  display_name: string;
+  role: string;
+  company: string;
+  grid_position: string;
+  registry_id: string;
+  thumbnail_url: string;
+  match_method: string;
+  match_confidence: number;
 }
 
 export async function getVideoSignals(
   id: string
 ): Promise<{ session_id: string; signals: VideoSignal[] }> {
   return request(`/sessions/${id}/video-signals`);
+}
+
+export async function getVideoSpeakers(
+  id: string
+): Promise<{ session_id: string; speakers: SpeakerInfo[] }> {
+  return request(`/sessions/${id}/video-speakers`);
 }
 
 export async function getReport(

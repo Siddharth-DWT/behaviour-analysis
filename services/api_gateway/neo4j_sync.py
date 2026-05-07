@@ -1188,7 +1188,8 @@ NODE LABELS and their PROPERTIES:
   id, label (e.g. "Speaker_0"), name, role, talk_time_ms, talk_time_pct, word_count
 
 (:PersistentSpeaker)   -- cross-session identity (Phase 3B)
-  id, display_name, role, company, session_count, first_seen, last_seen
+  id, display_name, role, company, session_count, first_seen, last_seen,
+  face_sample_count, has_face_embedding
 
 (:Segment)
   id, segment_index, start_ms, end_ms, text, speaker_label,
@@ -1519,12 +1520,14 @@ async def sync_speaker_registry_to_neo4j(pool, registry_id: str) -> bool:
             await nsession.run(
                 """
                 MERGE (ps:PersistentSpeaker {id: $id})
-                SET ps.display_name  = $name,
-                    ps.role          = $role,
-                    ps.company       = $company,
-                    ps.session_count = $count,
-                    ps.first_seen    = $first,
-                    ps.last_seen     = $last
+                SET ps.display_name       = $name,
+                    ps.role               = $role,
+                    ps.company            = $company,
+                    ps.session_count      = $count,
+                    ps.first_seen         = $first,
+                    ps.last_seen          = $last,
+                    ps.face_sample_count  = $face_sample_count,
+                    ps.has_face_embedding = $has_face
                 """,
                 id=str(speaker["id"]),
                 name=speaker["display_name"] or "",
@@ -1533,6 +1536,8 @@ async def sync_speaker_registry_to_neo4j(pool, registry_id: str) -> bool:
                 count=int(speaker["session_count"] or 0),
                 first=str(speaker["first_seen_at"]),
                 last=str(speaker["last_seen_at"]),
+                face_sample_count=int(speaker["face_sample_count"] or 0),
+                has_face=speaker["face_embedding"] is not None,
             )
 
             # Link PersistentSpeaker to each session-level Speaker node via APPEARED_AS.

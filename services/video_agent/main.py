@@ -12,13 +12,14 @@ GET  /health   → Liveness check
 Pipeline:
 1. Save uploaded video to temp file
 2. VideoFeatureExtractor.extract_all()  → (list[WindowFeatures], lip_activity_map)
-3. SpeakerFaceMapper.assign()           → dict[str, list[WindowFeatures]]
+3. SpeakerFaceMapper.assign()           → (dict[str, list[WindowFeatures]], dict[str, float])
 4. VideoCalibrationModule.build_all_baselines() per speaker
 5. Rule engines (Phase 2B-D placeholder — returns empty signals for now)
 6. Return VideoAnalysisResponse
 """
 import os
 import sys
+import json
 import time
 import uuid
 import asyncio
@@ -28,6 +29,11 @@ import concurrent.futures
 from pathlib import Path
 from typing import Optional
 
+try:
+    import redis as _sync_redis
+except ImportError:
+    _sync_redis = None  # type: ignore[assignment]
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -35,14 +41,16 @@ from pydantic import BaseModel
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 try:
-    from feature_extractor import VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures
+    from feature_extractor import (
+        VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures, FaceEmbeddingExtractor,
+    )
     from calibration import VideoCalibrationModule, FacialBaseline, BodyBaseline, GazeBaseline
     from facial_rules import FacialRuleEngine
     from gaze_rules import GazeRuleEngine
     from body_rules import BodyRuleEngine
 except ImportError:
     from services.video_agent.feature_extractor import (
-        VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures,
+        VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures, FaceEmbeddingExtractor,
     )
     from services.video_agent.calibration import (
         VideoCalibrationModule, FacialBaseline, BodyBaseline, GazeBaseline,
@@ -53,6 +61,24 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nexus.video")
+
+_REDIS_URL          = os.getenv("REDIS_URL", "redis://redis:6379/0").replace("localhost:6379", "redis:6379")
+_PENDING_SIGNAL_TTL = 86400  # 24 h auto-cleanup
+
+
+def _push_signals_to_redis(session_id: str, signals: list[dict]) -> None:
+    """Persist signal batch to Redis immediately. Sync — safe from thread-pool worker. Non-fatal."""
+    if not signals or _sync_redis is None:
+        return
+    try:
+        r = _sync_redis.from_url(_REDIS_URL, socket_timeout=3, decode_responses=True)
+        key = f"nexus:pending:{session_id}:video"
+        r.rpush(key, json.dumps(signals))
+        r.expire(key, _PENDING_SIGNAL_TTL)
+        r.close()
+    except Exception as exc:
+        logger.warning(f"[{session_id}] Redis signal backup failed (non-fatal): {exc}")
+
 
 # ─── FastAPI app ──────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -164,6 +190,8 @@ class VideoAnalysisResponse(BaseModel):
     participant_count:     int = 0        # max faces detected in any single frame
     backend:               str = "mediapipe"
     annotated_video_path:  Optional[str] = None
+    face_embeddings:       dict = {}      # {speaker_label: {embedding, thumbnail_b64, track_id}}
+    lip_sync_scores:       dict = {}      # {speaker_label: correlation_score} — lip-sync assignment quality
 
 
 class VideoJobResponse(BaseModel):
@@ -237,7 +265,7 @@ class VideoPipeline:
         duration_sec = (windows[-1].window_end_ms - windows[0].window_start_ms) / 1000.0
 
         # ── Step 2: Map windows → speakers (lip-sync correlation) ─────────────
-        windows_by_speaker: dict[str, list[WindowFeatures]] = self._mapper.assign(
+        windows_by_speaker, lip_sync_scores = self._mapper.assign(
             windows, diar_segments, lip_activity_map
         )
         speakers = sorted(windows_by_speaker.keys())
@@ -253,17 +281,23 @@ class VideoPipeline:
             )
             baselines[speaker_id] = (facial, body, gaze)
 
-        # ── Step 4: Rule engines ──────────────────────────────────────────────
+        # ── Step 4: Rule engines — persist each batch to Redis immediately ───────
         facial_signals = self._facial_rules.evaluate(
             windows_by_speaker, baselines, session_id, meeting_type
         )
+        _push_signals_to_redis(session_id, facial_signals)
+
         gaze_signals = self._gaze_rules.evaluate(
             windows_by_speaker, baselines, session_id, meeting_type
         )
+        _push_signals_to_redis(session_id, gaze_signals)
+
         body_signals = self._body_rules.evaluate(
             windows_by_speaker, baselines, session_id, meeting_type,
             extra_signals=facial_signals + gaze_signals,
         )
+        _push_signals_to_redis(session_id, body_signals)
+
         all_signals: list[dict] = facial_signals + gaze_signals + body_signals
 
         summaries    = self._build_summaries(windows_by_speaker, baselines)
@@ -271,6 +305,52 @@ class VideoPipeline:
             (w.face_count for w in windows if hasattr(w, "face_count")),
             default=len(speakers),
         )
+
+        # ── Step 5: ArcFace embeddings for cross-session identity ─────────────
+        # Prefer cached embeddings from the identity merge in _extract_frames
+        # to avoid running ArcFace a second time on the same crops.
+        face_embeddings_data: dict = {}
+        try:
+            import base64
+            cached = getattr(self._extractor, "_cached_embeddings", None)
+            if cached:
+                emb_results = cached
+                source = "cache"
+            elif hasattr(self._extractor, "_best_face_crops") and self._extractor._best_face_crops:
+                embedder = FaceEmbeddingExtractor.get_instance()
+                emb_results = embedder.extract_from_crops(self._extractor._best_face_crops) if embedder.available else {}
+                source = "fresh"
+            else:
+                emb_results = {}
+                source = "none"
+
+            for track_id, (embedding, thumbnail) in emb_results.items():
+                # Prefer a named Speaker_N label over Face_N when both exist
+                # (can happen if residual non-canonical windows survived).
+                speaker_label = next(
+                    (wf.speaker_id for wf in windows
+                     if wf.face_index == track_id
+                     and wf.speaker_id
+                     and not wf.speaker_id.startswith("Face_")),
+                    next(
+                        (wf.speaker_id for wf in windows
+                         if wf.face_index == track_id and wf.speaker_id),
+                        f"Face_{track_id}",
+                    ),
+                )
+                face_embeddings_data[speaker_label] = {
+                    "embedding":     embedding,
+                    "thumbnail_b64": base64.b64encode(thumbnail).decode(),
+                    "track_id":      track_id,
+                }
+            if emb_results:
+                logger.info(
+                    f"[{session_id}] Face embeddings: {len(face_embeddings_data)} "
+                    f"({source})"
+                )
+        except Exception as exc:
+            logger.warning(f"[{session_id}] Face embedding extraction failed (non-fatal): {exc}")
+
         elapsed = time.time() - start
 
         logger.info(
@@ -287,6 +367,8 @@ class VideoPipeline:
             processing_time=round(elapsed, 2),
             participant_count=participant_count,
             annotated_video_path=None,   # Phase 2 fills this in
+            face_embeddings=face_embeddings_data,
+            lip_sync_scores=lip_sync_scores,
         ), video_path
 
     def burn_overlay(
@@ -295,6 +377,7 @@ class VideoPipeline:
         video_path:    str,
         all_signals:   list[dict],
         diar_segments: list[dict] | None = None,
+        display_names: dict | None = None,
     ) -> Optional[str]:
         """
         Phase 2 — Burn signal text labels onto the original video.
@@ -313,7 +396,10 @@ class VideoPipeline:
                 f"→ {output_path}"
             )
             self._extractor._diar_segments = diar_segments or []
-            self._extractor.burn_landmarks_and_labels(video_path, all_signals, output_path=output_path)
+            self._extractor.burn_landmarks_and_labels(
+                video_path, all_signals, output_path=output_path,
+                display_names=display_names or {},
+            )
             logger.info(f"[{session_id}] Annotated video ready → {output_path}")
             return output_path
         except Exception as exc:
@@ -406,12 +492,23 @@ async def _run_video_job(
         f"[{session_id}] Video job {job_id} signals_ready: {len(analysis.signals)} signals"
     )
 
+    # Wait 15s so the gateway can complete registry matching and POST display names
+    # before Phase 2 burn begins. Non-blocking — event loop handles display-names
+    # POST requests from the gateway during this window.
+    await asyncio.sleep(15)
+    display_names: dict = _video_jobs[job_id].get("display_names") or {}
+    if display_names:
+        logger.info(f"[{session_id}] Video job {job_id} burn: {len(display_names)} display names received")
+
     # ── Phase 2: Burn signal labels onto original video (cosmetic) ────────────
     _video_jobs[job_id]["status"] = "annotating"
     try:
         annotated_path = await loop.run_in_executor(
             _thread_pool,
-            lambda: pipeline.burn_overlay(session_id, src_video_path, analysis.signals, diar_segments),
+            lambda: pipeline.burn_overlay(
+                session_id, src_video_path, analysis.signals, diar_segments,
+                display_names=display_names,
+            ),
         )
         if annotated_path:
             _video_jobs[job_id]["result"]["annotated_video_path"] = annotated_path
@@ -479,8 +576,6 @@ async def analyse(
     diar_segments_json  — JSON array of {speaker,start_ms,end_ms} from voice agent
     num_speakers        — expected speaker count (reserved for Phase 2B face budget)
     """
-    import json
-
     if not session_id:
         session_id = str(uuid.uuid4())
 
@@ -522,6 +617,49 @@ async def analyse(
 
     logger.info(f"[{session_id}] Video job {job_id} queued")
     return VideoJobResponse(job_id=job_id, status="queued")
+
+
+@app.post("/embed-face")
+async def embed_face(image: UploadFile = File(...)):
+    """
+    Extract a 512-dim ArcFace embedding from an uploaded face image.
+    Used by the API gateway's /speakers/search-by-face endpoint.
+
+    Returns: { embedding: [float×512], detected: bool }
+    """
+    import cv2
+    import numpy as np
+
+    img_bytes = await image.read()
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise HTTPException(status_code=400, detail="Could not decode image")
+
+    fe = FaceEmbeddingExtractor.get_instance()
+    if not fe.available:
+        raise HTTPException(status_code=503, detail="Face recognition model not available")
+
+    results = fe.extract_from_crops({0: bgr})
+    if not results:
+        return {"embedding": [], "detected": False}
+
+    embedding, _ = results[0]
+    return {"embedding": embedding, "detected": True}
+
+
+@app.post("/jobs/{job_id}/display-names")
+async def set_display_names(job_id: str, body: dict):
+    """
+    Set speaker display names for the overlay burn pass.
+    Called by the API gateway after registry matching completes,
+    during the 15s window between signals_ready and Phase 2 burn.
+    """
+    job = _video_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    job["display_names"] = body.get("names", {})
+    return {"status": "ok", "names_received": len(job["display_names"])}
 
 
 @app.get("/jobs/{job_id}", response_model=VideoJobResponse)

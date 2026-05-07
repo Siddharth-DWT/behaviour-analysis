@@ -143,6 +143,10 @@ function computeSpeakerStats(signals: Signal[]): SpeakerStats[] {
   const stats: SpeakerStats[] = [];
 
   for (const [label, sigs] of speakerMap) {
+    // Only include speakers who actually spoke — face-only participants (Face_N)
+    // have no voice or language signals and would show meaningless default values.
+    if (!sigs.some((s) => s.agent === "voice" || s.agent === "language")) continue;
+
     const stressVals = sigs
       .filter((s) => s.signal_type === "vocal_stress_score" && s.value != null)
       .map((s) => s.value!);
@@ -267,7 +271,7 @@ function computeVideoStats(signals: Signal[]): Record<string, VideoStats> {
     if (engSigs.length > 0) {
       const top = engSigs.reduce((a, b) => (b.confidence ?? 0) > (a.confidence ?? 0) ? b : a);
       if (top.value_text === "high_engagement") facialEngagement = "high_engagement";
-      else if (top.value_text === "disengaged") facialEngagement = "disengaged";
+      else if (top.value_text === "low_engagement" || top.value_text === "disengaged") facialEngagement = "disengaged";
     }
 
     // Facial stress level
@@ -342,7 +346,9 @@ function computeVideoStats(signals: Signal[]): Record<string, VideoStats> {
     // ── Alignment — real data only ─────────────────────────────────────
     const incongSigs = fusion.filter((s) =>
       ["tone_face_masking", "smile_sentiment_incongruence", "stress_suppression",
-       "head_body_incongruence", "verbal_incongruence"].includes(s.signal_type)
+       "head_body_incongruence", "verbal_incongruence", "voice_face_alignment"].includes(s.signal_type)
+      // voice_face_alignment: only count mismatch value_texts, not "congruent"
+      && !(s.signal_type === "voice_face_alignment" && s.value_text === "congruent")
     );
     let incongruenceLevel: VideoStats["incongruenceLevel"] = null;
     if (incongSigs.length > 0) {

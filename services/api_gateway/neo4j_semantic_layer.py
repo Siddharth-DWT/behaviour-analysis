@@ -660,7 +660,7 @@ async def select_tool(question: str, session_id: str, history: list[dict] | None
         end = text.rfind("}") + 1
         if start >= 0 and end > start:
             result = json.loads(text[start:end])
-            params = result.get("params", {})
+            params = result.get("params") or {}
             # Resolve natural-language signal names to canonical types
             for key in ("signal_type",):
                 if key in params and isinstance(params[key], str):
@@ -847,3 +847,264 @@ async def search_graph_context_fallback(question: str, session_id: str) -> str:
 
     logger.info(f"[{session_id}] GPT-5 Cypher fallback: {len(results)} rows returned")
     return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────
+# GraphRAG — enrich pgvector matches with graph relationships
+# ─────────────────────────────────────────────────────────
+
+async def enrich_chunks_with_graph(chunks: list[dict], session_id: str) -> str:
+    """
+    GraphRAG: use pgvector-matched chunks as entry points into the Neo4j graph.
+
+    For each matched chunk, traverse 1–2 hops of relationships to pull in
+    causal chains, topic correlations, transcript context, and speaker influence
+    that flat vector search cannot see.
+
+    Returns formatted relationship context, or "" if Neo4j is unavailable.
+    """
+    try:
+        from shared.utils.neo4j_client import run_query
+    except ImportError:
+        return ""
+
+    enrichments: list[str] = []
+
+    for chunk in chunks[:8]:
+        chunk_type = chunk.get("chunk_type", "")
+        metadata = chunk.get("metadata") or {}
+
+        try:
+            # ── Signals: find causal chains and transcript anchors ──
+            if chunk_type in ("signal_summary", "signal_event", "window_signals"):
+                sig_type = metadata.get("signal_type", "")
+                speaker = metadata.get("speaker") or None
+                if not sig_type:
+                    continue
+
+                results = await run_query(
+                    """
+                    MATCH (s:Signal {session_id: $session_id, signal_type: $sig_type})
+                    WHERE ($speaker IS NULL OR s.speaker_label = $speaker)
+                      AND s.confidence > 0.45
+                    WITH s ORDER BY s.confidence DESC LIMIT 4
+                    OPTIONAL MATCH (cause:Signal)-[:TRIGGERED]->(s)
+                    OPTIONAL MATCH (s)-[:TRIGGERED]->(effect:Signal)
+                    OPTIONAL MATCH (s)-[:CONTRADICTS]->(contra:Signal)
+                    OPTIONAL MATCH (s)-[:INFLUENCED]->(influenced:Signal)
+                    OPTIONAL MATCH (s)-[:OCCURRED_DURING]->(seg:Segment)
+                    OPTIONAL MATCH (seg)-[:DISCUSSES]->(topic:Topic)
+                    RETURN s.speaker_label AS speaker,
+                           s.value_text AS outcome,
+                           round(s.timestamp_ms / 1000.0) AS at_sec,
+                           collect(DISTINCT cause.signal_type)[..3] AS caused_by,
+                           collect(DISTINCT effect.signal_type)[..3] AS led_to,
+                           collect(DISTINCT contra.signal_type)[..2] AS contradicts,
+                           collect(DISTINCT influenced.speaker_label)[..2] AS influenced_speakers,
+                           left(seg.text, 120) AS transcript_ctx,
+                           topic.name AS topic_name
+                    LIMIT 3
+                    """,
+                    session_id=session_id,
+                    sig_type=sig_type,
+                    speaker=speaker,
+                )
+                for r in results:
+                    parts = []
+                    label = f"{r.get('speaker', '?')} {sig_type.replace('_', ' ')}"
+                    outcome = r.get("outcome", "")
+                    at_sec = r.get("at_sec")
+                    if outcome:
+                        label += f" ({outcome})"
+                    if at_sec is not None:
+                        label += f" at {int(at_sec)}s"
+                    parts.append(label)
+
+                    causes = [c for c in (r.get("caused_by") or []) if c]
+                    effects = [e for e in (r.get("led_to") or []) if e]
+                    contradicts = [c for c in (r.get("contradicts") or []) if c]
+                    influenced = [s for s in (r.get("influenced_speakers") or []) if s]
+
+                    if causes:
+                        parts.append(f"caused by: {', '.join(c.replace('_', ' ') for c in causes)}")
+                    if effects:
+                        parts.append(f"led to: {', '.join(e.replace('_', ' ') for e in effects)}")
+                    if contradicts:
+                        parts.append(f"contradicts: {', '.join(c.replace('_', ' ') for c in contradicts)}")
+                    if influenced:
+                        parts.append(f"influenced: {', '.join(influenced)}")
+                    if r.get("topic_name"):
+                        parts.append(f"during topic: \"{r['topic_name']}\"")
+                    if r.get("transcript_ctx"):
+                        parts.append(f'context: "{r["transcript_ctx"]}"')
+
+                    enrichments.append(" | ".join(parts))
+
+            # ── Transcript segments: find signals and topics at that moment ──
+            elif chunk_type == "transcript":
+                start_ms = int(metadata.get("start_ms") or 0)
+                end_ms = int(metadata.get("end_ms") or 0)
+                if not end_ms:
+                    continue
+
+                results = await run_query(
+                    """
+                    MATCH (seg:Segment {session_id: $session_id})
+                    WHERE seg.start_ms >= $start_ms AND seg.start_ms <= $end_ms
+                    WITH seg LIMIT 3
+                    OPTIONAL MATCH (sig:Signal)-[:OCCURRED_DURING]->(seg)
+                    WHERE sig.confidence > 0.5
+                    OPTIONAL MATCH (seg)-[:DISCUSSES]->(topic:Topic)
+                    OPTIONAL MATCH (seg)-[:NEXT]->(next_seg:Segment)
+                    RETURN seg.speaker_label AS speaker,
+                           collect(DISTINCT {type: sig.signal_type, outcome: sig.value_text,
+                                            spk: sig.speaker_label})[..6] AS signals,
+                           collect(DISTINCT topic.name)[..3] AS topics,
+                           left(next_seg.text, 80) AS next_context
+                    LIMIT 3
+                    """,
+                    session_id=session_id,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                )
+                for r in results:
+                    sigs = [s for s in (r.get("signals") or []) if s.get("type")]
+                    topics = [t for t in (r.get("topics") or []) if t]
+                    if not sigs and not topics:
+                        continue
+                    parts = []
+                    if topics:
+                        parts.append(f"topic: {', '.join(topics)}")
+                    if sigs:
+                        sig_str = ", ".join(
+                            f"{s['spk']}: {s['type'].replace('_', ' ')}={s.get('outcome', '') or ''}"
+                            for s in sigs
+                        )
+                        parts.append(f"signals: {sig_str}")
+                    if r.get("next_context"):
+                        parts.append(f'followed by: "{r["next_context"]}"')
+                    enrichments.append(
+                        f"[{start_ms // 1000}s–{end_ms // 1000}s] {r.get('speaker', '')}: "
+                        + " | ".join(parts)
+                    )
+
+            # ── Topics: find stress/engagement per topic phase ──
+            elif chunk_type == "topic":
+                topic_name = metadata.get("name", "")
+                if not topic_name:
+                    continue
+
+                results = await run_query(
+                    """
+                    MATCH (t:Topic {session_id: $session_id})
+                    WHERE t.name CONTAINS $topic_name OR $topic_name CONTAINS t.name
+                    WITH t LIMIT 2
+                    OPTIONAL MATCH (t)<-[:DISCUSSES]-(seg:Segment)<-[:OCCURRED_DURING]-(sig:Signal)
+                    WHERE sig.confidence > 0.45
+                    OPTIONAL MATCH (t)-[:FOLLOWED_BY]->(next_t:Topic)
+                    RETURN t.name AS topic,
+                           round(t.start_ms / 1000.0) AS start_sec,
+                           round(t.end_ms / 1000.0) AS end_sec,
+                           collect(DISTINCT {spk: sig.speaker_label,
+                                            type: sig.signal_type,
+                                            outcome: sig.value_text})[..8] AS signals,
+                           next_t.name AS next_topic
+                    LIMIT 2
+                    """,
+                    session_id=session_id,
+                    topic_name=topic_name,
+                )
+                for r in results:
+                    sigs = [s for s in (r.get("signals") or []) if s.get("type")]
+                    if not sigs:
+                        continue
+                    sig_str = ", ".join(
+                        f"{s['spk']}: {s['type'].replace('_', ' ')}={s.get('outcome', '') or ''}"
+                        for s in sigs
+                    )
+                    line = (
+                        f"Topic \"{r['topic']}\" ({int(r.get('start_sec') or 0)}s–"
+                        f"{int(r.get('end_sec') or 0)}s): {sig_str}"
+                    )
+                    if r.get("next_topic"):
+                        line += f" → next: \"{r['next_topic']}\""
+                    enrichments.append(line)
+
+            # ── Entities: find who said what and in what context ──
+            elif chunk_type in ("commitment", "objection", "person"):
+                entity_text = chunk.get("text", "")
+                if not entity_text:
+                    continue
+
+                results = await run_query(
+                    """
+                    MATCH (e:Entity {session_id: $session_id})
+                    WHERE e.text CONTAINS $search OR e.name CONTAINS $search
+                    WITH e LIMIT 3
+                    OPTIONAL MATCH (e)-[:RAISED_BY]->(spk:Speaker)
+                    OPTIONAL MATCH (e)-[:MENTIONED_IN]->(seg:Segment)
+                    OPTIONAL MATCH (seg)-[:DISCUSSES]->(topic:Topic)
+                    RETURN e.text AS text, e.name AS name,
+                           spk.label AS raised_by,
+                           left(seg.text, 100) AS context,
+                           topic.name AS topic
+                    LIMIT 3
+                    """,
+                    session_id=session_id,
+                    search=entity_text[:60],
+                )
+                for r in results:
+                    label = r.get("text") or r.get("name") or ""
+                    if not label:
+                        continue
+                    parts = [f'"{label[:80]}"']
+                    if r.get("raised_by"):
+                        parts.append(f"by {r['raised_by']}")
+                    if r.get("topic"):
+                        parts.append(f"during \"{r['topic']}\"")
+                    if r.get("context"):
+                        parts.append(f'context: "{r["context"]}"')
+                    enrichments.append(f"{chunk_type}: " + " | ".join(parts))
+
+            # ── Speaker profile: influence patterns ──
+            elif chunk_type == "speaker_profile":
+                speaker = metadata.get("speaker", "")
+                if not speaker:
+                    continue
+
+                results = await run_query(
+                    """
+                    MATCH (spk:Speaker {session_id: $session_id, label: $speaker})
+                    OPTIONAL MATCH (spk)<-[:EMITTED_BY]-(sig:Signal)
+                    WITH spk, count(sig) AS total_signals
+                    OPTIONAL MATCH (spk)<-[:EMITTED_BY]-(inf_sig:Signal)-[:INFLUENCED]->(eff:Signal)
+                    OPTIONAL MATCH (eff)-[:EMITTED_BY]->(affected:Speaker)
+                    RETURN spk.label AS speaker,
+                           spk.talk_time_pct AS talk_pct,
+                           total_signals,
+                           collect(DISTINCT affected.label)[..3] AS influences
+                    LIMIT 1
+                    """,
+                    session_id=session_id,
+                    speaker=speaker,
+                )
+                for r in results:
+                    parts = []
+                    if r.get("talk_pct") is not None:
+                        parts.append(f"talk time: {r['talk_pct']:.0f}%")
+                    if r.get("total_signals"):
+                        parts.append(f"{r['total_signals']} signals emitted")
+                    if r.get("influences"):
+                        parts.append(f"influenced: {', '.join(r['influences'])}")
+                    if parts:
+                        enrichments.append(f"{speaker} graph profile: {' | '.join(parts)}")
+
+        except Exception as e:
+            logger.debug(f"[{session_id}] Graph enrichment skipped for {chunk_type}: {e}")
+            continue
+
+    if not enrichments:
+        return ""
+
+    header = f"Relationship context ({len(enrichments)} graph traversal(s)):"
+    return header + "\n" + "\n".join(f"  • {e}" for e in enrichments)

@@ -59,6 +59,7 @@ class GazeRuleEngine(BaseVideoRuleEngine):
     ) -> list[dict]:
         signals: list[dict] = []
         for speaker_id, windows in windows_by_speaker.items():
+            windows = sorted(windows, key=lambda x: x.window_start_ms)
             _, _, gaze_bl = baselines.get(
                 speaker_id,
                 (None, None, GazeBaseline(speaker_id=speaker_id)),
@@ -84,15 +85,19 @@ class GazeRuleEngine(BaseVideoRuleEngine):
         for w in windows:
             if w.face_detection_rate < self.MIN_GAZE_RATE:
                 continue
+            self._current_w = w
             # face_detection_rate is the per-window reliability gate (face visible this window).
             # calibration_confidence is already enforced by MIN_GAZE_RATE above; using it as
             # a direct multiplier here permanently halves all gaze confidence when baselines
             # are sparse, pushing signals below the 0.30 display threshold.
             conf_mult = w.face_detection_rate
 
-            signals += self._rule_gaze_direction(w, bl, speaker_id, conf_mult)
-            signals += self._rule_blink_rate(w, bl, speaker_id, conf_mult)
-            signals += self._rule_attention(w, bl, speaker_id, conf_mult)
+            window_signals: list[dict] = []
+            window_signals += self._rule_gaze_direction(w, bl, speaker_id, conf_mult)
+            window_signals += self._rule_blink_rate(w, bl, speaker_id, conf_mult)
+            window_signals += self._rule_attention(w, bl, speaker_id, conf_mult)
+
+            signals += window_signals
 
         return signals
 
@@ -290,8 +295,14 @@ class GazeRuleEngine(BaseVideoRuleEngine):
         Listening norms: 55-80% screen time normal → flag below 40%
         """
         signals: list[dict] = []
-        block_size = self.CONTACT_BLOCK_WINDOWS
         valid_windows = [w for w in windows if w.face_detection_rate >= self.MIN_GAZE_RATE]
+        total_windows = len(valid_windows)
+        if total_windows < 30:        # < 60 seconds: ~4 blocks minimum
+            block_size = max(3, total_windows // 4)
+        elif total_windows < 75:      # < 150 seconds: 16-second blocks
+            block_size = 8
+        else:
+            block_size = self.CONTACT_BLOCK_WINDOWS  # default 15 (30s)
 
         for i in range(0, len(valid_windows), block_size):
             block = valid_windows[i: i + block_size]

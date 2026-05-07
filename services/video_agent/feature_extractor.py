@@ -16,7 +16,7 @@ Pipeline:
   VideoFeatureExtractor.extract_all(video_path)
       → (list[WindowFeatures], lip_activity_map)   (face-detected, unassigned + lip timeseries)
   SpeakerFaceMapper.assign(windows, diar_segments, lip_activity_map)
-      → dict[str, list[WindowFeatures]]            (per-speaker, lip-sync mapped)
+      → (dict[str, list[WindowFeatures]], dict[str, float])   (windows_by_speaker, lip_sync_scores)
 
 Research basis:
   - Soukupova & Cech 2016: Eye Aspect Ratio for blink detection
@@ -62,6 +62,8 @@ _LEFT_EYE_OUTER,  _LEFT_EYE_INNER  = 263, 362
 _POSE_NOSE           = 0
 _POSE_LEFT_SHOULDER  = 11
 _POSE_RIGHT_SHOULDER = 12
+_POSE_LEFT_ELBOW     = 13
+_POSE_RIGHT_ELBOW    = 14
 _POSE_LEFT_HIP       = 23
 _POSE_RIGHT_HIP      = 24
 
@@ -78,6 +80,10 @@ _MODEL_URLS: dict[str, str] = {
     "hand_landmarker.task": (
         "https://storage.googleapis.com/mediapipe-models/"
         "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+    ),
+    "gesture_recognizer.task": (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "gesture_recognizer/gesture_recognizer/float16/latest/gesture_recognizer.task"
     ),
     "blaze_face_full_range.tflite": (
         "https://storage.googleapis.com/mediapipe-models/"
@@ -129,6 +135,7 @@ class FrameFeatures:
     spine_angle: float = 0.0           # degrees from vertical (+ = leaning forward)
     head_shoulder_dist: float = 0.0    # nose-to-shoulder-midpoint (normalised by frame height)
     body_movement: float = 0.0         # sum of landmark velocity vectors vs previous frame
+    elbow_expansion: float = 0.0       # (elbow_width - shoulder_width) / shoulder_width; + = expansive, - = contracted
 
     # ── Hands ─────────────────────────────────────────────────────────────────
     hands_detected: int = 0            # 0, 1, or 2
@@ -142,9 +149,16 @@ class FrameFeatures:
     # Arm/hand posture indicators
     arms_crossed: bool = False         # both wrists near opposite shoulders/torso centre
     finger_steepling: bool = False     # both hands detected, fingertips touching
-    open_palms: bool = False           # palms facing forward/camera
+    open_palms: bool = False           # palms facing forward/camera (GestureRecognizer + fallback)
     head_supported_by_hand: bool = False  # palm supporting chin/cheek, head weight on hand
     hands_clasped: bool = False           # both hands interlaced/stacked (not steepling)
+
+    # GestureRecognizer outputs
+    thumb_up: bool = False
+    thumb_down: bool = False
+    pointing_up: bool = False
+    victory_sign: bool = False
+    closed_fist: bool = False
 
     # ── Per-frame behavioral state (computed from blendshapes + pose + gaze) ────
     behavioral_state: str = ""         # "speaking","agreeing","disagreeing","listening","distracted","tense","engaged"
@@ -218,6 +232,7 @@ class WindowFeatures:
     body_movement_mean:       float = 0.0
     body_movement_std:        float = 0.0
     body_movement_max:        float = 0.0
+    elbow_expansion_mean:     float = 0.0    # + = elbows wider than shoulders (expansive/dominant)
 
     # ── Hands ─────────────────────────────────────────────────────────────────
     hands_detected_rate:   float = 0.0
@@ -234,6 +249,8 @@ class WindowFeatures:
     touch_zone_ear_pct:      float = 0.0
     touch_zone_neck_pct:     float = 0.0
     touch_zone_forehead_pct: float = 0.0
+    touch_zone_eye_pct:      float = 0.0   # either hand near eye
+    touch_zone_eye_both_pct: float = 0.0   # both hands on eye simultaneously
     dominant_touch_zone:     str   = ""    # zone with highest pct (empty if no touch)
 
     # Arm posture
@@ -242,6 +259,11 @@ class WindowFeatures:
     open_palms_pct:        float = 0.0    # fraction of frames with open palms
     head_supported_pct:    float = 0.0    # fraction of frames with head resting on hand
     hands_clasped_pct:     float = 0.0    # fraction of frames with hands interlaced/stacked
+    thumb_up_pct:          float = 0.0
+    thumb_down_pct:        float = 0.0
+    pointing_up_pct:       float = 0.0
+    victory_sign_pct:      float = 0.0
+    closed_fist_pct:       float = 0.0
 
     # ── Cross-speaker interaction aggregation ─────────────────────────────────
     dominant_interaction: str = ""   # e.g. "Speaker_2_disagrees"
@@ -322,6 +344,9 @@ class MediaPipeModelManager:
 
     def get_face_detector_path(self) -> str:
         return self._get("blaze_face_full_range.tflite")
+
+    def get_gesture_recognizer_path(self) -> str:
+        return self._get("gesture_recognizer.task")
 
     def _get(self, filename: str) -> str:
         dest = self._dir / filename
@@ -514,6 +539,8 @@ class WindowAggregator:
             wf.body_movement_mean      = float(np.mean(movements))
             wf.body_movement_std       = float(np.std(movements))
             wf.body_movement_max       = float(np.max(movements))
+            expansions = np.array([f.elbow_expansion for f in body_frames], dtype=np.float32)
+            wf.elbow_expansion_mean    = float(np.mean(expansions))
 
         # ── Hands ──────────────────────────────────────────────────────────────
         wf.hands_detected_rate   = float(np.mean([f.hands_detected > 0 for f in frames]))
@@ -541,6 +568,11 @@ class WindowAggregator:
             wf.touch_zone_ear_pct      = zone_counts.get("ear",      0) / total
             wf.touch_zone_neck_pct     = zone_counts.get("neck",     0) / total
             wf.touch_zone_forehead_pct = zone_counts.get("forehead", 0) / total
+            wf.touch_zone_eye_pct      = zone_counts.get("eye",      0) / total
+            wf.touch_zone_eye_both_pct = sum(
+                1 for f in frames
+                if f.hand_touch_zone == "eye" and f.hand_touch_zone_r == "eye"
+            ) / total
 
             if zone_counts:
                 wf.dominant_touch_zone = max(zone_counts, key=lambda k: zone_counts[k])
@@ -550,6 +582,11 @@ class WindowAggregator:
             wf.open_palms_pct         = sum(1 for f in frames if f.open_palms)             / total
             wf.head_supported_pct     = sum(1 for f in frames if f.head_supported_by_hand) / total
             wf.hands_clasped_pct      = sum(1 for f in frames if f.hands_clasped)          / total
+            wf.thumb_up_pct           = sum(1 for f in frames if f.thumb_up)               / total
+            wf.thumb_down_pct         = sum(1 for f in frames if f.thumb_down)             / total
+            wf.pointing_up_pct        = sum(1 for f in frames if f.pointing_up)            / total
+            wf.victory_sign_pct       = sum(1 for f in frames if f.victory_sign)           / total
+            wf.closed_fist_pct        = sum(1 for f in frames if f.closed_fist)            / total
 
         # ── Cross-speaker interaction aggregation ─────────────────────────────
         window_interaction_counts: dict[str, int] = defaultdict(int)
@@ -702,11 +739,23 @@ class _PoseResult:
         self.pose_landmarks = pose_landmarks or []
 
 
-class _HandResult:
-    __slots__ = ("hand_landmarks",)
+# Maps GestureRecognizer category names to FrameFeatures bool fields
+_GESTURE_FIELD_MAP: dict[str, str] = {
+    "Open_Palm":   "open_palms",
+    "Closed_Fist": "closed_fist",
+    "Thumb_Up":    "thumb_up",
+    "Thumb_Down":  "thumb_down",
+    "Pointing_Up": "pointing_up",
+    "Victory":     "victory_sign",
+}
 
-    def __init__(self, hand_landmarks):
+
+class _HandResult:
+    __slots__ = ("hand_landmarks", "hand_gestures")
+
+    def __init__(self, hand_landmarks, hand_gestures=None):
         self.hand_landmarks = hand_landmarks or []
+        self.hand_gestures  = hand_gestures  or [""] * len(self.hand_landmarks)
 
 
 class TiledFrameProcessor:
@@ -739,16 +788,16 @@ class TiledFrameProcessor:
     """
 
     _FACE_PAD   = 0.30   # expand detected bbox by this fraction on all sides
-    _BODY_SCALE = 3.0    # extend bbox this many face-heights downward for pose
+    _BODY_SCALE = 2.5    # extend bbox this many face-heights downward for pose (was 3.0)
 
-    def __init__(self, face_det, face_det_img, face_lm, pose_lm, hand_lm, hand_lm_img, num_faces: int) -> None:
-        self._face_det     = face_det      # FaceDetector    — VIDEO mode, full frame
-        self._face_det_img = face_det_img  # FaceDetector    — IMAGE mode, quadrant passes
-        self._face_lm      = face_lm       # FaceLandmarker  — IMAGE mode, per crop
-        self._pose_lm      = pose_lm       # PoseLandmarker  — IMAGE mode, per crop
-        self._hand_lm      = hand_lm       # HandLandmarker  — VIDEO mode, full frame (fallback)
-        self._hand_lm_img  = hand_lm_img   # HandLandmarker  — IMAGE mode, per body crop
-        self._num_faces    = num_faces
+    def __init__(self, face_det, face_det_img, face_lm, pose_lm, hand_lm, gesture_rec_img, num_faces: int) -> None:
+        self._face_det        = face_det         # FaceDetector      — VIDEO mode, full frame
+        self._face_det_img    = face_det_img     # FaceDetector      — IMAGE mode, quadrant passes
+        self._face_lm         = face_lm          # FaceLandmarker    — IMAGE mode, per crop
+        self._pose_lm         = pose_lm          # PoseLandmarker    — IMAGE mode, per crop
+        self._hand_lm         = hand_lm          # HandLandmarker    — VIDEO mode, full frame (fallback)
+        self._gesture_rec_img = gesture_rec_img  # GestureRecognizer — IMAGE mode, per wrist crop
+        self._num_faces       = num_faces
 
     @classmethod
     def create(
@@ -805,10 +854,11 @@ class TiledFrameProcessor:
                 min_tracking_confidence=0.3,
             )
         )
-        # IMAGE mode for per-body-crop detection — stateless, max 2 hands per crop
-        hand_lm_img = mp.tasks.vision.HandLandmarker.create_from_options(
-            mp.tasks.vision.HandLandmarkerOptions(
-                base_options=BaseOptions(model_asset_path=model_mgr.get_hand_landmarker_path()),
+        # IMAGE mode GestureRecognizer — replaces per-crop HandLandmarker;
+        # returns hand landmarks + gesture category in one call.
+        gesture_rec_img = mp.tasks.vision.GestureRecognizer.create_from_options(
+            mp.tasks.vision.GestureRecognizerOptions(
+                base_options=BaseOptions(model_asset_path=model_mgr.get_gesture_recognizer_path()),
                 running_mode=Mode.IMAGE,
                 num_hands=2,
                 min_hand_detection_confidence=0.15,
@@ -816,7 +866,7 @@ class TiledFrameProcessor:
                 min_tracking_confidence=0.15,
             )
         )
-        return cls(face_det, face_det_img, face_lm, pose_lm, hand_lm, hand_lm_img, num_faces)
+        return cls(face_det, face_det_img, face_lm, pose_lm, hand_lm, gesture_rec_img, num_faces)
 
     def _detect_all_faces(self, rgb: np.ndarray, ts_ms: int, mp) -> list[tuple]:
         """
@@ -890,7 +940,8 @@ class TiledFrameProcessor:
         # ── Face bounding boxes: full-frame + quadrant passes ─────────────────
         face_boxes = self._detect_all_faces(rgb, ts_ms, mp)
 
-        all_hand_lm: list = []
+        all_hand_lm:      list = []
+        all_hand_gestures: list = []
 
         if not face_boxes:
             # No faces — still run full-frame hand detection for completeness
@@ -899,9 +950,10 @@ class TiledFrameProcessor:
                 hand_raw = self._hand_lm.detect_for_video(mp_full, ts_ms)
                 if hand_raw and hand_raw.hand_landmarks:
                     all_hand_lm.extend(hand_raw.hand_landmarks)
+                    all_hand_gestures.extend("" for _ in hand_raw.hand_landmarks)
             except Exception:
                 pass
-            return _FaceResult([]), _PoseResult([]), _HandResult(all_hand_lm)
+            return _FaceResult([]), _PoseResult([]), _HandResult(all_hand_lm, all_hand_gestures)
 
         all_face_lm:  list = []
         all_face_bs:  list = []
@@ -949,11 +1001,32 @@ class TiledFrameProcessor:
             except Exception as exc:
                 logger.debug(f"[tiled] face crop error: {exc}")
 
-            # ── Body crop (face bbox extended downward for pose) ──────────────
+            # ── Body crop (face bbox extended downward, clamped to tile) ──────
             bc_x1 = max(0, fx - px)
             bc_y1 = max(0, fy - py)
             bc_x2 = min(fw, fx + fbw + px)
-            bc_y2 = min(fh, fy + int(fbh * self._BODY_SCALE))
+
+            raw_bc_y2 = fy + int(fbh * self._BODY_SCALE)
+
+            # Clamp to midpoint between this face's bottom and the nearest face
+            # directly below in the same column — prevents body crop from bleeding
+            # into adjacent tiles in multi-person grid layouts.
+            face_bottom = fy + fbh
+            nearest_below_top = fh  # default: frame bottom
+
+            for ofx, ofy, ofbw, _ in face_boxes:
+                if ofy > face_bottom and abs((ofx + ofbw / 2) - (fx + fbw / 2)) < fw * 0.4:
+                    # Stop at the face TOP of the tile below — not the midpoint.
+                    # The midpoint was too tight (only ~40 px of body for the middle row),
+                    # preventing MediaPipe Pose from detecting shoulders. Using the face top
+                    # gives the full inter-tile gap as body crop space while still
+                    # stopping before the next person's face begins.
+                    nearest_below_top = min(nearest_below_top, ofy)
+
+            bc_y2 = min(fh, raw_bc_y2, nearest_below_top)
+            # Ensure we capture at least chin + shoulders (1.5× face height from face top).
+            bc_y2 = max(bc_y2, fy + int(fbh * 1.5))
+
             body_crop = rgb[bc_y1:bc_y2, bc_x1:bc_x2]
             if body_crop.size < 64:
                 continue
@@ -1021,9 +1094,9 @@ class TiledFrameProcessor:
                     image_format=mp.ImageFormat.SRGB,
                     data=np.ascontiguousarray(hand_crop),
                 )
-                hand_raw = self._hand_lm_img.detect(hc_mp)
-                if hand_raw and hand_raw.hand_landmarks:
-                    for hlm in hand_raw.hand_landmarks:
+                gr_raw = self._gesture_rec_img.recognize(hc_mp)
+                if gr_raw and gr_raw.hand_landmarks:
+                    for idx, hlm in enumerate(gr_raw.hand_landmarks):
                         remapped_hand = [
                             _Pt(
                                 x=(hx1_c + lm.x * hc_w) / fw,
@@ -1032,6 +1105,11 @@ class TiledFrameProcessor:
                             )
                             for lm in hlm
                         ]
+                        gesture_str = ""
+                        if gr_raw.gestures and idx < len(gr_raw.gestures) and gr_raw.gestures[idx]:
+                            cat = gr_raw.gestures[idx][0].category_name
+                            if cat != "None":
+                                gesture_str = cat
                         dup = any(
                             ((remapped_hand[0].x - ex[0].x) ** 2 +
                              (remapped_hand[0].y - ex[0].y) ** 2) ** 0.5 < 0.05
@@ -1039,6 +1117,7 @@ class TiledFrameProcessor:
                         )
                         if not dup:
                             all_hand_lm.append(remapped_hand)
+                            all_hand_gestures.append(gesture_str)
             except Exception as exc:
                 logger.debug(f"[tiled] pose-guided hand crop error: {exc}")
 
@@ -1054,6 +1133,7 @@ class TiledFrameProcessor:
                     )
                     if not dup:
                         all_hand_lm.append(hlm)
+                        all_hand_gestures.append("")
         except Exception:
             pass
 
@@ -1064,12 +1144,12 @@ class TiledFrameProcessor:
                 facial_transformation_matrixes=all_face_mat,  # same reason
             ),
             _PoseResult(pose_landmarks=all_pose_lm),
-            _HandResult(hand_landmarks=all_hand_lm),
+            _HandResult(all_hand_lm, all_hand_gestures),
         )
 
     def close(self) -> None:
         for obj in (self._face_det, self._face_det_img, self._face_lm,
-                    self._pose_lm, self._hand_lm, self._hand_lm_img):
+                    self._pose_lm, self._hand_lm, self._gesture_rec_img):
             try:
                 obj.close()
             except Exception:
@@ -1284,6 +1364,7 @@ class OverlayRenderer:
         ff: Optional["FrameFeatures"] = None,
         frame_features_list: Optional[list["FrameFeatures"]] = None,
         interactions: Optional[list[dict]] = None,
+        display_names: Optional[dict] = None,
     ) -> np.ndarray:
         """Return an annotated copy of bgr with all landmark overlays applied."""
         out = bgr.copy()
@@ -1298,7 +1379,7 @@ class OverlayRenderer:
         if face_result and getattr(face_result, "face_landmarks", None):
             self._draw_gaze_arrow(out, face_result, h, w)
 
-        # Per-face behavioral state panels (multi-face overlay)
+        # Per-face behavioral state panels + per-face signal badges
         ffl = frame_features_list or ([ff] if ff else [])
         for face_ff in ffl:
             if not face_ff or not face_ff.face_detected:
@@ -1306,9 +1387,16 @@ class OverlayRenderer:
             fi = getattr(face_ff, "face_index", 0)
             face_lms = getattr(face_result, "face_landmarks", None) if face_result else None
             if face_lms and fi < len(face_lms):
-                self._draw_behavioral_state_panel(out, face_ff, face_lms[fi], h, w)
+                self._draw_behavioral_state_panel(
+                    out, face_ff, face_lms[fi], h, w, display_names=display_names
+                )
                 if face_ff.hand_touch_zone:
                     self._draw_touch_zone(out, face_lms[fi], face_ff.hand_touch_zone, h, w)
+                if active_signals:
+                    spk = getattr(face_ff, "speaker_id", "") or f"Face_{fi}"
+                    face_sigs = [s for s in active_signals if s.get("speaker_id") == spk]
+                    if face_sigs:
+                        self._draw_face_signal_badges(out, face_sigs, face_lms[fi], h, w)
 
         # Posture indicators for primary face
         primary_ff = ffl[0] if ffl else ff
@@ -1319,9 +1407,41 @@ class OverlayRenderer:
         if interactions:
             self._draw_interaction_bar(out, interactions, h, w)
 
+        # Global bottom-left labels — only session-level / unattributed signals
         if active_signals:
-            self._draw_labels(out, active_signals, h)
+            unattributed = [
+                s for s in active_signals
+                if not s.get("speaker_id") or s.get("speaker_id") in ("session", "all", "")
+            ]
+            if unattributed:
+                self._draw_labels(out, unattributed, h)
         return out
+
+    def _draw_face_signal_badges(
+        self, bgr: np.ndarray, signals: list[dict],
+        face_landmarks, h: int, w: int,
+    ) -> None:
+        """Draw top-2 signal badges below each face's behavioral state panel."""
+        import cv2
+        face_xs = [lm.x * w for lm in face_landmarks]
+        face_ys = [lm.y * h for lm in face_landmarks]
+        face_cx     = int(sum(face_xs) / len(face_xs))
+        face_bottom = int(max(face_ys))
+
+        top2 = sorted(signals, key=lambda s: s.get("confidence", 0), reverse=True)[:2]
+        y = face_bottom + 16
+        for sig in top2:
+            label = self._get_overlay_label(sig)
+            conf  = f"{sig.get('confidence', 0.0):.0%}"
+            text  = f"{label} {conf}"
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.30, 1)
+            tx = max(5, min(face_cx - tw // 2, w - tw - 5))
+            overlay = bgr.copy()
+            cv2.rectangle(overlay, (tx - 3, y - th - 2), (tx + tw + 3, y + 3), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, bgr, 0.4, 0, bgr)
+            cv2.putText(bgr, text, (tx, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, (255, 255, 200), 1, cv2.LINE_AA)
+            y += 14
 
     def _draw_touch_zone(self, bgr: np.ndarray, face_landmarks, touch_zone: str, h: int, w: int) -> None:
         """Highlight the face zone being touched with a coloured circle + label."""
@@ -1346,10 +1466,19 @@ class OverlayRenderer:
         y = int(face_landmarks[lm_idx].y * h)
         if touch_zone == "neck":
             y += int(h * 0.05)
+        _ZONE_DISPLAY = {
+            "chin":     "EVALUATING",
+            "mouth":    "HOLDING BACK",
+            "nose":     "UNCOMFORTABLE",
+            "cheek":    "ATTENTIVE",
+            "ear":      "SELF-SOOTHING",
+            "neck":     "EXPOSED",
+            "forehead": "FRUSTRATED",
+        }
         color = zone_color.get(touch_zone, (0, 200, 200))
         cv2.circle(bgr, (x, y), 18, color, 2, cv2.LINE_AA)
         cv2.circle(bgr, (x, y), 8,  color, -1, cv2.LINE_AA)
-        cv2.putText(bgr, touch_zone.upper(), (x + 22, y + 5),
+        cv2.putText(bgr, _ZONE_DISPLAY.get(touch_zone, touch_zone.upper()), (x + 22, y + 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
 
     def _draw_posture_indicators(self, bgr: np.ndarray, ff: "FrameFeatures", h: int, w: int) -> None:
@@ -1364,6 +1493,22 @@ class OverlayRenderer:
             indicators.append(("HEAD RESTING",  (200, 200, 0)))
         if ff.hands_clasped:
             indicators.append(("HANDS CLASPED", (180, 180, 180)))
+        if ff.thumb_up:
+            indicators.append(("THUMB UP",      (0, 220, 80)))
+        if ff.thumb_down:
+            indicators.append(("THUMB DOWN",    (0, 80, 220)))
+        if ff.pointing_up:
+            indicators.append(("POINTING",      (200, 180, 0)))
+        if ff.victory_sign:
+            indicators.append(("VICTORY",       (0, 200, 180)))
+        if ff.closed_fist:
+            indicators.append(("FIST",          (180, 60, 60)))
+        if ff.open_palms:
+            indicators.append(("OPEN PALMS",    (60, 180, 60)))
+        if ff.elbow_expansion >= 0.15:
+            indicators.append(("ARMS OPEN",     (80, 200, 80)))
+        elif ff.elbow_expansion <= -0.20:
+            indicators.append(("ARMS TIGHT",    (180, 80, 80)))
         if not indicators:
             return
         y_offset = h - 30 * len(indicators) - 10
@@ -1378,6 +1523,7 @@ class OverlayRenderer:
     def _draw_behavioral_state_panel(
         self, bgr: np.ndarray, ff: "FrameFeatures",
         face_landmarks, h: int, w: int,
+        display_names: Optional[dict] = None,
     ) -> None:
         """Draw a small state panel anchored above each face bbox."""
         import cv2
@@ -1400,7 +1546,8 @@ class OverlayRenderer:
         }
         label, color = state_config.get(ff.behavioral_state, ("", (180, 180, 180)))
 
-        speaker_label = getattr(ff, "speaker_id", "") or f"Face_{getattr(ff, 'face_index', 0)}"
+        raw_label = getattr(ff, "speaker_id", "") or f"Face_{getattr(ff, 'face_index', 0)}"
+        speaker_label = (display_names or {}).get(raw_label, raw_label)
         stress_colors = {"low": (0, 200, 0), "moderate": (0, 200, 255), "high": (0, 0, 255)}
         stress_color  = stress_colors.get(ff.stress_level, (180, 180, 180))
 
@@ -1506,7 +1653,10 @@ class OverlayRenderer:
 
     def _draw_pose(self, bgr: np.ndarray, pose_result, h: int, w: int) -> None:
         import cv2
-        # Scale thickness/radius to frame size so 720p and 1080p look consistent
+        # MediaPipe extrapolates hips/knees/ankles even for head+shoulders crops.
+        # Only draw landmarks the model is confident about to prevent skeleton
+        # branches from bleeding into adjacent tiles in multi-person grid views.
+        _VIS_MIN = 0.5
         s = max(1.0, min(h, w) / 720.0)
         line_t = max(1, round(s))           # 1 at 720p, 2 at 1440p
         dot_r  = max(1, round(1.5 * s))     # 1-2px at 720p
@@ -1515,12 +1665,14 @@ class OverlayRenderer:
         color_dot  = (200, 200, 255)
         for pose_lm in pose_result.pose_landmarks:
             pts = [(int(lm.x * w), int(lm.y * h)) for lm in pose_lm]
+            vis = [getattr(lm, "visibility", 1.0) for lm in pose_lm]
             n = len(pts)
             for a, b in self._POSE_SEGS:
-                if a < n and b < n:
+                if a < n and b < n and vis[a] >= _VIS_MIN and vis[b] >= _VIS_MIN:
                     cv2.line(bgr, pts[a], pts[b], color_bone, line_t, cv2.LINE_AA)
-            for pt in pts[:33]:
-                cv2.circle(bgr, pt, dot_r, color_dot, -1, cv2.LINE_AA)
+            for i, pt in enumerate(pts[:33]):
+                if vis[i] >= _VIS_MIN:
+                    cv2.circle(bgr, pt, dot_r, color_dot, -1, cv2.LINE_AA)
 
     def _draw_hands(self, bgr: np.ndarray, hand_result, h: int, w: int) -> None:
         import cv2
@@ -1563,15 +1715,97 @@ class OverlayRenderer:
             except Exception:
                 continue
 
+    _OVERLAY_LABELS: dict = {
+        "self_touch": "Self-Touch",
+        "face_region_touch": {
+            "chin_touch_evaluation":      "Evaluating",
+            "mouth_cover_suppression":    "Holding Back",
+            "nose_touch_discomfort":      "Uncomfortable",
+            "cheek_touch_listening":      "Attentive",
+            "cheek_rest_fatigue":         "Low Energy",
+            "ear_touch_soothing":         "Self-Soothing",
+            "neck_touch_vulnerability":   "Feeling Exposed",
+            "forehead_touch_frustration": "Frustrated",
+            "eye_rub_discomfort":         "Eye Rub",
+            "eye_block_disbelief":        "Disbelief",
+        },
+        "arms_crossed":      "Guarded",
+        "finger_steepling":  "Confident",
+        "hands_clasped":     "Restrained",
+        "hand_gesture": {
+            "approval":    "Approval",
+            "disapproval": "Disapproval",
+            "emphasis":    "Emphasizing",
+            "victory":     "Victory",
+            "tension":     "Tense",
+            "open":        "Open",
+        },
+        "head_supported":    "Checked Out",
+        "head_nod":          "Agreeing",
+        "head_shake":        "Disagreeing",
+        "lip_pursing":       "Biting Tongue",
+        "facial_stress":     "Under Pressure",
+        "sustained_distraction": "Not Paying Attention",
+        "body_language_cluster": {
+            "skepticism_cluster":           "Skeptical",
+            "stress_anxiety_cluster":       "Stressed",
+            "confidence_authority_cluster": "In Command",
+            "disengagement_boredom_cluster":"Checked Out",
+        },
+        "cross_speaker_interaction": {
+            "agreement_reaction":   "Agrees",
+            "disagreement_reaction":"Disagrees",
+            "discomfort_reaction":  "Uncomfortable",
+            "incongruent_reaction": "Mixed Signals",
+        },
+        "screen_contact":         "Eye Contact",
+        "attention_level":        "Attention",
+        "gaze_direction_shift":   "Looked Away",
+        "posture":                "Posture",
+        "facial_engagement":      "Expression Level",
+        "blink_rate_anomaly":     "Blink Rate",
+        "body_fidgeting":         "Restless",
+        "body_lean":              "Leaning",
+        "shoulder_tension":       "Shoulder Tension",
+        "gesture_animation":      "Gesturing",
+        "cognitive_overload":     "Overwhelmed",
+        "emotional_suppression":  "Suppressing",
+        "vocal_stress_score":     "Voice Stress",
+        "filler_detection":       "Fillers",
+        "tone_classification":    "Tone",
+        "speech_rate_anomaly":    "Speech Pace",
+        "pitch_elevation_flag":   "Pitch Spike",
+        "buying_signal":          "Buying Signal",
+        "objection_signal":       "Objection",
+        "rapport_indicator":      "Rapport",
+        "head_body_incongruence": "Mixed Signals",
+        "escalation_ladder":      "Conflict Rising",
+        "engagement_decay":       "Engagement Fading",
+        "stress_trajectory":      "Stress Trend",
+        "adaptation_pattern":     "Adapting",
+        "fatigue_detection":      "Getting Tired",
+    }
+
+    def _get_overlay_label(self, signal: dict) -> str:
+        sig_type   = signal.get("signal_type", "")
+        value_text = signal.get("value_text", "")
+        entry = self._OVERLAY_LABELS.get(sig_type)
+        if isinstance(entry, dict):
+            return entry.get(value_text, value_text.replace("_", " ").title())
+        if isinstance(entry, str):
+            return entry
+        return sig_type.replace("_", " ").title()
+
     def _draw_labels(self, bgr: np.ndarray, signals: list, h: int) -> None:
-        """Up to 5 signal labels at bottom-left, sorted by confidence desc."""
+        """Up to 8 signal labels at bottom-left, sorted by confidence desc."""
         import cv2
-        top = sorted(signals, key=lambda s: s.get("confidence", 0), reverse=True)[:5]
+        top = sorted(signals, key=lambda s: s.get("confidence", 0), reverse=True)[:8]
         y = h - 12
         for sig in top:
-            label = f"{sig.get('signal_type', '')[:18]}  {sig.get('confidence', 0.0):.2f}"
+            label = self._get_overlay_label(sig)
+            conf  = f"{sig.get('confidence', 0.0):.0%}"
             cv2.putText(
-                bgr, label, (8, y),
+                bgr, f"{label}  {conf}", (8, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA,
             )
             y -= 16
@@ -1624,6 +1858,227 @@ class OverlayRenderer:
         writer.release()
 
         _reencode_for_browser(tmp, final_dst)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CentroidTracker  — stable face IDs across frames
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CentroidTracker:
+    """
+    Assigns temporally stable face IDs across video frames using centroid proximity.
+
+    Each detected face gets a persistent track_id that survives temporary detection
+    drops, size-ranking changes (someone leans forward), and tile re-ordering.
+    Without this, face_index is re-sorted by area every frame, so WindowAggregator
+    groups frames from multiple physical people into the same "speaker" baseline.
+
+    Algorithm: greedy nearest-neighbour matching with exponential moving average
+    position updates.  Centroid threshold 0.08 (normalised) handles small head
+    movements while preventing cross-tile matches in video-call grids.
+    """
+
+    def __init__(
+        self,
+        max_disappeared: int = 15,      # frames before a lost track is removed (~3s at 5fps)
+        match_threshold: float = 0.08,  # max centroid distance for a match (normalised)
+    ) -> None:
+        self._next_id: int = 0
+        self._tracks: dict[int, tuple[float, float]] = {}
+        self._disappeared: dict[int, int] = {}
+        self._max_disappeared = max_disappeared
+        self._match_threshold = match_threshold
+
+    def update(self, centroids: list[tuple[float, float]]) -> list[int]:
+        """
+        Update tracker with new frame's face centroids.
+
+        Args:
+            centroids: [(cx, cy), ...] one per detected face, same order as face_landmarks.
+
+        Returns:
+            List of stable track_ids, one per input centroid, in the same order.
+        """
+        if not centroids:
+            for tid in list(self._disappeared):
+                self._disappeared[tid] += 1
+                if self._disappeared[tid] > self._max_disappeared:
+                    del self._tracks[tid]
+                    del self._disappeared[tid]
+            return []
+
+        if not self._tracks:
+            return [self._register(cx, cy) for cx, cy in centroids]
+
+        track_ids = list(self._tracks.keys())
+        track_centres = [self._tracks[tid] for tid in track_ids]
+
+        distances: list[tuple[float, int, int]] = []
+        for ti, (tx, ty) in enumerate(track_centres):
+            for ci, (cx, cy) in enumerate(centroids):
+                d = ((tx - cx) ** 2 + (ty - cy) ** 2) ** 0.5
+                distances.append((d, ti, ci))
+        distances.sort(key=lambda x: x[0])
+
+        matched_tracks: set[int] = set()
+        matched_centroids: set[int] = set()
+        result_ids: dict[int, int] = {}
+
+        for dist, ti, ci in distances:
+            if ti in matched_tracks or ci in matched_centroids:
+                continue
+            if dist > self._match_threshold:
+                break
+            tid = track_ids[ti]
+            result_ids[ci] = tid
+            old_cx, old_cy = self._tracks[tid]
+            new_cx, new_cy = centroids[ci]
+            self._tracks[tid] = (old_cx * 0.7 + new_cx * 0.3, old_cy * 0.7 + new_cy * 0.3)
+            self._disappeared[tid] = 0
+            matched_tracks.add(ti)
+            matched_centroids.add(ci)
+
+        for ti, tid in enumerate(track_ids):
+            if ti not in matched_tracks:
+                self._disappeared[tid] += 1
+                if self._disappeared[tid] > self._max_disappeared:
+                    del self._tracks[tid]
+                    del self._disappeared[tid]
+
+        for ci, (cx, cy) in enumerate(centroids):
+            if ci not in matched_centroids:
+                result_ids[ci] = self._register(cx, cy)
+
+        return [result_ids[ci] for ci in range(len(centroids))]
+
+    def _register(self, cx: float, cy: float) -> int:
+        tid = self._next_id
+        self._tracks[tid] = (cx, cy)
+        self._disappeared[tid] = 0
+        self._next_id += 1
+        return tid
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FaceEmbeddingExtractor  — ArcFace embeddings for cross-session identity
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FaceEmbeddingExtractor:
+    """
+    Extract 512-dim ArcFace face embeddings for cross-session identification.
+
+    Uses InsightFace's buffalo_l model (ArcFace, NIST FRVT Rank-1 2021).
+    Called once per session after extraction completes — selects the single
+    best frame per tracked face and extracts a normalised embedding.
+
+    The embedding is L2-normalised so cosine similarity = dot product.
+    Matching threshold: 0.55 face-only, 0.50 combined with voice.
+
+    Singleton pattern: model is ~200 MB — load once per process.
+    """
+
+    _instance: Optional["FaceEmbeddingExtractor"] = None
+
+    @classmethod
+    def get_instance(cls) -> "FaceEmbeddingExtractor":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self) -> None:
+        try:
+            from insightface.app import FaceAnalysis
+            self._app = FaceAnalysis(
+                name="buffalo_l",
+                providers=["CPUExecutionProvider"],
+            )
+            self._app.prepare(ctx_id=0, det_size=(640, 640))
+            self._available = True
+            logger.info("InsightFace ArcFace (buffalo_l) loaded for face identification")
+        except Exception as exc:
+            logger.warning(f"InsightFace not available — face identification disabled: {exc}")
+            self._available = False
+            self._app = None
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def extract_from_crops(
+        self,
+        face_crops: dict[int, np.ndarray],
+    ) -> dict[int, tuple[list[float], bytes]]:
+        """
+        Extract ArcFace embedding + JPEG thumbnail from pre-cropped face images.
+
+        Args:
+            face_crops: {track_id: BGR face crop ndarray}
+                        Each crop should be the best-quality frame for this face.
+
+        Returns:
+            {track_id: (embedding_list_512, thumbnail_jpeg_bytes)}
+            Only includes faces where InsightFace detection succeeded.
+        """
+        if not self._available:
+            return {}
+
+        import cv2
+        results: dict[int, tuple[list[float], bytes]] = {}
+
+        for track_id, crop_bgr in face_crops.items():
+            if crop_bgr is None or crop_bgr.size < 100:
+                continue
+            try:
+                faces = self._app.get(crop_bgr)
+                if not faces:
+                    # Retry with padding — InsightFace needs context around the face
+                    h, w = crop_bgr.shape[:2]
+                    padded = cv2.copyMakeBorder(
+                        crop_bgr, h // 4, h // 4, w // 4, w // 4,
+                        cv2.BORDER_CONSTANT, value=(128, 128, 128),
+                    )
+                    faces = self._app.get(padded)
+                if not faces:
+                    logger.debug(f"InsightFace: no face in crop for track_{track_id}")
+                    continue
+                # Largest detected face = primary subject of this crop
+                best_face = max(
+                    faces,
+                    key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+                )
+                # L2-normalize so np.dot() == cosine similarity in [-1, 1]
+                emb_raw = best_face.embedding
+                norm = float(np.linalg.norm(emb_raw))
+                embedding = (emb_raw / norm) if norm > 0 else emb_raw
+                thumbnail = self._make_thumbnail(crop_bgr, best_face.bbox, size=96)
+                results[track_id] = (embedding.tolist(), thumbnail)
+            except Exception as exc:
+                logger.debug(f"InsightFace embedding failed for track_{track_id}: {exc}")
+
+        logger.info(
+            f"Face embeddings extracted: {len(results)}/{len(face_crops)} faces"
+        )
+        return results
+
+    @staticmethod
+    def _make_thumbnail(bgr: np.ndarray, bbox: np.ndarray, size: int = 96) -> bytes:
+        """Crop face from bbox with 20% padding, resize to size×size, encode as JPEG."""
+        import cv2
+        h, w = bgr.shape[:2]
+        x1, y1 = max(0, int(bbox[0])), max(0, int(bbox[1]))
+        x2, y2 = min(w, int(bbox[2])), min(h, int(bbox[3]))
+        pad_x = int((x2 - x1) * 0.2)
+        pad_y = int((y2 - y1) * 0.2)
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_y)
+        x2 = min(w, x2 + pad_x)
+        y2 = min(h, y2 + pad_y)
+        face_crop = bgr[y1:y2, x1:x2]
+        if face_crop.size == 0:
+            face_crop = bgr
+        thumb = cv2.resize(face_crop, (size, size), interpolation=cv2.INTER_AREA)
+        _, jpeg_bytes = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return jpeg_bytes.tobytes()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1756,6 +2211,7 @@ class VideoFeatureExtractor:
         video_path: str,
         signals: list,
         output_path: Optional[str] = None,
+        display_names: Optional[dict] = None,
     ) -> None:
         """
         Phase 2 overlay pass: re-run MediaPipe on the original video and draw
@@ -1826,6 +2282,7 @@ class VideoFeatureExtractor:
                 annotated = renderer.draw_frame(
                     bgr, last_face_result, last_pose_result, last_hand_result,
                     active if active else None,
+                    display_names=display_names,
                 )
                 writer.write(annotated)
                 frame_idx += 1
@@ -1884,6 +2341,11 @@ class VideoFeatureExtractor:
         frame_idx: int = 0
         prev_pose_lm_data: Optional[list] = None
 
+        centroid_tracker = CentroidTracker(
+            max_disappeared=90,   # ~18s at 5fps — faces in calls don't physically leave
+            match_threshold=0.12, # slightly wider to tolerate head rotation / detection jitter
+        )
+
         # Cache last MediaPipe results — reused for overlay on non-sampled frames
         last_face_result = None
         last_pose_result = None
@@ -1920,6 +2382,22 @@ class VideoFeatureExtractor:
                             last_face_result, last_pose_result, last_hand_result,
                             prev_pose_lm_data,
                         )
+
+                        # ── Apply temporal face tracking ──────────────────────
+                        # Replace area-sorted face_index with stable track_id so
+                        # WindowAggregator always groups the same physical person.
+                        centroids = [
+                            (ff.face_centre_x, ff.face_centre_y)
+                            for ff in frame_features_list
+                            if ff.face_detected
+                        ]
+                        if centroids:
+                            track_ids = centroid_tracker.update(centroids)
+                            ci = 0
+                            for ff in frame_features_list:
+                                if ff.face_detected and ci < len(track_ids):
+                                    ff.face_index = track_ids[ci]
+                                    ci += 1
 
                         # Detect cross-speaker interactions for this frame
                         last_interactions = InteractionDetector.detect_interactions(
@@ -1970,6 +2448,199 @@ class VideoFeatureExtractor:
             f"Extracted {len(frames)} frames from {Path(video_path).name} "
             f"({frame_idx} total, every {skip}th frame at video_fps={video_fps:.1f})"
         )
+
+        # ── Select best frame per tracked face for ArcFace embedding extraction ─
+        # Quality = frontal (low yaw+pitch) × large bbox × well-lit (luminance).
+        # Stored on self so run_analysis can access after extract_all() returns.
+        self._best_face_crops: dict[int, np.ndarray] = {}
+        best_quality: dict[int, float] = {}
+        best_frame_info: dict[int, tuple[float, int, float, float, float]] = {}
+        # track_id → (quality, frame_idx, cx, cy, face_box_area)
+
+        for ff in frames:
+            if not ff.face_detected or ff.face_box_area < 0.001:
+                continue
+            tid = ff.face_index
+            frontal = 1.0 / (1.0 + abs(ff.head_yaw) * 0.05 + abs(ff.head_pitch) * 0.05)
+            quality = frontal * ff.face_box_area * max(ff.face_luminance, 0.2)
+            if quality > best_quality.get(tid, -1.0):
+                best_quality[tid] = quality
+                best_frame_info[tid] = (
+                    quality, ff.frame_idx,
+                    ff.face_centre_x, ff.face_centre_y, ff.face_box_area,
+                )
+
+        if best_frame_info:
+            import cv2 as _cv2
+            _cap = _cv2.VideoCapture(video_path)
+            if _cap.isOpened():
+                _fw = int(_cap.get(_cv2.CAP_PROP_FRAME_WIDTH))
+                _fh = int(_cap.get(_cv2.CAP_PROP_FRAME_HEIGHT))
+
+                # Build frame_idx → list[track_ids] so each frame is read once
+                frames_to_read: dict[int, list[int]] = {}
+                for tid, (_, fidx, _, _, _) in best_frame_info.items():
+                    frames_to_read.setdefault(fidx, []).append(tid)
+
+                target_indices = sorted(frames_to_read.keys())
+                target_pos = 0
+                read_idx = 0
+
+                while _cap.isOpened() and target_pos < len(target_indices):
+                    ret, bgr = _cap.read()
+                    if not ret:
+                        break
+                    if read_idx == target_indices[target_pos]:
+                        for tid in frames_to_read[read_idx]:
+                            _, _, cx, cy, area = best_frame_info[tid]
+                            face_size = max(int((area ** 0.5) * _fw * 1.15), 250)
+                            x1 = max(0, int(cx * _fw) - face_size // 2)
+                            y1 = max(0, int(cy * _fh) - face_size // 2)
+                            x2 = min(_fw, x1 + face_size)
+                            y2 = min(_fh, y1 + face_size)
+                            self._best_face_crops[tid] = bgr[y1:y2, x1:x2].copy()
+                        target_pos += 1
+                    read_idx += 1
+                _cap.release()
+            logger.info(
+                f"Best-frame crops selected: {len(self._best_face_crops)} faces "
+                f"from {len(best_frame_info)} tracked identities"
+            )
+
+        # ── Filter transient face tracks before identity merge ─────────────────
+        # Tracks with very few frames are avatar images in shared screen content
+        # or momentary false-positive detections — discard before running ArcFace.
+        MIN_FRAMES_FOR_IDENTITY = 5  # at 5 fps this is 1 second of detection
+        frame_counts: dict[int, int] = {}
+        for ff in frames:
+            if ff.face_detected:
+                frame_counts[ff.face_index] = frame_counts.get(ff.face_index, 0) + 1
+
+        transient = [tid for tid, cnt in frame_counts.items()
+                     if cnt < MIN_FRAMES_FOR_IDENTITY]
+        if transient:
+            transient_set = set(transient)
+            self._best_face_crops = {
+                tid: crop for tid, crop in self._best_face_crops.items()
+                if tid not in transient_set
+            }
+            before_count = len(frames)
+            frames = [ff for ff in frames if ff.face_index not in transient_set]
+            logger.info(
+                f"Filtered {len(transient_set)} transient tracks "
+                f"(< {MIN_FRAMES_FOR_IDENTITY} frames): {transient} — "
+                f"removed {before_count - len(frames)} ghost frames from pipeline"
+            )
+
+        # ── Identity-based track deduplication via ArcFace ────────────────────
+        # CentroidTracker gives stable IDs within stable layouts but creates
+        # duplicate IDs on layout changes (screen share, grid rearrange, spotlight).
+        # ArcFace embeddings are layout-invariant — rewrite face_index here so
+        # WindowAggregator merges the same physical person into one stream.
+        # Results are cached in self._cached_embeddings for reuse in run_analysis
+        # Step 5, avoiding a second ArcFace pass.
+        self._cached_embeddings: dict[int, tuple[list[float], bytes]] = {}
+        if self._best_face_crops and len(self._best_face_crops) > 1:
+            try:
+                embedder = FaceEmbeddingExtractor.get_instance()
+                if embedder.available:
+                    emb_results = embedder.extract_from_crops(self._best_face_crops)
+                    self._cached_embeddings = emb_results
+
+                    if len(emb_results) > 1:
+                        track_embs: dict[int, np.ndarray] = {
+                            tid: np.array(emb_list)
+                            for tid, (emb_list, _) in emb_results.items()
+                        }
+                        canonical = self._merge_tracks_by_embedding(track_embs)
+                        merges = {k: v for k, v in canonical.items() if k != v}
+
+                        if merges:
+                            for ff in frames:
+                                if ff.face_index in canonical:
+                                    ff.face_index = canonical[ff.face_index]
+
+                            # Extend mapping to transient/unprocessed tracks via
+                            # nearest-canonical-centroid assignment.  These tracks
+                            # were filtered before ArcFace so they are absent from
+                            # `canonical`, but their frames still appear in the
+                            # windows that SpeakerFaceMapper processes.  Without
+                            # this pass, lip-sync can assign Speaker_N to a
+                            # transient track while the canonical track (same
+                            # physical person, many more frames) gets Face_N.
+                            canonical_ids = set(canonical.values())
+                            canon_pts: dict[int, list[tuple[float, float]]] = {
+                                cid: [] for cid in canonical_ids
+                            }
+                            for ff in frames:
+                                if ff.face_detected and ff.face_index in canonical_ids:
+                                    canon_pts[ff.face_index].append(
+                                        (ff.face_centre_x, ff.face_centre_y)
+                                    )
+                            canonical_centroids: dict[int, tuple[float, float]] = {
+                                cid: (
+                                    float(np.mean([p[0] for p in pts])),
+                                    float(np.mean([p[1] for p in pts])),
+                                )
+                                for cid, pts in canon_pts.items() if pts
+                            }
+                            # Max distance for same-person transient reassignment.
+                            # In a 7-person grid, adjacent cells are ~0.33 apart.
+                            # Same-person transients sit < 0.05 from their canonical;
+                            # different people at other grid positions sit > 0.25 away.
+                            # 0.15 catches transients while leaving distinct faces alone.
+                            _MAX_TRANSIENT_DIST = 0.15
+                            if canonical_centroids:
+                                for ff in frames:
+                                    if ff.face_index not in canonical_ids and ff.face_detected:
+                                        cx, cy = ff.face_centre_x, ff.face_centre_y
+                                        nearest = min(
+                                            canonical_centroids,
+                                            key=lambda tid: (
+                                                (cx - canonical_centroids[tid][0]) ** 2
+                                                + (cy - canonical_centroids[tid][1]) ** 2
+                                            ),
+                                        )
+                                        dist = (
+                                            (cx - canonical_centroids[nearest][0]) ** 2
+                                            + (cy - canonical_centroids[nearest][1]) ** 2
+                                        ) ** 0.5
+                                        if dist < _MAX_TRANSIENT_DIST:
+                                            ff.face_index = nearest
+                                        # else: different person at a different grid
+                                        # position — keep original track ID so they
+                                        # become their own Face_N canonical.
+
+                            # Keep only canonical crops; prefer the larger crop
+                            merged_crops: dict[int, np.ndarray] = {}
+                            for tid, crop in self._best_face_crops.items():
+                                canon_tid = canonical.get(tid, tid)
+                                if (canon_tid not in merged_crops
+                                        or crop.size > merged_crops[canon_tid].size):
+                                    merged_crops[canon_tid] = crop
+                            self._best_face_crops = merged_crops
+
+                            # Rebuild cached embeddings after merge
+                            self._cached_embeddings = embedder.extract_from_crops(
+                                self._best_face_crops
+                            )
+
+                            unique_count = len(set(canonical.values()))
+                            logger.info(
+                                f"Identity merge: {len(track_embs)} tracks → "
+                                f"{unique_count} unique people (merged: {merges})"
+                            )
+                        else:
+                            logger.info(
+                                f"Identity merge: {len(emb_results)} tracks — "
+                                f"all unique (no merges needed)"
+                            )
+            except Exception as exc:
+                logger.warning(
+                    f"Identity-based track merge failed (non-fatal, "
+                    f"position-based IDs preserved): {exc}"
+                )
+
         return frames
 
     def _build_landmarkers(self, mp):
@@ -2100,7 +2771,7 @@ class VideoFeatureExtractor:
             ff.behavioral_state = "agreeing"
             ff.behavioral_state_detail = "nodding+smiling" if smile_score > 0.15 else "nodding"
 
-        elif tension_score > 0.30:
+        elif tension_score > 0.45:
             ff.behavioral_state = "tense"
             details = []
             if brow_tension > 0.20:
@@ -2124,7 +2795,7 @@ class VideoFeatureExtractor:
             ff.behavioral_state_detail = "neutral"
 
         # ── Stress level ──────────────────────────────────────────────────────
-        if tension_score > 0.30:
+        if tension_score > 0.45:
             ff.stress_level = "high"
         elif tension_score > 0.15:
             ff.stress_level = "moderate"
@@ -2225,7 +2896,8 @@ class VideoFeatureExtractor:
                     )
                     ff.body_movement = self._compute_body_movement(plm, prev_pose_lm_data)
                     ff._raw_pose_lm = plm  # type: ignore[attr-defined]
-                    ff.arms_crossed = self._detect_crossed_arms(plm)
+                    ff.arms_crossed    = self._detect_crossed_arms(plm)
+                    ff.elbow_expansion = self._compute_elbow_expansion(plm)
 
             # Hands — use only hands pre-assigned to this face
             face_hands = hand_assignments.get(fi, [])
@@ -2251,6 +2923,22 @@ class VideoFeatureExtractor:
                     ff.finger_steepling = self._detect_finger_steepling(face_hands)
                     ff.hands_clasped    = self._detect_hands_clasped(face_hands)
 
+                # Map GestureRecognizer outputs to FrameFeature bools
+                for fh in face_hands:
+                    for i, global_h in enumerate(hand_result.hand_landmarks):
+                        if (abs(global_h[0].x - fh[0].x) < 0.005 and
+                                abs(global_h[0].y - fh[0].y) < 0.005 and
+                                i < len(hand_result.hand_gestures)):
+                            field = _GESTURE_FIELD_MAP.get(hand_result.hand_gestures[i])
+                            if field:
+                                setattr(ff, field, True)
+                            break
+
+                # Geometric open_palms fallback — fires when GestureRecognizer
+                # didn't return Open_Palm but fingers are clearly extended.
+                if not ff.open_palms:
+                    ff.open_palms = self._detect_open_palms(face_hands)
+
                 # Head supported by hand: chin/cheek touch + head tilted + low expression
                 if ff.hand_touch_zone in ("chin", "cheek"):
                     head_tilted = abs(ff.head_roll) > 8.0
@@ -2275,12 +2963,14 @@ class VideoFeatureExtractor:
     _FACE_ZONES: dict[str, list[int]] = {
         "chin":     [152, 200, 428, 175, 396],
         "mouth":    [0, 13, 14, 17, 37, 267, 39, 269],
-        "nose":     [1, 2, 3, 4, 5, 6, 168, 197],
+        "nose":     [1, 2, 4, 5, 6, 94, 168, 197],
         "cheek_l":  [116, 117, 118, 119, 100, 36],
         "cheek_r":  [345, 346, 347, 348, 329, 266],
         "ear_l":    [234, 127, 162],
         "ear_r":    [454, 356, 389],
         "forehead": [10, 338, 297, 332, 251, 21, 54, 103],
+        "eye_l":    [33, 159, 158, 133, 153, 145],    # right eye EAR 6-pt (image-left)
+        "eye_r":    [362, 380, 374, 263, 386, 385],   # left eye EAR 6-pt (image-right)
     }
 
     @staticmethod
@@ -2316,10 +3006,13 @@ class VideoFeatureExtractor:
         if dist_to_centre > face_h * 1.5:
             return ""
 
-        # Neck: below chin, within face horizontal bounds
+        # Neck: just below chin, tight vertical + narrow horizontal.
+        # Reduced vertical from 0.5→0.25 face_h — hands at collar/chest level
+        # during gestures must not trigger this.  Narrowed horizontal to exclude
+        # hand paths that cross the shoulder/collar area on either side.
         chin_y = face_landmarks[152].y if len(face_landmarks) > 152 else face_cy + face_h * 0.5
-        if chin_y < hy < chin_y + face_h * 0.5:
-            if min(face_xs) - face_w * 0.2 < hx < max(face_xs) + face_w * 0.2:
+        if chin_y < hy < chin_y + face_h * 0.25:
+            if min(face_xs) + face_w * 0.1 < hx < max(face_xs) - face_w * 0.1:
                 return "neck"
 
         best_zone = ""
@@ -2344,6 +3037,8 @@ class VideoFeatureExtractor:
             best_zone = "cheek"
         if best_zone.startswith("ear"):
             best_zone = "ear"
+        if best_zone.startswith("eye"):
+            best_zone = "eye"
         return best_zone
 
     @staticmethod
@@ -2371,12 +3066,61 @@ class VideoFeatureExtractor:
             if len(pose_landmarks) > 24 else chest_y + shoulder_w
         )
 
-        return (
+        if len(pose_landmarks) <= _POSE_RIGHT_ELBOW:
+            return (
+                abs(lw.x - centre_x) < shoulder_w * 0.6 and
+                abs(rw.x - centre_x) < shoulder_w * 0.6 and
+                lw.x > centre_x and rw.x < centre_x and
+                chest_y < lw.y < hip_y and chest_y < rw.y < hip_y
+            )
+
+        le = pose_landmarks[_POSE_LEFT_ELBOW]
+        re = pose_landmarks[_POSE_RIGHT_ELBOW]
+        # Elbows must be visible and at chest height — rules out wrists crossing
+        # during typing or hands-in-lap poses which also satisfy the wrist check.
+        elbows_visible = (
+            getattr(le, "visibility", 1.0) >= 0.4 and
+            getattr(re, "visibility", 1.0) >= 0.4
+        )
+        elbows_at_chest = chest_y < le.y < hip_y and chest_y < re.y < hip_y
+
+        wrists_crossed = (
             abs(lw.x - centre_x) < shoulder_w * 0.6 and
             abs(rw.x - centre_x) < shoulder_w * 0.6 and
             lw.x > centre_x and rw.x < centre_x and
             chest_y < lw.y < hip_y and chest_y < rw.y < hip_y
         )
+
+        if not elbows_visible:
+            return wrists_crossed
+        return wrists_crossed and elbows_at_chest
+
+    @staticmethod
+    def _compute_elbow_expansion(pose_landmarks) -> float:
+        """
+        Elbow expansion = (elbow_width - shoulder_width) / shoulder_width.
+        Positive → elbows wider than shoulders (expansive/dominant posture).
+        Negative → elbows tucked in (contracted/defensive posture).
+        Returns 0.0 when landmarks are not visible.
+        """
+        needed = [_POSE_LEFT_SHOULDER, _POSE_RIGHT_SHOULDER,
+                  _POSE_LEFT_ELBOW,    _POSE_RIGHT_ELBOW]
+        if len(pose_landmarks) <= max(needed):
+            return 0.0
+        for idx in needed:
+            if getattr(pose_landmarks[idx], "visibility", 1.0) < 0.4:
+                return 0.0
+        shoulder_w = abs(
+            pose_landmarks[_POSE_RIGHT_SHOULDER].x -
+            pose_landmarks[_POSE_LEFT_SHOULDER].x
+        )
+        if shoulder_w < 0.05:
+            return 0.0
+        elbow_w = abs(
+            pose_landmarks[_POSE_RIGHT_ELBOW].x -
+            pose_landmarks[_POSE_LEFT_ELBOW].x
+        )
+        return float((elbow_w - shoulder_w) / shoulder_w)
 
     @staticmethod
     def _detect_finger_steepling(hand_landmarks_list: list) -> bool:
@@ -2422,6 +3166,26 @@ class VideoFeatureExtractor:
             if ((a[idx].x - b[idx].x) ** 2 + (a[idx].y - b[idx].y) ** 2) ** 0.5 < 0.03
         )
         return close_tips < 3
+
+    @staticmethod
+    def _detect_open_palms(hand_landmarks_list: list) -> bool:
+        """
+        Geometric fallback for open-palm detection.
+        Returns True when at least one hand has 3+ fingers extended
+        (fingertip y < PIP y in normalised image coords, i.e. tip is higher).
+        Fires when GestureRecognizer didn't classify the hand as Open_Palm.
+        """
+        for hand_lm in hand_landmarks_list:
+            tips = [8, 12, 16, 20]   # index, middle, ring, pinky tips
+            pips = [6, 10, 14, 18]   # corresponding PIP joints
+            extended = sum(
+                1 for tip, pip in zip(tips, pips)
+                if tip < len(hand_lm) and pip < len(hand_lm)
+                and hand_lm[tip].y < hand_lm[pip].y
+            )
+            if extended >= 3:
+                return True
+        return False
 
     @staticmethod
     def _assign_hands_to_faces(hand_landmarks_list: list, face_landmarks_list: list) -> dict:
@@ -2715,6 +3479,65 @@ class VideoFeatureExtractor:
         except Exception:
             return 0.0
 
+    @staticmethod
+    def _merge_tracks_by_embedding(
+        track_embeddings: dict[int, "np.ndarray"],
+        threshold: float = 0.65,
+    ) -> dict[int, int]:
+        """
+        Merge CentroidTracker track_ids that belong to the same physical person.
+
+        Embeddings are L2-normalised in extract_from_crops so np.dot() here
+        equals cosine similarity in [-1, 1].  Same-person pairs score > 0.65;
+        0.65 is the threshold — different people in grid calls typically score
+        0.20–0.25, so this should not cause cross-person merges.
+
+        This is the primary deduplication for layout-change scenarios: screen
+        share toggling, grid rearrangement, spotlight view switches.
+        CentroidTracker handles frame-to-frame continuity within stable layouts;
+        this method resolves cross-layout identity after all frames are processed.
+
+        Returns {track_id: canonical_track_id} for ALL input track_ids.
+        canonical_track_id = lowest ID in each merge group (first detected).
+        Tracks that match nothing keep their own ID as canonical.
+        """
+        import logging as _logging
+        _log = _logging.getLogger("nexus.video.features")
+
+        canonical: dict[int, int] = {}
+        canon_embs: dict[int, "np.ndarray"] = {}
+
+        for tid in sorted(track_embeddings.keys()):
+            emb = track_embeddings[tid]
+            matched_canon: int | None = None
+            best_sim = 0.0
+
+            # Log all scores so we can see near-threshold matches
+            scores = {
+                canon_tid: float(np.dot(emb, canon_emb))
+                for canon_tid, canon_emb in canon_embs.items()
+            }
+            if scores:
+                top = max(scores.values())
+                top_tid = max(scores, key=lambda k: scores[k])
+                _log.info(
+                    f"Track {tid:>2} vs canonicals: best={top:.3f} (vs track {top_tid}) "
+                    f"— {'MERGE' if top > threshold else 'keep separate'}"
+                )
+
+            for canon_tid, sim in scores.items():
+                if sim > threshold and sim > best_sim:
+                    best_sim = sim
+                    matched_canon = canon_tid
+
+            if matched_canon is not None:
+                canonical[tid] = matched_canon
+            else:
+                canonical[tid] = tid
+                canon_embs[tid] = emb
+
+        return canonical
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SpeakerFaceMapper  — assigns windows to speakers
@@ -2743,7 +3566,7 @@ class SpeakerFaceMapper:
         windows: list[WindowFeatures],
         diar_segments: list[dict],
         lip_activity_map: Optional[dict[int, list[tuple[int, float]]]] = None,
-    ) -> dict[str, list[WindowFeatures]]:
+    ) -> tuple[dict[str, list[WindowFeatures]], dict[str, float]]:
         """
         Args:
             windows:          WindowFeatures from VideoFeatureExtractor.extract_all().
@@ -2753,12 +3576,13 @@ class SpeakerFaceMapper:
                               If None or single face, falls back to time-overlap.
 
         Returns:
-            dict[speaker_id → list[WindowFeatures]] with speaker_id set on each window.
+            (windows_by_speaker, lip_sync_scores) where lip_sync_scores maps
+            speaker_label → correlation score (0.0 when time-overlap fallback used).
         """
         result: dict[str, list[WindowFeatures]] = defaultdict(list)
 
         if not windows:
-            return dict(result)
+            return dict(result), {}
 
         speakers = sorted(set(seg.get("speaker", "Speaker_0") for seg in diar_segments))
         if not speakers:
@@ -2773,12 +3597,12 @@ class SpeakerFaceMapper:
         )
 
         if use_lip_sync:
-            face_to_speaker = self._lip_sync_assignment(
+            face_to_speaker, assignment_scores = self._lip_sync_assignment(
                 face_indices, speakers, diar_segments, lip_activity_map  # type: ignore[arg-type]
             )
             method = "lip_sync"
         else:
-            face_to_speaker = self._time_overlap_assignment(
+            face_to_speaker, assignment_scores = self._time_overlap_assignment(
                 face_indices, speakers, windows, diar_segments
             )
             method = "time_overlap"
@@ -2792,13 +3616,20 @@ class SpeakerFaceMapper:
             )
             result[speaker].append(wf)
 
+        # lip_sync_scores: only meaningful for confirmed speaker→face assignments
+        lip_sync_scores: dict[str, float] = {}
+        if method == "lip_sync":
+            for fi, spk in face_to_speaker.items():
+                if not spk.startswith("Face_"):
+                    lip_sync_scores[spk] = round(assignment_scores.get(fi, 0.0), 4)
+
         logger.info(
             "SpeakerFaceMapper: %d face(s) → %s (method=%s)",
             len(face_indices),
             {fi: spk for fi, spk in sorted(face_to_speaker.items())},
             method,
         )
-        return dict(result)
+        return dict(result), lip_sync_scores
 
     def _lip_sync_assignment(
         self,
@@ -2806,7 +3637,7 @@ class SpeakerFaceMapper:
         speakers: list[str],
         diar_segments: list[dict],
         lip_activity_map: dict[int, list[tuple[int, float]]],
-    ) -> dict[int, str]:
+    ) -> tuple[dict[int, str], dict[int, float]]:
         """
         Correlate each face's jawOpen composite with each speaker's active intervals.
 
@@ -2864,7 +3695,7 @@ class SpeakerFaceMapper:
         speakers: list[str],
         windows: list[WindowFeatures],
         diar_segments: list[dict],
-    ) -> dict[int, str]:
+    ) -> tuple[dict[int, str], dict[int, float]]:
         """Fallback: original time-overlap approach used when lip data is unavailable."""
         by_face: dict[int, list[WindowFeatures]] = defaultdict(list)
         for wf in windows:
@@ -2892,13 +3723,16 @@ class SpeakerFaceMapper:
         face_indices: list[int],
         speakers: list[str],
         scores: dict[tuple[int, str], float],
-    ) -> dict[int, str]:
+    ) -> tuple[dict[int, str], dict[int, float]]:
         """
         Greedy best-match-first assignment. Prevents duplicate face→speaker mappings.
 
         Sorts all (face, speaker) pairs by score descending, greedily picks the
         highest unassigned pair, skips any pair where face or speaker already taken.
         Leftover faces (more faces than speakers) receive "Face_{index}" labels.
+
+        Returns (mapping, assignment_scores) — assignment_scores maps face_index to
+        the winning correlation/overlap score for auditing and UI display.
         """
         candidates = sorted(
             ((scores.get((fi, spk), 0.0), fi, spk) for fi in face_indices for spk in speakers),
@@ -2909,19 +3743,22 @@ class SpeakerFaceMapper:
         assigned_faces: set[int] = set()
         assigned_speakers: set[str] = set()
         mapping: dict[int, str] = {}
+        assignment_scores: dict[int, float] = {}
 
-        for _, face_idx, speaker in candidates:
+        for score, face_idx, speaker in candidates:
             if face_idx in assigned_faces or speaker in assigned_speakers:
                 continue
             mapping[face_idx] = speaker
+            assignment_scores[face_idx] = score
             assigned_faces.add(face_idx)
             assigned_speakers.add(speaker)
 
         for fi in face_indices:
             if fi not in mapping:
                 mapping[fi] = f"Face_{fi}"
+                assignment_scores[fi] = 0.0
 
-        return mapping
+        return mapping, assignment_scores
 
     @staticmethod
     def _in_intervals(ts_ms: int, intervals: list[tuple[int, int]]) -> bool:

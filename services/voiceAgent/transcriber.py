@@ -466,6 +466,9 @@ class Transcriber:
                 except Exception as _emb_err:
                     logger.warning("MFCC embedding fallback failed (non-fatal): %s", _emb_err)
 
+            if self._last_speaker_embeddings:
+                result["speaker_embeddings"] = self._last_speaker_embeddings
+
             return result
         finally:
             # Cleanup temp WAV if we created one

@@ -1,6 +1,7 @@
 import { useRef, useState, useEffect, useCallback } from "react";
-import { getAccessToken } from "../api/client";
-import type { VideoSignal } from "../api/client";
+import { getAccessToken, getVideoSpeakers } from "../api/client";
+import type { VideoSignal, SpeakerInfo } from "../api/client";
+import { getSignalDisplay } from "../config/signalDisplayConfig";
 
 // ── Signal display configuration ──────────────────────────────────────────────
 
@@ -196,9 +197,35 @@ const SIGNAL_CONFIG: Record<string, SignalConfigEntry> = {
     color: "#EF4444",
     category: "compound",
   },
+  voice_face_alignment: {
+    icon: "≈",
+    label: (s) => {
+      const labels: Record<string, string> = {
+        congruent:                    "Authentic",
+        voice_positive_face_negative: "Forced Positivity",
+        voice_negative_face_positive: "Polite Masking",
+        voice_stressed_face_calm:     "Hidden Stress",
+        voice_calm_face_stressed:     "Face Leaking",
+        energy_mismatch:              "Energy Mismatch",
+      };
+      return labels[s.value_text] || "Voice-Face Sync";
+    },
+    color: (s) => {
+      if (s.value_text === "congruent") return "#10B981";
+      if (s.value_text === "energy_mismatch") return "#F59E0B";
+      return "#EF4444";
+    },
+    category: "compound",
+  },
   rapport_building: {
     icon: "♥",
     label: () => "Strong Rapport",
+    color: "#10B981",
+    category: "compound",
+  },
+  rapport_confirmation: {
+    icon: "◉",
+    label: () => "Rapport Confirmed",
     color: "#10B981",
     category: "compound",
   },
@@ -352,6 +379,12 @@ const SIGNAL_CONFIG: Record<string, SignalConfigEntry> = {
     color: "#F59E0B",
     category: "face",
   },
+  laughter: {
+    icon: "😂",
+    label: (s) => s.value_text === "genuine_laughter" ? "Genuine Laughter" : "Big Smile",
+    color: (s) => s.value_text === "genuine_laughter" ? "#10B981" : "#F59E0B",
+    category: "face",
+  },
   posture_transition: {
     icon: "⇄",
     label: (s) => {
@@ -392,6 +425,68 @@ const SIGNAL_CONFIG: Record<string, SignalConfigEntry> = {
         : "#EF4444",
     category: "compound",
   },
+  hand_gesture: {
+    icon: "✋",
+    label: (s) => {
+      const labels: Record<string, string> = {
+        approval:    "Thumbs Up",
+        disapproval: "Thumbs Down",
+        emphasis:    "Emphasizing",
+        victory:     "Victory Sign",
+        tension:     "Clenched Fist",
+      };
+      return labels[s.value_text] || `Gesture: ${s.value_text}`;
+    },
+    color: (s) => {
+      if (s.value_text === "approval" || s.value_text === "victory") return "#10B981";
+      if (s.value_text === "disapproval" || s.value_text === "tension") return "#EF4444";
+      return "#F59E0B";
+    },
+    category: "body",
+  },
+  evaluation_cluster: {
+    icon: "🤔",
+    label: () => "Evaluating",
+    color: "#F59E0B",
+    category: "body",
+  },
+  hidden_disagreement: {
+    icon: "◑",
+    label: () => "Suppressed Disagreement",
+    color: "#EF4444",
+    category: "body",
+  },
+  frustration_cluster: {
+    icon: "▲",
+    label: () => "Frustration",
+    color: "#EF4444",
+    category: "body",
+  },
+  arm_posture: {
+    icon: "↔",
+    label: (s) => s.value_text === "expansive" ? "Open Posture" : "Closed Posture",
+    color: (s) => s.value_text === "expansive" ? "#10B981" : "#F59E0B",
+    category: "body",
+  },
+  gesture_animation: {
+    icon: "✋",
+    label: (s) =>
+      s.value_text === "very_animated_gestures" ? "Very Animated" : "Gesturing",
+    color: "#10B981",
+    category: "body",
+  },
+  body_mirroring: {
+    icon: "⇔",
+    label: () => "Mirroring",
+    color: "#10B981",
+    category: "body",
+  },
+  gaze_synchrony: {
+    icon: "👀",
+    label: () => "Mutual Look-Away",
+    color: "#F59E0B",
+    category: "gaze",
+  },
 };
 
 const CATEGORIES: { key: string; label: string }[] = [
@@ -407,6 +502,107 @@ function resolveColor(
   signal: VideoSignal
 ): string {
   return typeof config.color === "function" ? config.color(signal) : config.color;
+}
+
+// ── Sub-components ────────────────────────────────────────────────────────────
+
+interface SpeakerGroupHeaderProps {
+  speakerLabel: string;
+  displayLabel: string;
+  roster: Record<string, SpeakerInfo>;
+  highlighted: boolean;
+  onToggle: () => void;
+}
+
+function SpeakerGroupHeader({
+  speakerLabel,
+  displayLabel,
+  roster,
+  highlighted,
+  onToggle,
+}: SpeakerGroupHeaderProps) {
+  const token = getAccessToken();
+  const info = roster[speakerLabel];
+  const thumbPath = info?.thumbnail_url
+    ? `/api${info.thumbnail_url}${token ? `?token=${encodeURIComponent(token)}` : ""}`
+    : null;
+  const initials = displayLabel
+    .split(" ")
+    .map((w) => w[0] ?? "")
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+
+  return (
+    <button
+      onClick={onToggle}
+      className={`flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left transition-colors ${
+        highlighted ? "bg-yellow-500/20" : "hover:bg-white/5"
+      }`}
+      title={highlighted ? `Unhighlight ${displayLabel}` : `Highlight ${displayLabel}`}
+    >
+      {thumbPath ? (
+        <img
+          src={thumbPath}
+          alt={displayLabel}
+          className="h-7 w-7 flex-shrink-0 rounded-full object-cover border border-gray-600"
+          onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+        />
+      ) : (
+        <div className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-gray-700">
+          <span className="text-[9px] font-bold text-gray-400">{initials}</span>
+        </div>
+      )}
+      <div className="min-w-0 flex-1">
+        <span className="block truncate text-[10px] font-medium text-gray-200">{displayLabel}</span>
+        {info?.grid_position && !info.display_name && (
+          <span className="text-[9px] text-gray-500">({info.grid_position})</span>
+        )}
+        {info?.match_method && info.match_method !== "new_registration" && info.match_method !== "" && (
+          <span className="text-[9px] text-gray-500">
+            {info.match_method === "face_voice_fused"
+              ? "biometric"
+              : info.match_method === "face_embedding"
+              ? "face"
+              : info.match_method === "voice_embedding"
+              ? "voice"
+              : info.match_method}{" "}
+            match ({Math.round((info.match_confidence ?? 0) * 100)}%)
+          </span>
+        )}
+      </div>
+      {highlighted && <span className="ml-auto shrink-0 text-[8px] text-yellow-400">●</span>}
+    </button>
+  );
+}
+
+interface FaceHighlightProps {
+  speaker: string;
+  signals: VideoSignal[];
+}
+
+function FaceHighlight({ speaker, signals }: FaceHighlightProps) {
+  const sig = signals.find(
+    (s) => s.speaker_id === speaker && s.metadata?.face_centre_x != null
+  );
+  if (!sig) return null;
+
+  const cx = sig.metadata!.face_centre_x as number;
+  const cy = sig.metadata!.face_centre_y as number;
+
+  return (
+    <div
+      className="pointer-events-none absolute rounded-lg border-2 border-yellow-400"
+      style={{
+        left: `${(cx - 0.08) * 100}%`,
+        top: `${(cy - 0.12) * 100}%`,
+        width: "16%",
+        height: "24%",
+        transition: "opacity 0.3s",
+        zIndex: 5,
+      }}
+    />
+  );
 }
 
 // ── Component ──────────────────────────────────────────────────────────────────
@@ -433,6 +629,22 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   const [selectedSpeaker, setSelectedSpeaker] = useState("all");
   const [showAnnotated, setShowAnnotated] = useState(false);
   const [annotatedAvailable, setAnnotatedAvailable] = useState(false);
+  const [showExpanded, setShowExpanded] = useState(false);
+  const [speakerRoster, setSpeakerRoster] = useState<Record<string, SpeakerInfo>>({});
+  const [highlightedSpeaker, setHighlightedSpeaker] = useState<string | null>(null);
+
+  // Fetch speaker roster once on mount to resolve display names and thumbnails.
+  useEffect(() => {
+    getVideoSpeakers(sessionId)
+      .then((data) => {
+        const roster: Record<string, SpeakerInfo> = {};
+        for (const spk of data.speakers) {
+          roster[spk.speaker_label] = spk;
+        }
+        setSpeakerRoster(roster);
+      })
+      .catch(() => {});
+  }, [sessionId]);
 
   // Poll until the annotated video is ready.
   // Landmark burn (full MediaPipe re-pass) takes several minutes for long videos.
@@ -466,8 +678,8 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   const speakers = [...new Set(signals.map((s) => s.speaker_id).filter(Boolean))];
 
   const computeActive = useCallback(
-    (ms: number): VideoSignal[] =>
-      signals.filter((s) => {
+    (ms: number): VideoSignal[] => {
+      const filtered = signals.filter((s) => {
         if (ms < (s.start_ms ?? 0) || ms > (s.end_ms ?? s.start_ms ?? 0)) return false;
         const cfg = SIGNAL_CONFIG[s.signal_type];
         if (!cfg) return false;
@@ -475,7 +687,17 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
         if (selectedSpeaker !== "all" && s.speaker_id !== selectedSpeaker) return false;
         if (s.confidence < 0.3) return false;
         return true;
-      }),
+      });
+      // Multiple overlapping 2-second windows can each emit the same signal_type for the
+      // same speaker. Deduplicate by keeping only the highest-confidence entry per pair.
+      const best = new Map<string, VideoSignal>();
+      for (const s of filtered) {
+        const key = `${s.speaker_id ?? ""}::${s.signal_type}`;
+        const prev = best.get(key);
+        if (!prev || s.confidence > prev.confidence) best.set(key, s);
+      }
+      return Array.from(best.values());
+    },
     [signals, enabledCategories, selectedSpeaker]
   );
 
@@ -538,16 +760,43 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
     });
   };
 
-  // Group active signals by speaker for badge display
-  const bySpeaker: Record<string, VideoSignal[]> = {};
+  function getSpeakerLabel(s: VideoSignal): string {
+    return s.speaker_id || "Unknown";
+  }
+
+  function getDisplayLabel(s: VideoSignal): string {
+    if (s.speaker_name) return s.speaker_name;
+    const entry = speakerRoster[s.speaker_id];
+    if (entry?.display_name) return entry.display_name;
+    return s.speaker_id || "Unknown";
+  }
+
+  // Seed bySpeaker from ALL known speakers in the full signals array so face-only
+  // participants (Face_N) are always visible regardless of whether they have an
+  // active signal at the current playback position.
+  const bySpeaker: Record<string, { label: string; rawId: string; signals: VideoSignal[] }> = {};
+  const allSpeakerIds = [...new Set(signals.map((s) => s.speaker_id).filter(Boolean))] as string[];
+  for (const spkId of allSpeakerIds) {
+    const rosterEntry = speakerRoster[spkId];
+    bySpeaker[spkId] = {
+      label: rosterEntry?.display_name || spkId,
+      rawId: spkId,
+      signals: [],
+    };
+  }
   for (const s of activeSignals) {
-    const key = s.speaker_id || "unknown";
-    (bySpeaker[key] ??= []).push(s);
+    const key = s.speaker_id || ("_noid_" + getSpeakerLabel(s));
+    if (!bySpeaker[key]) {
+      bySpeaker[key] = { label: getDisplayLabel(s), rawId: s.speaker_id || "", signals: [] };
+    }
+    bySpeaker[key].signals.push(s);
   }
 
   const hasIncongruence = activeSignals.some((s) =>
-    ["tone_face_masking", "head_body_incongruence", "cognitive_overload",
-     "stress_suppression", "emotional_suppression"].includes(s.signal_type)
+    (s.signal_type === "head_body_incongruence"
+      || s.signal_type === "verbal_nonverbal_discordance"
+      || s.signal_type === "tone_face_masking")
+    && (s.confidence ?? 0) > 0.40
   );
 
   const playheadPct = durationMs > 0 ? (currentTimeMs / durationMs) * 100 : 0;
@@ -569,55 +818,108 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
           {activeSignals.length === 0 ? (
             <span className="mt-4 text-center text-[10px] text-white/20">No active signals</span>
           ) : (
-            Object.entries(bySpeaker).map(([speaker, sigs]) => (
-              <div key={speaker} className="flex flex-col gap-1">
-                {speakers.length > 1 && (
-                  <span className="mb-0.5 text-[9px] font-semibold uppercase tracking-wider text-white/40">
-                    {speaker}
-                  </span>
-                )}
-                {sigs.slice(0, 6).map((s, i) => {
-                  const cfg = SIGNAL_CONFIG[s.signal_type];
-                  if (!cfg) return null;
-                  const color = resolveColor(cfg, s);
-                  return (
-                    <div
-                      key={`${s.signal_type}-${i}`}
-                      className="flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium text-white"
-                      style={{
-                        backgroundColor: `${color}22`,
-                        border: `1px solid ${color}55`,
-                      }}
-                    >
-                      <span className="font-mono text-[11px]">{cfg.icon}</span>
-                      <span className="truncate">{cfg.label(s)}</span>
-                      {s.confidence >= 0.5 && (
-                        <span className="ml-auto shrink-0 text-[10px] opacity-50">
-                          {Math.round(s.confidence * 100)}%
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            ))
+            <>
+              {Object.entries(bySpeaker).map(([speakerId, { label, rawId, signals: sigs }]) => {
+                const prioritySigs = sigs
+                  .filter((s: VideoSignal) => {
+                    const display = getSignalDisplay(s.signal_type, s.value_text ?? "");
+                    return display.priority <= (showExpanded ? 2 : 1);
+                  })
+                  .sort((a: VideoSignal, b: VideoSignal) => (b.confidence || 0) - (a.confidence || 0));
+                const visibleSigs = showExpanded ? prioritySigs : prioritySigs.slice(0, 3);
+                return (
+                  <div key={speakerId} className="flex flex-col gap-1">
+                    {Object.keys(bySpeaker).length > 1 && (
+                      <SpeakerGroupHeader
+                        speakerLabel={rawId}
+                        displayLabel={label}
+                        roster={speakerRoster}
+                        highlighted={!!rawId && highlightedSpeaker === rawId}
+                        onToggle={() =>
+                          setHighlightedSpeaker((prev) =>
+                            rawId && prev !== rawId ? rawId : null
+                          )
+                        }
+                      />
+                    )}
+                    {visibleSigs.map((s: VideoSignal, i: number) => {
+                      const display = getSignalDisplay(s.signal_type, s.value_text ?? "");
+                      const color = display.color;
+                      return (
+                        <div
+                          key={`${s.signal_type}-${i}`}
+                          className="flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium text-white"
+                          style={{
+                            backgroundColor: `${color}22`,
+                            border: `1px solid ${color}55`,
+                          }}
+                          title={display.description}
+                        >
+                          <span className="font-mono text-[11px]">{display.icon}</span>
+                          <span className="truncate">{display.label}</span>
+                          {s.confidence >= 0.5 && (
+                            <span className="ml-auto shrink-0 text-[10px] opacity-50">
+                              {Math.round(s.confidence * 100)}%
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {visibleSigs.length === 0 && (
+                      <span className="px-2 text-[9px] text-white/20">listening</span>
+                    )}
+                  </div>
+                );
+              })}
+              {(() => {
+                // Mirror the exact same filters/sort as the render loop above so
+                // the count reflects signals that will actually appear on expand.
+                const hiddenCount = showExpanded ? 0 : Object.values(bySpeaker).reduce(
+                  (total, { signals: sigs }) => {
+                    if (sigs.length === 0) return total;
+                    const sort = (a: VideoSignal, b: VideoSignal) =>
+                      (b.confidence || 0) - (a.confidence || 0);
+                    const shownNow = sigs
+                      .filter(s => getSignalDisplay(s.signal_type, s.value_text ?? "").priority <= 1)
+                      .sort(sort)
+                      .slice(0, 3).length;
+                    const shownExpanded = sigs
+                      .filter(s => getSignalDisplay(s.signal_type, s.value_text ?? "").priority <= 2)
+                      .sort(sort).length;
+                    return total + (shownExpanded - shownNow);
+                  },
+                  0,
+                );
+                return hiddenCount > 0 || showExpanded ? (
+                  <button
+                    onClick={() => setShowExpanded((v) => !v)}
+                    className="mt-1 text-[9px] text-white/30 hover:text-white/60 transition-colors text-center"
+                  >
+                    {showExpanded ? "Show less" : `+${hiddenCount} more`}
+                  </button>
+                ) : null;
+              })()}
+            </>
           )}
         </div>
 
         {/* Right panel: video — 9:16 portrait */}
         <div className="relative flex flex-1 items-center justify-center">
           <div className="relative w-full" style={{ aspectRatio: "16/9" }}>
-          <video
-            ref={videoRef}
-            src={videoUrl}
-            controls
-            className="h-full w-full object-contain"
-          />
-          {hasIncongruence && (
-            <div className="pointer-events-none absolute right-2 top-2 animate-pulse rounded-full bg-red-500/80 px-3 py-1.5 text-xs font-bold text-white backdrop-blur-sm">
-              ! Incongruence Detected
-            </div>
-          )}
+            <video
+              ref={videoRef}
+              src={videoUrl}
+              controls
+              className="h-full w-full object-contain"
+            />
+            {highlightedSpeaker && (
+              <FaceHighlight speaker={highlightedSpeaker} signals={activeSignals} />
+            )}
+            {hasIncongruence && (
+              <div className="pointer-events-none absolute right-2 top-2 animate-pulse rounded-full bg-red-500/80 px-3 py-1.5 text-xs font-bold text-white backdrop-blur-sm">
+                ! Incongruence Detected
+              </div>
+            )}
           </div>
         </div>
 
@@ -684,7 +986,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                           key={`${s.signal_type}-${s.start_ms}-${i}`}
                           className="absolute rounded-sm opacity-80 hover:opacity-100 transition-opacity"
                           style={{ left: `${left}%`, width: `${width}%`, minWidth: '3px', top: 1, bottom: 1, backgroundColor: color }}
-                          title={`${cfg.label(s)} @ ${(s.start_ms / 1000).toFixed(1)}s`}
+                          title={`${getSignalDisplay(s.signal_type, s.value_text ?? "").label} @ ${(s.start_ms / 1000).toFixed(1)}s`}
                           onClick={(e) => { e.stopPropagation(); seekTo(s.start_ms); }}
                         />
                       );
@@ -755,7 +1057,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
             <option value="all">All Speakers</option>
             {speakers.map((spk) => (
               <option key={spk} value={spk}>
-                {spk}
+                {speakerRoster[spk]?.display_name || spk}
               </option>
             ))}
           </select>

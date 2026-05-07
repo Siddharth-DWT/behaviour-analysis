@@ -165,6 +165,31 @@ async def _ensure_speaker_registry_tables(pool: asyncpg.Pool) -> None:
             "CREATE INDEX IF NOT EXISTS idx_sa_session  ON speaker_appearances(session_id)"
         )
 
+        # Face thumbnails — multiple per person (different sessions/angles)
+        await pool.execute("""
+            CREATE TABLE IF NOT EXISTS face_thumbnails (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                registry_id     UUID NOT NULL REFERENCES speakers_registry(id) ON DELETE CASCADE,
+                session_id      UUID REFERENCES sessions(id) ON DELETE SET NULL,
+                thumbnail       BYTEA NOT NULL,
+                quality_score   FLOAT DEFAULT 0.0,
+                is_primary      BOOLEAN DEFAULT FALSE,
+                created_at      TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await pool.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ft_registry ON face_thumbnails(registry_id)"
+        )
+
+        # ivfflat index on face_embedding for fast cosine similarity search
+        try:
+            await pool.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sr_face ON speakers_registry "
+                "USING ivfflat (face_embedding vector_cosine_ops) WITH (lists = 10)"
+            )
+        except Exception as e:
+            logger.warning(f"Could not create face embedding index (non-fatal): {e}")
+
         logger.info("Speaker registry tables ensured.")
     except Exception as e:
         logger.warning(f"Speaker registry table init failed (non-fatal): {e}")

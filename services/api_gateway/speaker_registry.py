@@ -2,26 +2,37 @@
 """
 NEXUS Speaker Registry — cross-session speaker identity matching.
 
-Two public functions called by _run_pipeline in main.py:
+Public functions called by _run_pipeline in main.py:
 
-  match_or_create_speakers  — called immediately after voice signals are
-      persisted; matches each speaker's voice embedding against the registry
-      (pgvector cosine similarity) and creates a new entry when no match
-      exceeds the threshold.
+  match_or_create_speakers     — fused face + voice matching; falls back to
+      voice-only when face embeddings are unavailable (backward-compatible).
 
-  update_appearance_stats   — called after ALL agent signals are persisted;
-      back-fills speaker_appearances.avg_stress / avg_engagement / filler_rate
-      from the signals table.
+  match_or_create_by_face_only — used for video-only sessions where no voice
+      diarization was performed.
+
+  update_appearance_stats      — back-fills per-session stats after all signals
+      are persisted.
 """
+import base64
 import logging
 import uuid as _uuid
 from typing import Optional
 
 logger = logging.getLogger("nexus.gateway.speaker_registry")
 
-# Cosine-similarity threshold above which a voice embedding is considered
-# a match to an existing registry entry.
-DEFAULT_SIMILARITY_THRESHOLD = 0.75
+# ── Similarity thresholds ─────────────────────────────────────────────────────
+DEFAULT_SIMILARITY_THRESHOLD = 0.75   # voice-only cosine similarity floor
+FACE_SIMILARITY_THRESHOLD    = 0.55   # ArcFace is highly discriminative
+FUSED_SIMILARITY_THRESHOLD   = 0.50   # lower bar when both modalities agree
+# MFCC fallback embeddings capture recording environment, not just speaker identity.
+# Cosine similarities > 0.97 between DIFFERENT speakers are MFCC artifacts — multiple
+# speakers in the same call often all score 99%+ against each other.
+# Ceiling prevents all speakers collapsing to one registry entry.
+VOICE_SIMILARITY_CEILING     = 0.97   # above this → likely MFCC artifact, create new
+
+# ── Fusion weights (face is more discriminative than MFCC voice) ──────────────
+FACE_WEIGHT  = 0.55
+VOICE_WEIGHT = 0.45
 
 
 async def match_or_create_speakers(
@@ -32,134 +43,314 @@ async def match_or_create_speakers(
     speaker_map: dict[str, str],
     org_id: str,
     similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    face_embeddings: Optional[dict[str, dict]] = None,
 ) -> dict[str, dict]:
     """
-    For each speaker in the session, try to match their voice embedding
-    against existing registry entries using pgvector cosine similarity.
-    Create a new registry entry for any unmatched speaker.
+    Match speakers to persistent identities using voice embeddings,
+    face embeddings, or both.
 
-    Also inserts a row into speaker_appearances linking the registry entry
-    to this session's speaker record (back-filled with stats later by
-    update_appearance_stats).
+    Matching priority:
+      1. Fused (face + voice, same person): weighted score >= 0.50 → match
+      2. Face-only: cosine similarity >= 0.55 → match
+      3. Voice-only: cosine similarity >= 0.75 → match (existing behaviour)
+      4. No match → create new registry entry
 
-    Args:
-        pool:                asyncpg connection pool.
-        session_id:          UUID of the current session (string).
-        speaker_embeddings:  {speaker_label: [float, ...]} L2-normalised
-                             vectors from the voice agent.
-        voice_speakers:      List of speaker dicts from voice agent response
-                             — each has at least "speaker_id".
-        speaker_map:         {speaker_label: speaker_db_uuid} built by
-                             upsert_speakers().
-        org_id:              Organisation UUID (string) — scopes the search.
-        similarity_threshold: Minimum cosine similarity (0–1) to count as a
-                             match. Default 0.75.
+    Fused score = face_similarity * 0.55 + voice_similarity * 0.45.
+    Face is weighted higher because ArcFace is more discriminative than MFCC.
 
     Returns:
-        {speaker_label: {"registry_id": str, "display_name": str,
-                         "match_method": str, "confidence": float}}
+        {speaker_label: {registry_id, display_name, match_method, confidence,
+                         voice_similarity, face_similarity}}
     """
+    face_embeddings = face_embeddings or {}
     result: dict[str, dict] = {}
 
-    for speaker_label, embedding in speaker_embeddings.items():
-        # pgvector expects a literal vector string: '[0.1,0.2,...]'
-        embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
+    for speaker_label, voice_embedding in speaker_embeddings.items():
+        voice_emb_str = "[" + ",".join(str(v) for v in voice_embedding) + "]"
 
-        # ── Attempt cosine-similarity match against registry ──────────────
-        match = await pool.fetchrow(
-            """
-            SELECT id, display_name, role,
-                   1 - (voice_embedding <=> $1::vector) AS similarity
+        face_data    = face_embeddings.get(speaker_label, {})
+        face_emb     = face_data.get("embedding")
+        face_emb_str = "[" + ",".join(str(v) for v in face_emb) + "]" if face_emb else None
+
+        # ── Query voice match ─────────────────────────────────────────────
+        voice_match = await pool.fetchrow("""
+            SELECT id, display_name,
+                   1 - (voice_embedding <=> $1::vector) AS voice_sim
             FROM   speakers_registry
             WHERE  org_id = $2
               AND  voice_embedding IS NOT NULL
             ORDER  BY voice_embedding <=> $1::vector
             LIMIT  1
-            """,
-            embedding_str,
-            _coerce_uuid(org_id),
-        )
+        """, voice_emb_str, _coerce_uuid(org_id))
 
-        if match and float(match["similarity"]) >= similarity_threshold:
-            # ── Matched existing speaker ───────────────────────────────────
-            registry_id  = str(match["id"])
-            display_name = match["display_name"]
-            confidence   = float(match["similarity"])
+        voice_sim = float(voice_match["voice_sim"]) if voice_match else 0.0
+
+        # ── Query face match ──────────────────────────────────────────────
+        face_sim   = 0.0
+        face_match = None
+        if face_emb_str:
+            face_match = await pool.fetchrow("""
+                SELECT id, display_name,
+                       1 - (face_embedding <=> $1::vector) AS face_sim
+                FROM   speakers_registry
+                WHERE  org_id = $2
+                  AND  face_embedding IS NOT NULL
+                ORDER  BY face_embedding <=> $1::vector
+                LIMIT  1
+            """, face_emb_str, _coerce_uuid(org_id))
+            face_sim = float(face_match["face_sim"]) if face_match else 0.0
+
+        # ── Decide: fused / face-only / voice-only / new ─────────────────
+        best_match   = None
+        best_score   = 0.0
+        match_method = "new_registration"
+
+        if face_emb_str and voice_match and face_match:
+            voice_id = str(voice_match["id"])
+            face_id  = str(face_match["id"])
+            if voice_id == face_id:
+                # Both modalities point to the same person — fused score
+                combined = face_sim * FACE_WEIGHT + voice_sim * VOICE_WEIGHT
+                if combined >= FUSED_SIMILARITY_THRESHOLD:
+                    best_match   = voice_match
+                    best_score   = combined
+                    match_method = "face_voice_fused"
+            else:
+                # Disagree — use the stronger modality above its own threshold
+                if face_sim >= FACE_SIMILARITY_THRESHOLD and face_sim > voice_sim:
+                    best_match   = face_match
+                    best_score   = face_sim
+                    match_method = "face_embedding"
+                elif similarity_threshold <= voice_sim <= VOICE_SIMILARITY_CEILING:
+                    best_match   = voice_match
+                    best_score   = voice_sim
+                    match_method = "voice_embedding"
+        elif face_emb_str and face_match and face_sim >= FACE_SIMILARITY_THRESHOLD:
+            best_match   = face_match
+            best_score   = face_sim
+            match_method = "face_embedding"
+        elif voice_match and similarity_threshold <= voice_sim <= VOICE_SIMILARITY_CEILING:
+            best_match   = voice_match
+            best_score   = voice_sim
             match_method = "voice_embedding"
 
+        # ── Apply match or create ─────────────────────────────────────────
+        if best_match:
+            registry_id  = str(best_match["id"])
+            display_name = best_match["display_name"]
+            confidence   = best_score
+
+            # Update registry — always increment voice; update face only if NULL
+            update_parts  = [
+                "session_count      = session_count + 1",
+                "voice_sample_count = voice_sample_count + 1",
+                "last_seen_at       = NOW()",
+                "updated_at         = NOW()",
+            ]
+            update_params = [best_match["id"]]
+
+            if face_emb_str:
+                p = len(update_params) + 1
+                update_parts.append(
+                    f"face_embedding    = CASE WHEN face_embedding IS NULL "
+                    f"THEN ${p}::vector ELSE face_embedding END"
+                )
+                update_parts.append("face_sample_count = face_sample_count + 1")
+                update_params.append(face_emb_str)
+
+            # voice_embedding: write when NULL — fixes face-only → speaking upgrade path
+            # (person was listener in session 1, speaks in session 2)
+            p = len(update_params) + 1
+            update_parts.append(
+                f"voice_embedding = CASE WHEN voice_embedding IS NULL "
+                f"THEN ${p}::vector ELSE voice_embedding END"
+            )
+            update_params.append(voice_emb_str)
+
             await pool.execute(
-                """
-                UPDATE speakers_registry
-                SET    session_count      = session_count + 1,
-                       voice_sample_count = voice_sample_count + 1,
-                       last_seen_at       = NOW(),
-                       updated_at         = NOW()
-                WHERE  id = $1
-                """,
-                match["id"],
+                f"UPDATE speakers_registry SET {', '.join(update_parts)} WHERE id = $1",
+                *update_params,
             )
             logger.info(
-                "Registry match: %s → %s (similarity=%.3f)",
-                speaker_label, display_name, confidence,
+                "Registry match: %s → %s (method=%s score=%.3f voice=%.3f face=%.3f)",
+                speaker_label, display_name, match_method, confidence, voice_sim, face_sim,
             )
         else:
-            # ── New speaker — create registry entry ────────────────────────
-            # voice_speakers uses "speaker_id" as the label key
             speaker_info = next(
-                (s for s in voice_speakers if s.get("speaker_id") == speaker_label),
-                {},
+                (s for s in voice_speakers if s.get("speaker_id") == speaker_label), {}
             )
             display_name = speaker_info.get("name") or speaker_label
-
-            row = await pool.fetchrow(
-                """
+            row = await pool.fetchrow("""
                 INSERT INTO speakers_registry
                     (org_id, display_name, role,
-                     voice_embedding, voice_sample_count, session_count)
-                VALUES ($1, $2, $3, $4::vector, 1, 1)
+                     voice_embedding, voice_sample_count,
+                     face_embedding,  face_sample_count,
+                     session_count)
+                VALUES ($1, $2, $3, $4::vector, 1, $5::vector, $6, 1)
                 RETURNING id
-                """,
+            """,
                 _coerce_uuid(org_id),
                 display_name,
                 speaker_info.get("role", ""),
-                embedding_str,
+                voice_emb_str,
+                face_emb_str,
+                1 if face_emb_str else 0,
             )
             registry_id  = str(row["id"])
             confidence   = 1.0
             match_method = "new_registration"
-            logger.info("Registry new: %s registered as %r", speaker_label, display_name)
+            logger.info(
+                "Registry new: %s registered as %r (has_face=%s)",
+                speaker_label, display_name, bool(face_emb_str),
+            )
 
-        # ── Insert / update appearance record ─────────────────────────────
-        # Per-session stats (avg_stress etc.) are left at defaults here and
-        # filled in by update_appearance_stats() once all signals are saved.
-        speaker_db_id = speaker_map.get(speaker_label)
+        # ── Store face thumbnail ──────────────────────────────────────────
+        # Only when the match used face evidence — a voice-only match means the
+        # thumbnail came from lip-sync and could belong to a DIFFERENT person than
+        # the registry entry (MFCC false-positives store wrong faces under wrong IDs).
+        if face_data.get("thumbnail_b64") and match_method != "voice_embedding":
+            await _store_thumbnail(pool, registry_id, session_id, face_data, best_score)
 
-        await pool.execute(
-            """
-            INSERT INTO speaker_appearances
-                (registry_id, session_id, speaker_id,
-                 speaker_label, match_method, match_confidence)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (registry_id, session_id, speaker_label) DO UPDATE
-                SET match_method    = EXCLUDED.match_method,
-                    match_confidence = EXCLUDED.match_confidence
-            """,
-            _coerce_uuid(registry_id),
-            _coerce_uuid(session_id),
-            _coerce_uuid(speaker_db_id) if speaker_db_id else None,
-            speaker_label,
-            match_method,
-            confidence,
+        # ── Appearance record ─────────────────────────────────────────────
+        await _upsert_appearance(
+            pool, registry_id, session_id,
+            speaker_map.get(speaker_label), speaker_label,
+            match_method, confidence,
         )
 
         result[speaker_label] = {
-            "registry_id":   registry_id,
-            "display_name":  display_name,
-            "match_method":  match_method,
-            "confidence":    confidence,
+            "registry_id":      registry_id,
+            "display_name":     display_name,
+            "match_method":     match_method,
+            "confidence":       confidence,
+            "voice_similarity": round(voice_sim, 4),
+            "face_similarity":  round(face_sim, 4),
         }
 
     return result
+
+
+async def match_or_create_by_face_only(
+    pool,
+    session_id: str,
+    face_embeddings: dict[str, dict],
+    speaker_map: dict[str, str],
+    org_id: str,
+) -> dict[str, dict]:
+    """
+    Match speakers using face embeddings only — used when no voice diarization
+    is available (video-only sessions, screen recordings with webcam).
+    """
+    result: dict[str, dict] = {}
+
+    for speaker_label, face_data in face_embeddings.items():
+        embedding = face_data.get("embedding")
+        if not embedding:
+            continue
+
+        emb_str = "[" + ",".join(str(v) for v in embedding) + "]"
+
+        match = await pool.fetchrow("""
+            SELECT id, display_name,
+                   1 - (face_embedding <=> $1::vector) AS similarity
+            FROM   speakers_registry
+            WHERE  org_id = $2
+              AND  face_embedding IS NOT NULL
+            ORDER  BY face_embedding <=> $1::vector
+            LIMIT  1
+        """, emb_str, _coerce_uuid(org_id))
+
+        if match and float(match["similarity"]) >= FACE_SIMILARITY_THRESHOLD:
+            registry_id  = str(match["id"])
+            display_name = match["display_name"]
+            confidence   = float(match["similarity"])
+            match_method = "face_embedding"
+            await pool.execute("""
+                UPDATE speakers_registry
+                SET session_count     = session_count + 1,
+                    face_sample_count = face_sample_count + 1,
+                    last_seen_at      = NOW(),
+                    updated_at        = NOW()
+                WHERE id = $1
+            """, match["id"])
+        else:
+            row = await pool.fetchrow("""
+                INSERT INTO speakers_registry
+                    (org_id, display_name, face_embedding, face_sample_count, session_count)
+                VALUES ($1, $2, $3::vector, 1, 1)
+                RETURNING id
+            """, _coerce_uuid(org_id), speaker_label, emb_str)
+            registry_id  = str(row["id"])
+            display_name = speaker_label
+            confidence   = 1.0
+            match_method = "new_registration"
+
+        if face_data.get("thumbnail_b64"):
+            await _store_thumbnail(pool, registry_id, session_id, face_data, confidence)
+
+        await _upsert_appearance(
+            pool, registry_id, session_id,
+            speaker_map.get(speaker_label), speaker_label,
+            match_method, confidence,
+        )
+
+        result[speaker_label] = {
+            "registry_id":  registry_id,
+            "display_name": display_name,
+            "match_method": match_method,
+            "confidence":   confidence,
+        }
+
+    return result
+
+
+async def _store_thumbnail(
+    pool, registry_id: str, session_id: str, face_data: dict, quality_score: float
+) -> None:
+    """Insert a face thumbnail; mark as primary when none exists yet."""
+    try:
+        thumb_bytes = base64.b64decode(face_data["thumbnail_b64"])
+        await pool.execute("""
+            INSERT INTO face_thumbnails
+                (registry_id, session_id, thumbnail, quality_score, is_primary)
+            VALUES ($1, $2, $3, $4,
+                    NOT EXISTS(SELECT 1 FROM face_thumbnails WHERE registry_id = $1))
+        """,
+            _coerce_uuid(registry_id),
+            _coerce_uuid(session_id),
+            thumb_bytes,
+            quality_score,
+        )
+    except Exception as exc:
+        logger.debug(f"Thumbnail store failed (non-fatal): {exc}")
+
+
+async def _upsert_appearance(
+    pool,
+    registry_id: str,
+    session_id: str,
+    speaker_db_id: Optional[str],
+    speaker_label: str,
+    match_method: str,
+    confidence: float,
+) -> None:
+    """Insert or update a speaker_appearances row for this session."""
+    await pool.execute("""
+        INSERT INTO speaker_appearances
+            (registry_id, session_id, speaker_id,
+             speaker_label, match_method, match_confidence)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (registry_id, session_id, speaker_label) DO UPDATE
+            SET match_method     = EXCLUDED.match_method,
+                match_confidence = EXCLUDED.match_confidence
+    """,
+        _coerce_uuid(registry_id),
+        _coerce_uuid(session_id),
+        _coerce_uuid(speaker_db_id) if speaker_db_id else None,
+        speaker_label,
+        match_method,
+        confidence,
+    )
 
 
 async def update_appearance_stats(pool, session_id: str) -> None:

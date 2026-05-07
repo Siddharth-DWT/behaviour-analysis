@@ -14,6 +14,7 @@ Rules implemented:
 
   Audio × Video (Phase 2E):
     FUSION-01: Tone × Facial Emotion → Masking detection
+    FUSION-15: Voice × Face Acoustic-Visual Alignment → Congruence / channel mismatch
     FUSION-03: Voice Stress × Facial Stress → Suppression detection
     FUSION-04: Filler Words × Gaze Break → Cognitive load
     FUSION-05: Head Nod/Shake × Objection → Disagreement signal
@@ -40,7 +41,7 @@ Confidence caps:
   FUSION-04: 0.70   FUSION-05: 0.55   FUSION-06: 0.60
   FUSION-07: 0.70   FUSION-08: 0.55   FUSION-09: 0.60
   FUSION-10: 0.60   FUSION-11: 0.65   FUSION-12: 0.55
-  FUSION-13: 0.60   FUSION-14: 0.70
+  FUSION-13: 0.60   FUSION-14: 0.70   FUSION-15: 0.60
 """
 import logging
 from typing import Optional
@@ -206,6 +207,11 @@ class FusionRuleEngine:
             if not (profile and profile.is_gated("FUSION-14")):
                 max_conf = profile.get_threshold("FUSION-14", "max_confidence", 0.70) if profile else 0.70
                 _maybe_append("FUSION-14", self._rule_fusion_14(language_signals, video_signals, max_conf), "rapport_confirmation")
+
+            # FUSION-15: Voice × Face Acoustic-Visual Alignment
+            if not (profile and profile.is_gated("FUSION-15")):
+                max_conf = profile.get_threshold("FUSION-15", "max_confidence", 0.60) if profile else 0.60
+                _maybe_append("FUSION-15", self._rule_fusion_15(voice_signals, video_signals, max_conf), "voice_face_alignment")
 
         return signals
 
@@ -1432,6 +1438,143 @@ class FusionRuleEngine:
                 "aligned_pairs": aligned_pairs,
                 "empathy_signal_count": len(empathy_sigs),
                 "nod_count": len(nod_sigs),
+            },
+        }
+
+    # ════════════════════════════════════════════════════════
+    # FUSION-15: Voice × Face Acoustic-Visual Alignment
+    # Research: Ekman 1969 (leakage hypothesis — suppressed emotion leaks
+    #           through the channel that is harder to consciously control),
+    #           Mehrabian 1972 (vocal + visual channels carry emotion independently)
+    # Max confidence: 0.60 (two independent sensors observing same event;
+    #   mismatch is significant but not conclusive without context)
+    # ════════════════════════════════════════════════════════
+
+    def _rule_fusion_15(
+        self,
+        voice_signals: list[dict],
+        video_signals: list[dict],
+        max_confidence: float = 0.60,
+    ) -> Optional[dict]:
+        """
+        Compares the acoustic channel (how they sound) with the visual channel
+        (how they look) across three dimensions:
+
+          1. Valence   — same emotional direction? tone vs facial emotion / smile
+          2. Stress    — voice stress level matches facial tension?
+          3. Energy    — speech rate + pitch matches facial engagement?
+
+        When the two channels agree → congruent (authentic signal).
+        When they diverge → one channel is being managed while the other leaks.
+        This is distinct from FUSION-01 (tone vs face) which fires on strong
+        masking; FUSION-15 also fires on the congruent end to confirm authenticity.
+        """
+        # ── Voice features ────────────────────────────────────────────────────
+        v_tone_sigs   = [s for s in voice_signals if s.get("signal_type") == "tone_classification"]
+        v_stress_sigs = [s for s in voice_signals if s.get("signal_type") == "vocal_stress_score"]
+        v_pitch_sigs  = [s for s in voice_signals if s.get("signal_type") == "pitch_elevation_flag"]
+        v_rate_sigs   = [s for s in voice_signals if s.get("signal_type") == "speech_rate_anomaly"]
+
+        # ── Face features ─────────────────────────────────────────────────────
+        f_emotion_sigs = [s for s in video_signals if s.get("signal_type") == "facial_emotion"]
+        f_smile_sigs   = [s for s in video_signals if s.get("signal_type") == "smile_type"]
+        f_stress_sigs  = [s for s in video_signals if s.get("signal_type") == "facial_stress"]
+        f_engage_sigs  = [s for s in video_signals if s.get("signal_type") == "facial_engagement"]
+        f_laugh_sigs   = [s for s in video_signals if s.get("signal_type") == "laughter"]
+
+        voice_present = sum(1 for lst in [v_tone_sigs, v_stress_sigs, v_pitch_sigs, v_rate_sigs] if lst)
+        face_present  = sum(1 for lst in [f_emotion_sigs, f_smile_sigs, f_stress_sigs, f_engage_sigs, f_laugh_sigs] if lst)
+        if voice_present < 1 or face_present < 1:
+            return None
+
+        # ── Channel 1: Valence alignment ─────────────────────────────────────
+        VOICE_VALENCE: dict[str, float] = {
+            "confident": 0.7, "warm": 0.8,
+            "hesitant": -0.3, "confrontational": -0.8,
+        }
+        FACE_VALENCE: dict[str, float] = {
+            "happy": 0.8, "surprised": 0.1,
+            "sad": -0.6, "angry": -0.8, "disgusted": -0.7,
+            "contempt": -0.6, "fearful": -0.4,
+        }
+
+        voice_val = 0.0
+        if v_tone_sigs:
+            best_tone = max(v_tone_sigs, key=lambda s: _to_float(s.get("confidence", 0)))
+            voice_val = VOICE_VALENCE.get(best_tone.get("value_text", ""), 0.0)
+
+        face_val = 0.0
+        if f_emotion_sigs:
+            best_emo = max(f_emotion_sigs, key=lambda s: _to_float(s.get("confidence", 0)))
+            face_val = FACE_VALENCE.get(best_emo.get("value_text", ""), 0.0)
+        if f_smile_sigs:
+            best_smile = max(f_smile_sigs, key=lambda s: _to_float(s.get("confidence", 0)))
+            vt = best_smile.get("value_text", "")
+            face_val = max(face_val, 0.8 if "duchenne" in vt else 0.3 if "social" in vt else 0.0)
+        if f_laugh_sigs:
+            face_val = max(face_val, 0.9)
+
+        valence_gap = voice_val - face_val
+
+        # ── Channel 2: Stress alignment ───────────────────────────────────────
+        voice_stress = max((_to_float(s.get("value", 0)) for s in v_stress_sigs), default=0.0)
+        face_stress  = max((_to_float(s.get("value", 0)) for s in f_stress_sigs), default=0.0)
+        stress_gap   = voice_stress - face_stress
+
+        # ── Channel 3: Energy alignment ───────────────────────────────────────
+        voice_energy = 0.5
+        if v_rate_sigs:
+            best_rate = max(v_rate_sigs, key=lambda s: _to_float(s.get("confidence", 0)))
+            vt = best_rate.get("value_text", "")
+            voice_energy = 0.8 if "fast" in vt else 0.2 if "slow" in vt else 0.5
+        if v_pitch_sigs:
+            voice_energy = min(voice_energy + 0.2, 1.0)
+
+        face_energy = 0.5
+        if f_engage_sigs:
+            best_eng = max(f_engage_sigs, key=lambda s: _to_float(s.get("confidence", 0)))
+            vt = best_eng.get("value_text", "")
+            face_energy = 0.8 if "high" in vt else 0.2 if "low" in vt else 0.5
+
+        energy_gap = abs(voice_energy - face_energy)
+
+        # ── Overall alignment score: 1.0 = fully congruent, 0.0 = maximal mismatch ─
+        alignment_score = max(0.0, min(
+            1.0 - (abs(valence_gap) * 0.45 + abs(stress_gap) * 0.30 + energy_gap * 0.25),
+            1.0,
+        ))
+
+        if alignment_score > 0.70:
+            # Two sensors agree → authentic signal detected
+            level      = "congruent"
+            score      = alignment_score
+            confidence = min(alignment_score * 0.65, max_confidence)
+        elif alignment_score < 0.35:
+            # Channels disagree → identify the dominant mismatch dimension
+            if abs(valence_gap) >= abs(stress_gap) and abs(valence_gap) >= energy_gap:
+                level = "voice_positive_face_negative" if valence_gap > 0 else "voice_negative_face_positive"
+            elif abs(stress_gap) >= energy_gap:
+                level = "voice_stressed_face_calm" if stress_gap > 0 else "voice_calm_face_stressed"
+            else:
+                level = "energy_mismatch"
+            score      = 1.0 - alignment_score   # reframe as incongruence magnitude
+            confidence = min((1.0 - alignment_score) * 0.55, max_confidence)
+        else:
+            return None   # Ambiguous mid-range — no signal
+
+        return {
+            "score": round(score, 4),
+            "level": level,
+            "confidence": round(confidence, 4),
+            "evidence": {
+                "alignment_score":  round(alignment_score, 3),
+                "valence_gap":      round(valence_gap, 3),
+                "stress_gap":       round(stress_gap, 3),
+                "energy_gap":       round(energy_gap, 3),
+                "voice_valence":    round(voice_val, 3),
+                "face_valence":     round(face_val, 3),
+                "voice_stress":     round(voice_stress, 3),
+                "face_stress":      round(face_stress, 3),
             },
         }
 

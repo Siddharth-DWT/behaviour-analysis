@@ -27,11 +27,22 @@ logger = logging.getLogger("nexus.video.facial_rules")
 EMOTION_BLENDSHAPES: dict[str, dict[str, float]] = {
     "happy":    {"mouthSmileLeft": 0.6, "mouthSmileRight": 0.6, "cheekSquintLeft": 0.4, "cheekSquintRight": 0.4},
     "sad":      {"mouthFrownLeft": 0.5, "mouthFrownRight": 0.5, "browInnerUp": 0.3, "eyeSquintLeft": 0.2, "eyeSquintRight": 0.2},
-    "angry":    {"browDownLeft": 0.6, "browDownRight": 0.6, "noseSneerLeft": 0.3, "noseSneerRight": 0.3, "mouthPressLeft": 0.1},
+    "angry":    {"browDownLeft": 0.6, "browDownRight": 0.6, "eyeWideLeft": 0.25, "eyeWideRight": 0.25, "jawForward": 0.20, "noseSneerLeft": 0.20, "noseSneerRight": 0.20, "mouthPressLeft": 0.10},
     "surprised":{"eyeWideLeft": 0.5, "eyeWideRight": 0.5, "jawOpen": 0.3, "browInnerUp": 0.2},
     "disgusted":{"noseSneerLeft": 0.5, "noseSneerRight": 0.5, "mouthShrugUpper": 0.3, "browDownLeft": 0.2},
     "contempt": {"mouthLeft": 0.6, "cheekSquintLeft": 0.3, "mouthDimpleLeft": 0.1},
     "fearful":  {"eyeWideLeft": 0.4, "eyeWideRight": 0.4, "browInnerUp": 0.4, "mouthStretchLeft": 0.2},
+}
+
+# Per-emotion delta overrides — emotions whose blendshapes overlap with normal
+# video-call expressions (concentration, squinting, screen glare) need higher
+# thresholds to avoid false positives.
+EMOTION_DELTA_OVERRIDES: dict[str, float] = {
+    "angry":     0.15,   # browDown fires on concentration / squinting
+    "disgusted": 0.14,   # noseSneer fires on screen glare
+    "contempt":  0.14,   # mouthLeft fires on asymmetric talking
+    "sad":       0.10,   # mouthFrown fires on neutral resting face
+    "fearful":   0.10,   # eyeWide fires on attentive listening
 }
 
 # confidence caps per emotion (deception-adjacent emotions capped lower)
@@ -52,6 +63,8 @@ STRESS_INDICATORS: dict[str, float] = {
     "mouthPressLeft": 1.2,
     "mouthPressRight":1.2,
     "jawForward":     0.5,
+    "jawLeft":        0.4,   # lateral jaw deviation = clenching/grinding tension
+    "jawRight":       0.4,
     "eyeSquintLeft":  0.8,
     "eyeSquintRight": 0.8,
     "noseSneerLeft":  0.4,
@@ -85,15 +98,16 @@ class FacialRuleEngine(BaseVideoRuleEngine):
     AGENT_NAME = "video"
 
     # Thresholds (overridable via rule_config in Phase 3)
-    EMOTION_DELTA_THRESHOLD  = 0.04   # min blendshape delta above neutral to fire
-    SMILE_DUCHENNE_THRESHOLD = 0.05   # min mouthSmile delta for Duchenne candidacy
-    CHEEK_DUCHENNE_THRESHOLD = 0.05   # min cheekSquint delta to confirm Duchenne
-    SMILE_SOCIAL_THRESHOLD   = 0.08   # higher bar for social smile (no eye crinkling)
+    EMOTION_DELTA_THRESHOLD  = 0.12   # min blendshape delta above neutral to fire (was 0.08)
+    SMILE_DUCHENNE_THRESHOLD = 0.08   # min mouthSmile delta for Duchenne candidacy (was 0.05)
+    CHEEK_DUCHENNE_THRESHOLD = 0.07   # min cheekSquint delta to confirm Duchenne (was 0.05)
+    SMILE_SOCIAL_THRESHOLD   = 0.12   # higher bar for social smile (no eye crinkling) (was 0.08)
     STRESS_THRESHOLD         = 0.35   # weighted stress score above which rule fires
     STRESS_HIGH_THRESHOLD    = 0.55
-    ENGAGEMENT_HIGH          = 0.60   # pose variance delta → high engagement
-    ENGAGEMENT_LOW           = 0.20   # pose variance delta → low engagement
+    ENGAGEMENT_HIGH          = 0.70   # combined score → high engagement (was 0.60)
+    ENGAGEMENT_LOW           = 0.20   # combined score → low engagement
     MIN_FACE_RATE            = 0.30   # skip window if face detected < 30% of frames
+    MIN_SIGNAL_CONFIDENCE    = 0.18   # discard signals below this before storage
 
     def evaluate(
         self,
@@ -104,6 +118,7 @@ class FacialRuleEngine(BaseVideoRuleEngine):
     ) -> list[dict]:
         signals: list[dict] = []
         for speaker_id, windows in windows_by_speaker.items():
+            windows = sorted(windows, key=lambda x: x.window_start_ms)
             facial_bl, _, _ = baselines.get(
                 speaker_id,
                 (FacialBaseline(speaker_id=speaker_id), None, None),
@@ -119,6 +134,7 @@ class FacialRuleEngine(BaseVideoRuleEngine):
                     prev_w = w
                     continue
 
+                self._current_w = w
                 conf_mult = cal_conf * w.face_detection_rate
 
                 # F-2: Skin tone confidence modifier (Buolamwini & Gebru 2018).
@@ -127,13 +143,19 @@ class FacialRuleEngine(BaseVideoRuleEngine):
                 if face_lum < 0.35:
                     conf_mult *= 0.85
 
-                signals += self._rule_emotion(w, facial_bl, speaker_id, conf_mult)
-                signals += self._rule_smile(w, facial_bl, speaker_id, conf_mult, prev_w)
-                signals += self._rule_stress(w, facial_bl, speaker_id, conf_mult)
-                signals += self._rule_engagement(w, facial_bl, speaker_id, conf_mult)
-                signals += self._rule_valence_arousal(w, facial_bl, speaker_id, conf_mult)
-                signals += self._rule_lip_pursing(w, facial_bl, speaker_id, conf_mult)
+                window_signals: list[dict] = []
+                window_signals += self._rule_emotion(w, facial_bl, speaker_id, conf_mult)
+                window_signals += self._rule_smile(w, facial_bl, speaker_id, conf_mult, prev_w)
+                window_signals += self._rule_laughter(w, facial_bl, speaker_id, conf_mult)
+                window_signals += self._rule_stress(w, facial_bl, speaker_id, conf_mult)
+                window_signals += self._rule_engagement(w, facial_bl, speaker_id, conf_mult)
+                window_signals += self._rule_valence_arousal(w, facial_bl, speaker_id, conf_mult)
+                window_signals += self._rule_lip_pursing(w, facial_bl, speaker_id, conf_mult)
 
+                signals += [
+                    s for s in window_signals
+                    if s.get("confidence", 0) >= self.MIN_SIGNAL_CONFIDENCE
+                ]
                 prev_w = w
 
         logger.info(f"[{session_id}] FacialRuleEngine: {len(signals)} signals")
@@ -156,7 +178,8 @@ class FacialRuleEngine(BaseVideoRuleEngine):
             raw = _weighted_blend_score(w.blendshapes_mean, weights)
             baseline_raw = _weighted_blend_score(bl.blendshapes_neutral, weights)
             delta = raw - baseline_raw
-            if delta > self.EMOTION_DELTA_THRESHOLD:
+            min_delta = EMOTION_DELTA_OVERRIDES.get(emotion, self.EMOTION_DELTA_THRESHOLD)
+            if delta > min_delta:
                 scores[emotion] = delta
 
         if not scores:
@@ -348,11 +371,14 @@ class FacialRuleEngine(BaseVideoRuleEngine):
         f3_smile = min(smile_mean / 0.3, 1.0)
 
         # F4: brow activity delta from neutral (more brow movement = more reactive)
+        # browOuterUpLeft/Right captures "interested/curious" raise; browInnerUp captures concern
         brow_activity = (
             abs(_blendshape_delta(w.blendshapes_mean, bl.blendshapes_neutral, "browDownLeft"))
             + abs(_blendshape_delta(w.blendshapes_mean, bl.blendshapes_neutral, "browDownRight"))
             + abs(_blendshape_delta(w.blendshapes_mean, bl.blendshapes_neutral, "browInnerUp"))
-        ) / 3.0
+            + abs(_blendshape_delta(w.blendshapes_mean, bl.blendshapes_neutral, "browOuterUpLeft"))
+            + abs(_blendshape_delta(w.blendshapes_mean, bl.blendshapes_neutral, "browOuterUpRight"))
+        ) / 5.0
         f4_brow = min(brow_activity / 0.15, 1.0)
 
         # F5: face detection rate as screen-facing proxy
@@ -422,7 +448,7 @@ class FacialRuleEngine(BaseVideoRuleEngine):
         valence = max(-1.0, min(valence, 1.0))
         arousal = max(0.0, min(arousal, 1.0))
 
-        if abs(valence) < 0.05 and arousal < 0.05:
+        if abs(valence) < 0.10 and arousal < 0.08:
             return []
 
         if valence > 0.05:
@@ -481,7 +507,12 @@ class FacialRuleEngine(BaseVideoRuleEngine):
         baseline_pucker = bl.blendshapes_neutral.get("mouthPucker", 0.05)
         delta = mouth_pucker - baseline_pucker
 
-        if delta < 0.10:
+        if delta < 0.18:
+            return []
+        if mouth_pucker < 0.22:
+            return []
+        pucker_std = w.blendshapes_std.get("mouthPucker", 0.0)
+        if pucker_std > 0.08:
             return []
         if mouth_smile > 0.15:
             return []
@@ -503,5 +534,68 @@ class FacialRuleEngine(BaseVideoRuleEngine):
                 "baseline_pucker": round(baseline_pucker, 4),
                 "delta": round(delta, 4),
                 "is_listening": not getattr(w, "is_speaking", True),
+            },
+        )]
+
+    # ── FACE-LAUGH-01: Laughter detection ────────────────────────────────────
+    def _rule_laughter(
+        self,
+        w: WindowFeatures,
+        bl: FacialBaseline,
+        speaker_id: str,
+        conf_mult: float,
+    ) -> list[dict]:
+        """
+        FACE-LAUGH-01: Laughter via rapid jawOpen oscillation + smile + eye crinkle.
+        At 5 fps each frame is 200ms — true micro-laughter bursts are unresolvable, but
+        sustained laughter within a 2s window leaves high jawOpen std (oscillating jaw)
+        combined with elevated smile and cheekSquint (Duchenne eye crinkle = genuine).
+        Ekman 2003: genuine amusement requires both AU6 (cheekSquint) and AU12 (mouthSmile).
+        """
+        if not getattr(w, "is_speaking", True):
+            return []
+
+        bs      = w.blendshapes_mean
+        bs_std  = w.blendshapes_std
+        bl_bs   = bl.blendshapes_neutral
+
+        jaw_std  = bs_std.get("jawOpen", 0.0)
+        jaw_mean = bs.get("jawOpen", 0.0)
+
+        # Oscillating jaw (std > 0.06) + open jaw (mean > 0.08) = laugh-like movement
+        if jaw_std < 0.06 or jaw_mean < 0.08:
+            return []
+
+        smile_mean  = (bs.get("mouthSmileLeft", 0.0) + bs.get("mouthSmileRight", 0.0)) / 2.0
+        smile_base  = (bl_bs.get("mouthSmileLeft", 0.0) + bl_bs.get("mouthSmileRight", 0.0)) / 2.0
+        smile_delta = smile_mean - smile_base
+        if smile_delta < 0.10:
+            return []
+
+        cheek_delta = (
+            (bs.get("cheekSquintLeft",  0.0) - bl_bs.get("cheekSquintLeft",  0.0)) +
+            (bs.get("cheekSquintRight", 0.0) - bl_bs.get("cheekSquintRight", 0.0))
+        ) / 2.0
+
+        is_genuine = cheek_delta >= 0.06   # Duchenne AU6 — hardest to fake
+        label      = "genuine_laughter" if is_genuine else "open_mouth_smile"
+        cap        = 0.65 if is_genuine else 0.50
+        confidence = min((jaw_std * 0.5 + smile_delta * 0.5) * conf_mult, cap)
+
+        return [self._make_signal(
+            rule_id="FACE-LAUGH-01",
+            signal_type="laughter",
+            speaker_id=speaker_id,
+            value=round(jaw_std, 4),
+            value_text=label,
+            confidence=confidence,
+            window_start_ms=w.window_start_ms,
+            window_end_ms=w.window_end_ms,
+            metadata={
+                "jaw_open_std":  round(jaw_std, 4),
+                "jaw_open_mean": round(jaw_mean, 4),
+                "smile_delta":   round(smile_delta, 4),
+                "cheek_delta":   round(cheek_delta, 4),
+                "is_genuine":    is_genuine,
             },
         )]

@@ -6,6 +6,7 @@
  */
 import { useRef, useState, useCallback, useEffect, useMemo } from "react";
 import type { Signal, TranscriptSegment } from "../api/client";
+import { getSignalDisplay } from "../config/signalDisplayConfig";
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
@@ -370,7 +371,7 @@ export default function TranscriptView({ segments, signals, speakerRoles, speake
                     style={{ backgroundColor: color + "18", border: `1px solid ${color}33` }}
                   >
                     <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: color }} />
-                    <span style={{ color }}>{s.signal_type.replace(/_/g, " ")}</span>
+                    <span style={{ color }}>{getSignalDisplay(s.signal_type, s.value_text ?? "").label}</span>
                     {s.value != null && (
                       <span className="text-nexus-text-muted">{Math.round((s.value as number) * 100)}%</span>
                     )}

@@ -132,8 +132,6 @@ services:
       - EXTERNAL_DIARIZE_URL=${EXTERNAL_DIARIZE_URL}
       - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
       - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
-      - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
-      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
       - PARAKEET_URL=${PARAKEET_URL}
       - TRANSCRIPTION_BACKEND=${TRANSCRIPTION_BACKEND:-auto}
       - USE_PYANNOTE=${USE_PYANNOTE:-false}
@@ -222,12 +220,16 @@ services:
       - PYTHONPATH=/app
       - MEDIAPIPE_MODEL_DIR=/app/models/mediapipe
       - OVERLAY_DIR=/app/data/overlays
+      - REDIS_URL=redis://redis:6379/0
     volumes:
       - ./services/video_agent:/app
       - ./shared:/app/shared
       - ./data:/app/data
       - ./models:/app/models
       - video_overlays:/app/data/overlays
+    depends_on:
+      redis:
+        condition: service_healthy
     networks:
       - nexus-network
 
@@ -294,13 +296,9 @@ services:
       - ZEPTOMAIL_TOKEN=${ZEPTOMAIL_TOKEN:-}
       - FROM_EMAIL=${FROM_EMAIL:-noreply@yourdomain.com}
       - FROM_NAME=${FROM_NAME:-NEXUS}
-      - APP_URL=${APP_URL:-http://localhost:3000}
+      - APP_URL=${APP_URL:-http://localhost:3006}
       - JWT_ACCESS_TOKEN_EXPIRE_MINUTES=${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
       - JWT_REFRESH_TOKEN_EXPIRE_DAYS=${JWT_REFRESH_TOKEN_EXPIRE_DAYS:-30}
-      - ZEPTOMAIL_TOKEN=${ZEPTOMAIL_TOKEN:-}
-      - FROM_EMAIL=${FROM_EMAIL:-noreply@yourdomain.com}
-      - FROM_NAME=${FROM_NAME:-NEXUS}
-      - APP_URL=${APP_URL:-http://localhost:3006}
       - OVERLAY_DIR=/app/data/overlays
     volumes:
       - ./services/api_gateway:/app

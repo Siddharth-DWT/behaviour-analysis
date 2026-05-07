@@ -434,63 +434,84 @@ def _build_prompt(context: str, meeting_type: str) -> tuple[str, str]:
             "Focus on: buying signals timeline, objection handling effectiveness, "
             "stress points during pricing/negotiation, decision readiness indicators, "
             "close probability assessment, and whether the prospect showed genuine "
-            "or manufactured interest. Identify the seller and buyer roles."
+            "or manufactured interest. Identify the seller and buyer roles. "
+            "If video data is present: note forward lean (engagement), gaze breaks (distraction), "
+            "facial stress peaks, head nods (agreement) or shakes (disagreement), "
+            "and any incongruence between spoken words and body language."
         ),
         # ── Podcast ──
         "podcast": (
             "Focus on: speaker dynamics and chemistry, topic flow and transitions, "
             "engagement peaks (where energy or interest spikes), most interesting "
             "moments based on vocal/linguistic indicators, host vs guest balance, "
-            "and audience engagement proxy from speaker energy patterns."
+            "and audience engagement proxy from speaker energy patterns. "
+            "If video data is present: note facial emotion shifts, posture changes, "
+            "and non-verbal rapport signals like head nods and mirroring."
         ),
         # ── Interview ──
         "interview": (
             "Focus on: candidate confidence trajectory over time, question quality "
             "from the interviewer, rapport assessment between participants, "
             "stress indicators during difficult questions, authenticity markers, "
-            "and communication style adaptability."
+            "and communication style adaptability. "
+            "If video data is present: facial stress during tough questions, gaze avoidance, "
+            "self-touch (pacifying gestures), posture shifts, and whether body language "
+            "is congruent with spoken confidence."
         ),
         # ── Lecture ──
         "lecture": (
             "Focus on: speaker clarity and pacing analysis, energy level changes "
             "over time, engagement indicators (if Q&A present), key emphasis moments, "
             "vocal fatigue patterns, and whether the speaker maintained audience "
-            "attention through vocal variety."
+            "attention through vocal variety. "
+            "If video data is present: facial engagement level, gestural animation, "
+            "gaze contact with audience, and posture confidence."
         ),
         # ── Debate ──
         "debate": (
             "Focus on: argument strength per speaker, dominance shifts over time, "
             "emotional escalation patterns, persuasion technique effectiveness, "
             "stress responses to challenges, and which speaker demonstrated "
-            "more confidence and control."
+            "more confidence and control. "
+            "If video data is present: facial anger or contempt signals, forward lean "
+            "during challenges, head shakes, and postural dominance indicators."
         ),
         # ── Meeting ──
         "meeting": (
             "Focus on: participation balance across all speakers, decision points "
             "and consensus moments, action item indicators, engagement distribution, "
             "stress or tension moments, dominant vs passive speakers, and "
-            "overall meeting productivity indicators."
+            "overall meeting productivity indicators. "
+            "If video data is present: engagement levels per participant (gaze, posture, "
+            "head nods), disengagement signals (gaze breaks, backward lean), and "
+            "non-verbal agreement or disagreement patterns."
         ),
         # ── Presentation ──
         "presentation": (
             "Focus on: speaker clarity and confidence, persuasion effectiveness, "
             "audience engagement indicators, key message delivery moments, "
-            "pacing and energy management, and vocal conviction markers."
+            "pacing and energy management, and vocal conviction markers. "
+            "If video data is present: facial engagement, animated gestures, "
+            "upright power posture, and eye contact with audience."
         ),
         # ── Casual conversation ──
         "casual_conversation": (
             "Focus on: rapport and connection quality, engagement levels, "
             "emotional dynamics, turn-taking balance, and overall "
-            "communication chemistry between participants."
+            "communication chemistry between participants. "
+            "If video data is present: shared smiles, mirroring signals, "
+            "head nod synchrony, and facial warmth indicators."
         ),
         # ── Legacy types ──
         "client_meeting": (
             "Focus on: rapport trajectory, client satisfaction indicators, "
-            "risk flags, unspoken concerns detected through cross-modal analysis."
+            "risk flags, unspoken concerns detected through cross-modal analysis. "
+            "If video data is present: note any body language incongruence with stated satisfaction."
         ),
         "internal": (
             "Focus on: engagement distribution across participants, "
-            "contribution balance, stress patterns, and consensus indicators."
+            "contribution balance, stress patterns, and consensus indicators. "
+            "If video data is present: note engagement vs disengagement signals per speaker."
         ),
     }
 
@@ -505,10 +526,20 @@ def _build_prompt(context: str, meeting_type: str) -> tuple[str, str]:
 
     system_prompt = (
         "You are the NEXUS Behavioural Analysis System producing a post-session analysis report. "
+        "You analyse SIX modalities simultaneously: Voice (stress, tone, pace, fillers), "
+        "Language (sentiment, buying signals, objections, power), "
+        "Facial Expression (emotion, engagement, stress blendshapes), "
+        "Body Language (posture, lean, gestures, self-touch, head nods/shakes), "
+        "Gaze (screen contact, gaze breaks, blink rate), and "
+        "Conversation Dynamics (turn-taking, dominance, rapport). "
         "You produce PROBABILISTIC INDICATORS, never binary determinations. "
         "Never claim to detect deception — only flag incongruence for human review. "
         "Maximum certainty for any claim is 'likely' or 'suggests' — never 'definitely'. "
-        "Cross-modal insights (where voice and language disagree) are the most valuable findings. "
+        "Cross-modal insights are the most valuable findings — especially when voice, language, "
+        "face, body, or gaze signals DISAGREE with each other (incongruence reveals hidden state). "
+        "When VIDEO ANALYSIS data is present (facial, gaze, body), you MUST incorporate it into "
+        "the executive summary, key moments, and cross-modal insights. Do not ignore body language "
+        "or facial expression data even if voice/language data is richer. "
         "IMPORTANT: Always use real names (e.g. 'John', 'Sarah') instead of Speaker_X labels "
         "wherever a name is available from the SPEAKER NAME MAP. Only use Speaker_X when no name is known."
     )
@@ -526,7 +557,7 @@ Respond with a JSON object containing EXACTLY these fields:
     {{"time_description": "timestamp or time range", "description": "what happened", "significance": "why it matters"}}
   ],
   "cross_modal_insights": [
-    "Each insight describes a pattern that only cross-modal analysis reveals"
+    "Each insight describes a pattern that only cross-modal analysis reveals. Include body/face/gaze vs voice/language incongruence (e.g. calm face but stressed voice, nodding while saying no, forward lean but avoidant gaze). At least one insight must reference video signals if VIDEO ANALYSIS data is present."
   ],
   "recommendations": [
     "Actionable recommendations based on the analysis"

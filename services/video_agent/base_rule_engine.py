@@ -60,14 +60,28 @@ class BaseVideoRuleEngine(ABC):
         metadata: Optional[dict] = None,
     ) -> dict:
         """Create a Signal dict with confidence hard-capped at 0.85."""
+        base_meta: dict = {"rule_id": rule_id}
+        if metadata:
+            base_meta.update(metadata)
+        # Auto-inject face grid position from the current window if available.
+        # Set self._current_w = w in each rule engine's evaluate loop.
+        w = getattr(self, "_current_w", None)
+        if w is not None:
+            cx = round(getattr(w, "face_centre_x", 0.0), 3)
+            cy = round(getattr(w, "face_centre_y", 0.0), 3)
+            if cx > 0 or cy > 0:
+                base_meta.setdefault("face_centre_x", cx)
+                base_meta.setdefault("face_centre_y", cy)
+        capped_confidence = round(min(confidence, 0.85), 4)
+
         return Signal(
             agent=self.AGENT_NAME,
             speaker_id=speaker_id,
             signal_type=signal_type,
             value=round(value, 4),
             value_text=value_text,
-            confidence=round(min(confidence, 0.85), 4),
+            confidence=capped_confidence,
             window_start_ms=window_start_ms,
             window_end_ms=window_end_ms,
-            metadata={"rule_id": rule_id, **(metadata or {})},
+            metadata=base_meta,
         ).to_dict()

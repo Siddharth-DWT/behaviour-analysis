@@ -213,16 +213,19 @@ class CompoundPatternEngine:
     ) -> Optional[dict]:
         """
         High voice stress + masking fusion signals + controlled speech.
-        Classic suppression: internal arousal masked externally.
-        Voice stress is required — without it the pattern is ambiguous.
+        Classic suppression: STRONG internal arousal masked externally.
+        Raised gate to 0.60 — mild stress (0.50) + fillers is not suppression.
+        Masking signal is scored but not hard-required: in audio-only mode
+        (Voice+Language+Conversation) tone_face_masking never appears, so a
+        hard requirement would break graceful degradation (CLAUDE.md §4).
         """
-        voice_stress = _sig(signals, "vocal_stress_score", min_value=0.50)
+        voice_stress = _sig(signals, "vocal_stress_score", min_value=0.60)
         if voice_stress is None:
             return None
         # Suppression = high internal arousal (voice stress) but masked externally.
-        # tone_face_masking / stress_suppression are the fusion signals that encode this
-        # directly. facial_stress is intentionally excluded: its presence means the
-        # face IS showing stress → not suppressed.
+        # tone_face_masking / stress_suppression are the video+voice fusion signals.
+        # facial_stress is intentionally excluded: its presence means the face IS
+        # showing stress → not suppressed.
         components = {
             "voice_stress":    voice_stress,
             "masking": (
@@ -281,8 +284,17 @@ class CompoundPatternEngine:
     ) -> Optional[dict]:
         """
         High fillers + gaze breaks + slow rate + self-touch + long latency.
+        ADDED: voice stress gate — cognitive overload without vocal strain is
+        normal multitasking, not genuine overload. Prevents false positives when
+        gaze_direction_shift fires freely (e.g. during early calibration windows).
         """
+        # Gate: voice stress must be mildly elevated (overload creates vocal strain)
+        voice_stress = _sig(signals, "vocal_stress_score", min_value=0.30)
+        if voice_stress is None:
+            return None
+
         components = {
+            "voice_stress":     voice_stress,
             "filler":           _sig(signals, "filler_detection"),
             "gaze_break": (
                 _sig(signals, "gaze_direction_shift")

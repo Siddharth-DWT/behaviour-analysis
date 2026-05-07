@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgles2 \
         libegl1 \
         ffmpeg \
+        g++ \
     && ldconfig \
     && rm -rf /var/lib/apt/lists/*
 
@@ -17,6 +18,16 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Pre-download InsightFace buffalo_l model so the first analysis job
+# does not stall on a runtime download.  Model lands in /root/.insightface/
+# (outside the /app volume mount) and is baked into the image layer.
+RUN python3 -c "\
+import insightface; \
+from insightface.app import FaceAnalysis; \
+app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider']); \
+app.prepare(ctx_id=0, det_size=(640, 640)); \
+print('buffalo_l pre-download complete')"
 
 COPY . .
 
