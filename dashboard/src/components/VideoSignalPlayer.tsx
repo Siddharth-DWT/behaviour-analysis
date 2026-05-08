@@ -1,4 +1,4 @@
-import { useRef, useState, useEffect, useCallback } from "react";
+import { useRef, useState, useEffect, useCallback, useMemo } from "react";
 import { getAccessToken, getVideoSpeakers } from "../api/client";
 import type { VideoSignal, SpeakerInfo } from "../api/client";
 import { getSignalDisplay } from "../config/signalDisplayConfig";
@@ -521,9 +521,10 @@ function SpeakerGroupHeader({
   highlighted,
   onToggle,
 }: SpeakerGroupHeaderProps) {
+  const [imgFailed, setImgFailed] = useState(false);
   const token = getAccessToken();
   const info = roster[speakerLabel];
-  const thumbPath = info?.thumbnail_url
+  const thumbPath = !imgFailed && info?.thumbnail_url
     ? `/api${info.thumbnail_url}${token ? `?token=${encodeURIComponent(token)}` : ""}`
     : null;
   const initials = displayLabel
@@ -546,7 +547,7 @@ function SpeakerGroupHeader({
           src={thumbPath}
           alt={displayLabel}
           className="h-7 w-7 flex-shrink-0 rounded-full object-cover border border-gray-600"
-          onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+          onError={() => setImgFailed(true)}
         />
       ) : (
         <div className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-gray-700">
@@ -776,16 +777,43 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   //      so participants aren't listed before they join the call.
 
   const rosterLoaded = Object.keys(speakerRoster).length > 0;
-  const isGhostTrack = (spkId: string) =>
-    rosterLoaded &&
+
+  // Pre-compute total session signal count per speaker (O(n) once, O(1) lookup).
+  const sessionSignalCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const s of signals) {
+      if (s.speaker_id) counts[s.speaker_id] = (counts[s.speaker_id] || 0) + 1;
+    }
+    return counts;
+  }, [signals]);
+
+  // Pre-compute unique signal types per speaker — single-type tracks are degenerate.
+  const sessionSignalTypes = useMemo(() => {
+    const types: Record<string, Set<string>> = {};
+    for (const s of signals) {
+      if (!s.speaker_id) continue;
+      (types[s.speaker_id] ??= new Set()).add(s.signal_type);
+    }
+    return types;
+  }, [signals]);
+
+  const MIN_FACE_SIGNALS = 30;
+
+  // A Face_N is a weak track (hidden everywhere) if ANY gate fails:
+  //   1. Too few signals       → noise/fragment (brief background appearance)
+  //   2. No thumbnail          → ArcFace never got a clean crop; identity unreliable
+  //   3. Only 1 signal type    → single-detector false track (real person = varied signals)
+  const isWeakTrack = (spkId: string) =>
     /^Face_\d+$/.test(spkId) &&
-    !speakerRoster[spkId]?.thumbnail_url;
+    ((sessionSignalCounts[spkId] || 0) < MIN_FACE_SIGNALS ||
+      (rosterLoaded && !speakerRoster[spkId]?.thumbnail_url) ||
+      (sessionSignalTypes[spkId]?.size ?? 0) <= 1);
 
   const allSpeakerIds = [...new Set(signals.map((s) => s.speaker_id).filter(Boolean))] as string[];
 
   // Pass 1 — group by registry_id (only once the roster is loaded)
   const registryGroups: Record<string, string[]> = {};
-  for (const spkId of allSpeakerIds.filter((id) => !isGhostTrack(id))) {
+  for (const spkId of allSpeakerIds.filter((id) => !isWeakTrack(id))) {
     const regId = rosterLoaded ? speakerRoster[spkId]?.registry_id : undefined;
     if (regId) (registryGroups[regId] ??= []).push(spkId);
   }
@@ -803,19 +831,51 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   // Keep the ref in sync so computeActive can use it without being a dependency
   toCanonicalRef.current = toCanonical;
 
-  // Pass 3 — first appearance per canonical speaker (min across all merged tracks)
-  const canonicalFirstMs: Record<string, number> = {};
-  for (const s of signals) {
-    if (!s.speaker_id || isGhostTrack(s.speaker_id)) continue;
-    const canonId = toCanonical[s.speaker_id] ?? s.speaker_id;
-    const prev = canonicalFirstMs[canonId];
-    if (prev === undefined || s.start_ms < prev) canonicalFirstMs[canonId] = s.start_ms;
-  }
+  // Pass 3 — first REAL appearance per raw speaker ID (NOT canonical).
+  // Uses a cluster-based approach: firstSeen = earliest time where at least
+  // CLUSTER_MIN_SIGNALS signals exist within CLUSTER_WINDOW_MS.
+  // Rationale: the facial agent detects faces in small thumbnail tiles from t=0
+  // (e.g., Mirko's tile visible top-right before he joins as main speaker).
+  // Those detections have valid face_centre_x > 0 but are isolated (1-2 signals
+  // over 20+ seconds). A real presence = consistent signal stream (3+ in 10s).
+  const speakerFirstSeen = useMemo(() => {
+    const CLUSTER_WINDOW_MS = 10_000;
+    const CLUSTER_MIN_SIGNALS = 3;
+
+    // Collect valid timestamps per raw speaker ID
+    const timesBySpk: Record<string, number[]> = {};
+    for (const s of signals) {
+      const spk = s.speaker_id;
+      if (!spk || isWeakTrack(spk)) continue;
+      if (/^Face_\d+$/.test(spk) && !((s.metadata?.face_centre_x as number) > 0)) continue;
+      (timesBySpk[spk] ??= []).push(s.start_ms ?? 0);
+    }
+
+    // Sliding window O(n) per speaker: find first cluster of CLUSTER_MIN_SIGNALS
+    // signals within CLUSTER_WINDOW_MS. Falls back to raw minimum for Speaker_*.
+    const firstSeen: Record<string, number> = {};
+    for (const [spk, times] of Object.entries(timesBySpk)) {
+      times.sort((a, b) => a - b);
+      if (/^Face_\d+$/.test(spk)) {
+        let right = 0;
+        for (let left = 0; left < times.length; left++) {
+          while (right < times.length && times[right] <= times[left] + CLUSTER_WINDOW_MS) right++;
+          if (right - left >= CLUSTER_MIN_SIGNALS) {
+            firstSeen[spk] = times[left];
+            break;
+          }
+        }
+      } else {
+        firstSeen[spk] = times[0];
+      }
+    }
+    return firstSeen;
+  }, [signals, isWeakTrack]);
 
   // Seed bySpeaker with canonical speakers only, after they've appeared
   const bySpeaker: Record<string, { label: string; rawId: string; signals: VideoSignal[] }> = {};
-  for (const spkId of allSpeakerIds.filter((id) => !isGhostTrack(id) && !toCanonical[id])) {
-    const firstMs = canonicalFirstMs[spkId] ?? Infinity;
+  for (const spkId of allSpeakerIds.filter((id) => !isWeakTrack(id) && !toCanonical[id])) {
+    const firstMs = speakerFirstSeen[spkId] ?? Infinity;
     if (firstMs > currentTimeMs) continue;
     const rosterEntry = speakerRoster[spkId];
     bySpeaker[spkId] = {
@@ -827,12 +887,31 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
 
   // Inject active signals — map non-canonical tracks to their canonical entry
   for (const s of activeSignals) {
-    if (isGhostTrack(s.speaker_id || "")) continue;
+    if (isWeakTrack(s.speaker_id || "")) continue;
     const canonId = toCanonical[s.speaker_id || ""] ?? s.speaker_id ?? "";
     if (canonId && bySpeaker[canonId]) {
       bySpeaker[canonId].signals.push(s);
     }
   }
+
+  // Trailing grace window — face stays visible for 4s after its last signal ends.
+  // No look-ahead: gaps between 2-second signal windows are covered by look-behind
+  // (a signal that ended 100ms ago keeps the face visible), and look-ahead was
+  // causing faces to pre-appear before the person is visually present.
+  const recentlyActive = useMemo(() => {
+    const GRACE_BEHIND_MS = 4000;
+    const active: Record<string, boolean> = {};
+    for (const s of signals) {
+      if (!s.speaker_id) continue;
+      const start = s.start_ms ?? 0;
+      const end = s.end_ms ?? start;
+      if (end >= currentTimeMs - GRACE_BEHIND_MS && start <= currentTimeMs) {
+        const canonId = toCanonical[s.speaker_id] ?? s.speaker_id;
+        active[canonId] = true;
+      }
+    }
+    return active;
+  }, [signals, currentTimeMs, toCanonical]);
 
   const hasIncongruence = activeSignals.some((s) =>
     (s.signal_type === "head_body_incongruence"
@@ -869,6 +948,15 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                   })
                   .sort((a: VideoSignal, b: VideoSignal) => (b.confidence || 0) - (a.confidence || 0));
                 const visibleSigs = showExpanded ? prioritySigs : prioritySigs.slice(0, 3);
+                const hasThumb = !!speakerRoster[rawId]?.thumbnail_url;
+                const isFaceTrack = /^Face_\d+$/.test(rawId);
+                if (isFaceTrack) {
+                  // Face_* needs thumbnail + signal within ±4s grace window
+                  if (!hasThumb || !recentlyActive[rawId]) return null;
+                } else {
+                  // Speaker_* needs only active signals at current moment
+                  if (visibleSigs.length === 0) return null;
+                }
                 return (
                   <div key={speakerId} className="flex flex-col gap-1">
                     {Object.keys(bySpeaker).length > 1 && (
@@ -907,9 +995,6 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                         </div>
                       );
                     })}
-                    {visibleSigs.length === 0 && (
-                      <span className="px-2 text-[9px] text-white/20">listening</span>
-                    )}
                   </div>
                 );
               })}

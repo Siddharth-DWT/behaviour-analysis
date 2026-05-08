@@ -1471,182 +1471,47 @@ async def _run_pipeline(
     if vid_signals:
         video_signals = vid_signals
 
-        # ── Merge Face_* IDs by ArcFace embedding similarity ────────────────
-        # The video agent performs identity-based merge at the track level
-        # (rewriting face_index before WindowAggregator runs). This gateway-level
-        # merge is a safety net for edge cases where the video agent's merge
-        # could not fire (ArcFace extraction failed for one track, or signals
-        # arrived from an older agent build).
-        #
-        # Speaker_* are IMMOVABLE — voice diarization confirmed they are distinct
-        # people. Face_* merge into the nearest canonical owner by cosine
-        # similarity > 0.70. A Face_* that matches a Speaker_* is the same
-        # physical person whose face was tracked under a separate CentroidTracker
-        # ID (common when screen share toggled or grid rearranged).
-        #
-        # This replaces the old position-based merge (grid distance < 0.10)
-        # which failed whenever the video layout changed.
-        if face_embeddings_from_video:
-            def _dot(a: list, b: list) -> float:
-                return sum(x * y for x, y in zip(a, b))
+        # Identity resolution is fully handled by the video agent (ArcFace merge +
+        # position fallback). The gateway trusts the face_index values as-is.
+        face_ids_received = {
+            s.get("speaker_id", "")
+            for s in video_signals
+            if s.get("speaker_id", "").startswith("Face_")
+        }
+        logger.info(
+            f"[{session_id}] Video signals received: {len(face_ids_received)} "
+            f"Face_* IDs: {sorted(face_ids_received)}"
+        )
 
-            face_ids_before_merge = {
-                s.get("speaker_id", "")
-                for s in video_signals
-                if s.get("speaker_id", "").startswith("Face_")
-            }
-            logger.info(
-                f"[{session_id}] Before embed merge: {len(face_ids_before_merge)} "
-                f"Face_* IDs: {sorted(face_ids_before_merge)}"
-            )
-
-            canonical: dict[str, str] = {}
-            canon_embs: dict[str, list] = {}
-
-            # Step 1: register Speaker_* as immovable canonical owners.
-            for label in sorted(face_embeddings_from_video.keys()):
-                if label.startswith("Speaker_"):
-                    canonical[label] = label
-                    emb = face_embeddings_from_video[label].get("embedding")
-                    if emb:
-                        canon_embs[label] = emb
-
-            # Step 2: merge Face_* by embedding similarity.
-            for face_label in sorted(face_embeddings_from_video.keys()):
-                if not face_label.startswith("Face_"):
-                    continue
-                emb_data = face_embeddings_from_video[face_label].get("embedding")
-                if not emb_data:
-                    canonical[face_label] = face_label
-                    continue
-                matched_canon = None
-                best_sim = 0.0
-                for canon_id, canon_emb in canon_embs.items():
-                    sim = _dot(emb_data, canon_emb)
-                    if sim > 0.80 and sim > best_sim:
-                        best_sim = sim
-                        matched_canon = canon_id
-                if matched_canon:
-                    canonical[face_label] = matched_canon
-                    logger.debug(
-                        f"[{session_id}] Embedding merge: {face_label} → "
-                        f"{matched_canon} (sim={best_sim:.3f})"
-                    )
-                else:
-                    canonical[face_label] = face_label
-                    canon_embs[face_label] = emb_data
-
-            merged_count = 0
-            for sig in video_signals:
-                spk = sig.get("speaker_id", "")
-                if spk in canonical and canonical[spk] != spk:
-                    sig["speaker_id"] = canonical[spk]
-                    merged_count += 1
-
-            total_ids = len([k for k in face_embeddings_from_video
-                             if k.startswith("Face_") or k.startswith("Speaker_")])
-            unique_ids = len(set(canonical.values()))
-            if merged_count:
-                logger.info(
-                    f"[{session_id}] Embedding merge: {total_ids} IDs → "
-                    f"{unique_ids} canonical ({merged_count} signals rewritten)"
-                )
-            else:
-                logger.info(
-                    f"[{session_id}] Embedding merge: {total_ids} IDs — all unique"
-                )
-
-            # Debug: report which Face_* IDs survived the embedding merge
-            remaining_face_ids_after_merge = {
-                s.get("speaker_id", "")
-                for s in video_signals
-                if s.get("speaker_id", "").startswith("Face_")
-            }
-            logger.info(
-                f"[{session_id}] After embed merge: {len(remaining_face_ids_after_merge)} "
-                f"Face_* IDs remain: {sorted(remaining_face_ids_after_merge)}"
-            )
-
-        # ── Pass 2: Position fallback for Face_* without embeddings ──────────────
-        # ArcFace fails on small grid faces (~150px). These Face_* IDs were
-        # skipped by the embedding merge above. Fall back to grid-position
-        # proximity (distance < 0.10 normalised) so they get consolidated
-        # into canonical owners or into each other.
-        # Speaker_* are still immovable — this only touches Face_* IDs.
-        already_handled = set(canonical.keys()) if face_embeddings_from_video else set()
-        remaining_faces: dict[str, tuple[float, float]] = {}
+        # ── Filter Face_* speakers with too few signals ───────────────────────
+        # A Face_* with < MIN_FACE_SIGNALS total signals across the session is:
+        #   - A background person too far from camera for meaningful analysis
+        #   - A brief appearance the frame-level filter in the video agent missed
+        #   - Intermittent detection noise (e.g. face every 30s for 1 frame)
+        # Remove their signals before persisting so they don't clutter the sidebar.
+        # Speaker_* are never filtered — they have confirmed voice identity.
+        MIN_FACE_SIGNALS = 10
+        face_signal_counts: dict[str, int] = {}
         for sig in video_signals:
             spk = sig.get("speaker_id", "")
-            if not spk.startswith("Face_") or spk in already_handled:
-                continue
-            meta = sig.get("metadata") or {}
-            if isinstance(meta, str):
-                import json as _json2
-                try:
-                    meta = _json2.loads(meta)
-                except Exception:
-                    meta = {}
-            cx = float(meta.get("face_centre_x", 0))
-            cy = float(meta.get("face_centre_y", 0))
-            if (cx > 0 or cy > 0) and spk not in remaining_faces:
-                remaining_faces[spk] = (cx, cy)
+            if spk.startswith("Face_"):
+                face_signal_counts[spk] = face_signal_counts.get(spk, 0) + 1
 
-        if remaining_faces:
-            # Collect positions for existing canonical owners
-            canon_positions: dict[str, tuple[float, float]] = {}
-            for sig in video_signals:
-                spk = sig.get("speaker_id", "")
-                if spk.startswith("Speaker_") or spk in already_handled:
-                    meta = sig.get("metadata") or {}
-                    if isinstance(meta, str):
-                        try:
-                            meta = _json2.loads(meta)
-                        except Exception:
-                            meta = {}
-                    cx = float(meta.get("face_centre_x", 0))
-                    cy = float(meta.get("face_centre_y", 0))
-                    if cx > 0 and spk not in canon_positions:
-                        canon_positions[spk] = (cx, cy)
-
-            pos_canonical: dict[str, str] = {}
-            for face_id in sorted(remaining_faces, key=lambda x: int(x.split("_")[1])):
-                fx, fy = remaining_faces[face_id]
-                matched = None
-                best_dist = float("inf")
-
-                for cid, (cx, cy) in canon_positions.items():
-                    d = ((fx - cx) ** 2 + (fy - cy) ** 2) ** 0.5
-                    if d < 0.10 and d < best_dist:
-                        best_dist = d
-                        matched = cid
-
-                if not matched:
-                    for other_id, canon_target in pos_canonical.items():
-                        if canon_target in canon_positions:
-                            ox, oy = canon_positions[canon_target]
-                            d = ((fx - ox) ** 2 + (fy - oy) ** 2) ** 0.5
-                            if d < 0.10 and d < best_dist:
-                                best_dist = d
-                                matched = canon_target
-
-                if matched:
-                    pos_canonical[face_id] = matched
-                else:
-                    pos_canonical[face_id] = face_id
-                    canon_positions[face_id] = (fx, fy)
-
-            pos_merged_count = 0
-            for sig in video_signals:
-                spk = sig.get("speaker_id", "")
-                if spk in pos_canonical and pos_canonical[spk] != spk:
-                    sig["speaker_id"] = pos_canonical[spk]
-                    pos_merged_count += 1
-            if pos_merged_count:
-                unique_remaining = len(set(pos_canonical.values()))
-                logger.info(
-                    f"[{session_id}] Position fallback: {len(remaining_faces)} Face_* "
-                    f"→ {unique_remaining} canonical ({pos_merged_count} signals rewritten)"
-                )
+        weak_faces: set[str] = {
+            fid for fid, cnt in face_signal_counts.items()
+            if cnt < MIN_FACE_SIGNALS
+        }
+        if weak_faces:
+            before = len(video_signals)
+            video_signals = [
+                s for s in video_signals
+                if s.get("speaker_id", "") not in weak_faces
+            ]
+            logger.info(
+                f"[{session_id}] Filtered {len(weak_faces)} weak Face_* "
+                f"(< {MIN_FACE_SIGNALS} signals): {sorted(weak_faces)} — "
+                f"removed {before - len(video_signals)} signals"
+            )
 
         # Speaker_* keys are already in speaker_map — only Face_* canonical IDs
         # that are not already matched need new DB entries.
@@ -1661,7 +1526,7 @@ async def _run_pipeline(
                 {"speaker_id": face_id} for face_id in unmatched_face_ids
             ])
             video_speaker_map.update(new_face_speakers)
-        await _persist_agent_signals(session_id, video_signals, video_speaker_map, "video")
+        # Signals persisted AFTER registry matching below — see end of vid_signals block
 
     # ── Speaker registry: fused face + voice identity matching ───────────────
     # Runs here (after gather) so both voice embeddings AND face embeddings are
@@ -1730,6 +1595,36 @@ async def _run_pipeline(
                 logger.warning(
                     f"[{session_id}] Non-speaking face registry failed (non-fatal): {e}"
                 )
+
+    # ── Persist video signals (after registry so unregistered faces are excluded) ──
+    # Registry matching (fused + face-only + non-speaking) is now complete.
+    # Any Face_* not in speaker_identity_map has no ArcFace embedding — MediaPipe
+    # tracked it but couldn't identify it (too small, occluded, background face).
+    # Filter those out before writing to DB so they never appear in the UI or reports.
+    if vid_signals:
+        registered_face_labels: set[str] = {
+            label for label in speaker_identity_map
+            if label.startswith("Face_")
+        }
+        all_face_labels_in_signals: set[str] = {
+            s.get("speaker_id", "")
+            for s in video_signals
+            if s.get("speaker_id", "").startswith("Face_")
+        }
+        unregistered_faces = all_face_labels_in_signals - registered_face_labels
+        if unregistered_faces:
+            before = len(video_signals)
+            video_signals = [
+                s for s in video_signals
+                if s.get("speaker_id", "") not in unregistered_faces
+            ]
+            logger.info(
+                f"[{session_id}] Excluded {len(unregistered_faces)} unregistered "
+                f"Face_* (no registry entry, signals not persisted): "
+                f"{sorted(unregistered_faces)} — "
+                f"dropped {before - len(video_signals)} signals"
+            )
+        await _persist_agent_signals(session_id, video_signals, video_speaker_map, "video")
 
     # ── Post display names to video agent for burned-in overlay ──────────────
     # The burn phase waits 15s after signals_ready before starting, giving us
@@ -1851,6 +1746,45 @@ async def _run_pipeline(
         graph_analytics=graph_analytics,
         conversation_summary=conversation_summary,
     )
+
+    # ── Completion notification email (behavioural analysis only) ────────────
+    # Lightweight sessions (transcription/diarization/entity-only) finish in
+    # seconds — user is still on the page, no email needed.
+    # Full behavioural analysis takes 5-30+ minutes — user may have closed
+    # the browser, so notify them via email that results are ready.
+    if run_behavioural and user_email:
+        try:
+            from email_service import send_processing_complete_email, is_email_configured
+            if is_email_configured():
+                _user_name = "there"
+                try:
+                    _pool = await get_pool()
+                    _user_row = await _pool.fetchrow(
+                        "SELECT full_name FROM users WHERE email = $1", user_email
+                    )
+                    if _user_row and _user_row["full_name"]:
+                        _user_name = _user_row["full_name"]
+                except Exception:
+                    pass
+
+                await send_processing_complete_email(
+                    to_email=user_email,
+                    to_name=_user_name,
+                    session_id=session_id,
+                    session_title=title,
+                    meeting_type=meeting_type,
+                    status=final_status,
+                    signal_counts={
+                        "voice":        len(voice_signals),
+                        "language":     len(language_signals),
+                        "conversation": len(conversation_signals),
+                        "video":        len(video_signals),
+                        "fusion":       len(fusion_signals),
+                    },
+                    duration_seconds=duration_seconds,
+                )
+        except Exception as e:
+            logger.warning(f"[{session_id}] Completion email failed (non-fatal): {e}")
 
     # Cleanup old recordings in background
     _cleanup_old_recordings()
@@ -2304,6 +2238,16 @@ async def get_video_signals(
             "agent":        r["agent"] or "",
             "metadata":     meta,
         })
+
+    # Filter session-spanning temporal/fusion signals before building the overlay.
+    # Temporal patterns (adaptation, fatigue, behavioral_shift) emit analytical
+    # summaries whose window spans the full session — they break computeActive by
+    # appearing active at every playback position. Cap at 120 s, same gate as
+    # _should_display_signal applies to /sessions/{id}/signals.
+    signals = [
+        s for s in signals
+        if (s["end_ms"] - s["start_ms"]) <= 120_000
+    ]
 
     # Build speaker → grid_position map from video signals (face coords present)
     # Used to enrich temporal/fusion signals that have no face_centre_x/y.

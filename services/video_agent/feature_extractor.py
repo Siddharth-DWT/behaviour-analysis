@@ -2343,7 +2343,9 @@ class VideoFeatureExtractor:
 
         centroid_tracker = CentroidTracker(
             max_disappeared=90,   # ~18s at 5fps — faces in calls don't physically leave
-            match_threshold=0.20, # wide enough to survive head turns and fast leans
+            match_threshold=0.15, # compromise: tight enough to avoid cross-tile matches
+                                  # in 7-person grids (0.33 apart), wide enough to
+                                  # survive head turns. ArcFace merge fixes the rest.
         )
 
         # Cache last MediaPipe results — reused for overlay on non-sampled frames
@@ -2507,39 +2509,35 @@ class VideoFeatureExtractor:
                 f"from {len(best_frame_info)} tracked identities"
             )
 
-        # ── Filter transient face tracks before identity merge ─────────────────
-        # Tracks with very few frames are avatar images in shared screen content
-        # or momentary false-positive detections — discard before running ArcFace.
-        MIN_FRAMES_FOR_IDENTITY = 3  # at 5 fps this is 0.6 seconds of detection
+        # ── Identity-based track deduplication via ArcFace ────────────────────
+        # Run ArcFace on ALL tracks including short 1-2 frame ones.
+        # A 1-frame track during a head turn IS the same person as Face_0 for
+        # 200 frames — it deserves identity matching, not silent discard.
+        # The old MIN_FRAMES filter before ArcFace caused those short tracks to
+        # become orphaned Face_N IDs that never merged.
+        #
+        # Order of operations:
+        #   1. ArcFace embed + adaptive threshold merge (all tracks)
+        #   2. Position fallback for tracks where ArcFace extraction failed
+        #   3. Remove true transients AFTER all merging:
+        #      any track with < 10 frames (2s at 5fps), regardless of embedding
+        self._cached_embeddings: dict[int, tuple[list[float], bytes]] = {}
+
+        # Frame counts per track — dominant tracks anchor the merge
         frame_counts: dict[int, int] = {}
         for ff in frames:
             if ff.face_detected:
                 frame_counts[ff.face_index] = frame_counts.get(ff.face_index, 0) + 1
 
-        transient = [tid for tid, cnt in frame_counts.items()
-                     if cnt < MIN_FRAMES_FOR_IDENTITY]
-        if transient:
-            transient_set = set(transient)
-            self._best_face_crops = {
-                tid: crop for tid, crop in self._best_face_crops.items()
-                if tid not in transient_set
-            }
-            before_count = len(frames)
-            frames = [ff for ff in frames if ff.face_index not in transient_set]
-            logger.info(
-                f"Filtered {len(transient_set)} transient tracks "
-                f"(< {MIN_FRAMES_FOR_IDENTITY} frames): {transient} — "
-                f"removed {before_count - len(frames)} ghost frames from pipeline"
-            )
+        # Face size + duration: computed once, used by merge threshold AND
+        # position fallback threshold selection below.
+        face_areas = [
+            ff.face_box_area for ff in frames
+            if ff.face_detected and ff.face_box_area > 0.001
+        ]
+        avg_face_h = float(np.mean([a ** 0.5 for a in face_areas])) if face_areas else 0.10
+        duration_s = max((ff.timestamp_ms for ff in frames), default=60000) / 1000.0
 
-        # ── Identity-based track deduplication via ArcFace ────────────────────
-        # CentroidTracker gives stable IDs within stable layouts but creates
-        # duplicate IDs on layout changes (screen share, grid rearrange, spotlight).
-        # ArcFace embeddings are layout-invariant — rewrite face_index here so
-        # WindowAggregator merges the same physical person into one stream.
-        # Results are cached in self._cached_embeddings for reuse in run_analysis
-        # Step 5, avoiding a second ArcFace pass.
-        self._cached_embeddings: dict[int, tuple[list[float], bytes]] = {}
         if self._best_face_crops and len(self._best_face_crops) > 1:
             try:
                 embedder = FaceEmbeddingExtractor.get_instance()
@@ -2552,17 +2550,17 @@ class VideoFeatureExtractor:
                             tid: np.array(emb_list)
                             for tid, (emb_list, _) in emb_results.items()
                         }
-                        face_areas = [
-                            ff.face_box_area for ff in frames
-                            if ff.face_detected and ff.face_box_area > 0.001
-                        ]
-                        avg_face_h = float(np.mean([a ** 0.5 for a in face_areas])) if face_areas else 0.10
-                        duration_s = max((ff.timestamp_ms for ff in frames), default=60000) / 1000.0
-                        merge_threshold = self._compute_merge_threshold(duration_s, avg_face_h)
+
+                        merge_threshold = self._compute_merge_threshold(
+                            duration_s, avg_face_h
+                        )
                         logger.info(
                             f"Adaptive merge threshold: {merge_threshold:.3f} "
-                            f"(duration={duration_s:.0f}s, avg_face_h={avg_face_h:.3f})"
+                            f"(duration={duration_s:.0f}s, avg_face_h={avg_face_h:.3f}, "
+                            f"tracks_with_emb={len(track_embs)}, "
+                            f"total_tracks={len(self._best_face_crops)})"
                         )
+
                         canonical = self._merge_tracks_by_embedding(
                             track_embs,
                             threshold=merge_threshold,
@@ -2571,60 +2569,10 @@ class VideoFeatureExtractor:
                         merges = {k: v for k, v in canonical.items() if k != v}
 
                         if merges:
+                            # Rewrite face_index on all frames
                             for ff in frames:
                                 if ff.face_index in canonical:
                                     ff.face_index = canonical[ff.face_index]
-
-                            # Extend mapping to transient/unprocessed tracks via
-                            # nearest-canonical-centroid assignment.  These tracks
-                            # were filtered before ArcFace so they are absent from
-                            # `canonical`, but their frames still appear in the
-                            # windows that SpeakerFaceMapper processes.  Without
-                            # this pass, lip-sync can assign Speaker_N to a
-                            # transient track while the canonical track (same
-                            # physical person, many more frames) gets Face_N.
-                            canonical_ids = set(canonical.values())
-                            canon_pts: dict[int, list[tuple[float, float]]] = {
-                                cid: [] for cid in canonical_ids
-                            }
-                            for ff in frames:
-                                if ff.face_detected and ff.face_index in canonical_ids:
-                                    canon_pts[ff.face_index].append(
-                                        (ff.face_centre_x, ff.face_centre_y)
-                                    )
-                            canonical_centroids: dict[int, tuple[float, float]] = {
-                                cid: (
-                                    float(np.mean([p[0] for p in pts])),
-                                    float(np.mean([p[1] for p in pts])),
-                                )
-                                for cid, pts in canon_pts.items() if pts
-                            }
-                            # Max distance for same-person transient reassignment.
-                            # In a 7-person grid, adjacent cells are ~0.33 apart.
-                            # Same-person transients sit < 0.05 from their canonical;
-                            # different people at other grid positions sit > 0.25 away.
-                            # 0.15 catches transients while leaving distinct faces alone.
-                            _MAX_TRANSIENT_DIST = 0.15
-                            if canonical_centroids:
-                                for ff in frames:
-                                    if ff.face_index not in canonical_ids and ff.face_detected:
-                                        cx, cy = ff.face_centre_x, ff.face_centre_y
-                                        nearest = min(
-                                            canonical_centroids,
-                                            key=lambda tid: (
-                                                (cx - canonical_centroids[tid][0]) ** 2
-                                                + (cy - canonical_centroids[tid][1]) ** 2
-                                            ),
-                                        )
-                                        dist = (
-                                            (cx - canonical_centroids[nearest][0]) ** 2
-                                            + (cy - canonical_centroids[nearest][1]) ** 2
-                                        ) ** 0.5
-                                        if dist < _MAX_TRANSIENT_DIST:
-                                            ff.face_index = nearest
-                                        # else: different person at a different grid
-                                        # position — keep original track ID so they
-                                        # become their own Face_N canonical.
 
                             # Keep only canonical crops; prefer the larger crop
                             merged_crops: dict[int, np.ndarray] = {}
@@ -2635,26 +2583,134 @@ class VideoFeatureExtractor:
                                     merged_crops[canon_tid] = crop
                             self._best_face_crops = merged_crops
 
-                            # Rebuild cached embeddings after merge
-                            self._cached_embeddings = embedder.extract_from_crops(
-                                self._best_face_crops
+                            # Update cached embeddings to canonical only
+                            # (no second ArcFace pass — reuse extraction results)
+                            merged_embs: dict[int, tuple[list[float], bytes]] = {}
+                            for tid, data in self._cached_embeddings.items():
+                                canon_tid = canonical.get(tid, tid)
+                                if canon_tid not in merged_embs:
+                                    merged_embs[canon_tid] = data
+                            self._cached_embeddings = merged_embs
+
+                        unique_count = len(set(canonical.values()))
+                        logger.info(
+                            f"Identity merge: {len(track_embs)} embedded tracks "
+                            f"→ {unique_count} unique people "
+                            f"(merged {len(merges)} tracks)"
+                        )
+
+                    # ── Position fallback for tracks where ArcFace failed ─────
+                    # Some tracks have crops but ArcFace couldn't extract an
+                    # embedding (face too small, too blurry, partially occluded).
+                    # Assign them to the nearest canonical track by centroid so
+                    # they merge into their real owner rather than float as
+                    # orphaned Face_N IDs.
+                    tracks_without_emb = (
+                        set(self._best_face_crops.keys())
+                        - set(self._cached_embeddings.keys())
+                    )
+                    if tracks_without_emb and self._cached_embeddings:
+                        # Build centroid per canonical (embedded) track
+                        canon_sum: dict[int, list[float]] = {}
+                        canon_cnt: dict[int, int] = {}
+                        for ff in frames:
+                            if not ff.face_detected:
+                                continue
+                            tid = ff.face_index
+                            if tid not in self._cached_embeddings:
+                                continue
+                            if tid not in canon_sum:
+                                canon_sum[tid] = [0.0, 0.0]
+                                canon_cnt[tid] = 0
+                            canon_sum[tid][0] += ff.face_centre_x
+                            canon_sum[tid][1] += ff.face_centre_y
+                            canon_cnt[tid] += 1
+                        canon_centroids: dict[int, tuple[float, float]] = {
+                            tid: (canon_sum[tid][0] / canon_cnt[tid],
+                                  canon_sum[tid][1] / canon_cnt[tid])
+                            for tid in canon_sum
+                        }
+
+                        # Grid calls: adjacent tiles ~0.33 apart → threshold 0.15
+                        # Conference rooms: adjacent people ~0.10-0.20 → threshold 0.08
+                        pos_threshold = 0.08 if avg_face_h <= 0.20 else 0.15
+
+                        pos_merges = 0
+                        for no_emb_tid in tracks_without_emb:
+                            no_emb_frames = [
+                                ff for ff in frames
+                                if ff.face_index == no_emb_tid and ff.face_detected
+                            ]
+                            if not no_emb_frames:
+                                continue
+                            ncx = sum(f.face_centre_x for f in no_emb_frames) / len(no_emb_frames)
+                            ncy = sum(f.face_centre_y for f in no_emb_frames) / len(no_emb_frames)
+
+                            best_canon = min(
+                                canon_centroids,
+                                key=lambda cid: (
+                                    (ncx - canon_centroids[cid][0]) ** 2
+                                    + (ncy - canon_centroids[cid][1]) ** 2
+                                ),
+                                default=None,
+                            )
+                            if best_canon is None:
+                                continue
+                            dist = (
+                                (ncx - canon_centroids[best_canon][0]) ** 2
+                                + (ncy - canon_centroids[best_canon][1]) ** 2
+                            ) ** 0.5
+                            if dist < pos_threshold:
+                                for ff in frames:
+                                    if ff.face_index == no_emb_tid:
+                                        ff.face_index = best_canon
+                                pos_merges += 1
+
+                        if pos_merges:
+                            logger.info(
+                                f"Position fallback: {pos_merges}/{len(tracks_without_emb)} "
+                                f"non-embedded tracks assigned to canonical owners"
                             )
 
-                            unique_count = len(set(canonical.values()))
-                            logger.info(
-                                f"Identity merge: {len(track_embs)} tracks → "
-                                f"{unique_count} unique people (merged: {merges})"
-                            )
-                        else:
-                            logger.info(
-                                f"Identity merge: {len(emb_results)} tracks — "
-                                f"all unique (no merges needed)"
-                            )
             except Exception as exc:
                 logger.warning(
-                    f"Identity-based track merge failed (non-fatal, "
-                    f"position-based IDs preserved): {exc}"
+                    f"Identity merge failed (non-fatal): {exc}"
                 )
+
+        # ── Remove true transient tracks ──────────────────────────────────────
+        # After ALL merging (embedding + position), remove any track that has
+        # fewer than MIN_FRAMES_AFTER_MERGE frames. A track this brief does not
+        # have enough data for reliable behavioural analysis regardless of whether
+        # ArcFace extracted a crop — embeddings from 1-2 frames are unreliable
+        # (person mid-turn, partially occluded). The old embedding-exemption
+        # was the root cause of ghost faces reaching signal emission.
+        # At 5 fps, 10 frames = 2 seconds = minimum for one complete window.
+        MIN_FRAMES_AFTER_MERGE = 10
+        final_counts: dict[int, int] = {}
+        for ff in frames:
+            if ff.face_detected:
+                final_counts[ff.face_index] = final_counts.get(ff.face_index, 0) + 1
+
+        true_transients = {
+            tid for tid, cnt in final_counts.items()
+            if cnt < MIN_FRAMES_AFTER_MERGE
+        }
+        if true_transients:
+            before = len(frames)
+            frames = [ff for ff in frames if ff.face_index not in true_transients]
+            self._best_face_crops = {
+                tid: crop for tid, crop in self._best_face_crops.items()
+                if tid not in true_transients
+            }
+            self._cached_embeddings = {
+                tid: data for tid, data in self._cached_embeddings.items()
+                if tid not in true_transients
+            }
+            logger.info(
+                f"Removed {len(true_transients)} transient tracks "
+                f"(< {MIN_FRAMES_AFTER_MERGE} frames): "
+                f"{sorted(true_transients)} — dropped {before - len(frames)} frames"
+            )
 
         return frames
 
@@ -3500,13 +3556,19 @@ class VideoFeatureExtractor:
         Adaptive ArcFace cosine-similarity threshold for track deduplication.
 
         avg_face_height_ratio = mean sqrt(face_box_area) across detected frames.
-          > 0.20  → grid / video-call  (large faces filling boxes)
-          ≤ 0.20  → in-person room     (small faces around a table)
+          > 0.20  → grid / video-call    (large faces filling tiles)
+          ≤ 0.20  → conference room      (small faces, many angles, people lean/turn)
 
-        Grid calls:  different-person ceiling ≈ 0.25–0.30, floor = 0.42.
-        In-person:   different-person ceiling ≈ 0.40–0.42, floor = 0.48.
-        Longer videos accumulate more track fragments so same-person scores drop;
-        decay reduces the threshold to catch those lower-scoring pairs.
+        Grid calls:
+          - High-quality frontal embeddings → scores 0.70+
+          - Base 0.50-0.65, decay 0.012/min, floor 0.42
+
+        Conference rooms:
+          - Small faces, profile angles, variable lighting → same-person 0.40-0.65
+          - Base 0.50, decay 0.008/min (more variation in longer rooms)
+          - Floor 0.40 — same-person pairs at extreme angles score as low as 0.40;
+            different-person pairs typically score < 0.35 in conference conditions.
+            (floor was 0.48 — too strict, left too many fragments unmerged)
         """
         duration_min = duration_s / 60.0
         if avg_face_height_ratio > 0.20:
@@ -3514,9 +3576,9 @@ class VideoFeatureExtractor:
             decay = duration_min * 0.012
             floor = 0.42
         else:
-            base  = 0.58
-            decay = duration_min * 0.005
-            floor = 0.48
+            base  = 0.50
+            decay = duration_min * 0.008
+            floor = 0.40
         return round(max(floor, base - decay), 3)
 
     @staticmethod

@@ -111,6 +111,26 @@ class TemporalPatternEngine:
         if session_end_ms - session_start_ms < 60_000:
             return []  # need at least 60s for temporal patterns
 
+        if not all_signals:
+            return []
+
+        # Use the speaker's actual active range, not the full session bounds.
+        # A speaker who joins at 2:00 gets temporal signals spanning 2:00→end,
+        # not 0:00→end — so at playback 0:10 they correctly don't appear.
+        # Falls back to session bounds per-signal when the field is absent.
+        speaker_start = min(
+            int(s.get("window_start_ms") or session_start_ms) for s in all_signals
+        )
+        speaker_end = max(
+            int(s.get("window_end_ms") or session_end_ms) for s in all_signals
+        )
+
+        if speaker_end - speaker_start < 60_000:
+            return []  # speaker present for < 60 s — no meaningful trend
+
+        ss = speaker_start
+        se = speaker_end
+
         patterns = [
             self._t01_stress_trajectory,
             self._t02_engagement_decay,
@@ -124,7 +144,7 @@ class TemporalPatternEngine:
 
         results: list[dict] = []
         for fn in patterns:
-            result = fn(speaker_id, all_signals, session_start_ms, session_end_ms)
+            result = fn(speaker_id, all_signals, ss, se)
             if result:
                 results.append(result)
 
