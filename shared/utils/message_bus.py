@@ -1,28 +1,13 @@
-"""
-NEXUS Message Bus - Redis Streams wrapper for inter-agent communication.
-
-Every agent publishes signals to its own stream and subscribes to other agents' streams.
-The FUSION Agent subscribes to ALL streams.
-
-Stream naming: nexus:stream:{agent}:{session_id}
-Message format: {
-    "agent": "voice",
-    "speaker_id": "uuid",
-    "signal_type": "stress_score",
-    "value": "0.67",
-    "value_text": "",
-    "confidence": "0.55",
-    "window_start_ms": "1710500420000",
-    "window_end_ms": "1710500425000",
-    "metadata": "{}"  # JSON string
-}
-"""
+"""NEXUS message bus backed by the shared Redis coordination layer."""
 import json
-import time
 from typing import Optional
 import redis.asyncio as aioredis
 
 from shared.config.settings import config
+from shared.redis_layer.client import RedisClientFactory
+from shared.redis_layer.keys import RedisKeys
+from shared.redis_layer.repository import RedisRepository
+from shared.redis_layer.schemas import SignalRecord
 
 
 class MessageBus:
@@ -30,14 +15,12 @@ class MessageBus:
     
     def __init__(self):
         self._redis: Optional[aioredis.Redis] = None
+        self._repository = RedisRepository(stream_maxlen=config.max_stream_length)
     
     async def connect(self):
         """Establish connection to Redis/Valkey."""
         if self._redis is None:
-            self._redis = aioredis.from_url(
-                config.redis_url,
-                decode_responses=True
-            )
+            self._redis = RedisClientFactory.get_async_client()
         return self._redis
     
     async def disconnect(self):
@@ -59,34 +42,19 @@ class MessageBus:
         window_end_ms: int = 0,
         metadata: dict = None
     ) -> str:
-        """
-        Publish a signal to the agent's stream.
-        Returns the stream message ID.
-        """
-        r = await self.connect()
-        stream_name = config.stream_name(agent, session_id)
-        
-        message = {
-            "agent": agent,
-            "speaker_id": speaker_id,
-            "signal_type": signal_type,
-            "value": str(value) if value is not None else "",
-            "value_text": value_text,
-            "confidence": str(confidence),
-            "window_start_ms": str(window_start_ms),
-            "window_end_ms": str(window_end_ms),
-            "timestamp": str(int(time.time() * 1000)),
-            "metadata": json.dumps(metadata or {})
-        }
-        
-        msg_id = await r.xadd(
-            stream_name, 
-            message,
-            maxlen=config.max_stream_length,
-            approximate=True
+        signal = SignalRecord(
+            session_id=session_id,
+            agent=agent,
+            speaker_id=speaker_id,
+            signal_type=signal_type,
+            value=value,
+            value_text=value_text,
+            confidence=confidence,
+            window_start_ms=window_start_ms,
+            window_end_ms=window_end_ms,
+            metadata=metadata or {},
         )
-        
-        return msg_id
+        return await self._repository.publish_signal(signal)
     
     async def subscribe(
         self,
@@ -113,7 +81,7 @@ class MessageBus:
         
         streams = {}
         for agent in agents:
-            stream_name = config.stream_name(agent, session_id)
+            stream_name = RedisKeys.signal_stream(session_id, agent)
             last_id = (last_ids or {}).get(stream_name, "$")
             streams[stream_name] = last_id
         
@@ -127,7 +95,7 @@ class MessageBus:
         if result:
             for stream_name, messages in result:
                 parsed[stream_name] = [
-                    {"id": msg_id, **fields}
+                    SignalRecord.from_stream_fields({"id": msg_id, **fields}).model_dump()
                     for msg_id, fields in messages
                 ]
         
@@ -144,21 +112,12 @@ class MessageBus:
         Get the most recent signals from an agent's stream.
         Useful for FUSION Agent to get current state without subscribing.
         """
-        r = await self.connect()
-        stream_name = config.stream_name(agent, session_id)
-        
-        # XREVRANGE returns newest first
-        messages = await r.xrevrange(stream_name, count=count)
-        
+        messages = await self._repository.read_latest_signals(session_id, agent, count=count)
         results = []
-        for msg_id, fields in messages:
+        for fields in messages:
             if signal_type and fields.get("signal_type") != signal_type:
                 continue
-            fields["id"] = msg_id
-            if fields.get("metadata"):
-                fields["metadata"] = json.loads(fields["metadata"])
             results.append(fields)
-        
         return results
     
     async def publish_alert(
@@ -172,20 +131,17 @@ class MessageBus:
         evidence: dict = None
     ) -> str:
         """Publish an alert to the alerts stream."""
-        r = await self.connect()
-        stream_name = f"nexus:alerts:{session_id}"
-        
-        message = {
-            "speaker_id": speaker_id,
-            "alert_type": alert_type,
-            "severity": severity,
-            "title": title,
-            "description": description,
-            "evidence": json.dumps(evidence or {}),
-            "timestamp": str(int(time.time() * 1000))
-        }
-        
-        return await r.xadd(stream_name, message, maxlen=1000)
+        return await self._repository.publish_alert(
+            session_id,
+            {
+                "speaker_id": speaker_id,
+                "alert_type": alert_type,
+                "severity": severity,
+                "title": title,
+                "description": description,
+                "evidence": evidence or {},
+            },
+        )
 
 
 # Singleton message bus instance

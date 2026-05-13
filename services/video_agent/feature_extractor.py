@@ -37,6 +37,7 @@ logger = logging.getLogger("nexus.video.features")
 # ─── Processing constants ──────────────────────────────────────────────────
 TARGET_FPS: int = 5
 WINDOW_MS: int = 2000
+MIN_LIP_SYNC_LINK_SCORE: float = 0.02
 
 # Blink detection (Soukupova & Cech 2016)
 BLINK_EAR_THRESHOLD: float = 0.20
@@ -409,6 +410,12 @@ class WindowAggregator:
                     wf.face_centre_x = sum(cx) / len(cx)
                 if cy:
                     wf.face_centre_y = sum(cy) / len(cy)
+                areas = [f.face_box_area for f in window_frames if f.face_box_area > 0]
+                if areas:
+                    wf.face_box_area_mean = float(np.mean(areas))
+                if window_frames:
+                    detected = sum(1 for f in window_frames if f.face_detected)
+                    wf.face_detection_rate = detected / len(window_frames)
             all_windows.extend(windows)
 
         return all_windows
@@ -1844,7 +1851,7 @@ class OverlayRenderer:
             ret, bgr = cap.read()
             if not ret:
                 break
-            ts_ms = int(frame_idx / fps * 1000)
+            ts_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
             active = [
                 s for s in signals
                 if s.get("window_start_ms", 0) <= ts_ms < s.get("window_end_ms", ts_ms + 1)
@@ -2264,7 +2271,7 @@ class VideoFeatureExtractor:
                 ret, bgr = cap.read()
                 if not ret:
                     break
-                ts_ms = int(frame_idx / video_fps * 1000)
+                ts_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
 
                 if frame_idx % skip == 0:
                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -2342,10 +2349,9 @@ class VideoFeatureExtractor:
         prev_pose_lm_data: Optional[list] = None
 
         centroid_tracker = CentroidTracker(
-            max_disappeared=90,   # ~18s at 5fps — faces in calls don't physically leave
-            match_threshold=0.15, # compromise: tight enough to avoid cross-tile matches
-                                  # in 7-person grids (0.33 apart), wide enough to
-                                  # survive head turns. ArcFace merge fixes the rest.
+            max_disappeared=30,   # ~6s at 5fps — limits ID inheritance when a tile changes occupant
+            match_threshold=0.10, # below half inter-tile distance (0.16) to avoid cross-tile matches;
+                                  # above 0.08 to survive moderate head turns between sampled frames
         )
 
         # Cache last MediaPipe results — reused for overlay on non-sampled frames
@@ -2365,7 +2371,7 @@ class VideoFeatureExtractor:
                 if not ret:
                     break
 
-                timestamp_ms = int(frame_idx / video_fps * 1000)
+                timestamp_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
 
                 if frame_idx % skip == 0:
                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -2391,7 +2397,7 @@ class VideoFeatureExtractor:
                         centroids = [
                             (ff.face_centre_x, ff.face_centre_y)
                             for ff in frame_features_list
-                            if ff.face_detected
+                            if ff.face_detected and ff.face_box_area > 0.02
                         ]
                         if centroids:
                             track_ids = centroid_tracker.update(centroids)
@@ -2529,6 +2535,25 @@ class VideoFeatureExtractor:
             if ff.face_detected:
                 frame_counts[ff.face_index] = frame_counts.get(ff.face_index, 0) + 1
 
+        # Per-track avg face height and centroid — used for tiny-face-aware merge.
+        # Computed from all frames (not just best-frame crop) for accuracy.
+        _track_face_areas: dict[int, list[float]] = {}
+        _track_cx: dict[int, list[float]] = {}
+        _track_cy: dict[int, list[float]] = {}
+        for ff in frames:
+            if ff.face_detected and ff.face_box_area > 0.0:
+                _track_face_areas.setdefault(ff.face_index, []).append(ff.face_box_area)
+                _track_cx.setdefault(ff.face_index, []).append(ff.face_centre_x)
+                _track_cy.setdefault(ff.face_index, []).append(ff.face_centre_y)
+        track_face_heights: dict[int, float] = {
+            tid: float(np.mean([a ** 0.5 for a in areas]))
+            for tid, areas in _track_face_areas.items()
+        }
+        track_centroids: dict[int, tuple[float, float]] = {
+            tid: (float(np.mean(_track_cx[tid])), float(np.mean(_track_cy[tid])))
+            for tid in _track_face_areas
+        }
+
         # Face size + duration: computed once, used by merge threshold AND
         # position fallback threshold selection below.
         face_areas = [
@@ -2565,6 +2590,8 @@ class VideoFeatureExtractor:
                             track_embs,
                             threshold=merge_threshold,
                             frame_counts=frame_counts,
+                            track_face_heights=track_face_heights,
+                            track_centroids=track_centroids,
                         )
                         merges = {k: v for k, v in canonical.items() if k != v}
 
@@ -2599,78 +2626,17 @@ class VideoFeatureExtractor:
                             f"(merged {len(merges)} tracks)"
                         )
 
-                    # ── Position fallback for tracks where ArcFace failed ─────
-                    # Some tracks have crops but ArcFace couldn't extract an
-                    # embedding (face too small, too blurry, partially occluded).
-                    # Assign them to the nearest canonical track by centroid so
-                    # they merge into their real owner rather than float as
-                    # orphaned Face_N IDs.
+                    # Tracks without an ArcFace embedding keep their own Face_N
+                    # identity and pass through the transient filter independently.
                     tracks_without_emb = (
                         set(self._best_face_crops.keys())
                         - set(self._cached_embeddings.keys())
                     )
-                    if tracks_without_emb and self._cached_embeddings:
-                        # Build centroid per canonical (embedded) track
-                        canon_sum: dict[int, list[float]] = {}
-                        canon_cnt: dict[int, int] = {}
-                        for ff in frames:
-                            if not ff.face_detected:
-                                continue
-                            tid = ff.face_index
-                            if tid not in self._cached_embeddings:
-                                continue
-                            if tid not in canon_sum:
-                                canon_sum[tid] = [0.0, 0.0]
-                                canon_cnt[tid] = 0
-                            canon_sum[tid][0] += ff.face_centre_x
-                            canon_sum[tid][1] += ff.face_centre_y
-                            canon_cnt[tid] += 1
-                        canon_centroids: dict[int, tuple[float, float]] = {
-                            tid: (canon_sum[tid][0] / canon_cnt[tid],
-                                  canon_sum[tid][1] / canon_cnt[tid])
-                            for tid in canon_sum
-                        }
-
-                        # Grid calls: adjacent tiles ~0.33 apart → threshold 0.15
-                        # Conference rooms: adjacent people ~0.10-0.20 → threshold 0.08
-                        pos_threshold = 0.08 if avg_face_h <= 0.20 else 0.15
-
-                        pos_merges = 0
-                        for no_emb_tid in tracks_without_emb:
-                            no_emb_frames = [
-                                ff for ff in frames
-                                if ff.face_index == no_emb_tid and ff.face_detected
-                            ]
-                            if not no_emb_frames:
-                                continue
-                            ncx = sum(f.face_centre_x for f in no_emb_frames) / len(no_emb_frames)
-                            ncy = sum(f.face_centre_y for f in no_emb_frames) / len(no_emb_frames)
-
-                            best_canon = min(
-                                canon_centroids,
-                                key=lambda cid: (
-                                    (ncx - canon_centroids[cid][0]) ** 2
-                                    + (ncy - canon_centroids[cid][1]) ** 2
-                                ),
-                                default=None,
-                            )
-                            if best_canon is None:
-                                continue
-                            dist = (
-                                (ncx - canon_centroids[best_canon][0]) ** 2
-                                + (ncy - canon_centroids[best_canon][1]) ** 2
-                            ) ** 0.5
-                            if dist < pos_threshold:
-                                for ff in frames:
-                                    if ff.face_index == no_emb_tid:
-                                        ff.face_index = best_canon
-                                pos_merges += 1
-
-                        if pos_merges:
-                            logger.info(
-                                f"Position fallback: {pos_merges}/{len(tracks_without_emb)} "
-                                f"non-embedded tracks assigned to canonical owners"
-                            )
+                    if tracks_without_emb:
+                        logger.info(
+                            f"{len(tracks_without_emb)} tracks had no ArcFace embedding "
+                            f"— kept as independent Face_N identities"
+                        )
 
             except Exception as exc:
                 logger.warning(
@@ -2678,7 +2644,7 @@ class VideoFeatureExtractor:
                 )
 
         # ── Remove true transient tracks ──────────────────────────────────────
-        # After ALL merging (embedding + position), remove any track that has
+        # After ArcFace embedding merge, remove any track that has
         # fewer than MIN_FRAMES_AFTER_MERGE frames. A track this brief does not
         # have enough data for reliable behavioural analysis regardless of whether
         # ArcFace extracted a crop — embeddings from 1-2 frames are unreliable
@@ -3586,6 +3552,8 @@ class VideoFeatureExtractor:
         track_embeddings: dict[int, "np.ndarray"],
         threshold: float = 0.65,
         frame_counts: dict[int, int] | None = None,
+        track_face_heights: dict[int, float] | None = None,
+        track_centroids: dict[int, tuple[float, float]] | None = None,
     ) -> dict[int, int]:
         """
         Merge CentroidTracker track_ids that belong to the same physical person.
@@ -3598,6 +3566,12 @@ class VideoFeatureExtractor:
         so fragment tracks are always compared against the highest-quality
         embedding rather than an arbitrary earlier track.
 
+        Tiny-face guard: when either track in a pair has avg face height < 0.07
+        (face_area < 0.005, ~70px in 1080p), ArcFace produces noisy embeddings
+        that score 0.40-0.49 against unrelated faces. The effective threshold is
+        raised to 0.60 for those pairs, above all observed false-match scores,
+        while still allowing legitimate same-person tiny-face merges at 0.60+.
+
         Returns {track_id: canonical_track_id} for ALL input track_ids.
         Tracks that match nothing keep their own ID as canonical.
         """
@@ -3608,6 +3582,42 @@ class VideoFeatureExtractor:
         canon_embs: dict[int, "np.ndarray"] = {}
 
         counts = frame_counts or {}
+        face_hs = track_face_heights or {}
+        centroids = track_centroids or {}
+
+        def _effective_thresh(tid_a: int, tid_b: int, sim: float) -> float:
+            """Return merge threshold for this track pair, with tiny-face guard
+            and position-based fallback for ambiguous embedding scores."""
+            fh_a = face_hs.get(tid_a, 1.0)
+            fh_b = face_hs.get(tid_b, 1.0)
+            min_fh = min(fh_a, fh_b)
+            max_fh = max(fh_a, fh_b)
+            if min_fh >= 0.07:
+                # Both normal-sized: use standard threshold
+                return threshold
+            if max_fh < 0.07:
+                # SYMMETRIC: both tiny → both embeddings noisy; strict floor blocks
+                # false merges between different people (false scores 0.40–0.49)
+                floor = max(threshold, 0.55)
+            else:
+                # ASYMMETRIC: one tiny (noisy), one large (clean). The large embedding
+                # is reliable; noise from the small crop depresses similarity without
+                # indicating a different person. Lower floor to 0.45.
+                # Different-person tiny-vs-large scores are typically < 0.35.
+                floor = max(threshold, 0.45)
+            if sim >= floor:
+                return floor
+            # Score is below floor but above noise floor (0.35): use grid position
+            # as a second signal. Same grid tile (dist < 0.05) means same person.
+            if sim > 0.35 and centroids:
+                ca = centroids.get(tid_a)
+                cb = centroids.get(tid_b)
+                if ca and cb:
+                    pos_dist = ((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5
+                    if pos_dist < 0.05:
+                        return threshold  # drop floor, same tile → allow merge
+            return floor
+
         # Dominant tracks (most frames) become canonical anchors first so that
         # fragment tracks are always merged into the best-quality embedding.
         for tid in sorted(track_embeddings.keys(), key=lambda t: counts.get(t, 0), reverse=True):
@@ -3623,13 +3633,24 @@ class VideoFeatureExtractor:
             if scores:
                 top = max(scores.values())
                 top_tid = max(scores, key=lambda k: scores[k])
+                fh_tid = face_hs.get(tid, 1.0)
+                fh_top = face_hs.get(top_tid, 1.0)
+                eff_thresh = _effective_thresh(tid, top_tid, top)
+                pos_note = ""
+                if min(fh_tid, fh_top) < 0.07 and top < max(threshold, 0.55) and top > 0.35:
+                    ca, cb = centroids.get(tid), centroids.get(top_tid)
+                    if ca and cb:
+                        d = ((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5
+                        pos_note = f" pos_dist={d:.3f}{'(grid-match)' if d < 0.05 else ''}"
                 _log.info(
                     f"Track {tid:>2} vs canonicals: best={top:.3f} (vs track {top_tid}) "
-                    f"— {'MERGE' if top > threshold else 'keep separate'}"
+                    f"thresh={eff_thresh:.3f} (face_h: {fh_tid:.3f}×{fh_top:.3f}){pos_note} "
+                    f"— {'MERGE' if top > eff_thresh else 'keep separate'}"
                 )
 
             for canon_tid, sim in scores.items():
-                if sim > threshold and sim > best_sim:
+                eff = _effective_thresh(tid, canon_tid, sim)
+                if sim > eff and sim > best_sim:
                     best_sim = sim
                     matched_canon = canon_tid
 
@@ -3669,7 +3690,7 @@ class SpeakerFaceMapper:
         windows: list[WindowFeatures],
         diar_segments: list[dict],
         lip_activity_map: Optional[dict[int, list[tuple[int, float]]]] = None,
-    ) -> tuple[dict[str, list[WindowFeatures]], dict[str, float]]:
+    ) -> tuple[dict[str, list[WindowFeatures]], dict[str, float], dict[int, str]]:
         """
         Args:
             windows:          WindowFeatures from VideoFeatureExtractor.extract_all().
@@ -3679,13 +3700,17 @@ class SpeakerFaceMapper:
                               If None or single face, falls back to time-overlap.
 
         Returns:
-            (windows_by_speaker, lip_sync_scores) where lip_sync_scores maps
-            speaker_label → correlation score (0.0 when time-overlap fallback used).
+            (windows_by_face, lip_sync_scores, face_to_speaker) where:
+            - windows_by_face:  {Face_N: [WindowFeatures, ...]} — ownership by face track
+            - lip_sync_scores:  {Speaker_N: correlation_score} — only for accepted lip-sync links
+            - face_to_speaker:  {face_index_int: "Speaker_N"} — conservative linkage map for gateway
+              Exported only for sufficiently positive lip-sync matches; time-overlap
+              fallback is used for in-session speaking state only, not identity linking.
         """
         result: dict[str, list[WindowFeatures]] = defaultdict(list)
 
         if not windows:
-            return dict(result), {}
+            return dict(result), {}, {}
 
         speakers = sorted(set(seg.get("speaker", "Speaker_0") for seg in diar_segments))
         if not speakers:
@@ -3710,29 +3735,35 @@ class SpeakerFaceMapper:
             )
             method = "time_overlap"
 
+        # Group windows by Face_N — signal ownership stays on face tracks, not
+        # voice speakers. face_to_speaker is returned as a linkage map for the
+        # gateway to remap face_embeddings keys before registry matching.
         for wf in windows:
             face_idx = getattr(wf, "face_index", 0)
-            speaker = face_to_speaker.get(face_idx, speakers[0])
-            wf.speaker_id = speaker
+            face_label = f"Face_{face_idx}"
+            wf.speaker_id = face_label
             wf.is_speaking = self._is_speaking_in_window(
-                wf.window_start_ms, wf.window_end_ms, speaker, diar_segments
+                wf.window_start_ms, wf.window_end_ms,
+                face_to_speaker.get(face_idx, ""),
+                diar_segments,
             )
-            result[speaker].append(wf)
+            result[face_label].append(wf)
 
         # lip_sync_scores: only meaningful for confirmed speaker→face assignments
         lip_sync_scores: dict[str, float] = {}
+        confident_mapping: dict[int, str] = {}
         if method == "lip_sync":
             for fi, spk in face_to_speaker.items():
-                if not spk.startswith("Face_"):
-                    lip_sync_scores[spk] = round(assignment_scores.get(fi, 0.0), 4)
+                score = assignment_scores.get(fi, 0.0)
+                if spk.startswith("Speaker_") and score >= MIN_LIP_SYNC_LINK_SCORE:
+                    lip_sync_scores[spk] = round(score, 4)
+                    confident_mapping[fi] = spk
 
         logger.info(
-            "SpeakerFaceMapper: %d face(s) → %s (method=%s)",
-            len(face_indices),
-            {fi: spk for fi, spk in sorted(face_to_speaker.items())},
-            method,
+            "SpeakerFaceMapper: %d face(s), method=%s, exported_linkage=%s",
+            len(face_indices), method, confident_mapping,
         )
-        return dict(result), lip_sync_scores
+        return dict(result), lip_sync_scores, confident_mapping
 
     def _lip_sync_assignment(
         self,

@@ -5,7 +5,7 @@ Provides the Signal factory (_make_signal) shared by Facial, Gaze, and Body engi
 import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Optional
+from typing import Optional  # noqa: F401 — kept for callers that import it
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -60,18 +60,25 @@ class BaseVideoRuleEngine(ABC):
         metadata: Optional[dict] = None,
     ) -> dict:
         """Create a Signal dict with confidence hard-capped at 0.85."""
+        w = getattr(self, "_current_w", None)
+        area = (getattr(w, "face_box_area_mean", 0.0) or 0.0) if w is not None else 0.0
+        rate = (getattr(w, "face_detection_rate", 0.0) or 0.0) if w is not None else 0.0
+
         base_meta: dict = {"rule_id": rule_id}
         if metadata:
             base_meta.update(metadata)
         # Auto-inject face grid position from the current window if available.
         # Set self._current_w = w in each rule engine's evaluate loop.
-        w = getattr(self, "_current_w", None)
         if w is not None:
             cx = round(getattr(w, "face_centre_x", 0.0), 3)
             cy = round(getattr(w, "face_centre_y", 0.0), 3)
             if cx > 0 or cy > 0:
                 base_meta.setdefault("face_centre_x", cx)
                 base_meta.setdefault("face_centre_y", cy)
+            if area > 0:
+                base_meta.setdefault("face_box_area", round(area, 4))
+            if rate > 0:
+                base_meta.setdefault("face_detection_rate", round(rate, 3))
         capped_confidence = round(min(confidence, 0.85), 4)
 
         return Signal(

@@ -5,6 +5,8 @@ All agents import from here for consistent DB/Redis connections.
 import os
 from dataclasses import dataclass
 
+from shared.redis_layer.keys import RedisKeys
+
 
 @dataclass
 class NexusConfig:
@@ -44,8 +46,8 @@ class NexusConfig:
     max_stream_length: int = 10000          # Max entries per stream before trimming
 
     def stream_name(self, agent: str, session_id: str) -> str:
-        """Generate stream name: nexus:stream:voice:{session_id}"""
-        return f"{self.stream_prefix}:{agent}:{session_id}"
+        """Generate canonical signal stream name."""
+        return RedisKeys.signal_stream(session_id, agent)
 
     @property
     def has_external_whisper(self) -> bool:

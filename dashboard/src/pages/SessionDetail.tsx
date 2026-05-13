@@ -783,62 +783,62 @@ export default function SessionDetail() {
 
       {/* 3. CALL OUTCOME (sales_call only) */}
       {session.meeting_type === "sales_call" && speakerStats.length > 0 && (
-        <>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-            {/* Estimated Outcome */}
-            <div className="rounded-lg border border-nexus-border bg-nexus-surface p-4 text-center">
-              <div className="text-[11px] text-nexus-text-secondary mb-2">
-                Estimated Outcome
-              </div>
-              <div className="flex items-center justify-center gap-2">
-                {callOutcome.outcome === "Positive" ? (
-                  <CheckCircle className="h-5 w-5" style={{ color: callOutcome.outcomeColor }} />
-                ) : callOutcome.outcome === "Negative" ? (
-                  <XCircle className="h-5 w-5" style={{ color: callOutcome.outcomeColor }} />
-                ) : (
-                  <TrendingUp className="h-5 w-5" style={{ color: callOutcome.outcomeColor }} />
-                )}
-                <span className="text-xl font-bold" style={{ color: callOutcome.outcomeColor }}>
-                  {callOutcome.outcome}
-                </span>
-              </div>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          {/* Estimated Outcome */}
+          <div className="rounded-lg border border-nexus-border bg-nexus-surface p-4 text-center">
+            <div className="text-[11px] text-nexus-text-secondary mb-2">
+              Estimated Outcome
             </div>
-
-            {/* Decision Readiness */}
-            <div className="rounded-lg border border-nexus-border bg-nexus-surface p-4 text-center">
-              <div className="text-[11px] text-nexus-text-secondary mb-2">
-                Decision Readiness
-              </div>
-              <div className="flex items-center justify-center gap-2">
-                <ShieldCheck className="h-5 w-5" style={{ color: callOutcome.readinessColor }} />
-                <span className="text-xl font-bold" style={{ color: callOutcome.readinessColor }}>
-                  {callOutcome.readinessLabel}
-                </span>
-              </div>
-            </div>
-
-            {/* Objection Handled */}
-            <div className="rounded-lg border border-nexus-border bg-nexus-surface p-4 text-center">
-              <div className="text-[11px] text-nexus-text-secondary mb-2">
-                Objection Handled
-              </div>
-              <div className="flex items-center justify-center gap-2">
-                <MessageSquare className="h-5 w-5" style={{ color: callOutcome.objHandledColor }} />
-                <span className="text-xl font-bold" style={{ color: callOutcome.objHandledColor }}>
-                  {callOutcome.objHandledLabel}
-                </span>
-              </div>
+            <div className="flex items-center justify-center gap-2">
+              {callOutcome.outcome === "Positive" ? (
+                <CheckCircle className="h-5 w-5" style={{ color: callOutcome.outcomeColor }} />
+              ) : callOutcome.outcome === "Negative" ? (
+                <XCircle className="h-5 w-5" style={{ color: callOutcome.outcomeColor }} />
+              ) : (
+                <TrendingUp className="h-5 w-5" style={{ color: callOutcome.outcomeColor }} />
+              )}
+              <span className="text-xl font-bold" style={{ color: callOutcome.outcomeColor }}>
+                {callOutcome.outcome}
+              </span>
             </div>
           </div>
 
-          {/* Signal Explorer */}
-          <SignalExplorer
-            signals={signals}
-            signalsByAgent={detail.signals_by_agent}
-            totalCount={detail.signal_count}
-            speakerRoles={speakerRoles}
-          />
-        </>
+          {/* Decision Readiness */}
+          <div className="rounded-lg border border-nexus-border bg-nexus-surface p-4 text-center">
+            <div className="text-[11px] text-nexus-text-secondary mb-2">
+              Decision Readiness
+            </div>
+            <div className="flex items-center justify-center gap-2">
+              <ShieldCheck className="h-5 w-5" style={{ color: callOutcome.readinessColor }} />
+              <span className="text-xl font-bold" style={{ color: callOutcome.readinessColor }}>
+                {callOutcome.readinessLabel}
+              </span>
+            </div>
+          </div>
+
+          {/* Objection Handled */}
+          <div className="rounded-lg border border-nexus-border bg-nexus-surface p-4 text-center">
+            <div className="text-[11px] text-nexus-text-secondary mb-2">
+              Objection Handled
+            </div>
+            <div className="flex items-center justify-center gap-2">
+              <MessageSquare className="h-5 w-5" style={{ color: callOutcome.objHandledColor }} />
+              <span className="text-xl font-bold" style={{ color: callOutcome.objHandledColor }}>
+                {callOutcome.objHandledLabel}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Signal Explorer — all meeting types */}
+      {signals.length > 0 && (
+        <SignalExplorer
+          signals={signals}
+          signalsByAgent={detail.signals_by_agent}
+          totalCount={detail.signal_count}
+          speakerRoles={speakerRoles}
+        />
       )}
 
       {/* 3b. BEHAVIORAL OVERVIEW (shows when video or fusion signals present) */}

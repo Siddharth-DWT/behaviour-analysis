@@ -43,12 +43,12 @@ import sys
 import uuid
 import time
 import json
+import re
 import asyncio
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
-
 import redis.asyncio as _aioredis
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends, BackgroundTasks
@@ -65,6 +65,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # isort: split
 from shared.models.requests import SessionListResponse
+from shared.redis_layer import (
+    AgentStatusRecord,
+    EventRecord,
+    RedisEventStore,
+    RedisRepository,
+    SessionStateRecord,
+)
 
 try:
     from database import (
@@ -117,6 +124,22 @@ logger = logging.getLogger("nexus.gateway")
 
 _GATEWAY_REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
+# Module-level connection pool — reused across all _drain_pending_signals calls.
+# redis.asyncio pools are async-safe; no race risk since asyncio is single-threaded
+# and there is no await between the None-check and the assignment in _get_redis_pool.
+_redis_pool: Optional[_aioredis.Redis] = None
+
+
+async def _get_redis_pool() -> _aioredis.Redis:
+    global _redis_pool
+    if _redis_pool is None:
+        _redis_pool = _aioredis.from_url(
+            _GATEWAY_REDIS_URL,
+            decode_responses=True,
+            max_connections=10,
+        )
+    return _redis_pool
+
 
 async def _drain_pending_signals(session_id: str, agent: str) -> list[dict]:
     """
@@ -125,19 +148,34 @@ async def _drain_pending_signals(session_id: str, agent: str) -> list[dict]:
     Returns [] if Redis is unreachable or the key is empty.
     """
     try:
-        r = _aioredis.from_url(_GATEWAY_REDIS_URL, decode_responses=True)
-        async with r:
-            key = f"nexus:pending:{session_id}:{agent}"
-            batches = await r.lrange(key, 0, -1)  # type: ignore[misc]
-            if batches:
-                await r.delete(key)
-                signals: list[dict] = []
-                for batch_json in batches:
-                    signals.extend(json.loads(batch_json))
-                return signals
+        r = await _get_redis_pool()
+        key = f"nexus:pending:{session_id}:{agent}"
+        batches = await r.lrange(key, 0, -1)  # type: ignore[misc]
+        if batches:
+            await r.delete(key)
+            signals: list[dict] = []
+            for batch_json in batches:
+                signals.extend(json.loads(batch_json))
+            return signals
     except Exception as exc:
         logger.warning(f"[{session_id}] Redis drain ({agent}) failed (non-fatal): {exc}")
     return []
+
+
+redis_repo = RedisRepository()
+event_store = RedisEventStore()
+
+
+async def _read_agent_signals(session_id: str, agent: str, count: int = 10_000) -> list[dict]:
+    """Read canonical stream signals with legacy pending-list fallback."""
+    try:
+        signals = await redis_repo.read_latest_signals(session_id, agent, count=count)
+        if signals:
+            return signals
+        return await redis_repo.drain_legacy_pending_signals(session_id, agent)
+    except Exception as exc:
+        logger.warning(f"[{session_id}] Redis read ({agent}) failed (non-fatal): {exc}")
+        return []
 
 
 # ── Agent URLs (configurable via environment) ──
@@ -169,6 +207,40 @@ _pipeline_progress: dict[str, str] = {}
 
 def _set_step(session_id: str, step: str) -> None:
     _pipeline_progress[session_id] = step
+
+
+async def _set_step_state(session_id: str, step: str, status: str = "running", error: str = "") -> None:
+    _set_step(session_id, step)
+    await redis_repo.set_session_state(
+        session_id,
+        SessionStateRecord(status=status, current_step=step, error=error or ""),
+    )
+
+
+async def _set_agent_status(
+    session_id: str,
+    agent: str,
+    status: str,
+    signal_count: int = 0,
+    error: str = "",
+) -> None:
+    await redis_repo.set_agent_status(
+        session_id,
+        agent,
+        AgentStatusRecord(
+            status=status,
+            signal_count=signal_count,
+            summary_key=f"summary:{agent}",
+            error=error or "",
+        ),
+    )
+
+
+async def _append_agent_event(session_id: str, agent: str, event_type: str, payload: Optional[dict[str, Any]] = None) -> None:
+    await event_store.append(
+        session_id,
+        EventRecord(session_id=session_id, agent=agent, event_type=event_type, payload=payload or {}),
+    )
 
 # ── Chunked upload config ──
 CHUNK_UPLOAD_DIR = Path(os.getenv("CHUNK_UPLOAD_DIR", "data/chunks"))
@@ -1267,7 +1339,7 @@ async def _run_pipeline(
     run_entity_extraction = analysis_config.get("run_entity_extraction", True)
 
     # ── Step 3: Voice Agent (with retry — this is the critical agent) ──
-    _set_step(session_id, "transcribing")
+    await _set_step_state(session_id, "transcribing")
     voice_result = None
     try:
         voice_result = await _call_with_retry(
@@ -1286,6 +1358,10 @@ async def _run_pipeline(
         )
     except Exception as e:
         logger.error(f"[{session_id}] Voice Agent transcription failed: {e}")
+        await redis_repo.set_session_state(
+            session_id,
+            SessionStateRecord(status="failed", current_step="transcribing", error=str(e)),
+        )
         await _try_update_status(session_id, "failed")
         return  # Background task — cannot raise HTTPException
 
@@ -1333,7 +1409,7 @@ async def _run_pipeline(
     # ── Steps 4 / 4b / 4c: Language + Conversation + Video (parallel) ──
     # All three depend only on voice output — no inter-dependency.
     # Video signals are awaited before Fusion so the report is fully multimodal.
-    _set_step(session_id, "language")
+    await _set_step_state(session_id, "language")
 
     video_signals: list[dict] = []
     run_video = video_path is not None and run_behavioural
@@ -1418,31 +1494,36 @@ async def _run_pipeline(
             logger.warning(f"[{session_id}] Conversation Agent failed (continuing): {e}")
             return {}
 
-    async def _run_video() -> tuple[list[dict], dict, str]:
-        """Returns (signals, face_embeddings_dict, video_job_id)."""
+    async def _run_video() -> tuple[list[dict], dict, dict, dict, str]:
+        """Returns (signals, face_embeddings_dict, face_to_speaker, lip_sync_scores, video_job_id)."""
         if not run_video or video_path is None:
-            return [], {}, ""
+            return [], {}, {}, {}, ""
         try:
-            _set_step(session_id, "video")
+            await _set_step_state(session_id, "video")
             result, vid_job_id = await _call_video_agent(
                 session_id, str(video_path.resolve()),
                 diar_segments_for_video, meeting_type, speaker_count,
             )
             sigs      = result.get("signals", [])
             face_embs = result.get("face_embeddings", {})
+            f2s       = {int(k): v for k, v in result.get("face_to_speaker", {}).items()}
+            lip_scores = result.get("lip_sync_scores", {})
             agent_status["video"] = "completed"
             logger.info(
                 f"[{session_id}] Video Agent: {len(sigs)} signals, "
-                f"{len(face_embs)} face embeddings"
+                f"{len(face_embs)} face embeddings, "
+                f"{len(f2s)} face-speaker links, "
+                f"{len(lip_scores)} lip-sync scores"
             )
-            return sigs, face_embs, vid_job_id
+            return sigs, face_embs, f2s, lip_scores, vid_job_id
         except Exception as e:
             agent_status["video"] = "failed"
             logger.warning(f"[{session_id}] Video Agent failed (continuing without video): {e}")
-            return [], {}, ""
+            return [], {}, {}, {}, ""
 
-    lang_outcome, conv_outcome, (vid_signals, face_embeddings_from_video, video_job_id) = await asyncio.gather(
-        _run_language(), _run_conversation(), _run_video()
+    # Run Language and Video in parallel; wait for Language result first
+    lang_outcome, (vid_signals, face_embeddings_from_video, face_to_speaker, lip_sync_scores, video_job_id) = await asyncio.gather(
+        _run_language(), _run_video()
     )
 
     # ── Unpack language result ──
@@ -1453,13 +1534,20 @@ async def _run_pipeline(
         logger.info(f"[{session_id}] Language Agent: {len(language_signals)} signals")
         await _persist_agent_signals(session_id, language_signals, speaker_map, "language")
 
-    # ── Unpack conversation result ──
-    _set_step(session_id, "conversation")
-    if conv_outcome:
-        conversation_result = conv_outcome
-        conversation_signals = conversation_result.get("signals", [])
-        conversation_summary = conversation_result.get("summary", {})
-        logger.info(f"[{session_id}] Conversation Agent: {len(conversation_signals)} signals")
+    # ── Call Conversation Agent (now that language signals are available) ──
+    await _set_step_state(session_id, "conversation")
+    try:
+        # Pass language signals into the Conversation Agent for cross-modal rules
+        conv_outcome = await _call_conversation_agent(session_id, transcript_segments, meeting_type, language_signals=language_signals)
+        if conv_outcome:
+            conversation_result = conv_outcome
+            conversation_signals = conversation_result.get("signals", [])
+            conversation_summary = conversation_result.get("summary", {})
+            logger.info(f"[{session_id}] Conversation Agent: {len(conversation_signals)} signals")
+            agent_status["conversation"] = "completed"
+    except Exception as e:
+        agent_status["conversation"] = "failed"
+        logger.warning(f"[{session_id}] Conversation Agent failed (continuing): {e}")
         await _persist_agent_signals(session_id, conversation_signals, speaker_map, "conversation")
 
     # ── Unpack video result ──
@@ -1483,19 +1571,18 @@ async def _run_pipeline(
             f"Face_* IDs: {sorted(face_ids_received)}"
         )
 
-        # ── Filter Face_* speakers with too few signals ───────────────────────
-        # A Face_* with < MIN_FACE_SIGNALS total signals across the session is:
-        #   - A background person too far from camera for meaningful analysis
-        #   - A brief appearance the frame-level filter in the video agent missed
-        #   - Intermittent detection noise (e.g. face every 30s for 1 frame)
-        # Remove their signals before persisting so they don't clutter the sidebar.
-        # Speaker_* are never filtered — they have confirmed voice identity.
+        # ── Single-pass Face_* signal analysis ───────────────────────────────
+        # One iteration collects signal counts AND all Face_* IDs seen, then
+        # derives weak_faces and unmatched_face_ids via set arithmetic —
+        # eliminates a second scan of video_signals (up to 6000 items).
         MIN_FACE_SIGNALS = 10
         face_signal_counts: dict[str, int] = {}
+        face_ids_in_signals: set[str] = set()
         for sig in video_signals:
             spk = sig.get("speaker_id", "")
             if spk.startswith("Face_"):
                 face_signal_counts[spk] = face_signal_counts.get(spk, 0) + 1
+                face_ids_in_signals.add(spk)
 
         weak_faces: set[str] = {
             fid for fid, cnt in face_signal_counts.items()
@@ -1513,14 +1600,10 @@ async def _run_pipeline(
                 f"removed {before - len(video_signals)} signals"
             )
 
-        # Speaker_* keys are already in speaker_map — only Face_* canonical IDs
-        # that are not already matched need new DB entries.
-        unmatched_face_ids = {
-            s.get("speaker_id", "")
-            for s in video_signals
-            if s.get("speaker_id", "").startswith("Face_")
-            and s.get("speaker_id", "") not in video_speaker_map
-        }
+        # Unmatched = seen in signals, not weak, not already in speaker_map.
+        # Equivalent to iterating filtered video_signals for Face_* not in map,
+        # but uses set arithmetic instead of a second list comprehension.
+        unmatched_face_ids = face_ids_in_signals - weak_faces - set(video_speaker_map.keys())
         if unmatched_face_ids:
             new_face_speakers = await upsert_speakers(session_id, [
                 {"speaker_id": face_id} for face_id in unmatched_face_ids
@@ -1531,6 +1614,97 @@ async def _run_pipeline(
     # ── Speaker registry: fused face + voice identity matching ───────────────
     # Runs here (after gather) so both voice embeddings AND face embeddings are
     # available. Falls back to voice-only when no video was processed.
+
+    # Remap face_embeddings keys: Face_N → Speaker_N using lip-sync linkage.
+    # Build a session-scoped lock map so only reasonably strong lip-sync links
+    # are used as visual evidence for registry matching.
+    SESSION_FACE_LOCK_MIN_SCORE = float(os.getenv("SESSION_FACE_LOCK_MIN_SCORE", "0.10"))
+
+    def _build_session_face_locks(
+        face_to_speaker: dict,
+        lip_sync_scores: dict,
+        face_embeddings_from_video: dict,
+        session_id: str,
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        locked_face_to_speaker: dict[str, str] = {}
+        locked_speaker_to_face: dict[str, str] = {}
+        if not face_to_speaker or not lip_sync_scores:
+            return locked_face_to_speaker, locked_speaker_to_face
+
+        candidates = []
+        for raw_face_idx, speaker_label in face_to_speaker.items():
+            if not str(speaker_label).startswith("Speaker_"):
+                continue
+            try:
+                face_label = (
+                    raw_face_idx if str(raw_face_idx).startswith("Face_")
+                    else f"Face_{int(raw_face_idx)}"
+                )
+            except Exception:
+                face_label = f"Face_{raw_face_idx}"
+
+            if face_label not in face_embeddings_from_video:
+                continue
+
+            score = float(lip_sync_scores.get(speaker_label, 0.0) or 0.0)
+            candidates.append((score, face_label, speaker_label))
+
+        candidates.sort(reverse=True, key=lambda x: x[0])
+
+        for score, face_label, speaker_label in candidates:
+            if score < SESSION_FACE_LOCK_MIN_SCORE:
+                logger.warning(
+                    f"[{session_id}] Rejecting weak session face lock "
+                    f"{face_label} → {speaker_label}, lip_sync_score={score:.4f}, "
+                    f"threshold={SESSION_FACE_LOCK_MIN_SCORE:.4f}"
+                )
+                continue
+
+            if face_label in locked_face_to_speaker:
+                continue
+
+            if speaker_label in locked_speaker_to_face:
+                logger.warning(
+                    f"[{session_id}] Rejecting duplicate speaker lock candidate "
+                    f"{face_label} → {speaker_label}; already locked to "
+                    f"{locked_speaker_to_face[speaker_label]}"
+                )
+                continue
+
+            locked_face_to_speaker[face_label] = speaker_label
+            locked_speaker_to_face[speaker_label] = face_label
+
+            logger.info(
+                f"[{session_id}] Session face lock accepted: "
+                f"{face_label} → {speaker_label}, lip_sync_score={score:.4f}"
+            )
+
+        return locked_face_to_speaker, locked_speaker_to_face
+
+    locked_face_to_speaker, locked_speaker_to_face = _build_session_face_locks(
+        face_to_speaker=face_to_speaker,
+        lip_sync_scores=lip_sync_scores,
+        face_embeddings_from_video=face_embeddings_from_video,
+        session_id=session_id,
+    )
+
+    speaker_keyed_face_embs: dict = {}
+    for face_label, speaker_label in locked_face_to_speaker.items():
+        face_data = face_embeddings_from_video.get(face_label)
+        if not face_data:
+            continue
+        score = float(lip_sync_scores.get(speaker_label, 0.0) or 0.0)
+        speaker_keyed_face_embs[speaker_label] = {
+            **face_data,
+            "source_face_label": face_label,
+            "session_face_lock": True,
+            "lip_sync_score": score,
+        }
+        logger.info(
+            f"[{session_id}] Locked face embedding for registry: "
+            f"{face_label} → {speaker_label}, score={score:.4f}"
+        )
+
     speaker_identity_map: dict = {}
     if speaker_embeddings:
         try:
@@ -1543,7 +1717,7 @@ async def _run_pipeline(
                 voice_speakers=voice_speakers,
                 speaker_map=speaker_map,
                 org_id=org_id,
-                face_embeddings=face_embeddings_from_video,
+                face_embeddings=speaker_keyed_face_embs,
             )
             logger.info(f"[{session_id}] Speaker identity: {speaker_identity_map}")
         except Exception as e:
@@ -1570,10 +1744,14 @@ async def _run_pipeline(
     # people never spoke. Register them by face-only so they are recognized across
     # sessions — next time they speak their face match upgrades to fused identity.
     if speaker_embeddings and face_embeddings_from_video:
+        # Exclude faces that were session-locked to speakers from face-only registration
+        linked_face_labels = set(locked_face_to_speaker.keys())
         non_speaking = {
             label: data
             for label, data in face_embeddings_from_video.items()
-            if label.startswith("Face_") and label not in speaker_identity_map
+            if label.startswith("Face_")
+            and label not in speaker_identity_map
+            and label not in linked_face_labels
         }
         if non_speaking:
             try:
@@ -1594,6 +1772,38 @@ async def _run_pipeline(
             except Exception as e:
                 logger.warning(
                     f"[{session_id}] Non-speaking face registry failed (non-fatal): {e}"
+                )
+
+    # ── Link Face_N → Speaker_N registry entries via lip-sync linkage ────────
+    # After fused matching, Speaker_N entries have registry_ids. Face_N tracks
+    # that map to the same person (via face_to_speaker) must share that same
+    # registry_id so /video-signals and /video-speakers canonical merge groups
+    # them as one person in the UI.
+    # Create session-locked aliases only from locked_face_to_speaker (strong lip-sync links)
+    if locked_face_to_speaker:
+        for face_label, speaker_label in locked_face_to_speaker.items():
+            if speaker_label not in speaker_identity_map:
+                logger.warning(
+                    f"[{session_id}] Cannot alias locked face {face_label} → {speaker_label}: "
+                    f"{speaker_label} has no registry identity"
+                )
+                continue
+
+            if face_label not in speaker_identity_map:
+                score = float(lip_sync_scores.get(speaker_label, 0.0) or 0.0)
+
+                speaker_identity_map[face_label] = {
+                    **speaker_identity_map[speaker_label],
+                    "match_method": "session_lip_sync_lock",
+                    "match_confidence": min(0.95, max(0.0, score)),
+                    "source_speaker_label": speaker_label,
+                }
+
+                logger.info(
+                    f"[{session_id}] Session-locked alias created: "
+                    f"{face_label} → {speaker_label} "
+                    f"(registry_id={speaker_identity_map[speaker_label].get('registry_id')}, "
+                    f"score={score:.4f})"
                 )
 
     # ── Persist video signals (after registry so unregistered faces are excluded) ──
@@ -1639,7 +1849,7 @@ async def _run_pipeline(
             asyncio.create_task(_post_video_display_names(video_job_id, display_name_map))
 
     # ── Step 5: Fusion Agent (only when behavioural analysis enabled) ──
-    _set_step(session_id, "fusion")
+    await _set_step_state(session_id, "fusion")
     fusion_result = None
     fusion_signals = []
     alerts = []
@@ -1701,7 +1911,7 @@ async def _run_pipeline(
     key_paths = fusion_summary.get("key_paths", [])
 
     # ── Step 6: Persist report ──
-    _set_step(session_id, "report")
+    await _set_step_state(session_id, "report")
     report_generated = False
     report_content = report or {}
     graph_analytics = fusion_summary.get("graph_analytics", {})
@@ -1789,7 +1999,11 @@ async def _run_pipeline(
     # Cleanup old recordings in background
     _cleanup_old_recordings()
 
-    _pipeline_progress.pop(session_id, None)  # stop progress tracking
+    _pipeline_progress.pop(session_id, None)  # legacy in-memory progress cleanup
+    await redis_repo.set_session_state(
+        session_id,
+        SessionStateRecord(status=final_status, current_step="completed"),
+    )
 
     logger.info(
         f"[{session_id}] Pipeline finished: status={final_status}, "
@@ -1808,7 +2022,7 @@ async def _run_pipeline(
 
 @app.get("/sessions", response_model=SessionListResponse)
 async def list_sessions_endpoint(
-    limit: int = Query(default=25, ge=1, le=100),
+    limit: int = Query(default=25, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     status: Optional[str] = Query(default=None),
     meeting_type: Optional[str] = Query(default=None),
@@ -2084,6 +2298,9 @@ async def get_session_progress(session_id: str, current_user: dict = Depends(get
     Return the current pipeline step for a session being processed.
     Returns pipeline_step=null when the session is no longer in-flight.
     """
+    state = await redis_repo.get_session_state(session_id)
+    if state:
+        return {"pipeline_step": state.get("current_step"), "status": state.get("status")}
     return {"pipeline_step": _pipeline_progress.get(session_id)}
 
 
@@ -2155,7 +2372,17 @@ _VIDEO_OVERLAY_TYPES = [
     "stress_recovery",
     # Graph-based
     "tension_cluster",
+    # Voice (shown alongside face signals for Speaker_* identities)
+    "vocal_stress_score", "tone_classification", "filler_detection",
+    "speech_rate_anomaly", "energy_level", "pitch_elevation_flag",
+    "monotone_flag", "interruption_event",
+    # Language
+    "sentiment_score",
 ]
+
+
+# Matches auto-generated speaker labels that should not be used as display names.
+_GENERIC_SPEAKER_LABEL_RE = re.compile(r'^(Speaker|Face)_\d+$')
 
 
 def _speaker_grid_position(face_centre_x: float, face_centre_y: float) -> str:
@@ -2174,10 +2401,8 @@ async def get_video_signals(
 ):
     """Return video + fusion signals for playback overlay, ordered by window start."""
     logger.info(f"[{session_id}] GET /sessions/{{id}}/video-signals")
-    import uuid as _uuid
-    import json as _json
     try:
-        _uuid.UUID(session_id)
+        uuid.UUID(session_id)
     except ValueError:
         raise HTTPException(404, "Session not found")
     session = await get_session(session_id, current_user.get("org_id") or DEV_ORG_ID)
@@ -2207,15 +2432,12 @@ async def get_video_signals(
         _VIDEO_OVERLAY_TYPES,
     )
 
-    import re as _re2
-    _generic_sig_label = _re2.compile(r'^(Speaker|Face)_\d+$')
-
     signals = []
     for r in rows:
         meta: dict = {}
         if r["metadata"]:
             try:
-                meta = _json.loads(r["metadata"]) if isinstance(r["metadata"], str) else dict(r["metadata"])
+                meta = json.loads(r["metadata"]) if isinstance(r["metadata"], str) else dict(r["metadata"])
             except Exception:
                 pass
         cx = float(meta.get("face_centre_x", 0))
@@ -2224,7 +2446,7 @@ async def get_video_signals(
             meta["grid_position"] = _speaker_grid_position(cx, cy)
         reg_name  = r["registry_name"] or ""
         spk_label = r["speaker_label"] or ""
-        speaker_name = reg_name if (reg_name and not _generic_sig_label.match(reg_name)) else spk_label
+        speaker_name = reg_name if (reg_name and not _GENERIC_SPEAKER_LABEL_RE.match(reg_name)) else spk_label
         signals.append({
             "signal_type":  r["signal_type"],
             "value":        float(r["value"]) if r["value"] is not None else 0.0,
@@ -2248,6 +2470,36 @@ async def get_video_signals(
         s for s in signals
         if (s["end_ms"] - s["start_ms"]) <= 120_000
     ]
+
+    # Merge duplicate speaker labels that share the same registry identity.
+    # The video agent may emit the same person under different labels across a
+    # session (e.g. Face_2 for 0–636 s then Speaker_1 when promoted to the
+    # active-speaker tile). Rewrite all signals to one canonical label per
+    # registry_id so the frontend groups them as one person.
+    # Canonical preference: Speaker_* before Face_*, then alphabetical.
+    registry_groups: dict[str, list[str]] = {}
+    for sig in signals:
+        reg = sig.get("registry_id")
+        spk = sig.get("speaker_id")
+        if reg and spk:
+            registry_groups.setdefault(reg, []).append(spk)
+
+    canonical_by_registry: dict[str, str] = {
+        reg: sorted(
+            set(labels),
+            key=lambda x: (0 if x.startswith("Speaker_") else 1, x),
+        )[0]
+        for reg, labels in registry_groups.items()
+    }
+
+    for sig in signals:
+        reg = sig.get("registry_id")
+        if reg and reg in canonical_by_registry:
+            canonical = canonical_by_registry[reg]
+            if sig["speaker_id"] != canonical:
+                sig["raw_speaker_id"] = sig["speaker_id"]
+                sig["speaker_id"]     = canonical
+                sig["speaker_name"]   = canonical
 
     # Build speaker → grid_position map from video signals (face coords present)
     # Used to enrich temporal/fusion signals that have no face_centre_x/y.
@@ -2283,8 +2535,6 @@ async def get_video_speakers(
 
     Called once by VideoSignalPlayer on mount to build the speaker roster.
     """
-    import json as _json
-
     try:
         uuid.UUID(session_id)
     except ValueError:
@@ -2297,7 +2547,8 @@ async def get_video_speakers(
     pool = await get_pool()
 
     rows = await pool.fetch("""
-        SELECT sp.speaker_label,
+        SELECT DISTINCT ON (sp.speaker_label)
+               sp.speaker_label,
                sa.registry_id, sr.display_name, sr.role, sr.company,
                sa.match_method, sa.match_confidence
         FROM   speakers sp
@@ -2306,27 +2557,27 @@ async def get_video_speakers(
               AND sa.speaker_label = sp.speaker_label
         LEFT JOIN speakers_registry sr ON sr.id = sa.registry_id
         WHERE  sp.session_id = $1
-        ORDER  BY sp.speaker_label
+        ORDER  BY sp.speaker_label,
+                  sa.match_confidence DESC NULLS LAST,
+                  sa.registry_id      NULLS LAST
     """, uuid.UUID(session_id))
 
     # Build speaker_label → grid_position from face_centre coords in signal metadata
     pos_rows = await pool.fetch("""
-        SELECT DISTINCT sp.speaker_label, s.metadata
+        SELECT DISTINCT ON (sp.speaker_label) sp.speaker_label, s.metadata
         FROM   signals s
         JOIN   speakers sp ON sp.id = s.speaker_id
         WHERE  s.session_id = $1
           AND  s.agent = 'video'
           AND  s.metadata IS NOT NULL
-        LIMIT  200
+        ORDER  BY sp.speaker_label, s.window_start_ms
     """, uuid.UUID(session_id))
 
     label_positions: dict[str, str] = {}
     for pr in pos_rows:
         label = pr["speaker_label"]
-        if label in label_positions:
-            continue
         try:
-            meta = _json.loads(pr["metadata"]) if isinstance(pr["metadata"], str) else dict(pr["metadata"])
+            meta = json.loads(pr["metadata"]) if isinstance(pr["metadata"], str) else dict(pr["metadata"])
             cx = float(meta.get("face_centre_x", 0))
             cy = float(meta.get("face_centre_y", 0))
             if cx > 0 or cy > 0:
@@ -2334,24 +2585,48 @@ async def get_video_speakers(
         except Exception:
             pass
 
-    import re as _re
-    _generic_label = _re.compile(r'^(Speaker|Face)_\d+$')
+    # Build canonical label per registry_id: Speaker_* preferred over Face_*,
+    # then alphabetical. Mirrors the same preference used in /video-signals.
+    reg_label_groups: dict[str, list[str]] = {}
+    for r in rows:
+        reg = str(r["registry_id"]) if r["registry_id"] else ""
+        lbl = r["speaker_label"] or ""
+        if reg and lbl:
+            reg_label_groups.setdefault(reg, []).append(lbl)
+
+    canonical_label_for_reg: dict[str, str] = {
+        reg: sorted(
+            set(labels),
+            key=lambda x: (0 if x.startswith("Speaker_") else 1, x),
+        )[0]
+        for reg, labels in reg_label_groups.items()
+    }
 
     speakers = []
+    seen_registries: set[str] = set()
     for r in rows:
         registry_id = str(r["registry_id"]) if r["registry_id"] else ""
-        rname  = r["display_name"] or ""
         slabel = r["speaker_label"] or ""
-        # Only use the registry's display_name if it's a real person name.
-        # Auto-generated labels ("Speaker_1", "Face_3") from past sessions can
-        # collide with this session's labels and cause duplicate sidebar entries.
-        display_name = rname if (rname and not _generic_label.match(rname)) else slabel
+
+        # Skip non-canonical rows — same person already added under canonical label
+        if registry_id and registry_id in seen_registries:
+            continue
+        if registry_id:
+            seen_registries.add(registry_id)
+
+        # Use canonical label (Speaker_* preferred) as the displayed speaker_label
+        canonical = canonical_label_for_reg.get(registry_id, slabel)
+
+        rname = r["display_name"] or ""
+        # Only use registry display_name if it's a real person name, not a generated label
+        display_name = rname if (rname and not _GENERIC_SPEAKER_LABEL_RE.match(rname)) else canonical
+
         speakers.append({
-            "speaker_label":    slabel,
+            "speaker_label":    canonical,
             "display_name":     display_name,
             "role":             r["role"] or "",
             "company":          r["company"] or "",
-            "grid_position":    label_positions.get(r["speaker_label"], ""),
+            "grid_position":    label_positions.get(canonical, "") or label_positions.get(slabel, ""),
             "registry_id":      registry_id,
             "match_method":     r["match_method"] or "",
             "match_confidence": float(r["match_confidence"]) if r["match_confidence"] else 0.0,
@@ -2577,7 +2852,7 @@ async def _post_process_pipeline(
     conversation_summary: dict,
 ) -> None:
     """Knowledge store embedding + Neo4j sync — both non-fatal."""
-    _set_step(session_id, "entity_extraction")
+    await _set_step_state(session_id, "entity_extraction")
     if run_behavioural:
         try:
             from knowledge_store import store_session_knowledge
@@ -2595,7 +2870,7 @@ async def _post_process_pipeline(
     else:
         logger.info(f"[{session_id}] Knowledge store skipped (behavioural analysis off)")
 
-    _set_step(session_id, "knowledge_graph")
+    await _set_step_state(session_id, "knowledge_graph")
     if run_knowledge_graph:
         try:
             from neo4j_sync import sync_session as neo4j_sync_session
@@ -2685,8 +2960,12 @@ async def _call_conversation_agent(
     session_id: str,
     segments: list[dict],
     meeting_type: str,
+    language_signals: list[dict] | None = None,
 ) -> dict:
-    """Call Conversation Agent POST /analyse with transcript segments."""
+    """Call Conversation Agent POST /analyse with transcript segments.
+
+    Optionally include `language_signals` for cross-modal conflict detection.
+    """
     t0 = time.time()
     speakers = list(set(seg.get("speaker", "unknown") for seg in segments))
     logger.info(f"[{session_id}] → Conversation Agent /analyse ({len(segments)} segments, {len(speakers)} speakers)")
@@ -2698,6 +2977,7 @@ async def _call_conversation_agent(
                 "speakers": speakers,
                 "content_type": meeting_type,
                 "session_id": session_id,
+                "language_signals": language_signals,
             },
         )
         resp.raise_for_status()
@@ -2782,7 +3062,7 @@ async def _call_video_agent(
                 result = poll_data["result"]
                 # Prefer Redis-backed signals (written per rule-engine during processing)
                 # over the HTTP response body — they survive a gateway crash mid-run.
-                redis_signals = await _drain_pending_signals(session_id, "video")
+                redis_signals = await _read_agent_signals(session_id, "video")
                 if redis_signals:
                     result["signals"] = redis_signals
                     logger.info(
@@ -3454,7 +3734,11 @@ async def list_speakers(
     )
 
     return {
-        "speakers": [dict(r) for r in rows],
+        "speakers": [
+            {**dict(r),
+             "display_name": r["display_name"] if (r["display_name"] and not _GENERIC_SPEAKER_LABEL_RE.match(r["display_name"])) else ""}
+            for r in rows
+        ],
         "total": total,
         "limit": limit,
         "offset": offset,
@@ -3859,8 +4143,9 @@ async def global_chat(
 
     speaker_context = "Registered speakers:\n"
     for s in speakers:
+        name = s['display_name'] if (s['display_name'] and not _GENERIC_SPEAKER_LABEL_RE.match(s['display_name'])) else "unnamed speaker"
         speaker_context += (
-            f"- {s['display_name']} ({s['role'] or 'unknown role'}): "
+            f"- {name} ({s['role'] or 'unknown role'}): "
             f"{s['session_count']} sessions, "
             f"avg stress {round(float(s['avg_stress'] or 0) * 100)}%, "
             f"avg engagement {round(float(s['avg_engagement'] or 0) * 100)}%\n"
@@ -3985,7 +4270,7 @@ async def search_speakers_by_face(
         import base64 as _b64
         output.append({
             "registry_id":  str(m["id"]),
-            "display_name": m["display_name"],
+            "display_name": m["display_name"] if (m["display_name"] and not _GENERIC_SPEAKER_LABEL_RE.match(m["display_name"])) else "",
             "role":         m["role"] or "",
             "company":      m["company"] or "",
             "similarity":   round(float(m["similarity"]), 3),

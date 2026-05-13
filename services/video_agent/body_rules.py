@@ -228,7 +228,8 @@ class BodyRuleEngine(BaseVideoRuleEngine):
                 # Cross-modal context: facial + gaze signals overlapping this window
                 window_extra = [
                     s for s in _extra
-                    if s.get("speaker_id") == speaker_id
+                    if s is not None
+                    and s.get("speaker_id") == speaker_id
                     and s.get("window_start_ms", 0) < w.window_end_ms
                     and s.get("window_end_ms", 0) > w.window_start_ms
                 ]
@@ -264,7 +265,7 @@ class BodyRuleEngine(BaseVideoRuleEngine):
 
                 signals += [
                     s for s in window_signals
-                    if s.get("confidence", 0) >= self.MIN_SIGNAL_CONFIDENCE
+                    if s is not None and s.get("confidence", 0) >= self.MIN_SIGNAL_CONFIDENCE
                 ]
 
         # Cross-speaker rule (needs all speakers simultaneously)

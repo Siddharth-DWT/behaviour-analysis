@@ -44,6 +44,14 @@ from shared.models.requests import (
     ReportRequest,
     FusionAnalyseResponse as AnalyseResponse,
 )
+from shared.redis_layer import (
+    AgentStatusRecord,
+    EventRecord,
+    RedisEventStore,
+    RedisLockManager,
+    RedisRepository,
+    SessionStateRecord,
+)
 
 try:
     from fusion_engine import SignalBuffer, compute_unified_state, WINDOW_SHORT_MS
@@ -89,6 +97,9 @@ app.add_middleware(
 rule_engine:     Optional[FusionRuleEngine]     = None
 compound_engine: Optional[CompoundPatternEngine] = None
 temporal_engine: Optional[TemporalPatternEngine] = None
+redis_repo = RedisRepository()
+event_store = RedisEventStore()
+lock_manager = RedisLockManager()
 
 
 @app.on_event("startup")
@@ -154,6 +165,15 @@ async def analyse_signals(request: AnalyseRequest):
     session_id = request.session_id or str(uuid.uuid4())
     content_type = request.content_type or request.meeting_type or "sales_call"
     start_time = time.time()
+    lock_token = await lock_manager.acquire(session_id, "fusion")
+    if not lock_token:
+        raise HTTPException(409, "Fusion agent is already processing this session")
+    await redis_repo.set_session_state(session_id, SessionStateRecord(status="running", current_step="fusion"))
+    await redis_repo.set_agent_status(session_id, "fusion", AgentStatusRecord(status="running", summary_key="summary:fusion"))
+    await event_store.append(
+        session_id,
+        EventRecord(session_id=session_id, agent="fusion", event_type="agent_started", payload={}),
+    )
 
     # Create content-type profile for all rules
     try:
@@ -515,6 +535,17 @@ async def analyse_signals(request: AnalyseRequest):
     summary["signal_graph"] = graph_json
     summary["key_paths"] = key_paths
     summary["graph_analytics"] = graph_insights
+    await redis_repo.write_artifact(session_id, "summary:fusion", {"summary": summary, "alerts": all_alerts})
+    await redis_repo.set_agent_status(
+        session_id,
+        "fusion",
+        AgentStatusRecord(status="completed", signal_count=len(all_fusion_signals), summary_key="summary:fusion"),
+    )
+    await event_store.append(
+        session_id,
+        EventRecord(session_id=session_id, agent="fusion", event_type="agent_completed", payload={"signal_count": len(all_fusion_signals)}),
+    )
+    await lock_manager.release(session_id, "fusion", lock_token)
 
     return AnalyseResponse(
         session_id=session_id,

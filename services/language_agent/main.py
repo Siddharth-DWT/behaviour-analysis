@@ -32,6 +32,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # isort: split
 from shared.models.transcript import TranscriptSegment
 from shared.models.requests import LanguageAnalysisRequest as AnalysisRequest, LanguageAnalysisResponse as AnalysisResponse
+from shared.redis_layer import (
+    AgentStatusRecord,
+    EventRecord,
+    RedisEventStore,
+    RedisLockManager,
+    RedisRepository,
+    SessionStateRecord,
+)
 
 # Import from same directory (works in Docker /app context)
 try:
@@ -71,6 +79,9 @@ app.add_middleware(
 feature_extractor: Optional[LanguageFeatureExtractor] = None
 rule_engine: Optional[LanguageRuleEngine] = None
 entity_extractor: Optional[EntityExtractor] = None
+redis_repo = RedisRepository()
+event_store = RedisEventStore()
+lock_manager = RedisLockManager()
 
 
 @app.on_event("startup")
@@ -145,6 +156,15 @@ async def analyse_transcript(request: AnalysisRequest):
 
     session_id = request.session_id or str(uuid.uuid4())
     start_time = time.time()
+    lock_token = await lock_manager.acquire(session_id, "language")
+    if not lock_token:
+        raise HTTPException(409, "Language agent is already processing this session")
+    await redis_repo.set_session_state(session_id, SessionStateRecord(status="running", current_step="language"))
+    await redis_repo.set_agent_status(session_id, "language", AgentStatusRecord(status="running", summary_key="summary:language"))
+    await event_store.append(
+        session_id,
+        EventRecord(session_id=session_id, agent="language", event_type="agent_started", payload={"segment_count": len(request.segments)}),
+    )
 
     # Determine content type (affects which rules are active)
     content_type = request.content_type or request.meeting_type or "sales_call"
@@ -267,6 +287,17 @@ async def analyse_transcript(request: AnalysisRequest):
 
     summary = _build_summary(all_signals, features_list, speakers, profile=_profile)
     summary["entities"] = entities
+    await redis_repo.write_artifact(session_id, "summary:language", {"summary": summary, "entities": entities})
+    await redis_repo.set_agent_status(
+        session_id,
+        "language",
+        AgentStatusRecord(status="completed", signal_count=len(all_signals), summary_key="summary:language"),
+    )
+    await event_store.append(
+        session_id,
+        EventRecord(session_id=session_id, agent="language", event_type="agent_completed", payload={"signal_count": len(all_signals)}),
+    )
+    await lock_manager.release(session_id, "language", lock_token)
 
     return AnalysisResponse(
         session_id=session_id,

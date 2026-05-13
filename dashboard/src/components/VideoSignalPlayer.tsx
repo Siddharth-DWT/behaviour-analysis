@@ -9,7 +9,7 @@ type SignalConfigEntry = {
   icon: string;
   label: (s: VideoSignal) => string;
   color: string | ((s: VideoSignal) => string);
-  category: "face" | "body" | "gaze" | "compound";
+  category: "face" | "body" | "gaze" | "voice" | "compound";
 };
 
 const SIGNAL_CONFIG: Record<string, SignalConfigEntry> = {
@@ -487,6 +487,88 @@ const SIGNAL_CONFIG: Record<string, SignalConfigEntry> = {
     color: "#F59E0B",
     category: "gaze",
   },
+
+  // ── Voice signals (shown for Speaker_* who have diarization) ─────────────────
+  vocal_stress_score: {
+    icon: "◆",
+    label: (s) => {
+      if (s.value > 0.70) return "Voice Stress: High";
+      if (s.value > 0.50) return "Voice Stress: Elevated";
+      return "Voice Stress: Moderate";
+    },
+    color: (s) => (s.value > 0.70 ? "#EF4444" : s.value > 0.50 ? "#F59E0B" : "#6B7280"),
+    category: "voice" as const,
+  },
+  tone_classification: {
+    icon: "♪",
+    label: (s) => {
+      const labels: Record<string, string> = {
+        warm: "Warm Tone", cold: "Cold Tone",
+        aggressive: "Aggressive Tone", excited: "Excited Tone",
+        nervous: "Nervous Tone", confident: "Confident Tone",
+        neutral: "Neutral Tone",
+      };
+      return labels[s.value_text ?? ""] || `Tone: ${s.value_text ?? ""}`;
+    },
+    color: (s) => {
+      if (["warm", "confident", "excited"].includes(s.value_text ?? "")) return "#10B981";
+      if (["cold", "aggressive"].includes(s.value_text ?? "")) return "#EF4444";
+      if (s.value_text === "nervous") return "#F59E0B";
+      return "#6B7280";
+    },
+    category: "voice" as const,
+  },
+  filler_detection: {
+    icon: "…",
+    label: (s) => `Fillers: ${(s.value_text ?? "detected").replace(/_/g, " ")}`,
+    color: "#F59E0B",
+    category: "voice" as const,
+  },
+  speech_rate_anomaly: {
+    icon: "⏩",
+    label: (s) => {
+      if ((s.value_text ?? "").includes("fast")) return "Speaking Fast";
+      if ((s.value_text ?? "").includes("slow")) return "Speaking Slow";
+      return `Pace: ${(s.value_text ?? "anomaly").replace(/_/g, " ")}`;
+    },
+    color: (s) => ((s.value_text ?? "").includes("fast") ? "#F59E0B" : "#6B7280"),
+    category: "voice" as const,
+  },
+  energy_level: {
+    icon: "⚡",
+    label: (s) => {
+      if (s.value_text === "elevated") return "High Energy";
+      if (s.value_text === "depressed") return "Low Energy";
+      return `Energy: ${s.value_text ?? "normal"}`;
+    },
+    color: (s) =>
+      s.value_text === "elevated" ? "#10B981"
+      : s.value_text === "depressed" ? "#6B7280"
+      : "#F59E0B",
+    category: "voice" as const,
+  },
+  pitch_elevation_flag: {
+    icon: "↑",
+    label: (s) => {
+      if (s.value_text === "extreme_pitch_spike") return "Pitch Spike: Extreme";
+      if (s.value_text === "significant_elevation") return "Pitch: Elevated";
+      return "Pitch Shift";
+    },
+    color: "#F59E0B",
+    category: "voice" as const,
+  },
+  monotone_flag: {
+    icon: "─",
+    label: () => "Monotone Voice",
+    color: "#6B7280",
+    category: "voice" as const,
+  },
+  interruption_event: {
+    icon: "⚡",
+    label: (s) => (s.value_text === "competitive" ? "Interruption" : "Overlap"),
+    color: (s) => (s.value_text === "competitive" ? "#EF4444" : "#F59E0B"),
+    category: "voice" as const,
+  },
 };
 
 const CATEGORIES: { key: string; label: string }[] = [
@@ -502,6 +584,17 @@ function resolveColor(
   signal: VideoSignal
 ): string {
   return typeof config.color === "function" ? config.color(signal) : config.color;
+}
+
+const GENERIC_LABEL = /^(Face|Speaker|Person)_\d+$/;
+
+function resolveDisplayLabel(
+  rosterEntry: SpeakerInfo | undefined,
+  spkId: string
+): string {
+  const name = rosterEntry?.display_name;
+  if (name && !GENERIC_LABEL.test(name)) return name;
+  return spkId;
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -556,9 +649,7 @@ function SpeakerGroupHeader({
       )}
       <div className="min-w-0 flex-1">
         <span className="block truncate text-[10px] font-medium text-gray-200">{displayLabel}</span>
-        {info?.grid_position && !info.display_name && (
-          <span className="text-[9px] text-gray-500">({info.grid_position})</span>
-        )}
+
         {info?.match_method && info.match_method !== "new_registration" && info.match_method !== "" && (
           <span className="text-[9px] text-gray-500">
             {info.match_method === "face_voice_fused"
@@ -621,7 +712,8 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const animFrameRef = useRef<number | null>(null);
 
-  const [currentTimeMs, setCurrentTimeMs] = useState(0);
+  const [currentTimeMs, setCurrentTimeMs] = useState<number>(-1);
+  const [hasPlayed, setHasPlayed] = useState(false);
   const [durationMs, setDurationMs] = useState(0);
   const [activeSignals, setActiveSignals] = useState<VideoSignal[]>([]);
   const [enabledCategories, setEnabledCategories] = useState<Set<string>>(
@@ -682,9 +774,14 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
 
   const computeActive = useCallback(
     (ms: number): VideoSignal[] => {
+      if (ms < 0 || !hasPlayed) return [];
       const canon = toCanonicalRef.current;
+      const FORWARD_GRACE_MS = 250;
       const filtered = signals.filter((s) => {
-        if (ms < (s.start_ms ?? 0) || ms > (s.end_ms ?? s.start_ms ?? 0)) return false;
+        const start = Number(s.start_ms ?? 0);
+        const rawEnd = Number(s.end_ms ?? s.start_ms ?? 0);
+        const end = Math.max(rawEnd, start + 1) + FORWARD_GRACE_MS;
+        if (ms < start || ms > end) return false;
         const cfg = SIGNAL_CONFIG[s.signal_type];
         if (!cfg) return false;
         if (!enabledCategories.has(cfg.category)) return false;
@@ -705,7 +802,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
       }
       return Array.from(best.values());
     },
-    [signals, enabledCategories, selectedSpeaker]
+    [signals, enabledCategories, selectedSpeaker, hasPlayed]
   );
 
   const tick = useCallback(() => {
@@ -713,11 +810,12 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
     if (!video) return;
     const ms = video.currentTime * 1000;
     setCurrentTimeMs(ms);
+    if (ms > 0 && !hasPlayed) setHasPlayed(true);
     setActiveSignals(computeActive(ms));
     if (!video.paused && !video.ended) {
       animFrameRef.current = requestAnimationFrame(tick);
     }
-  }, [computeActive]);
+  }, [computeActive, hasPlayed]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -737,6 +835,14 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
     video.addEventListener("loadedmetadata", onMeta);
     video.addEventListener("loadeddata", onMeta);
     video.addEventListener("canplay", onMeta);
+
+    // When tick is recreated (e.g. hasPlayed transitions false→true), the effect
+    // cleanup cancels the RAF and re-runs this effect. If the video is already
+    // playing at that point no "play" event fires, so the loop must be restarted
+    // here explicitly — otherwise currentTimeMs freezes within the first few frames.
+    if (!video.paused && !video.ended) {
+      animFrameRef.current = requestAnimationFrame(tick);
+    }
 
     return () => {
       video.removeEventListener("play", onPlay);
@@ -767,53 +873,20 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
     });
   };
 
-  // ── Speaker deduplication ────────────────────────────────────────────────────
-  // Three-pass approach:
-  //   1. Ghost filter  — Face_N with no thumbnail = no ArcFace embedding, junk track
-  //   2. Registry merge — multiple Face_N entries with the same registry_id are the
-  //      same real person seen at different angles; collapse to the dominant track
-  //      (most signals). This is the primary fix for the crowded sidebar.
-  //   3. Appear-gate   — only show a speaker after their earliest signal starts,
-  //      so participants aren't listed before they join the call.
+  // ── Speaker identity resolution ───────────────────────────────────────────────
+  // Two-pass approach:
+  //   1. Registry merge — collapse multiple Face_N entries for the same person
+  //      when ArcFace matched them to the same registry_id (safety net for when
+  //      the backend merge didn't run).
+  //   2. Window-bounded visibility — entries appear and disappear with their
+  //      signals; no session-level pre-seeding, no cluster gate.
 
   const rosterLoaded = Object.keys(speakerRoster).length > 0;
-
-  // Pre-compute total session signal count per speaker (O(n) once, O(1) lookup).
-  const sessionSignalCounts = useMemo(() => {
-    const counts: Record<string, number> = {};
-    for (const s of signals) {
-      if (s.speaker_id) counts[s.speaker_id] = (counts[s.speaker_id] || 0) + 1;
-    }
-    return counts;
-  }, [signals]);
-
-  // Pre-compute unique signal types per speaker — single-type tracks are degenerate.
-  const sessionSignalTypes = useMemo(() => {
-    const types: Record<string, Set<string>> = {};
-    for (const s of signals) {
-      if (!s.speaker_id) continue;
-      (types[s.speaker_id] ??= new Set()).add(s.signal_type);
-    }
-    return types;
-  }, [signals]);
-
-  const MIN_FACE_SIGNALS = 30;
-
-  // A Face_N is a weak track (hidden everywhere) if ANY gate fails:
-  //   1. Too few signals       → noise/fragment (brief background appearance)
-  //   2. No thumbnail          → ArcFace never got a clean crop; identity unreliable
-  //   3. Only 1 signal type    → single-detector false track (real person = varied signals)
-  const isWeakTrack = (spkId: string) =>
-    /^Face_\d+$/.test(spkId) &&
-    ((sessionSignalCounts[spkId] || 0) < MIN_FACE_SIGNALS ||
-      (rosterLoaded && !speakerRoster[spkId]?.thumbnail_url) ||
-      (sessionSignalTypes[spkId]?.size ?? 0) <= 1);
-
   const allSpeakerIds = [...new Set(signals.map((s) => s.speaker_id).filter(Boolean))] as string[];
 
-  // Pass 1 — group by registry_id (only once the roster is loaded)
+  // Pass 1 — group by registry_id
   const registryGroups: Record<string, string[]> = {};
-  for (const spkId of allSpeakerIds.filter((id) => !isWeakTrack(id))) {
+  for (const spkId of allSpeakerIds) {
     const regId = rosterLoaded ? speakerRoster[spkId]?.registry_id : undefined;
     if (regId) (registryGroups[regId] ??= []).push(spkId);
   }
@@ -831,87 +904,54 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   // Keep the ref in sync so computeActive can use it without being a dependency
   toCanonicalRef.current = toCanonical;
 
-  // Pass 3 — first REAL appearance per raw speaker ID (NOT canonical).
-  // Uses a cluster-based approach: firstSeen = earliest time where at least
-  // CLUSTER_MIN_SIGNALS signals exist within CLUSTER_WINDOW_MS.
-  // Rationale: the facial agent detects faces in small thumbnail tiles from t=0
-  // (e.g., Mirko's tile visible top-right before he joins as main speaker).
-  // Those detections have valid face_centre_x > 0 but are isolated (1-2 signals
-  // over 20+ seconds). A real presence = consistent signal stream (3+ in 10s).
-  const speakerFirstSeen = useMemo(() => {
-    const CLUSTER_WINDOW_MS = 10_000;
-    const CLUSTER_MIN_SIGNALS = 3;
+  // Window-bounded grouping — entries exist only while their signals are active.
+  // No cluster gate, no pre-seeding. Entries self-clean when their windows close.
+  const visibleByFace = useMemo(() => {
+    const groups: Record<
+      string,
+      {
+        rawId: string;
+        label: string;
+        signals: VideoSignal[];
+        faceCentreX: number;
+        faceCentreY: number;
+      }
+    > = {};
 
-    // Collect valid timestamps per raw speaker ID
-    const timesBySpk: Record<string, number[]> = {};
-    for (const s of signals) {
-      const spk = s.speaker_id;
-      if (!spk || isWeakTrack(spk)) continue;
-      if (/^Face_\d+$/.test(spk) && !((s.metadata?.face_centre_x as number) > 0)) continue;
-      (timesBySpk[spk] ??= []).push(s.start_ms ?? 0);
-    }
+    for (const s of activeSignals) {
+      const rawId = s.speaker_id;
+      if (!rawId) continue;
+      const cfg = SIGNAL_CONFIG[s.signal_type];
+      if (cfg?.category === "voice") continue;
 
-    // Sliding window O(n) per speaker: find first cluster of CLUSTER_MIN_SIGNALS
-    // signals within CLUSTER_WINDOW_MS. Falls back to raw minimum for Speaker_*.
-    const firstSeen: Record<string, number> = {};
-    for (const [spk, times] of Object.entries(timesBySpk)) {
-      times.sort((a, b) => a - b);
-      if (/^Face_\d+$/.test(spk)) {
-        let right = 0;
-        for (let left = 0; left < times.length; left++) {
-          while (right < times.length && times[right] <= times[left] + CLUSTER_WINDOW_MS) right++;
-          if (right - left >= CLUSTER_MIN_SIGNALS) {
-            firstSeen[spk] = times[left];
-            break;
-          }
-        }
+      const canonId = toCanonical[rawId] ?? rawId;
+      const rosterEntry = speakerRoster[canonId];
+      const cx = (s.metadata?.face_centre_x as number) ?? 0;
+      const cy = (s.metadata?.face_centre_y as number) ?? 0;
+
+      const g = groups[canonId];
+      if (!g) {
+        groups[canonId] = {
+          rawId: canonId,
+          label: resolveDisplayLabel(rosterEntry, canonId),
+          signals: [s],
+          faceCentreX: cx,
+          faceCentreY: cy,
+        };
       } else {
-        firstSeen[spk] = times[0];
+        g.signals.push(s);
+        const latest = g.signals.reduce((a, b) =>
+          (a.start_ms ?? 0) > (b.start_ms ?? 0) ? a : b
+        );
+        if (latest === s) {
+          g.faceCentreX = cx;
+          g.faceCentreY = cy;
+        }
       }
     }
-    return firstSeen;
-  }, [signals, isWeakTrack]);
 
-  // Seed bySpeaker with canonical speakers only, after they've appeared
-  const bySpeaker: Record<string, { label: string; rawId: string; signals: VideoSignal[] }> = {};
-  for (const spkId of allSpeakerIds.filter((id) => !isWeakTrack(id) && !toCanonical[id])) {
-    const firstMs = speakerFirstSeen[spkId] ?? Infinity;
-    if (firstMs > currentTimeMs) continue;
-    const rosterEntry = speakerRoster[spkId];
-    bySpeaker[spkId] = {
-      label: rosterEntry?.display_name || spkId,
-      rawId: spkId,
-      signals: [],
-    };
-  }
-
-  // Inject active signals — map non-canonical tracks to their canonical entry
-  for (const s of activeSignals) {
-    if (isWeakTrack(s.speaker_id || "")) continue;
-    const canonId = toCanonical[s.speaker_id || ""] ?? s.speaker_id ?? "";
-    if (canonId && bySpeaker[canonId]) {
-      bySpeaker[canonId].signals.push(s);
-    }
-  }
-
-  // Trailing grace window — face stays visible for 4s after its last signal ends.
-  // No look-ahead: gaps between 2-second signal windows are covered by look-behind
-  // (a signal that ended 100ms ago keeps the face visible), and look-ahead was
-  // causing faces to pre-appear before the person is visually present.
-  const recentlyActive = useMemo(() => {
-    const GRACE_BEHIND_MS = 4000;
-    const active: Record<string, boolean> = {};
-    for (const s of signals) {
-      if (!s.speaker_id) continue;
-      const start = s.start_ms ?? 0;
-      const end = s.end_ms ?? start;
-      if (end >= currentTimeMs - GRACE_BEHIND_MS && start <= currentTimeMs) {
-        const canonId = toCanonical[s.speaker_id] ?? s.speaker_id;
-        active[canonId] = true;
-      }
-    }
-    return active;
-  }, [signals, currentTimeMs, toCanonical]);
+    return groups;
+  }, [activeSignals, toCanonical, speakerRoster]);
 
   const hasIncongruence = activeSignals.some((s) =>
     (s.signal_type === "head_body_incongruence"
@@ -936,11 +976,11 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
 
         {/* Left panel: signal badges in the black area */}
         <div className="flex w-48 flex-shrink-0 flex-col justify-start gap-1 overflow-y-auto p-3">
-          {activeSignals.length === 0 ? (
+          {Object.keys(visibleByFace).length === 0 ? (
             <span className="mt-4 text-center text-[10px] text-white/20">No active signals</span>
           ) : (
             <>
-              {Object.entries(bySpeaker).map(([speakerId, { label, rawId, signals: sigs }]) => {
+              {Object.entries(visibleByFace).map(([speakerId, { label, rawId, signals: sigs }]) => {
                 const prioritySigs = sigs
                   .filter((s: VideoSignal) => {
                     const display = getSignalDisplay(s.signal_type, s.value_text ?? "");
@@ -948,30 +988,20 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                   })
                   .sort((a: VideoSignal, b: VideoSignal) => (b.confidence || 0) - (a.confidence || 0));
                 const visibleSigs = showExpanded ? prioritySigs : prioritySigs.slice(0, 3);
-                const hasThumb = !!speakerRoster[rawId]?.thumbnail_url;
-                const isFaceTrack = /^Face_\d+$/.test(rawId);
-                if (isFaceTrack) {
-                  // Face_* needs thumbnail + signal within ±4s grace window
-                  if (!hasThumb || !recentlyActive[rawId]) return null;
-                } else {
-                  // Speaker_* needs only active signals at current moment
-                  if (visibleSigs.length === 0) return null;
-                }
+                if (visibleSigs.length === 0) return null;
                 return (
                   <div key={speakerId} className="flex flex-col gap-1">
-                    {Object.keys(bySpeaker).length > 1 && (
-                      <SpeakerGroupHeader
-                        speakerLabel={rawId}
-                        displayLabel={label}
-                        roster={speakerRoster}
-                        highlighted={!!rawId && highlightedSpeaker === rawId}
-                        onToggle={() =>
-                          setHighlightedSpeaker((prev) =>
-                            rawId && prev !== rawId ? rawId : null
-                          )
-                        }
-                      />
-                    )}
+                    <SpeakerGroupHeader
+                      speakerLabel={rawId}
+                      displayLabel={label}
+                      roster={speakerRoster}
+                      highlighted={!!rawId && highlightedSpeaker === rawId}
+                      onToggle={() =>
+                        setHighlightedSpeaker((prev) =>
+                          rawId && prev !== rawId ? rawId : null
+                        )
+                      }
+                    />
                     {visibleSigs.map((s: VideoSignal, i: number) => {
                       const display = getSignalDisplay(s.signal_type, s.value_text ?? "");
                       const color = display.color;
@@ -999,19 +1029,17 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                 );
               })}
               {(() => {
-                // Mirror the exact same filters/sort as the render loop above so
-                // the count reflects signals that will actually appear on expand.
-                const hiddenCount = showExpanded ? 0 : Object.values(bySpeaker).reduce(
-                  (total, { signals: sigs }) => {
+                const hiddenCount = showExpanded ? 0 : Object.values(visibleByFace).reduce(
+                  (total: number, { signals: sigs }) => {
                     if (sigs.length === 0) return total;
                     const sort = (a: VideoSignal, b: VideoSignal) =>
                       (b.confidence || 0) - (a.confidence || 0);
                     const shownNow = sigs
-                      .filter(s => getSignalDisplay(s.signal_type, s.value_text ?? "").priority <= 1)
+                      .filter((s: VideoSignal) => getSignalDisplay(s.signal_type, s.value_text ?? "").priority <= 1)
                       .sort(sort)
                       .slice(0, 3).length;
                     const shownExpanded = sigs
-                      .filter(s => getSignalDisplay(s.signal_type, s.value_text ?? "").priority <= 2)
+                      .filter((s: VideoSignal) => getSignalDisplay(s.signal_type, s.value_text ?? "").priority <= 2)
                       .sort(sort).length;
                     return total + (shownExpanded - shownNow);
                   },
@@ -1105,8 +1133,10 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                       const cfg = SIGNAL_CONFIG[s.signal_type];
                       if (!cfg) return null;
                       const color = resolveColor(cfg, s);
-                      const left = Math.max(0, Math.min((s.start_ms / effectiveDuration) * 100, 100));
-                      const rawWidth = Math.max(((s.end_ms - s.start_ms) / effectiveDuration) * 100, 0.5);
+                      const segStart = s.start_ms;
+                      const segEnd   = s.end_ms;
+                      const left = Math.max(0, Math.min((segStart / effectiveDuration) * 100, 100));
+                      const rawWidth = Math.max(((segEnd - segStart) / effectiveDuration) * 100, 0.5);
                       const width = Math.min(rawWidth, 100 - left);
                       return (
                         <div
@@ -1175,16 +1205,16 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
           ))}
         </div>
 
-        {Object.keys(bySpeaker).length > 1 && (
+        {allSpeakerIds.length > 1 && (
           <select
             value={selectedSpeaker}
             onChange={(e) => setSelectedSpeaker(e.target.value)}
             className="rounded-lg border border-nexus-border bg-nexus-surface px-3 py-1 text-xs text-nexus-text-primary"
           >
             <option value="all">All Speakers</option>
-            {Object.keys(bySpeaker).map((spk) => (
+            {allSpeakerIds.map((spk) => (
               <option key={spk} value={spk}>
-                {speakerRoster[spk]?.display_name || spk}
+                {resolveDisplayLabel(speakerRoster[spk], spk)}
               </option>
             ))}
           </select>

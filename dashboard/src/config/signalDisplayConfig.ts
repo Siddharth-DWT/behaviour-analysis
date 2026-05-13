@@ -744,4 +744,51 @@ const SIGNAL_MAP: Record<string, SignalDisplay> = {
     description: 'Whether voice tone and facial expression are in sync',
     icon: '🎭', color: '#6B7280', category: 'pattern', priority: 2,
   },
+
+  // ── Top-level voice signal types (no value_text subtype) ─────────────────────
+  'energy_level': {
+    label: 'Energy Level',
+    description: 'Vocal energy relative to baseline — elevated indicates arousal, depressed indicates fatigue',
+    icon: '⚡', color: '#F59E0B', category: 'voice', priority: 2,
+  },
+  'volume_shift': {
+    label: 'Volume Shift',
+    description: 'Speaking louder or quieter than baseline — dominance, emphasis, or withdrawal',
+    icon: '🔊', color: '#8B5CF6', category: 'voice', priority: 2,
+  },
+  'pause_classification': {
+    label: 'Pause Detected',
+    description: 'Extended hesitation or thinking pause — cognitive load or uncertainty',
+    icon: '⏸', color: '#6B7280', category: 'voice', priority: 2,
+  },
+  'strategic_pause': {
+    label: 'Strategic Pause',
+    description: 'Intentional emphasis pause before key content — deliberate communication',
+    icon: '⏯', color: '#3B82F6', category: 'voice', priority: 1,
+  },
+  'talk_time_ratio': {
+    label: 'Talk Time',
+    description: 'Speaker dominance — proportion of total conversation time',
+    icon: '⏱', color: '#10B981', category: 'voice', priority: 2,
+  },
+  'speech_rate_anomaly': {
+    label: 'Speech Pace',
+    description: 'Speaking significantly faster or slower than baseline — anxiety, rushing, or deliberation',
+    icon: '🏃', color: '#F97316', category: 'voice', priority: 2,
+  },
+  'filler_detection': {
+    label: 'Filler Words',
+    description: 'Um, uh, like, you know — verbal fillers indicating uncertainty or cognitive load',
+    icon: '💬', color: '#EF4444', category: 'voice', priority: 2,
+  },
+  'sentiment_score': {
+    label: 'Sentiment',
+    description: 'Positive or negative language sentiment from transcript analysis',
+    icon: '💭', color: '#8B5CF6', category: 'voice', priority: 2,
+  },
+  'tone_classification': {
+    label: 'Tone',
+    description: 'Vocal tone — warm, cold, aggressive, excited, nervous, or confident',
+    icon: '🎭', color: '#6366F1', category: 'voice', priority: 1,
+  },
 };

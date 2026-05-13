@@ -40,6 +40,16 @@ from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from shared.redis_layer import (
+    AgentStatusRecord,
+    EventRecord,
+    RedisEventStore,
+    RedisLockManager,
+    SessionStateRecord,
+    SignalRecord,
+    SyncRedisRepository,
+)
+
 try:
     from feature_extractor import (
         VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures, FaceEmbeddingExtractor,
@@ -64,18 +74,71 @@ logger = logging.getLogger("nexus.video")
 
 _REDIS_URL          = os.getenv("REDIS_URL", "redis://redis:6379/0").replace("localhost:6379", "redis:6379")
 _PENDING_SIGNAL_TTL = 86400  # 24 h auto-cleanup
+_redis_repo = SyncRedisRepository()
+_event_store = RedisEventStore()
+_lock_manager = RedisLockManager()
+
+
+def _record_to_signal(session_id: str, signal: dict) -> SignalRecord:
+    return SignalRecord(
+        session_id=session_id,
+        agent="video",
+        speaker_id=signal.get("speaker_id", "unknown"),
+        registry_id=signal.get("registry_id"),
+        signal_type=signal.get("signal_type", ""),
+        value=signal.get("value"),
+        value_text=signal.get("value_text", ""),
+        confidence=signal.get("confidence", 0.5),
+        window_start_ms=signal.get("window_start_ms", 0),
+        window_end_ms=signal.get("window_end_ms", 0),
+        metadata=signal.get("metadata") or {},
+    )
+
+
+def _set_video_status(session_id: str, status: str, signal_count: int = 0, error: str = "") -> None:
+    _redis_repo.set_agent_status(
+        session_id,
+        "video",
+        AgentStatusRecord(
+            status=status,
+            signal_count=signal_count,
+            summary_key="summary:video",
+            error=error or "",
+        ),
+    )
+
+
+def _publish_video_artifacts(session_id: str, analysis: "VideoAnalysisResponse") -> None:
+    _redis_repo.write_artifact(
+        session_id,
+        "summary:video",
+        {
+            "session_id": session_id,
+            "duration_seconds": analysis.duration_seconds,
+            "total_windows": analysis.total_windows,
+            "speakers": analysis.speakers,
+            "speaker_summaries": [summary.model_dump() for summary in analysis.speaker_summaries],
+            "participant_count": analysis.participant_count,
+            "backend": analysis.backend,
+            "face_embeddings": analysis.face_embeddings,
+            "lip_sync_scores": analysis.lip_sync_scores,
+            "face_to_speaker": analysis.face_to_speaker,
+        },
+    )
 
 
 def _push_signals_to_redis(session_id: str, signals: list[dict]) -> None:
-    """Persist signal batch to Redis immediately. Sync — safe from thread-pool worker. Non-fatal."""
-    if not signals or _sync_redis is None:
+    """Persist signals to canonical Redis streams and the temporary legacy list."""
+    if not signals:
         return
     try:
-        r = _sync_redis.from_url(_REDIS_URL, socket_timeout=3, decode_responses=True)
-        key = f"nexus:pending:{session_id}:video"
-        r.rpush(key, json.dumps(signals))
-        r.expire(key, _PENDING_SIGNAL_TTL)
-        r.close()
+        _redis_repo.publish_signal_batch(_record_to_signal(session_id, signal) for signal in signals)
+        if _sync_redis is not None:
+            r = _sync_redis.from_url(_REDIS_URL, socket_timeout=3, decode_responses=True)
+            key = f"nexus:pending:{session_id}:video"
+            r.rpush(key, json.dumps(signals))
+            r.expire(key, _PENDING_SIGNAL_TTL)
+            r.close()
     except Exception as exc:
         logger.warning(f"[{session_id}] Redis signal backup failed (non-fatal): {exc}")
 
@@ -105,7 +168,10 @@ _calibrator:  Optional[VideoCalibrationModule]  = None
 _video_jobs: dict[str, dict] = {}
 
 # CPU-bound pipeline.run() runs in this thread pool so the event loop stays free
-_thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="video-pipeline")
+_thread_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=min(os.cpu_count() or 4, 8),
+    thread_name_prefix="video-pipeline",
+)
 
 
 def _get_extractor() -> VideoFeatureExtractor:
@@ -190,8 +256,9 @@ class VideoAnalysisResponse(BaseModel):
     participant_count:     int = 0        # max faces detected in any single frame
     backend:               str = "mediapipe"
     annotated_video_path:  Optional[str] = None
-    face_embeddings:       dict = {}      # {speaker_label: {embedding, thumbnail_b64, track_id}}
-    lip_sync_scores:       dict = {}      # {speaker_label: correlation_score} — lip-sync assignment quality
+    face_embeddings:       dict = {}      # {Face_N: {embedding, thumbnail_b64, track_id}}
+    lip_sync_scores:       dict = {}      # {Speaker_N: correlation_score} — lip-sync assignment quality
+    face_to_speaker:       dict = {}      # {face_index_int: "Speaker_N"} — linkage map for gateway
 
 
 class VideoJobResponse(BaseModel):
@@ -265,40 +332,56 @@ class VideoPipeline:
         duration_sec = (windows[-1].window_end_ms - windows[0].window_start_ms) / 1000.0
 
         # ── Step 2: Map windows → speakers (lip-sync correlation) ─────────────
-        windows_by_speaker, lip_sync_scores = self._mapper.assign(
+        windows_by_speaker, lip_sync_scores, face_to_speaker = self._mapper.assign(
             windows, diar_segments, lip_activity_map
         )
         speakers = sorted(windows_by_speaker.keys())
         logger.info(f"[{session_id}] Speakers detected: {speakers}")
 
-        # ── Step 3: Per-speaker baselines ─────────────────────────────────────
+        # ── Step 3: Per-speaker baselines (parallel — stateless, each speaker independent) ─
+        # VideoCalibrationModule has no mutable instance state; each call only reads
+        # its own `windows` slice and returns new typed dataclasses. Safe for threads.
         baselines: dict[str, tuple[FacialBaseline, BodyBaseline, GazeBaseline]] = {}
-        for speaker_id, spk_windows in windows_by_speaker.items():
-            facial, body, gaze = self._calibrator.build_all_baselines(
-                speaker_id=speaker_id,
-                session_id=session_id,
-                windows=spk_windows,
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(windows_by_speaker), 4),
+        ) as bl_pool:
+            future_to_speaker = {
+                bl_pool.submit(
+                    self._calibrator.build_all_baselines,
+                    speaker_id=spk,
+                    session_id=session_id,
+                    windows=wins,
+                ): spk
+                for spk, wins in windows_by_speaker.items()
+            }
+            for fut in concurrent.futures.as_completed(future_to_speaker):
+                spk = future_to_speaker[fut]
+                facial, body, gaze = fut.result()
+                baselines[spk] = (facial, body, gaze)
+
+        # ── Step 4: Rule engines ──────────────────────────────────────────────────
+        # Facial and Gaze are fully stateless and mutually independent — run in parallel.
+        # Body depends on their outputs (extra_signals) — runs strictly after both finish.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as rule_pool:
+            facial_future = rule_pool.submit(
+                self._facial_rules.evaluate,
+                windows_by_speaker, baselines, session_id, meeting_type,
             )
-            baselines[speaker_id] = (facial, body, gaze)
-
-        # ── Step 4: Rule engines — persist each batch to Redis immediately ───────
-        facial_signals = self._facial_rules.evaluate(
-            windows_by_speaker, baselines, session_id, meeting_type
-        )
-        _push_signals_to_redis(session_id, facial_signals)
-
-        gaze_signals = self._gaze_rules.evaluate(
-            windows_by_speaker, baselines, session_id, meeting_type
-        )
-        _push_signals_to_redis(session_id, gaze_signals)
+            gaze_future = rule_pool.submit(
+                self._gaze_rules.evaluate,
+                windows_by_speaker, baselines, session_id, meeting_type,
+            )
+            facial_signals = facial_future.result()
+            gaze_signals   = gaze_future.result()
 
         body_signals = self._body_rules.evaluate(
             windows_by_speaker, baselines, session_id, meeting_type,
             extra_signals=facial_signals + gaze_signals,
         )
-        _push_signals_to_redis(session_id, body_signals)
 
         all_signals: list[dict] = facial_signals + gaze_signals + body_signals
+        # Persist all signals in one Redis call instead of three separate connections
+        _push_signals_to_redis(session_id, all_signals)
 
         summaries    = self._build_summaries(windows_by_speaker, baselines)
         participant_count = max(
@@ -369,6 +452,7 @@ class VideoPipeline:
             annotated_video_path=None,   # Phase 2 fills this in
             face_embeddings=face_embeddings_data,
             lip_sync_scores=lip_sync_scores,
+            face_to_speaker={str(k): v for k, v in face_to_speaker.items()},
         ), video_path
 
     def burn_overlay(
@@ -466,6 +550,23 @@ async def _run_video_job(
         mapper=_get_mapper(),
         calibrator=_get_calibrator(),
     )
+    lock_token = await _lock_manager.acquire(session_id, "video")
+    if not lock_token:
+        logger.warning(f"[{session_id}] Video agent lock already held; skipping duplicate execution")
+        _video_jobs[job_id]["status"] = "failed"
+        _video_jobs[job_id]["error"] = "video agent already running for this session"
+        _set_video_status(session_id, "skipped", error="duplicate execution prevented")
+        return
+
+    _redis_repo.set_session_state(
+        session_id,
+        SessionStateRecord(status="running", current_step="video"),
+    )
+    _set_video_status(session_id, "running")
+    await _event_store.append(
+        session_id,
+        EventRecord(session_id=session_id, agent="video", event_type="agent_started", payload={"job_id": job_id}),
+    )
 
     # ── Phase 1: Frame extraction ─────────────────────────────────────────────
     _video_jobs[job_id]["status"] = "extracting"
@@ -483,11 +584,28 @@ async def _run_video_job(
         logger.exception(f"[{session_id}] Video job {job_id} analysis failed: {exc}")
         _video_jobs[job_id]["status"] = "failed"
         _video_jobs[job_id]["error"] = str(exc)
+        _set_video_status(session_id, "failed", error=str(exc))
+        await _event_store.append(
+            session_id,
+            EventRecord(session_id=session_id, agent="video", event_type="agent_failed", payload={"error": str(exc)}),
+        )
+        await _lock_manager.release(session_id, "video", lock_token)
         return
 
     # ── Signals ready — gateway can return results immediately ────────────────
     _video_jobs[job_id]["status"] = "signals_ready"
     _video_jobs[job_id]["result"] = analysis.model_dump()
+    _publish_video_artifacts(session_id, analysis)
+    _set_video_status(session_id, "completed", signal_count=len(analysis.signals))
+    await _event_store.append(
+        session_id,
+        EventRecord(
+            session_id=session_id,
+            agent="video",
+            event_type="signals_ready",
+            payload={"job_id": job_id, "signal_count": len(analysis.signals)},
+        ),
+    )
     logger.info(
         f"[{session_id}] Video job {job_id} signals_ready: {len(analysis.signals)} signals"
     )
@@ -517,6 +635,11 @@ async def _run_video_job(
 
     _video_jobs[job_id]["status"] = "done"
     logger.info(f"[{session_id}] Video job {job_id} done")
+    await _event_store.append(
+        session_id,
+        EventRecord(session_id=session_id, agent="video", event_type="agent_completed", payload={"job_id": job_id}),
+    )
+    await _lock_manager.release(session_id, "video", lock_token)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

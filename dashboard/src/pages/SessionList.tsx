@@ -1,49 +1,75 @@
 import { useState, useEffect } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
-import { Upload, Loader2 } from "lucide-react";
+import { Upload, Loader2, ChevronDown } from "lucide-react";
 import { listSessions } from "../api/client";
 import SessionCard from "../components/SessionCard";
+import type { Session } from "../api/client";
 
+const PAGE_SIZE = 50;
 
 export default function SessionList() {
-  const queryClient = useQueryClient();
   const navigate = useNavigate();
+
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [total, setTotal] = useState<number>(0);
+  const [offset, setOffset] = useState<number>(0);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isLoadingMore, setIsLoadingMore] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
   const [processingIds, setProcessingIds] = useState<Set<string>>(new Set());
 
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["sessions"],
-    queryFn: () => listSessions({ limit: 50 }),
-    refetchInterval: (query) => {
-      if (processingIds.size > 0) return 3000;
-      const sessions = (query.state.data as any)?.sessions ?? [];
-      if (sessions.some((s: any) => s.status === "processing" || s.status === "analysing"))
-        return 3000;
-      return false;
-    },
-  });
+  const fetchSessions = async (currentOffset: number, append: boolean) => {
+    try {
+      const data = await listSessions({ limit: PAGE_SIZE, offset: currentOffset });
+      setTotal(data.total);
+      setSessions((prev) => append ? [...prev, ...data.sessions] : data.sessions);
 
-  // Clear completed sessions from polling set
-  useEffect(() => {
-    if (!data?.sessions || processingIds.size === 0) return;
-    const completed = new Set<string>();
-    for (const s of data.sessions) {
-      if (
-        processingIds.has(s.id) &&
-        s.status !== "processing" &&
-        s.status !== "analysing"
-      ) {
-        completed.add(s.id);
+      // Track any processing sessions for polling
+      const newProcessing = data.sessions
+        .filter((s: Session) => s.status === "processing" || s.status === "analysing")
+        .map((s: Session) => s.id);
+      if (newProcessing.length > 0) {
+        setProcessingIds((prev) => new Set([...prev, ...newProcessing]));
       }
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setIsLoading(false);
+      setIsLoadingMore(false);
     }
-    if (completed.size > 0) {
-      setProcessingIds((prev) => {
-        const next = new Set(prev);
-        for (const id of completed) next.delete(id);
-        return next;
+  };
+
+  // Initial load
+  useEffect(() => {
+    fetchSessions(0, false);
+  }, []);
+
+  // Poll for processing sessions
+  useEffect(() => {
+    if (processingIds.size === 0) return;
+    const interval = setInterval(async () => {
+      const data = await listSessions({ limit: PAGE_SIZE, offset: 0 });
+      setTotal(data.total);
+      setSessions((prev) => {
+        const updated = new Map(data.sessions.map((s: Session) => [s.id, s]));
+        return prev.map((s) => updated.get(s.id) ?? s);
       });
-    }
-  }, [data, processingIds]);
+      const stillProcessing = data.sessions.filter(
+        (s: Session) => s.status === "processing" || s.status === "analysing"
+      );
+      if (stillProcessing.length === 0) setProcessingIds(new Set());
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [processingIds]);
+
+  const handleLoadMore = () => {
+    const nextOffset = offset + PAGE_SIZE;
+    setOffset(nextOffset);
+    setIsLoadingMore(true);
+    fetchSessions(nextOffset, true);
+  };
+
+  const hasMore = sessions.length < total;
 
   return (
     <div className="mx-auto max-w-4xl">
@@ -52,9 +78,9 @@ export default function SessionList() {
         <div>
           <h1 className="text-xl font-semibold text-nexus-text-primary">Sessions</h1>
           <p className="mt-0.5 text-xs text-nexus-text-muted">
-            {data
-              ? `${data.total} session${data.total !== 1 ? "s" : ""}`
-              : "Loading..."}
+            {total > 0
+              ? `${sessions.length} of ${total} session${total !== 1 ? "s" : ""}`
+              : isLoading ? "Loading..." : "No sessions"}
           </p>
         </div>
       </div>
@@ -70,14 +96,14 @@ export default function SessionList() {
       {/* Error */}
       {error && (
         <div className="rounded-lg border border-stress-high-30 bg-stress-high-10 p-4 text-sm text-nexus-stress-high">
-          Failed to load sessions: {(error as Error).message}
+          Failed to load sessions: {error}
         </div>
       )}
 
       {/* Session list */}
-      {data && (
+      {!isLoading && (
         <div className="space-y-2">
-          {data.sessions.length === 0 ? (
+          {sessions.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-20 text-nexus-text-muted">
               <Upload className="mb-3 h-8 w-8 opacity-40" />
               <p className="text-sm">No sessions yet</p>
@@ -91,9 +117,28 @@ export default function SessionList() {
               </button>
             </div>
           ) : (
-            data.sessions.map((session) => (
-              <SessionCard key={session.id} session={session} />
-            ))
+            <>
+              {sessions.map((session) => (
+                <SessionCard key={session.id} session={session} />
+              ))}
+
+              {hasMore && (
+                <div className="flex justify-center pt-4 pb-8">
+                  <button
+                    onClick={handleLoadMore}
+                    disabled={isLoadingMore}
+                    className="flex items-center gap-2 rounded-lg border border-nexus-border px-5 py-2.5 text-sm text-nexus-text-muted hover:border-nexus-accent-blue hover:text-nexus-accent-blue transition-colors disabled:opacity-50"
+                  >
+                    {isLoadingMore ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    )}
+                    {isLoadingMore ? "Loading..." : `Load more (${total - sessions.length} remaining)`}
+                  </button>
+                </div>
+              )}
+            </>
           )}
         </div>
       )}

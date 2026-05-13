@@ -33,6 +33,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # isort: split
 from shared.models.requests import VoiceAnalysisRequest as AnalysisRequest, VoiceAnalysisResponse as AnalysisResponse
+from shared.redis_layer import (
+    AgentStatusRecord,
+    EventRecord,
+    RedisEventStore,
+    RedisLockManager,
+    RedisRepository,
+    SessionStateRecord,
+    SignalRecord,
+)
 
 try:
     from shared.utils.audio_loader import load_audio as _load_audio
@@ -74,6 +83,48 @@ app.add_middleware(
 feature_extractor: Optional[VoiceFeatureExtractor] = None
 transcriber: Optional[Transcriber] = None
 rule_engine: Optional[VoiceRuleEngine] = None
+redis_repo = RedisRepository()
+event_store = RedisEventStore()
+lock_manager = RedisLockManager()
+
+
+async def _publish_voice_outputs(
+    session_id: str,
+    transcript: dict,
+    speaker_payload: list[dict],
+    signals: list[dict],
+    summary: dict,
+    speaker_embeddings: Optional[dict],
+) -> None:
+    await redis_repo.write_artifact(session_id, "transcript", {"segments": transcript.get("segments", [])})
+    await redis_repo.write_artifact(session_id, "speakers", {"speakers": speaker_payload})
+    await redis_repo.write_artifact(session_id, "diarization", {"segments": transcript.get("segments", [])})
+    await redis_repo.write_artifact(
+        session_id,
+        "summary:voice",
+        {
+            "summary": summary,
+            "duration_seconds": transcript.get("duration_seconds", 0),
+            "speaker_embeddings": speaker_embeddings or {},
+        },
+    )
+    if signals:
+        await redis_repo.publish_signals(
+            SignalRecord(
+                session_id=session_id,
+                agent="voice",
+                speaker_id=signal.get("speaker_id", "unknown"),
+                registry_id=signal.get("registry_id"),
+                signal_type=signal.get("signal_type", ""),
+                value=signal.get("value"),
+                value_text=signal.get("value_text", ""),
+                confidence=signal.get("confidence", 0.5),
+                window_start_ms=signal.get("window_start_ms", 0),
+                window_end_ms=signal.get("window_end_ms", 0),
+                metadata=signal.get("metadata") or {},
+            )
+            for signal in signals
+        )
 
 
 @app.on_event("startup")
@@ -194,6 +245,15 @@ async def analyse_audio(request: AnalysisRequest):
     
     session_id = request.session_id or str(uuid.uuid4())
     start_time = time.time()
+    lock_token = await lock_manager.acquire(session_id, "voice")
+    if not lock_token:
+        raise HTTPException(409, "Voice agent is already processing this session")
+    await redis_repo.set_session_state(session_id, SessionStateRecord(status="running", current_step="transcribing"))
+    await redis_repo.set_agent_status(session_id, "voice", AgentStatusRecord(status="running", summary_key="summary:voice"))
+    await event_store.append(
+        session_id,
+        EventRecord(session_id=session_id, agent="voice", event_type="agent_started", payload={"file_path": str(file_path)}),
+    )
     
     logger.info(f"[{session_id}] Analysing: {file_path.name}")
 
@@ -264,25 +324,34 @@ async def analyse_audio(request: AnalysisRequest):
             word_counts[spk] = word_counts.get(spk, 0) + len(seg.get("text", "").split())
             transcript_speech_quick[spk] = transcript_speech_quick.get(spk, 0.0) + (seg["end_ms"] - seg["start_ms"]) / 1000.0
         total_speech_sec_quick = sum(transcript_speech_quick.values()) or duration_sec
+        speaker_payload = [
+            {
+                "speaker_id": sid,
+                "baseline": None,
+                "signal_count": 0,
+                "talk_time_ms": int(transcript_speech_quick.get(sid, 0.0) * 1000),
+                "talk_time_pct": round(transcript_speech_quick.get(sid, 0.0) / total_speech_sec_quick * 100, 2),
+                "total_words": word_counts.get(sid, 0),
+                "calibration_confidence": 0.0,
+            }
+            for sid in speakers
+        ]
+        speaker_embeddings = getattr(transcriber, "_last_speaker_embeddings", None) or None
+        await _publish_voice_outputs(session_id, transcript, speaker_payload, [], {}, speaker_embeddings)
+        await redis_repo.set_agent_status(session_id, "voice", AgentStatusRecord(status="completed", summary_key="summary:voice"))
+        await event_store.append(
+            session_id,
+            EventRecord(session_id=session_id, agent="voice", event_type="agent_completed", payload={"signal_count": 0}),
+        )
+        await lock_manager.release(session_id, "voice", lock_token)
         return AnalysisResponse(
             session_id=session_id,
             duration_seconds=duration_sec,
-            speakers=[
-                {
-                    "speaker_id": sid,
-                    "baseline": None,
-                    "signal_count": 0,
-                    "talk_time_ms": int(transcript_speech_quick.get(sid, 0.0) * 1000),
-                    "talk_time_pct": round(transcript_speech_quick.get(sid, 0.0) / total_speech_sec_quick * 100, 2),
-                    "total_words": word_counts.get(sid, 0),
-                    "calibration_confidence": 0.0,
-                }
-                for sid in speakers
-            ],
+            speakers=speaker_payload,
             signals=[],
             summary={},
             transcript_segments=transcript["segments"],
-            speaker_embeddings=getattr(transcriber, "_last_speaker_embeddings", None) or None,
+            speaker_embeddings=speaker_embeddings,
         )
 
     # ── Step 2: Extract acoustic features ──
@@ -397,14 +466,27 @@ async def analyse_audio(request: AnalysisRequest):
         for sid in speakers
     ]
 
+    signal_dicts = [s if isinstance(s, dict) else s.to_dict() for s in all_signals]
+    speaker_embeddings = getattr(transcriber, "_last_speaker_embeddings", None) or None
+    await _publish_voice_outputs(session_id, transcript, speaker_data, signal_dicts, summary, speaker_embeddings)
+    await redis_repo.set_agent_status(
+        session_id,
+        "voice",
+        AgentStatusRecord(status="completed", signal_count=len(signal_dicts), summary_key="summary:voice"),
+    )
+    await event_store.append(
+        session_id,
+        EventRecord(session_id=session_id, agent="voice", event_type="agent_completed", payload={"signal_count": len(signal_dicts)}),
+    )
+    await lock_manager.release(session_id, "voice", lock_token)
     return AnalysisResponse(
         session_id=session_id,
         duration_seconds=duration_sec,
         speakers=speaker_data,
-        signals=[s if isinstance(s, dict) else s.to_dict() for s in all_signals],
+        signals=signal_dicts,
         summary=summary,
         transcript_segments=transcript["segments"],
-        speaker_embeddings=getattr(transcriber, "_last_speaker_embeddings", None) or None,
+        speaker_embeddings=speaker_embeddings,
     )
 
 

@@ -15,6 +15,7 @@ Public functions called by _run_pipeline in main.py:
 """
 import base64
 import logging
+import re
 import uuid as _uuid
 from typing import Optional
 
@@ -22,8 +23,12 @@ logger = logging.getLogger("nexus.gateway.speaker_registry")
 
 # ── Similarity thresholds ─────────────────────────────────────────────────────
 DEFAULT_SIMILARITY_THRESHOLD = 0.75   # voice-only cosine similarity floor
-FACE_SIMILARITY_THRESHOLD    = 0.55   # ArcFace is highly discriminative
+FACE_SIMILARITY_THRESHOLD    = 0.62   # was 0.55; below ArcFace's reliable operating range
 FUSED_SIMILARITY_THRESHOLD   = 0.50   # lower bar when both modalities agree
+DEDUP_THRESHOLD              = 0.50   # near-duplicate check at INSERT time; lower than match
+                                      # threshold by design — false negatives here are permanent
+                                      # (creates duplicate row), false positives are recoverable
+                                      # via the existing /speakers/{id}/merge endpoint.
 # MFCC fallback embeddings capture recording environment, not just speaker identity.
 # Cosine similarities > 0.97 between DIFFERENT speakers are MFCC artifacts — multiple
 # speakers in the same call often all score 99%+ against each other.
@@ -33,6 +38,18 @@ VOICE_SIMILARITY_CEILING     = 0.97   # above this → likely MFCC artifact, cre
 # ── Fusion weights (face is more discriminative than MFCC voice) ──────────────
 FACE_WEIGHT  = 0.55
 VOICE_WEIGHT = 0.45
+
+# ── Label helpers ─────────────────────────────────────────────────────────────
+GENERIC_LABEL = re.compile(r"^(Face|Speaker|Person)_\d+$")
+
+
+def _meaningful_name(label) -> str:
+    """Return label only if it's a real human name. Empty string otherwise."""
+    if not label:
+        return ""
+    if GENERIC_LABEL.match(label):
+        return ""
+    return label
 
 
 async def match_or_create_speakers(
@@ -51,9 +68,9 @@ async def match_or_create_speakers(
 
     Matching priority:
       1. Fused (face + voice, same person): weighted score >= 0.50 → match
-      2. Face-only: cosine similarity >= 0.55 → match
+      2. Face-only: cosine similarity >= 0.62 → match
       3. Voice-only: cosine similarity >= 0.75 → match (existing behaviour)
-      4. No match → create new registry entry
+      4. No match → dedup check at 0.50, then INSERT if no near-duplicate found
 
     Fused score = face_similarity * 0.55 + voice_similarity * 0.45.
     Face is weighted higher because ArcFace is more discriminative than MFCC.
@@ -116,15 +133,24 @@ async def match_or_create_speakers(
                     best_score   = combined
                     match_method = "face_voice_fused"
             else:
-                # Disagree — use the stronger modality above its own threshold
-                if face_sim >= FACE_SIMILARITY_THRESHOLD and face_sim > voice_sim:
-                    best_match   = face_match
-                    best_score   = face_sim
-                    match_method = "face_embedding"
-                elif similarity_threshold <= voice_sim <= VOICE_SIMILARITY_CEILING:
+                # For a speaking Speaker_N, strong voice evidence defines the
+                # identity. Face evidence may support it, but should not override
+                # a conflicting strong voice match.
+                if similarity_threshold <= voice_sim <= VOICE_SIMILARITY_CEILING:
                     best_match   = voice_match
                     best_score   = voice_sim
                     match_method = "voice_embedding"
+                    logger.warning(
+                        "Registry conflict for %s: voice=%s(%.3f) face=%s(%.3f) "
+                        "-> keeping voice identity",
+                        speaker_label,
+                        voice_id, voice_sim,
+                        face_id, face_sim,
+                    )
+                elif face_sim >= FACE_SIMILARITY_THRESHOLD:
+                    best_match   = face_match
+                    best_score   = face_sim
+                    match_method = "face_embedding"
         elif face_emb_str and face_match and face_sim >= FACE_SIMILARITY_THRESHOLD:
             best_match   = face_match
             best_score   = face_sim
@@ -135,6 +161,11 @@ async def match_or_create_speakers(
             match_method = "voice_embedding"
 
         # ── Apply match or create ─────────────────────────────────────────
+        # Lookup speaker_info once, before deciding match vs INSERT.
+        speaker_info = next(
+            (s for s in (voice_speakers or []) if s.get("speaker_id") == speaker_label), {}
+        )
+
         if best_match:
             registry_id  = str(best_match["id"])
             display_name = best_match["display_name"]
@@ -148,6 +179,18 @@ async def match_or_create_speakers(
                 "updated_at         = NOW()",
             ]
             update_params = [best_match["id"]]
+
+            # Upgrade display_name only when the registry has no real name yet.
+            # Never overwrite a human-meaningful name — admin corrections take priority
+            # over automated diarization output (which can be wrong or hallucinated).
+            new_name = _meaningful_name(speaker_info.get("name")) if voice_speakers else ""
+            if new_name:
+                existing_name = best_match["display_name"] or ""
+                if not existing_name or GENERIC_LABEL.match(existing_name):
+                    p = len(update_params) + 1
+                    update_parts.append(f"display_name = ${p}")
+                    update_params.append(new_name)
+                    display_name = new_name
 
             if face_emb_str:
                 p = len(update_params) + 1
@@ -176,33 +219,77 @@ async def match_or_create_speakers(
                 speaker_label, display_name, match_method, confidence, voice_sim, face_sim,
             )
         else:
-            speaker_info = next(
-                (s for s in voice_speakers if s.get("speaker_id") == speaker_label), {}
-            )
-            display_name = speaker_info.get("name") or speaker_label
-            row = await pool.fetchrow("""
-                INSERT INTO speakers_registry
-                    (org_id, display_name, role,
-                     voice_embedding, voice_sample_count,
-                     face_embedding,  face_sample_count,
-                     session_count)
-                VALUES ($1, $2, $3, $4::vector, 1, $5::vector, $6, 1)
-                RETURNING id
-            """,
-                _coerce_uuid(org_id),
-                display_name,
-                speaker_info.get("role", ""),
-                voice_emb_str,
-                face_emb_str,
-                1 if face_emb_str else 0,
-            )
-            registry_id  = str(row["id"])
-            confidence   = 1.0
-            match_method = "new_registration"
-            logger.info(
-                "Registry new: %s registered as %r (has_face=%s)",
-                speaker_label, display_name, bool(face_emb_str),
-            )
+            # Before creating a new row, look for a near-duplicate by face embedding.
+            # Dedup applies only when we have a face embedding to compare; voice-only
+            # registrations skip dedup because MFCC false-positives (see VOICE_SIMILARITY_CEILING)
+            # would cause cross-speaker merges.
+            near_dup = None
+            if face_emb_str:
+                near_dup = await pool.fetchrow("""
+                    SELECT id, display_name,
+                           1 - (face_embedding <=> $1::vector) AS sim
+                    FROM   speakers_registry
+                    WHERE  org_id = $2 AND face_embedding IS NOT NULL
+                    ORDER  BY face_embedding <=> $1::vector
+                    LIMIT  1
+                """, face_emb_str, _coerce_uuid(org_id))
+
+            if near_dup and float(near_dup["sim"]) >= DEDUP_THRESHOLD:
+                # Same person, just below the match threshold. Merge into the existing row.
+                registry_id   = str(near_dup["id"])
+                existing_name = near_dup["display_name"] or ""
+                new_name      = _meaningful_name(speaker_info.get("name"))
+                display_name  = new_name if (new_name and (not existing_name or GENERIC_LABEL.match(existing_name))) else existing_name
+                confidence    = float(near_dup["sim"])
+                match_method  = "face_embedding"
+
+                # Update the existing row — add voice if missing, increment counters.
+                dup_parts = [
+                    "session_count      = session_count + 1",
+                    "voice_sample_count = voice_sample_count + 1",
+                    "face_sample_count  = face_sample_count + 1",
+                    "last_seen_at       = NOW()",
+                    "updated_at         = NOW()",
+                    "voice_embedding    = CASE WHEN voice_embedding IS NULL THEN $2::vector ELSE voice_embedding END",
+                ]
+                dup_params = [near_dup["id"], voice_emb_str]
+                if display_name != existing_name:
+                    dup_parts.append("display_name = $3")
+                    dup_params.append(display_name)
+                await pool.execute(
+                    f"UPDATE speakers_registry SET {', '.join(dup_parts)} WHERE id = $1",
+                    *dup_params,
+                )
+                logger.info(
+                    "Registry dedup-merge: %s → %s (sim=%.3f, avoided INSERT)",
+                    speaker_label, display_name or "(unnamed)", near_dup["sim"],
+                )
+            else:
+                # No near-duplicate. Create a new row.
+                display_name = _meaningful_name(speaker_info.get("name")) or _meaningful_name(speaker_label)
+                row = await pool.fetchrow("""
+                    INSERT INTO speakers_registry
+                        (org_id, display_name, role,
+                         voice_embedding, voice_sample_count,
+                         face_embedding,  face_sample_count,
+                         session_count)
+                    VALUES ($1, $2, $3, $4::vector, 1, $5::vector, $6, 1)
+                    RETURNING id
+                """,
+                    _coerce_uuid(org_id),
+                    display_name,
+                    speaker_info.get("role", ""),
+                    voice_emb_str,
+                    face_emb_str,
+                    1 if face_emb_str else 0,
+                )
+                registry_id  = str(row["id"])
+                confidence   = 1.0
+                match_method = "new_registration"
+                logger.info(
+                    "Registry new: %s registered as %r (has_face=%s)",
+                    speaker_label, display_name or "(unnamed)", bool(face_emb_str),
+                )
 
         # ── Store face thumbnail ──────────────────────────────────────────
         # Only when the match used face evidence — a voice-only match means the
@@ -274,16 +361,44 @@ async def match_or_create_by_face_only(
                 WHERE id = $1
             """, match["id"])
         else:
-            row = await pool.fetchrow("""
-                INSERT INTO speakers_registry
-                    (org_id, display_name, face_embedding, face_sample_count, session_count)
-                VALUES ($1, $2, $3::vector, 1, 1)
-                RETURNING id
-            """, _coerce_uuid(org_id), speaker_label, emb_str)
-            registry_id  = str(row["id"])
-            display_name = speaker_label
-            confidence   = 1.0
-            match_method = "new_registration"
+            # Before INSERT, check for near-duplicate by face embedding.
+            near_dup = await pool.fetchrow("""
+                SELECT id, display_name,
+                       1 - (face_embedding <=> $1::vector) AS sim
+                FROM   speakers_registry
+                WHERE  org_id = $2 AND face_embedding IS NOT NULL
+                ORDER  BY face_embedding <=> $1::vector
+                LIMIT  1
+            """, emb_str, _coerce_uuid(org_id))
+
+            if near_dup and float(near_dup["sim"]) >= DEDUP_THRESHOLD:
+                registry_id  = str(near_dup["id"])
+                display_name = near_dup["display_name"] or ""
+                confidence   = float(near_dup["sim"])
+                match_method = "face_embedding"
+                await pool.execute("""
+                    UPDATE speakers_registry
+                    SET session_count     = session_count + 1,
+                        face_sample_count = face_sample_count + 1,
+                        last_seen_at      = NOW(),
+                        updated_at        = NOW()
+                    WHERE id = $1
+                """, near_dup["id"])
+                logger.info(
+                    "Face-only dedup-merge: %s → %s (sim=%.3f)",
+                    speaker_label, display_name or "(unnamed)", near_dup["sim"],
+                )
+            else:
+                row = await pool.fetchrow("""
+                    INSERT INTO speakers_registry
+                        (org_id, display_name, face_embedding, face_sample_count, session_count)
+                    VALUES ($1, $2, $3::vector, 1, 1)
+                    RETURNING id
+                """, _coerce_uuid(org_id), _meaningful_name(speaker_label), emb_str)
+                registry_id  = str(row["id"])
+                display_name = _meaningful_name(speaker_label)
+                confidence   = 1.0
+                match_method = "new_registration"
 
         if face_data.get("thumbnail_b64"):
             await _store_thumbnail(pool, registry_id, session_id, face_data, confidence)

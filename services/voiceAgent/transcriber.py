@@ -331,10 +331,12 @@ class Transcriber:
             from faster_whisper import WhisperModel
 
             logger.info(f"Loading local Whisper model: {WHISPER_MODEL} ...")
+            import os as _os
             self._model = WhisperModel(
                 WHISPER_MODEL,
-                device="cpu",       # Use "cuda" if GPU available
-                compute_type="int8" # Fastest on CPU; use "float16" on GPU
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=min(_os.cpu_count() or 4, 16),
             )
             logger.info(f"Local Whisper model loaded.")
         except ImportError:

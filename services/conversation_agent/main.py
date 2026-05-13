@@ -40,6 +40,14 @@ try:
         ConversationAnalysisRequest as AnalysisRequest,
         ConversationAnalysisResponse as AnalysisResponse,
     )
+    from shared.redis_layer import (
+        AgentStatusRecord,
+        EventRecord,
+        RedisEventStore,
+        RedisLockManager,
+        RedisRepository,
+        SessionStateRecord,
+    )
 except ImportError:
     # Fallback: define locally if shared models are not available
     class AnalysisRequest(BaseModel):
@@ -90,6 +98,9 @@ app.add_middleware(
 # -- Globals (initialised on startup) --
 feature_extractor: Optional[ConversationFeatureExtractor] = None
 rule_engine: Optional[ConversationRuleEngine] = None
+redis_repo = RedisRepository()
+event_store = RedisEventStore()
+lock_manager = RedisLockManager()
 
 
 @app.on_event("startup")
@@ -148,6 +159,15 @@ async def analyse(request: AnalysisRequest):
 
     session_id = request.session_id or str(uuid.uuid4())
     segments = request.segments
+    lock_token = await lock_manager.acquire(session_id, "conversation")
+    if not lock_token:
+        raise HTTPException(409, "Conversation agent is already processing this session")
+    await redis_repo.set_session_state(session_id, SessionStateRecord(status="running", current_step="conversation"))
+    await redis_repo.set_agent_status(session_id, "conversation", AgentStatusRecord(status="running", summary_key="summary:conversation"))
+    await event_store.append(
+        session_id,
+        EventRecord(session_id=session_id, agent="conversation", event_type="agent_started", payload={"segment_count": len(segments)}),
+    )
     speakers = request.speakers or []
     content_type = request.content_type or "sales_call"
 
@@ -214,6 +234,17 @@ async def analyse(request: AnalysisRequest):
 
     elapsed = time.time() - t0
     logger.info(f"[{session_id}] Conversation analysis complete in {elapsed:.2f}s")
+    await redis_repo.write_artifact(session_id, "summary:conversation", {"summary": summary})
+    await redis_repo.set_agent_status(
+        session_id,
+        "conversation",
+        AgentStatusRecord(status="completed", signal_count=len(signals), summary_key="summary:conversation"),
+    )
+    await event_store.append(
+        session_id,
+        EventRecord(session_id=session_id, agent="conversation", event_type="agent_completed", payload={"signal_count": len(signals)}),
+    )
+    await lock_manager.release(session_id, "conversation", lock_token)
 
     return AnalysisResponse(
         session_id=session_id,

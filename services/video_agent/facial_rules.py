@@ -48,12 +48,12 @@ EMOTION_DELTA_OVERRIDES: dict[str, float] = {
 # confidence caps per emotion (deception-adjacent emotions capped lower)
 EMOTION_CONF_CAPS: dict[str, float] = {
     "happy":     0.70,
-    "sad":       0.55,
-    "angry":     0.55,
+    "sad":       0.60,
+    "angry":     0.65,
     "surprised": 0.60,
-    "disgusted": 0.35,
+    "disgusted": 0.40,
     "contempt":  0.35,
-    "fearful":   0.50,
+    "fearful":   0.55,
 }
 
 # Stress blendshapes with weights (Ekman: AU4 = brow lowerer, AU17 = chin raiser)
@@ -154,7 +154,7 @@ class FacialRuleEngine(BaseVideoRuleEngine):
 
                 signals += [
                     s for s in window_signals
-                    if s.get("confidence", 0) >= self.MIN_SIGNAL_CONFIDENCE
+                    if s is not None and s.get("confidence", 0) >= self.MIN_SIGNAL_CONFIDENCE
                 ]
                 prev_w = w
 

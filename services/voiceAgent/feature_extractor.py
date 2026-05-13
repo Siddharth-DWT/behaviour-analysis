@@ -117,8 +117,15 @@ class VoiceFeatureExtractor:
 
             if features:
                 features["speaker_id"] = speaker_id
-                features["window_start_ms"] = win_start_ms
-                features["window_end_ms"] = win_end_ms
+                # Store the speaker's actual speaking span within this analysis window,
+                # not the full grid boundary. Grid windows can start up to WINDOW_SIZE_SEC
+                # before the speaker's first word, causing badges to appear long before speech.
+                features["window_start_ms"] = max(
+                    min(s["start_ms"] for s in win_segments), win_start_ms
+                )
+                features["window_end_ms"] = min(
+                    max(s["end_ms"] for s in win_segments), win_end_ms
+                )
                 speaker_features.append(features)
 
         return speaker_features

@@ -64,12 +64,12 @@ class GazeRuleEngine(BaseVideoRuleEngine):
                 speaker_id,
                 (None, None, GazeBaseline(speaker_id=speaker_id)),
             )
-            signals += self._per_window_rules(windows, gaze_bl, speaker_id)
-            signals += self._rule_screen_contact(windows, gaze_bl, speaker_id)
-            signals += self._rule_distraction(windows, gaze_bl, speaker_id)
+            signals += [s for s in self._per_window_rules(windows, gaze_bl, speaker_id) if s is not None]
+            signals += [s for s in self._rule_screen_contact(windows, gaze_bl, speaker_id) if s is not None]
+            signals += [s for s in self._rule_distraction(windows, gaze_bl, speaker_id) if s is not None]
 
         # Cross-speaker rule (needs all speakers simultaneously)
-        signals += self._rule_gaze_sync(windows_by_speaker)
+        signals += [s for s in self._rule_gaze_sync(windows_by_speaker) if s is not None]
 
         logger.info(f"[{session_id}] GazeRuleEngine: {len(signals)} signals")
         return signals
@@ -97,7 +97,7 @@ class GazeRuleEngine(BaseVideoRuleEngine):
             window_signals += self._rule_blink_rate(w, bl, speaker_id, conf_mult)
             window_signals += self._rule_attention(w, bl, speaker_id, conf_mult)
 
-            signals += window_signals
+            signals += [s for s in window_signals if s is not None]
 
         return signals
 
