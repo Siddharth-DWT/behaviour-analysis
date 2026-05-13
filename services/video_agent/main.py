@@ -29,11 +29,6 @@ import concurrent.futures
 from pathlib import Path
 from typing import Optional
 
-try:
-    import redis as _sync_redis
-except ImportError:
-    _sync_redis = None  # type: ignore[assignment]
-
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -72,8 +67,6 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nexus.video")
 
-_REDIS_URL          = os.getenv("REDIS_URL", "redis://redis:6379/0").replace("localhost:6379", "redis:6379")
-_PENDING_SIGNAL_TTL = 86400  # 24 h auto-cleanup
 _redis_repo = SyncRedisRepository()
 _event_store = RedisEventStore()
 _lock_manager = RedisLockManager()
@@ -128,19 +121,13 @@ def _publish_video_artifacts(session_id: str, analysis: "VideoAnalysisResponse")
 
 
 def _push_signals_to_redis(session_id: str, signals: list[dict]) -> None:
-    """Persist signals to canonical Redis streams and the temporary legacy list."""
+    """Persist signals to the canonical Redis stream for this session."""
     if not signals:
         return
     try:
         _redis_repo.publish_signal_batch(_record_to_signal(session_id, signal) for signal in signals)
-        if _sync_redis is not None:
-            r = _sync_redis.from_url(_REDIS_URL, socket_timeout=3, decode_responses=True)
-            key = f"nexus:pending:{session_id}:video"
-            r.rpush(key, json.dumps(signals))
-            r.expire(key, _PENDING_SIGNAL_TTL)
-            r.close()
     except Exception as exc:
-        logger.warning(f"[{session_id}] Redis signal backup failed (non-fatal): {exc}")
+        logger.warning(f"[{session_id}] Redis signal publish failed (non-fatal): {exc}")
 
 
 # ─── FastAPI app ──────────────────────────────────────────────────────────────

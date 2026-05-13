@@ -1478,22 +1478,6 @@ async def _run_pipeline(
             logger.warning(f"[{session_id}] Language Agent failed (continuing): {e}")
             return {}
 
-    async def _run_conversation() -> dict:
-        try:
-            if not run_conversation:
-                if not run_behavioural:
-                    logger.info(f"[{session_id}] Behavioural analysis disabled — skipping Conversation Agent")
-                else:
-                    logger.info(f"[{session_id}] < 2 speakers — skipping Conversation Agent")
-                return {}
-            result = await _call_conversation_agent(session_id, transcript_segments, meeting_type)
-            agent_status["conversation"] = "completed"
-            return result
-        except Exception as e:
-            agent_status["conversation"] = "failed"
-            logger.warning(f"[{session_id}] Conversation Agent failed (continuing): {e}")
-            return {}
-
     async def _run_video() -> tuple[list[dict], dict, dict, dict, str]:
         """Returns (signals, face_embeddings_dict, face_to_speaker, lip_sync_scores, video_job_id)."""
         if not run_video or video_path is None:
@@ -1536,18 +1520,23 @@ async def _run_pipeline(
 
     # ── Call Conversation Agent (now that language signals are available) ──
     await _set_step_state(session_id, "conversation")
-    try:
-        # Pass language signals into the Conversation Agent for cross-modal rules
-        conv_outcome = await _call_conversation_agent(session_id, transcript_segments, meeting_type, language_signals=language_signals)
-        if conv_outcome:
-            conversation_result = conv_outcome
-            conversation_signals = conversation_result.get("signals", [])
-            conversation_summary = conversation_result.get("summary", {})
-            logger.info(f"[{session_id}] Conversation Agent: {len(conversation_signals)} signals")
-            agent_status["conversation"] = "completed"
-    except Exception as e:
-        agent_status["conversation"] = "failed"
-        logger.warning(f"[{session_id}] Conversation Agent failed (continuing): {e}")
+    if not run_conversation:
+        if not run_behavioural:
+            logger.info(f"[{session_id}] Behavioural analysis disabled — skipping Conversation Agent")
+        else:
+            logger.info(f"[{session_id}] < 2 speakers — skipping Conversation Agent")
+    else:
+        try:
+            conv_outcome = await _call_conversation_agent(session_id, transcript_segments, meeting_type, language_signals=language_signals)
+            if conv_outcome:
+                conversation_result = conv_outcome
+                conversation_signals = conversation_result.get("signals", [])
+                conversation_summary = conversation_result.get("summary", {})
+                logger.info(f"[{session_id}] Conversation Agent: {len(conversation_signals)} signals")
+                agent_status["conversation"] = "completed"
+        except Exception as e:
+            agent_status["conversation"] = "failed"
+            logger.warning(f"[{session_id}] Conversation Agent failed (continuing): {e}")
         await _persist_agent_signals(session_id, conversation_signals, speaker_map, "conversation")
 
     # ── Unpack video result ──
@@ -3006,7 +2995,7 @@ async def _call_video_agent(
     diar_segments: list[dict],
     meeting_type: str,
     num_speakers: int = 2,
-) -> dict:
+) -> tuple[dict, str]:
     """
     Submit video to the Video Agent async job queue, then poll until done.
 

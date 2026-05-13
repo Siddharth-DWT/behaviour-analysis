@@ -16,7 +16,7 @@ Pipeline:
   VideoFeatureExtractor.extract_all(video_path)
       → (list[WindowFeatures], lip_activity_map)   (face-detected, unassigned + lip timeseries)
   SpeakerFaceMapper.assign(windows, diar_segments, lip_activity_map)
-      → (dict[str, list[WindowFeatures]], dict[str, float])   (windows_by_speaker, lip_sync_scores)
+      → (dict[str, list[WindowFeatures]], dict[str, float], dict[int, str])   (windows_by_face, lip_sync_scores, face_to_speaker)
 
 Research basis:
   - Soukupova & Cech 2016: Eye Aspect Ratio for blink detection
@@ -3749,7 +3749,7 @@ class SpeakerFaceMapper:
             )
             result[face_label].append(wf)
 
-        # lip_sync_scores: only meaningful for confirmed speaker→face assignments
+        # lip_sync_scores: face→speaker linkage exported for gateway registry matching
         lip_sync_scores: dict[str, float] = {}
         confident_mapping: dict[int, str] = {}
         if method == "lip_sync":
@@ -3757,6 +3757,17 @@ class SpeakerFaceMapper:
                 score = assignment_scores.get(fi, 0.0)
                 if spk.startswith("Speaker_") and score >= MIN_LIP_SYNC_LINK_SCORE:
                     lip_sync_scores[spk] = round(score, 4)
+                    confident_mapping[fi] = spk
+        elif method == "time_overlap":
+            # time_overlap is used for single-speaker sessions or when lip data is absent.
+            # Export any face with positive speaking-time overlap so the gateway can alias
+            # Face_N → Speaker_N for registry matching. Sentinel score 1.0 is above
+            # SESSION_FACE_LOCK_MIN_SCORE=0.10; time-overlap assignment is reliable when
+            # voice diarization is accurate.
+            for fi, spk in face_to_speaker.items():
+                score = assignment_scores.get(fi, 0.0)
+                if spk.startswith("Speaker_") and score > 0.0:
+                    lip_sync_scores[spk] = 1.0
                     confident_mapping[fi] = spk
 
         logger.info(
