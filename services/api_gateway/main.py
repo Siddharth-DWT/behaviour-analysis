@@ -66,6 +66,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # isort: split
 from shared.models.requests import SessionListResponse
 from shared.redis_layer import (
+    AgentJobDispatcher,
     AgentStatusRecord,
     EventRecord,
     RedisEventStore,
@@ -164,6 +165,7 @@ async def _drain_pending_signals(session_id: str, agent: str) -> list[dict]:
 
 redis_repo = RedisRepository()
 event_store = RedisEventStore()
+_dispatcher = AgentJobDispatcher(redis_repo)
 
 
 async def _read_agent_signals(session_id: str, agent: str, count: int = 10_000) -> list[dict]:
@@ -2885,6 +2887,17 @@ async def _post_process_pipeline(
         logger.info(f"[{session_id}] Neo4j sync skipped (run_knowledge_graph=false)")
 
 
+async def _dispatch_job(
+    agent: str,
+    session_id: str,
+    payload: dict,
+    timeout: float,
+    log_label: str = "",
+) -> dict:
+    """Delegate to AgentJobDispatcher — pub/sub notification with exponential-backoff fallback."""
+    return await _dispatcher.dispatch(agent, session_id, payload, timeout, label=log_label)
+
+
 async def _call_voice_agent(
     session_id: str,
     file_path: str,
@@ -2893,10 +2906,7 @@ async def _call_voice_agent(
     analysis_config: Optional[dict] = None,
     num_speakers: Optional[int] = None,
 ) -> dict:
-    """Call Voice Agent POST /analyse with file path."""
-    t0 = time.time()
-    logger.info(f"[{session_id}] → Voice Agent /analyse ({Path(file_path).name}, meeting_type={meeting_type})")
-    payload: dict[str, Any] = {
+    payload: dict = {
         "file_path": file_path,
         "session_id": session_id,
         "meeting_type": meeting_type,
@@ -2904,21 +2914,18 @@ async def _call_voice_agent(
     if num_speakers:
         payload["num_speakers"] = num_speakers
     if transcription_config:
-        payload["transcription_config"] = transcription_config
-    if analysis_config:
-        payload["analysis_config"] = analysis_config
-    async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
-        resp = await client.post(
-            f"{VOICE_AGENT_URL}/analyse",
-            json=payload,
+        payload["transcription_config"] = (
+            transcription_config.model_dump()
+            if hasattr(transcription_config, "model_dump")
+            else transcription_config
         )
-        resp.raise_for_status()
-        result = resp.json()
-    logger.info(
-        f"[{session_id}] ← Voice Agent: {len(result.get('signals', []))} signals, "
-        f"{len(result.get('speakers', []))} speakers in {time.time()-t0:.1f}s"
-    )
-    return result
+    if analysis_config:
+        payload["analysis_config"] = (
+            analysis_config.model_dump()
+            if hasattr(analysis_config, "model_dump")
+            else analysis_config
+        )
+    return await _dispatch_job("voice", session_id, payload, timeout=AGENT_TIMEOUT, log_label="Voice Agent")
 
 
 async def _call_language_agent(
@@ -2926,23 +2933,12 @@ async def _call_language_agent(
     segments: list[dict],
     meeting_type: str,
 ) -> dict:
-    """Call Language Agent POST /analyse with transcript segments."""
-    t0 = time.time()
-    logger.info(f"[{session_id}] → Language Agent /analyse ({len(segments)} segments, meeting_type={meeting_type})")
-    async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
-        resp = await client.post(
-            f"{LANGUAGE_AGENT_URL}/analyse",
-            json={
-                "segments": segments,
-                "session_id": session_id,
-                "meeting_type": meeting_type,
-                "run_intent_classification": True,
-            },
-        )
-        resp.raise_for_status()
-        result = resp.json()
-    logger.info(f"[{session_id}] ← Language Agent: {len(result.get('signals', []))} signals in {time.time()-t0:.1f}s")
-    return result
+    return await _dispatch_job("language", session_id, {
+        "segments": segments,
+        "session_id": session_id,
+        "meeting_type": meeting_type,
+        "run_intent_classification": True,
+    }, timeout=AGENT_TIMEOUT, log_label="Language Agent")
 
 
 async def _call_conversation_agent(
@@ -2951,42 +2947,24 @@ async def _call_conversation_agent(
     meeting_type: str,
     language_signals: list[dict] | None = None,
 ) -> dict:
-    """Call Conversation Agent POST /analyse with transcript segments.
-
-    Optionally include `language_signals` for cross-modal conflict detection.
-    """
-    t0 = time.time()
     speakers = list(set(seg.get("speaker", "unknown") for seg in segments))
-    logger.info(f"[{session_id}] → Conversation Agent /analyse ({len(segments)} segments, {len(speakers)} speakers)")
-    async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
-        resp = await client.post(
-            f"{CONVERSATION_AGENT_URL}/analyse",
-            json={
-                "segments": segments,
-                "speakers": speakers,
-                "content_type": meeting_type,
-                "session_id": session_id,
-                "language_signals": language_signals,
-            },
-        )
-        resp.raise_for_status()
-        result = resp.json()
-    logger.info(f"[{session_id}] ← Conversation Agent: {len(result.get('signals', []))} signals in {time.time()-t0:.1f}s")
-    return result
+    return await _dispatch_job("conversation", session_id, {
+        "segments": segments,
+        "speakers": speakers,
+        "content_type": meeting_type,
+        "session_id": session_id,
+        "language_signals": language_signals,
+    }, timeout=AGENT_TIMEOUT, log_label="Conversation Agent")
 
 
 async def _post_video_display_names(job_id: str, display_names: dict) -> None:
-    """Fire-and-forget: send registry display names to video agent for burn overlay."""
+    """Write speaker display names to Redis for the video agent burn overlay pass."""
+    # job_id is session_id in the Redis-based flow
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                f"{VIDEO_AGENT_URL}/jobs/{job_id}/display-names",
-                json={"names": display_names},
-            )
-            resp.raise_for_status()
-            logger.info(f"Display names posted to video job {job_id}: {list(display_names)}")
+        await redis_repo.write_artifact(job_id, "display_names", {"names": display_names})
+        logger.info(f"Display names written to Redis for session {job_id}: {list(display_names)}")
     except Exception as exc:
-        logger.debug(f"Display names POST to job {job_id} failed (non-fatal): {exc}")
+        logger.debug(f"Display names Redis write failed (non-fatal): {exc}")
 
 
 async def _call_video_agent(
@@ -2996,85 +2974,22 @@ async def _call_video_agent(
     meeting_type: str,
     num_speakers: int = 2,
 ) -> tuple[dict, str]:
-    """
-    Submit video to the Video Agent async job queue, then poll until done.
-
-    Protocol:
-      POST /analyse  → HTTP 202 {job_id, status="queued"}
-      GET  /jobs/{job_id} every POLL_INTERVAL seconds until status in {done, failed}
-    """
-    import json as _json
-
-    POLL_INTERVAL = 10   # seconds between status checks
-    SUBMIT_TIMEOUT = 120 # seconds for the initial upload POST
-
-    t0 = time.time()
-    video_file = Path(video_path)
     logger.info(
-        f"[{session_id}] → Video Agent /analyse (async) "
-        f"({video_file.name}, {len(diar_segments)} diar segments, num_speakers={num_speakers})"
+        f"[{session_id}] → Video Agent (Redis) "
+        f"({Path(video_path).name}, {len(diar_segments)} diar segments)"
     )
-
-    with open(video_file, "rb") as f:
-        video_bytes = f.read()
-
-    # ── Step 1: Submit job ────────────────────────────────────────────────────
-    async with httpx.AsyncClient(timeout=SUBMIT_TIMEOUT) as client:
-        resp = await client.post(
-            f"{VIDEO_AGENT_URL}/analyse",
-            files={"video": (video_file.name, video_bytes, "video/mp4")},
-            data={
-                "session_id":         session_id,
-                "meeting_type":       meeting_type,
-                "diar_segments_json": _json.dumps(diar_segments),
-                "num_speakers":       str(num_speakers),
-            },
-        )
-        resp.raise_for_status()
-        job_info = resp.json()
-
-    job_id = job_info["job_id"]
-    logger.info(f"[{session_id}] Video Agent job {job_id} queued — polling every {POLL_INTERVAL}s")
-
-    # ── Step 2: Poll until done or deadline ───────────────────────────────────
-    deadline = t0 + VIDEO_AGENT_TIMEOUT
-    async with httpx.AsyncClient(timeout=30) as poll_client:
-        while time.time() < deadline:
-            await asyncio.sleep(POLL_INTERVAL)
-            poll_resp = await poll_client.get(f"{VIDEO_AGENT_URL}/jobs/{job_id}")
-            poll_resp.raise_for_status()
-            poll_data = poll_resp.json()
-            status = poll_data["status"]
-
-            # Return as soon as signals are available — don't wait for overlay burn
-            if status in ("signals_ready", "annotating", "done"):
-                result = poll_data["result"]
-                # Prefer Redis-backed signals (written per rule-engine during processing)
-                # over the HTTP response body — they survive a gateway crash mid-run.
-                redis_signals = await _read_agent_signals(session_id, "video")
-                if redis_signals:
-                    result["signals"] = redis_signals
-                    logger.info(
-                        f"[{session_id}] ← Video Agent job {job_id} {status}: "
-                        f"{len(redis_signals)} signals from Redis in {time.time()-t0:.1f}s"
-                    )
-                else:
-                    logger.info(
-                        f"[{session_id}] ← Video Agent job {job_id} {status}: "
-                        f"{len(result.get('signals', []))} signals "
-                        f"in {time.time()-t0:.1f}s"
-                    )
-                return result, job_id
-
-            if status == "failed":
-                error = poll_data.get("error", "unknown error")
-                logger.error(f"[{session_id}] Video Agent job {job_id} failed: {error}")
-                raise RuntimeError(f"Video Agent job failed: {error}")
-
-            elapsed = time.time() - t0
-            logger.info(f"[{session_id}] Video Agent job {job_id} status={status} ({elapsed:.0f}s)")
-
-    raise TimeoutError(f"Video Agent job {job_id} timed out after {VIDEO_AGENT_TIMEOUT}s")
+    result = await _dispatch_job("video", session_id, {
+        "video_path": video_path,
+        "session_id": session_id,
+        "meeting_type": meeting_type,
+        "diar_segments": diar_segments,
+        "num_speakers": num_speakers,
+    }, timeout=VIDEO_AGENT_TIMEOUT, log_label="Video Agent")
+    # Prefer Redis-backed signals over result payload
+    redis_signals = await _read_agent_signals(session_id, "video")
+    if redis_signals:
+        result["signals"] = redis_signals
+    return result, session_id  # job_id = session_id in Redis flow
 
 
 def _build_video_summary(video_signals: list[dict]) -> dict:
@@ -3179,14 +3094,6 @@ async def _call_fusion_agent(
     meeting_type: str,
     video_signals: Optional[list[dict]] = None,
 ) -> dict:
-    """Call Fusion Agent POST /analyse with all signals."""
-    t0 = time.time()
-    logger.info(
-        f"[{session_id}] → Fusion Agent /analyse "
-        f"({len(voice_signals)} voice + {len(language_signals)} language"
-        f"{f' + {len(video_signals)} video' if video_signals else ''} signals)"
-    )
-    # Convert signals to FusionSignalInput format
     def _to_fusion_input(signal: dict, agent: str) -> dict:
         return {
             "agent": signal.get("agent", agent),
@@ -3199,35 +3106,21 @@ async def _call_fusion_agent(
             "window_end_ms": signal.get("window_end_ms", 0),
             "metadata": signal.get("metadata"),
         }
-
-    # Merge video signals into the voice-side pool so fusion sees all modalities
     all_voice_side = [_to_fusion_input(s, "voice") for s in voice_signals]
     video_summary: Optional[dict] = None
     if video_signals:
         all_voice_side += [_to_fusion_input(s, "video") for s in video_signals]
         video_summary = _build_video_summary(video_signals)
-
-    async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
-        resp = await client.post(
-            f"{FUSION_AGENT_URL}/analyse",
-            json={
-                "voice_signals": all_voice_side,
-                "language_signals": [_to_fusion_input(s, "language") for s in language_signals],
-                "session_id": session_id,
-                "meeting_type": meeting_type,
-                "generate_report": True,
-                "voice_summary": voice_summary,
-                "language_summary": language_summary,
-                "video_summary": video_summary,
-            },
-        )
-        resp.raise_for_status()
-        result = resp.json()
-    logger.info(
-        f"[{session_id}] ← Fusion Agent: {len(result.get('fusion_signals', []))} fusion signals, "
-        f"{len(result.get('alerts', []))} alerts in {time.time()-t0:.1f}s"
-    )
-    return result
+    return await _dispatch_job("fusion", session_id, {
+        "voice_signals": all_voice_side,
+        "language_signals": [_to_fusion_input(s, "language") for s in language_signals],
+        "session_id": session_id,
+        "meeting_type": meeting_type,
+        "generate_report": True,
+        "voice_summary": voice_summary,
+        "language_summary": language_summary,
+        "video_summary": video_summary,
+    }, timeout=AGENT_TIMEOUT, log_label="Fusion Agent")
 
 
 def _extract_transcript_segments(voice_result: dict) -> list[dict]:

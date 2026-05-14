@@ -25,7 +25,7 @@ Research basis:
 """
 import logging
 import urllib.request
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -38,6 +38,7 @@ logger = logging.getLogger("nexus.video.features")
 TARGET_FPS: int = 5
 WINDOW_MS: int = 2000
 MIN_LIP_SYNC_LINK_SCORE: float = 0.02
+ACTIVE_TILE_MIN_AREA:   float = 0.08   # face_box_area above this → dominant/active-speaker tile
 
 # Blink detection (Soukupova & Cech 2016)
 BLINK_EAR_THRESHOLD: float = 0.20
@@ -2347,6 +2348,8 @@ class VideoFeatureExtractor:
         frames: list[FrameFeatures] = []
         frame_idx: int = 0
         prev_pose_lm_data: Optional[list] = None
+        # {face_index: [(timestamp_ms, "Speaker_0"), ...]}
+        active_tile_tags: dict[int, list[tuple[int, str]]] = {}
 
         centroid_tracker = CentroidTracker(
             max_disappeared=30,   # ~6s at 5fps — limits ID inheritance when a tile changes occupant
@@ -2420,6 +2423,22 @@ class VideoFeatureExtractor:
                             ]
 
                         frames.extend(frame_features_list)
+
+                        # ── Tag largest face with current diar speaker ────────
+                        if diar_segments and frame_features_list:
+                            largest = max(
+                                (ff for ff in frame_features_list if ff.face_detected),
+                                key=lambda f: f.face_box_area,
+                                default=None,
+                            )
+                            if largest and largest.face_box_area > ACTIVE_TILE_MIN_AREA:
+                                for seg in diar_segments:
+                                    if seg["start_ms"] <= timestamp_ms < seg["end_ms"]:
+                                        active_tile_tags.setdefault(
+                                            largest.face_index, []
+                                        ).append((timestamp_ms, seg["speaker"]))
+                                        break
+
                         last_frame_features_list = frame_features_list
                         for ff in frame_features_list:
                             if ff.face_index == 0:
@@ -2456,6 +2475,51 @@ class VideoFeatureExtractor:
             f"Extracted {len(frames)} frames from {Path(video_path).name} "
             f"({frame_idx} total, every {skip}th frame at video_fps={video_fps:.1f})"
         )
+
+        # ── Face→Speaker: split contaminated active-speaker tracks ────────────
+        # If one face_index was tagged with multiple speakers, the active tile
+        # changed occupant mid-track. Split so each person gets clean frames.
+        split_face_to_speaker: dict[int, str] = {}
+
+        for tid, tags in active_tile_tags.items():
+            speaker_counts = Counter(spk for _, spk in tags)
+
+            if len(speaker_counts) == 1:
+                # Clean track — one speaker
+                split_face_to_speaker[tid] = next(iter(speaker_counts))
+                continue
+
+            # Contaminated: multiple speakers in same track
+            majority_speaker = speaker_counts.most_common(1)[0][0]
+            split_face_to_speaker[tid] = majority_speaker
+
+            for minority_speaker, count in speaker_counts.items():
+                if minority_speaker == majority_speaker:
+                    continue
+
+                minority_timestamps = {
+                    ts for ts, spk in tags if spk == minority_speaker
+                }
+
+                new_tid = centroid_tracker._next_id
+                centroid_tracker._next_id += 1
+                split_face_to_speaker[new_tid] = minority_speaker
+
+                rewritten = 0
+                for ff in frames:
+                    if (ff.face_index == tid
+                            and ff.timestamp_ms in minority_timestamps):
+                        ff.face_index = new_tid
+                        rewritten += 1
+
+                logger.info(
+                    f"Face→Speaker split: Face_{tid} ({majority_speaker}) "
+                    f"→ new Face_{new_tid} ({minority_speaker}), "
+                    f"{rewritten} frames rewritten"
+                )
+
+        # Store for return via run_analysis
+        self._active_tile_face_to_speaker = split_face_to_speaker
 
         # ── Select best frame per tracked face for ArcFace embedding extraction ─
         # Quality = frontal (low yaw+pitch) × large bbox × well-lit (luminance).
@@ -3685,6 +3749,10 @@ class SpeakerFaceMapper:
     speech in MediaPipe blendshapes (r=0.82 with ground-truth voice activity).
     """
 
+    def __init__(self) -> None:
+        # Injected by VideoAnalysisPipeline.run_analysis from extractor after extraction
+        self._active_tile_face_to_speaker: dict[int, str] = {}
+
     def assign(
         self,
         windows: list[WindowFeatures],
@@ -3692,52 +3760,73 @@ class SpeakerFaceMapper:
         lip_activity_map: Optional[dict[int, list[tuple[int, float]]]] = None,
     ) -> tuple[dict[str, list[WindowFeatures]], dict[str, float], dict[int, str]]:
         """
-        Args:
-            windows:          WindowFeatures from VideoFeatureExtractor.extract_all().
-            diar_segments:    [{speaker, start_ms, end_ms}, ...] from voice agent.
-            lip_activity_map: {face_index: [(timestamp_ms, lip_score), ...]}
-                              from VideoFeatureExtractor.build_lip_activity_map().
-                              If None or single face, falls back to time-overlap.
-
         Returns:
-            (windows_by_face, lip_sync_scores, face_to_speaker) where:
-            - windows_by_face:  {Face_N: [WindowFeatures, ...]} — ownership by face track
-            - lip_sync_scores:  {Speaker_N: correlation_score} — only for accepted lip-sync links
-            - face_to_speaker:  {face_index_int: "Speaker_N"} — conservative linkage map for gateway
-              Exported only for sufficiently positive lip-sync matches; time-overlap
-              fallback is used for in-session speaking state only, not identity linking.
+            windows_by_face:  {"Face_2": [...]} — grouped by face label
+            lip_sync_scores:  {"Speaker_0": 0.35} — correlation per speaker
+            face_to_speaker:  {2: "Speaker_0", 3: "Speaker_1"} — linkage map
         """
         result: dict[str, list[WindowFeatures]] = defaultdict(list)
-
         if not windows:
             return dict(result), {}, {}
 
-        speakers = sorted(set(seg.get("speaker", "Speaker_0") for seg in diar_segments))
+        speakers = sorted(set(
+            seg.get("speaker", "Speaker_0") for seg in diar_segments
+        ))
         if not speakers:
             speakers = ["Speaker_0"]
 
-        face_indices = sorted(set(getattr(wf, "face_index", 0) for wf in windows))
+        face_indices = sorted(set(
+            getattr(wf, "face_index", 0) for wf in windows
+        ))
+
+        # ── Active-tile faces: use pre-computed face→speaker tags ─────────
+        # Injected by VideoAnalysisPipeline.run_analysis before this call (Change 4)
+        active_map = getattr(self, "_active_tile_face_to_speaker", {})
+
+        pre_assigned: dict[int, str] = {
+            fi: spk for fi, spk in active_map.items()
+            if spk.startswith("Speaker_")
+        }
+
+        # ── Sidebar faces: lip-sync for faces NOT already assigned ────────
+        remaining_faces = [fi for fi in face_indices if fi not in pre_assigned]
+        remaining_speakers = [
+            spk for spk in speakers if spk not in pre_assigned.values()
+        ]
+
+        lip_mapping: dict[int, str] = {}
+        lip_scores: dict[str, float] = {}
 
         use_lip_sync = (
             lip_activity_map is not None
-            and len(face_indices) > 1
-            and len(speakers) > 1
+            and len(remaining_faces) >= 1
+            and len(remaining_speakers) >= 1
         )
-
         if use_lip_sync:
-            face_to_speaker, assignment_scores = self._lip_sync_assignment(
-                face_indices, speakers, diar_segments, lip_activity_map  # type: ignore[arg-type]
+            lip_mapping, assignment_scores = self._lip_sync_assignment(
+                remaining_faces, remaining_speakers,
+                diar_segments, lip_activity_map,  # type: ignore[arg-type]
             )
-            method = "lip_sync"
-        else:
-            face_to_speaker, assignment_scores = self._time_overlap_assignment(
-                face_indices, speakers, windows, diar_segments
-            )
-            method = "time_overlap"
+            for fi, spk in lip_mapping.items():
+                if spk.startswith("Speaker_"):
+                    lip_scores[spk] = round(assignment_scores.get(fi, 0.0), 4)
 
-        # Group windows by Face_N — signal ownership stays on face tracks, not
-        # voice speakers. face_to_speaker is returned as a linkage map for the
-        # gateway to remap face_embeddings keys before registry matching.
+        # ── Combine both mappings ─────────────────────────────────────────
+        face_to_speaker: dict[int, str] = {}
+        combined_scores: dict[str, float] = {}
+
+        # Active-tile assignments (high confidence — direct observation)
+        for fi, spk in pre_assigned.items():
+            face_to_speaker[fi] = spk
+            combined_scores[spk] = 1.0  # direct observation = max confidence
+
+        # Lip-sync assignments for remaining faces
+        for fi, spk in lip_mapping.items():
+            if fi not in face_to_speaker and spk.startswith("Speaker_"):
+                face_to_speaker[fi] = spk
+                combined_scores[spk] = lip_scores.get(spk, 0.0)
+
+        # ── Group windows by Face_N — no speaker_id rewrite ───────────────
         for wf in windows:
             face_idx = getattr(wf, "face_index", 0)
             face_label = f"Face_{face_idx}"
@@ -3749,32 +3838,13 @@ class SpeakerFaceMapper:
             )
             result[face_label].append(wf)
 
-        # lip_sync_scores: face→speaker linkage exported for gateway registry matching
-        lip_sync_scores: dict[str, float] = {}
-        confident_mapping: dict[int, str] = {}
-        if method == "lip_sync":
-            for fi, spk in face_to_speaker.items():
-                score = assignment_scores.get(fi, 0.0)
-                if spk.startswith("Speaker_") and score >= MIN_LIP_SYNC_LINK_SCORE:
-                    lip_sync_scores[spk] = round(score, 4)
-                    confident_mapping[fi] = spk
-        elif method == "time_overlap":
-            # time_overlap is used for single-speaker sessions or when lip data is absent.
-            # Export any face with positive speaking-time overlap so the gateway can alias
-            # Face_N → Speaker_N for registry matching. Sentinel score 1.0 is above
-            # SESSION_FACE_LOCK_MIN_SCORE=0.10; time-overlap assignment is reliable when
-            # voice diarization is accurate.
-            for fi, spk in face_to_speaker.items():
-                score = assignment_scores.get(fi, 0.0)
-                if spk.startswith("Speaker_") and score > 0.0:
-                    lip_sync_scores[spk] = 1.0
-                    confident_mapping[fi] = spk
-
         logger.info(
-            "SpeakerFaceMapper: %d face(s), method=%s, exported_linkage=%s",
-            len(face_indices), method, confident_mapping,
+            "SpeakerFaceMapper: %d faces, "
+            "active_tile=%s, lip_sync=%s, combined=%s",
+            len(face_indices), pre_assigned, lip_mapping, face_to_speaker,
         )
-        return dict(result), lip_sync_scores, confident_mapping
+
+        return dict(result), combined_scores, face_to_speaker
 
     def _lip_sync_assignment(
         self,

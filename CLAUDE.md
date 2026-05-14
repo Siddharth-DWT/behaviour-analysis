@@ -62,6 +62,12 @@ NEXUS runs **7 independent agents** as microservices communicating via Redis Str
 - **Infrastructure**: Docker Compose with PostgreSQL+pgvector + Valkey (Redis)
 - **Database Schema**: 15 tables with all indexes, including rule_config, fusion_weights, signals, alerts, vector storage
 - **Shared Libraries**: Signal models, message bus (Redis Streams wrapper), configuration
+- **Redis Job Dispatch Layer** (`shared/redis_layer/`): Full inter-service communication via Redis only
+  - `RedisJobConsumer` ABC (Template Method pattern) — each agent subclasses with `process_job()`; base owns the full loop: xgroup_create → xreadgroup → deserialise → write_result → xack
+  - `AgentJobDispatcher` — subscribes to `nexus:result-ready:{sid}:{agent}` before pushing the job (no race), wakes the caller via asyncio.Event the instant the result is written (O(1)), falls back to exponential-backoff polling (0.1s → 2s) if pub/sub fails
+  - Zero HTTP calls between Gateway and Agents — all job dispatch routes through `nexus:jobs:{agent}` Redis Streams
+  - Results stored at `nexus:session:{id}:result:{agent}` and notified via Redis pub/sub channel `nexus:result-ready:{id}:{agent}`
+  - `VideoJobConsumer` overrides `_handle()` instead of `process_job()` — ACKs immediately, spawns the 10–90 min background task, result written internally by `_run_video_job()`
 - **Voice Agent v0.1**: Complete implementation with 5 core rules
   - Feature extractor (25+ acoustic features via librosa)
   - Calibration module (per-speaker baselines)
@@ -198,8 +204,17 @@ nexus/
 ├── shared/
 │   ├── config/settings.py       ← Central config (DB, Redis, external APIs)
 │   ├── models/signals.py
+│   ├── redis_layer/             ← Redis coordination layer (single source of truth)
+│   │   ├── client.py            ← RedisClientFactory (async + sync singleton pools)
+│   │   ├── keys.py              ← Canonical key builders (all nexus:* key names)
+│   │   ├── repository.py        ← RedisRepository (async) + SyncRedisRepository
+│   │   ├── job_consumer.py      ← RedisJobConsumer ABC — Template Method pattern
+│   │   ├── job_dispatcher.py    ← AgentJobDispatcher — pub/sub notify + backoff polling
+│   │   ├── schemas.py           ← Pydantic models (SignalRecord, SessionStateRecord, …)
+│   │   ├── events.py            ← RedisEventStore
+│   │   └── locks.py             ← RedisLockManager
 │   └── utils/
-│       ├── message_bus.py       ← Redis Streams wrapper
+│       ├── message_bus.py       ← Redis Streams wrapper (legacy, kept for fallback drain)
 │       └── external_apis.py     ← WhisperClient + TTSClient for GPU server
 ├── scripts/
 │   ├── start_all.sh             ← Start infrastructure + all agents
@@ -377,9 +392,11 @@ in the UI means registry match confidence, not lip-sync confidence.
 - **Never start Docker containers** without explicit user instruction
 - **Never run INSERT/UPDATE/DELETE/DROP** on any DB without explicit user instruction
 - **Dashboard + video agent containers have internal source copies** — after code changes, must
-  `docker cp` the file into the container and rebuild; just restarting does not pick up changes
+  `docker cp` the file into the container and rebuild; just restarting does not pick up changes but only with permission
 - **Check container logs before grepping internal source files** — confirms what code is actually running
 - **Always check all containers in one parallel call** — never check logs sequentially
+- **Apply OOP principles and DSA reasoning** — applies to all code across the system, not just one layer. Encapsulate shared behaviour in base classes rather than duplicating it. Choose data structures for their time-complexity properties (e.g. a set for O(1) membership tests, pub/sub for O(1) event notification vs O(T/interval) polling). Apply design patterns (Template Method, Strategy, Factory) where they eliminate copy-paste. Place shared logic in the appropriate `shared/` module rather than repeating it per-service. Example: `RedisJobConsumer` ABC in `shared/redis_layer/job_consumer.py` owns the full consumer loop; each agent subclasses with one method
+- **Inter-service communication is Redis-only between gateway and agents** — all gateway→agent calls use `AgentJobDispatcher.dispatch()` via Redis Streams (`nexus:jobs:{agent}`). Never add direct HTTP calls between the gateway and agents. Dashboard→Gateway HTTPS is the only HTTP boundary in the system
 
 ## Video Agent — Critical Rules
 

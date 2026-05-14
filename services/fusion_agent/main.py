@@ -48,6 +48,7 @@ from shared.redis_layer import (
     AgentStatusRecord,
     EventRecord,
     RedisEventStore,
+    RedisJobConsumer,
     RedisLockManager,
     RedisRepository,
     SessionStateRecord,
@@ -102,6 +103,18 @@ event_store = RedisEventStore()
 lock_manager = RedisLockManager()
 
 
+class FusionJobConsumer(RedisJobConsumer):
+    """Consumes fusion jobs from nexus:jobs:fusion and invokes analyse_signals()."""
+
+    def __init__(self) -> None:
+        super().__init__("fusion", "fusion-workers", "fusion-1")
+
+    async def process_job(self, session_id: str, payload: dict) -> dict:
+        request = AnalyseRequest(**payload)
+        response = await analyse_signals(request)
+        return response.model_dump()
+
+
 @app.on_event("startup")
 async def startup():
     global rule_engine, compound_engine, temporal_engine
@@ -117,6 +130,7 @@ async def startup():
         except Exception as e:
             logger.warning(f"Redis connection failed (non-fatal): {e}")
 
+    asyncio.create_task(FusionJobConsumer().run())
     logger.info("Fusion Agent ready.")
 
 

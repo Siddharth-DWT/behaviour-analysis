@@ -70,3 +70,17 @@ class RedisKeys:
     @classmethod
     def legacy_pending(cls, session_id: str, agent: str) -> str:
         return f"{cls.LEGACY_PENDING_PREFIX}:{session_id}:{agent}"
+
+    # ── Inter-service job dispatch (Redis Streams, no HTTP between services) ──
+
+    JOB_PREFIX: str = "nexus:jobs"
+
+    @classmethod
+    def job_stream(cls, agent: str) -> str:
+        """Stream gateway pushes jobs into; agent consumers read from it."""
+        return f"{cls.JOB_PREFIX}:{agent}"
+
+    @classmethod
+    def agent_result(cls, session_id: str, agent: str) -> str:
+        """Key where agent writes its result for the gateway to pick up."""
+        return cls.artifact(session_id, f"result:{agent}")

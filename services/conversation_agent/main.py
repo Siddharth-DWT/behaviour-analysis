@@ -19,6 +19,8 @@ Endpoints:
   POST /analyse          -> Analyse transcript segments for conversation dynamics
   GET  /health           -> Health check
 """
+import asyncio
+import json
 import os
 import sys
 import uuid
@@ -43,7 +45,10 @@ try:
     from shared.redis_layer import (
         AgentStatusRecord,
         EventRecord,
+        RedisClientFactory,
         RedisEventStore,
+        RedisJobConsumer,
+        RedisKeys,
         RedisLockManager,
         RedisRepository,
         SessionStateRecord,
@@ -103,6 +108,18 @@ event_store = RedisEventStore()
 lock_manager = RedisLockManager()
 
 
+class ConversationJobConsumer(RedisJobConsumer):
+    """Consumes conversation jobs from nexus:jobs:conversation and invokes analyse()."""
+
+    def __init__(self) -> None:
+        super().__init__("conversation", "conversation-workers", "conversation-1")
+
+    async def process_job(self, session_id: str, payload: dict) -> dict:
+        request = AnalysisRequest(**payload)
+        response = await analyse(request)
+        return response.model_dump()
+
+
 @app.on_event("startup")
 async def startup():
     global feature_extractor, rule_engine
@@ -119,6 +136,7 @@ async def startup():
         except Exception as e:
             logger.warning(f"Redis connection failed (non-fatal): {e}")
 
+    asyncio.create_task(ConversationJobConsumer().run())
     logger.info("Conversation Agent ready.")
 
 

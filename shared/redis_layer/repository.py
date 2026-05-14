@@ -105,6 +105,31 @@ class RedisRepository:
             signals.extend(json.loads(batch_json))
         return signals
 
+    # ── Inter-service job dispatch ────────────────────────────────────────────
+
+    async def push_job(self, agent: str, session_id: str, payload: dict[str, Any]) -> str:
+        """Push a job onto the agent's job stream. Returns the stream entry ID."""
+        return await self.client.xadd(
+            RedisKeys.job_stream(agent),
+            {"session_id": session_id, "payload": json.dumps(payload)},
+            maxlen=1000,
+            approximate=True,
+        )
+
+    async def write_result(self, session_id: str, agent: str, result: dict[str, Any]) -> str:
+        """Store an agent result and notify any waiting dispatcher via pub/sub."""
+        key = await self.write_artifact(session_id, f"result:{agent}", result)
+        channel = f"nexus:result-ready:{session_id}:{agent}"
+        try:
+            await self.client.publish(channel, "1")
+        except Exception:
+            pass
+        return key
+
+    async def read_result(self, session_id: str, agent: str) -> Optional[dict[str, Any]]:
+        """Read agent result. Returns None if not yet available."""
+        return await self.read_artifact(session_id, f"result:{agent}")
+
     async def publish_dlq(self, agent: str, record: DlqRecord) -> str:
         payload = record.model_dump()
         payload["original_payload"] = json.dumps(payload["original_payload"])
@@ -197,6 +222,18 @@ class SyncRedisRepository:
         payload = record.model_dump()
         payload["original_payload"] = json.dumps(payload["original_payload"])
         return self.client.xadd(RedisKeys.dlq(agent), {k: str(v) for k, v in payload.items()}, maxlen=self._stream_maxlen, approximate=True)
+
+    # ── Inter-service job dispatch (sync path — video agent uses thread pool) ──
+
+    def write_result(self, session_id: str, agent: str, result: dict[str, Any]) -> str:
+        """Store an agent result and notify any waiting dispatcher via pub/sub (sync)."""
+        key = self.write_artifact(session_id, f"result:{agent}", result)
+        channel = f"nexus:result-ready:{session_id}:{agent}"
+        try:
+            self.client.publish(channel, "1")
+        except Exception:
+            pass
+        return key
 
     def publish_alert(self, session_id: str, payload: dict[str, Any]) -> str:
         stream_payload = {

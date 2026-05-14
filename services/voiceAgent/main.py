@@ -16,6 +16,7 @@ Endpoints:
   POST /analyse/stream   → Process audio chunk (for future real-time)
   GET  /health           → Health check
 """
+import asyncio
 import os
 import sys
 import uuid
@@ -37,6 +38,8 @@ from shared.redis_layer import (
     AgentStatusRecord,
     EventRecord,
     RedisEventStore,
+    RedisJobConsumer,
+    RedisKeys,
     RedisLockManager,
     RedisRepository,
     SessionStateRecord,
@@ -127,15 +130,29 @@ async def _publish_voice_outputs(
         )
 
 
+class VoiceJobConsumer(RedisJobConsumer):
+    """Consumes voice analysis jobs from nexus:jobs:voice and invokes analyse_audio()."""
+
+    def __init__(self) -> None:
+        super().__init__("voice", "voice-workers", "voice-1")
+
+    async def process_job(self, session_id: str, payload: dict) -> dict:
+        request = AnalysisRequest(**payload)
+        response = await analyse_audio(request)
+        return response.model_dump()
+
+
 @app.on_event("startup")
 async def startup():
     global feature_extractor, transcriber, rule_engine
     logger.info("Starting NEXUS Voice Agent...")
-    
+
     feature_extractor = VoiceFeatureExtractor()
     transcriber = Transcriber()
     rule_engine = VoiceRuleEngine()
-    
+
+    asyncio.create_task(VoiceJobConsumer().run())
+
     logger.info("Voice Agent ready.")
 
 

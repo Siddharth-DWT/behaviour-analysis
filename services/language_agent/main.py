@@ -14,6 +14,7 @@ Endpoints:
   POST /analyse          → Analyse transcript segments
   GET  /health           → Health check
 """
+import json
 import os
 import sys
 import uuid
@@ -35,7 +36,10 @@ from shared.models.requests import LanguageAnalysisRequest as AnalysisRequest, L
 from shared.redis_layer import (
     AgentStatusRecord,
     EventRecord,
+    RedisClientFactory,
     RedisEventStore,
+    RedisJobConsumer,
+    RedisKeys,
     RedisLockManager,
     RedisRepository,
     SessionStateRecord,
@@ -84,6 +88,18 @@ event_store = RedisEventStore()
 lock_manager = RedisLockManager()
 
 
+class LanguageJobConsumer(RedisJobConsumer):
+    """Consumes language analysis jobs from nexus:jobs:language and invokes analyse_transcript()."""
+
+    def __init__(self) -> None:
+        super().__init__("language", "language-workers", "language-1")
+
+    async def process_job(self, session_id: str, payload: dict) -> dict:
+        request = AnalysisRequest(**payload)
+        response = await analyse_transcript(request)
+        return response.model_dump()
+
+
 @app.on_event("startup")
 async def startup():
     global feature_extractor, rule_engine, entity_extractor
@@ -105,6 +121,7 @@ async def startup():
         except Exception as e:
             logger.warning(f"Redis connection failed (non-fatal): {e}")
 
+    asyncio.create_task(LanguageJobConsumer().run())
     logger.info("Language Agent ready.")
 
 

@@ -39,6 +39,7 @@ from shared.redis_layer import (
     AgentStatusRecord,
     EventRecord,
     RedisEventStore,
+    RedisJobConsumer,
     RedisLockManager,
     SessionStateRecord,
     SignalRecord,
@@ -319,6 +320,10 @@ class VideoPipeline:
         duration_sec = (windows[-1].window_end_ms - windows[0].window_start_ms) / 1000.0
 
         # ── Step 2: Map windows → speakers (lip-sync correlation) ─────────────
+        # Pass active-tile face→speaker tags to mapper
+        self._mapper._active_tile_face_to_speaker = getattr(
+            self._extractor, "_active_tile_face_to_speaker", {}
+        )
         windows_by_speaker, lip_sync_scores, face_to_speaker = self._mapper.assign(
             windows, diar_segments, lip_activity_map
         )
@@ -584,6 +589,7 @@ async def _run_video_job(
     _video_jobs[job_id]["result"] = analysis.model_dump()
     _publish_video_artifacts(session_id, analysis)
     _set_video_status(session_id, "completed", signal_count=len(analysis.signals))
+    _redis_repo.write_result(session_id, "video", analysis.model_dump())
     await _event_store.append(
         session_id,
         EventRecord(
@@ -601,7 +607,12 @@ async def _run_video_job(
     # before Phase 2 burn begins. Non-blocking — event loop handles display-names
     # POST requests from the gateway during this window.
     await asyncio.sleep(15)
-    display_names: dict = _video_jobs[job_id].get("display_names") or {}
+    _dn_raw = _redis_repo.client.get(f"nexus:session:{session_id}:display_names")
+    display_names: dict = {}
+    if _dn_raw is not None:
+        _dn_bytes: bytes = _dn_raw if isinstance(_dn_raw, (bytes, bytearray)) else str(_dn_raw).encode()
+        _dn_data = json.loads(_dn_bytes)
+        display_names = _dn_data.get("payload", {}).get("names", {})
     if display_names:
         logger.info(f"[{session_id}] Video job {job_id} burn: {len(display_names)} display names received")
 
@@ -630,6 +641,52 @@ async def _run_video_job(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Redis job consumer
+# ══════════════════════════════════════════════════════════════════════════════
+
+class VideoJobConsumer(RedisJobConsumer):
+    """
+    Fire-and-forget consumer for video analysis jobs.
+
+    Video processing takes 10-90 minutes so the message is ACKed immediately
+    after the background task is created. _run_video_job writes the result
+    directly to Redis when it finishes, triggering the gateway's pub/sub listener.
+    _handle is overridden instead of process_job to control ACK timing.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("video", "video-workers", "video-1")
+
+    async def process_job(self, session_id: str, payload: dict) -> dict:
+        raise NotImplementedError("VideoJobConsumer uses fire-and-forget via _handle override")
+
+    async def _handle(self, msg_id: str, fields: dict) -> None:
+        session_id: str = fields.get("session_id", "")
+        try:
+            payload = json.loads(fields.get("payload", "{}"))
+            video_path    = payload["video_path"]
+            diar_segments = payload.get("diar_segments", [])
+            meeting_type  = payload.get("meeting_type", "general")
+            job_id = str(uuid.uuid4())
+            _video_jobs[job_id] = {
+                "status": "queued",
+                "session_id": session_id,
+                "result": None,
+                "error": None,
+                "created_at": time.time(),
+            }
+            asyncio.create_task(
+                _run_video_job(job_id, video_path, session_id, diar_segments, meeting_type),
+                name=f"video-job-{job_id[:8]}",
+            )
+        except Exception as exc:
+            logger.error("[%s] Video job dispatch failed: %s", session_id, exc)
+            _redis_repo.write_result(session_id, "video", {"error": str(exc)})
+        finally:
+            await self._ack(msg_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Startup
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -638,6 +695,7 @@ async def startup_event():
     logger.info("Video Agent starting — singletons initialised on first request.")
     # Model files download lazily on first extract_all() call.
     # Pre-warming here would block startup; lazy is preferred.
+    asyncio.create_task(VideoJobConsumer().run())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
