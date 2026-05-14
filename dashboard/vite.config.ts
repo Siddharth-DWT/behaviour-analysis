@@ -23,7 +23,7 @@ export default defineConfig({
   preview: {
     port: 3000,
     host: true,
-    allowedHosts: ["analysis.pathtodeal.com"],
+    allowedHosts: ["analysis.pathtodeal.com", "localhost", "127.0.0.1"],
     proxy: {
       "/api": {
         target: process.env.API_GATEWAY_URL || "https://analysis-be.pathtodeal.com",

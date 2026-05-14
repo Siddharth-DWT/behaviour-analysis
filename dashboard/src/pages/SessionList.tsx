@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { Upload, Loader2, ChevronDown } from "lucide-react";
-import { listSessions } from "../api/client";
+import { listSessions, getSession } from "../api/client";
 import SessionCard from "../components/SessionCard";
 import type { Session } from "../api/client";
 
@@ -44,21 +44,33 @@ export default function SessionList() {
     fetchSessions(0, false);
   }, []);
 
-  // Poll for processing sessions
+  // Poll only the specific sessions that are still processing — one request per session,
+  // not a full list reload. Remove each ID individually when it finishes.
   useEffect(() => {
     if (processingIds.size === 0) return;
     const interval = setInterval(async () => {
-      const data = await listSessions({ limit: PAGE_SIZE, offset: 0 });
-      setTotal(data.total);
-      setSessions((prev) => {
-        const updated = new Map(data.sessions.map((s: Session) => [s.id, s]));
-        return prev.map((s) => updated.get(s.id) ?? s);
-      });
-      const stillProcessing = data.sessions.filter(
-        (s: Session) => s.status === "processing" || s.status === "analysing"
+      const results = await Promise.allSettled(
+        [...processingIds].map((id) => getSession(id))
       );
-      if (stillProcessing.length === 0) setProcessingIds(new Set());
-    }, 3000);
+      const completed = new Set<string>();
+      results.forEach((result, i) => {
+        if (result.status !== "fulfilled") return;
+        const session: Session = result.value.session;
+        const isDone =
+          session.status !== "processing" && session.status !== "analysing";
+        setSessions((prev) =>
+          prev.map((s) => (s.id === session.id ? session : s))
+        );
+        if (isDone) completed.add([...processingIds][i]);
+      });
+      if (completed.size > 0) {
+        setProcessingIds((prev) => {
+          const next = new Set(prev);
+          completed.forEach((id) => next.delete(id));
+          return next;
+        });
+      }
+    }, 5000);
     return () => clearInterval(interval);
   }, [processingIds]);
 
