@@ -250,28 +250,34 @@ avg_face_height_ratio = mean(sqrt(face_box_area)) across all detected frames (vi
 **Grid mode**: base=0.50–0.65 (by face size), decay=0.012/min, floor=0.42
 **Conference room mode**: base=0.50, decay=0.008/min, floor=0.40
 
-⚠️ **Known Problem — Tiny Face False Merges (UNRESOLVED as of 2026-05-12)**:
-The threshold formula uses a video-wide average face size, not per-track size. When a participant
-occupies a small grid tile (face_area ≈ 0.001, ~73×73px in 1080p), ArcFace produces noisy
-embeddings. Those noisy embeddings generate false cosine similarity scores of 0.40–0.49 against
-completely different people's faces — and with floor=0.40, all of them pass the merge check.
+⚠️ **Known Problem — ArcFace False Merges (PARTIALLY MITIGATED, still unresolved for medium-small faces)**:
+`_merge_tracks_by_embedding()` now accepts `track_face_heights`, `track_centroids`, and
+`pose_quality`. A nested `_effective_thresh()` applies per-pair floors in three tiers:
+- **Tier 1** — both tracks normal (face_h ≥ 0.07): global threshold − pose_discount (floor 0.35)
+- **Tier 2** — both tiny (face_h < 0.07, symmetric): max(global, 0.55) − pose_discount (floor 0.40)
+- **Tier 3** — one tiny, one normal (asymmetric): max(global, 0.45) − pose_discount (floor 0.35)
+- **Centroid fallback** — score below floor but > 0.35: if same grid tile (dist < 0.05) allow merge
 
-**Symptoms**: A small-tile speaker has signals scattered across 4–5 different face positions
-(e.g. cx=0.63/0.69/0.34 instead of consistently cx=0.91). Wrong-face merges also delay first
-signal appearance because calibration fires on the merged wrong face first.
+**What this fixed**: Truly tiny-face tracks (face_h < 0.07, face_area < 0.005) are guarded at
+floor 0.55/0.45 instead of the global floor 0.40.
 
-**Root cause confirmed** on HR session (session `26a50159`): Speaker_2 (Sid, face_area=0.001)
-had ~70–80 of 258 signals attributed to wrong faces at positions (0.34,0.96), (0.63,0.65),
-(0.69,0.86). All wrong merges had similarity 0.40–0.49.
+**What still fails — medium-small faces**: When both tracks have face_h ≥ 0.07 (Tier 1), the
+effective threshold is just the global threshold (≈0.40 for a 21-min conference room session).
+Different people's ArcFace embeddings at medium-small face size still score 0.40–0.45 and pass.
 
-**Correct fix (not yet applied)**: Per-track face-size-aware threshold inside
-`_merge_tracks_by_embedding()`. When `min(face_h_A, face_h_B) < 0.07` (face_area < 0.005),
-use `effective_threshold = max(global_threshold, 0.60)`. Requires passing per-track avg face
-heights alongside `frame_counts`. Original hardcoded threshold=0.70 (from 2026-05-06 commit)
-never had this problem because 0.70 > all false-match scores.
+**Confirmed in session `8140d4de`**: Face_3 (Mirko) had **59.9% off-primary signals** (882/1473)
+scattered across three positions: cx≈0.90 (his real tile), cx≈0.55–0.60 (another participant),
+cx≈0.40 (Sid's tile). Face_11 (Sid) was clean — only 1.7% off-primary. Face_3's track absorbed
+other people's detections because their face sizes fell into Tier 1 and ArcFace similarity was
+0.40–0.45. Face_2 (Ansuya) also absorbed ~30% signals from cx≈0.90 (Mirko's tile) by the same path.
 
-**Do NOT** simply raise the global floor — same-person tiny-face scores can also be 0.50–0.59,
-so a flat floor=0.60 would prevent legitimate fragment merges for small faces.
+**Symptom in frontend**: Face highlight jumps to wrong person's face position during playback.
+Calibration fires on wrong face first, delaying signal appearance for the misattributed tracks.
+
+**Do NOT** raise the global floor above 0.40 — same-person conference room pairs at extreme
+angles legitimately score 0.40–0.49 and would be broken by a higher floor.
+**Do NOT** change the 0.55/0.45 tier values without re-running cross-track similarity analysis
+on session `26a50159` — those values were calibrated to that session's score distribution.
 
 ### Signal Pipeline Filters (full chain)
 1. **`MIN_FACE_RATE = 0.30`** — rule engines skip a window if face detected < 30% of its frames
@@ -295,15 +301,54 @@ longer — Sid (face_area=0.001) first appeared at 22,000ms vs Face_3 at 16,000m
 
 This section records recurring problems so future sessions do not re-investigate solved issues.
 
-### 1. ArcFace Merge: Tiny Faces Merged With Wrong People
-**File**: `services/video_agent/feature_extractor.py` — `_compute_merge_threshold()`, `_merge_tracks_by_embedding()`
-**First seen**: HR session 2026-05-11 (6-person grid call, session `26a50159`)
-**Symptom**: Small-tile participant (Speaker_2, Sid) had signals attributed to 4–5 different
-face positions instead of consistently cx≈0.91. ~70/258 signals came from wrong faces.
-**Root cause**: `avg_face_h` is a video-wide average. Conference room floor=0.40 accepted
-false similarity scores (0.40–0.49) from noisy tiny-face ArcFace embeddings.
-**Status**: UNRESOLVED — fix designed (per-track size-aware threshold, min 0.60 when face_h < 0.07) but not implemented.
-**Do NOT**: Lower the threshold (makes more wrong merges). Do NOT raise global floor to 0.60+ (breaks legitimate tiny-face same-person merges at 0.50–0.59).
+### 1. ArcFace Merge: False Track Consolidation (Two Distinct Failure Modes)
+**File**: `backend/services/video_agent/feature_extractor.py` — `_compute_merge_threshold()`, `_merge_tracks_by_embedding()`
+**First seen**: HR session 2026-05-11 (session `26a50159`)
+
+**Failure Mode A — Wrong merge (different people collapsed into one track)**:
+Different people's ArcFace embeddings score 0.40–0.45 at medium-small face sizes. With conference
+room global floor ≈0.40, they pass the merge check and one person's track absorbs another's
+detections. Symptom: a speaker's signals are scattered across 2–5 face positions; face highlight
+jumps to wrong person on video. Session `8140d4de`: Face_3 (Mirko) had 59.9% of signals at wrong
+positions (882/1473 absorbed from other tracks). Face_11 (Sid) was clean — 1.7% off-primary.
+
+**Failure Mode B — Missed merge (same person's tracks not consolidated)**:
+When a person's tile expands or moves (corner tile → center dominant tile), CentroidTracker creates
+a new track_id because the centroid moved beyond `match_threshold=0.12`. ArcFace then fails to
+consolidate because: (a) small-tile embedding is noisy, depressing similarity ~0.05–0.10 below
+its true value; AND (b) centroids are at different positions so the centroid fallback (dist < 0.05
+same-tile check) doesn't fire. Result: same person appears as two Face_N entries.
+Session `96be93e2`: Face_2 + Face_10 were both Ansuya (small corner tile + large dominant tile),
+1816 + 399 signals respectively. Session `8140d4de`: Face_2 + Face_5 both Ansuya, cosine sim ≈0.38.
+
+**Fixes applied (2026-05-12 and 2026-05-13)**:
+`_merge_tracks_by_embedding()` now accepts `track_face_heights`, `track_centroids`, `pose_quality`.
+Nested `_effective_thresh()` applies per-pair floors in three tiers:
+- Tier 1 — both face_h ≥ 0.07 (normal): global adaptive threshold minus pose_discount (floor 0.35)
+- Tier 2 — both face_h < 0.07 (symmetric tiny): floor=0.55 — blocks confirmed false range 0.40–0.49
+- Tier 3 — one tiny, one normal (asymmetric): floor=0.45 — targets tile-swap where noisy small
+  embedding (sim ~0.48) should merge with clean large embedding of the same person
+- Centroid fallback: score in (0.35, floor) AND same grid tile (dist < 0.05) → allow merge anyway
+- Pose discount: off-angle tracks lower effective threshold by up to 0.05
+
+The asymmetric tier (0.45) was calibrated for session `96be93e2`: Face_2 (face_h=0.032) × Face_10
+(face_h=0.20) had sim ≈0.48 > 0.45 → merged correctly.
+
+**What still fails**:
+- Mode A: Normal-sized faces (Tier 1, both face_h ≥ 0.07) still use global floor ≈0.40. False
+  matches at 0.40–0.45 pass. Cannot raise the floor — legitimate same-person conference room pairs
+  at extreme angles also score 0.40–0.49.
+- Mode B: Tile-swaps where sim < 0.45 AND centroids are far apart. Session `8140d4de` Face_2 +
+  Face_5 (Ansuya): sim ≈0.38, below all tier floors, centroids too far for fallback.
+
+**Future fix not yet built**: Post-processing track-split step — after ArcFace batch extraction,
+detect track_ids whose embeddings form two temporally distinct clusters (early vs late frames,
+cosine dist > 0.50 between cluster centroids) and split into two track_ids. This is the inverse
+of `_merge_tracks_by_embedding()` and addresses Mode A without touching Mode B logic.
+
+**Do NOT**: Raise global floor above 0.40 (breaks same-person conference room merges at 0.40–0.49).
+Change the 0.55/0.45 tier values only after re-running cross-track similarity analysis on sessions
+`26a50159` and `96be93e2` — those values were calibrated to those score distributions.
 
 ### 2. CentroidTracker ID Inflation (SOLVED 2026-05-06)
 **File**: `services/video_agent/feature_extractor.py`
@@ -386,11 +431,14 @@ in the UI means registry match confidence, not lip-sync confidence.
 - **`_compute_merge_threshold` and `_merge_tracks_by_embedding`** are the most sensitive functions
   in the codebase. Changes here directly affect how many unique people are identified and whether
   signals get attributed to the right person. Read the "Known Issues" section above before touching.
-- **`avg_face_h` is a video-wide average** (line ~2543 in feature_extractor.py) — not per-track.
-  Any logic that needs per-track face size must compute it separately from `frames`.
+- **`avg_face_h` is a video-wide average** used only by `_compute_merge_threshold()` to select
+  grid vs conference-room mode. `_merge_tracks_by_embedding()` uses per-track heights via the
+  `track_face_heights` dict — the two are separate; do not confuse them.
 - **The adaptive threshold formula has been intentionally reverted** multiple times. The current
   values (conference room: base=0.50, decay=0.008/min, floor=0.40) are the reverted state.
-  The pending unresolved fix is per-track size-awareness, not global floor changes.
+  The per-track tiny-face guard (floor 0.55/0.45 when face_h < 0.07) was then added on top.
+  Do not remove the guard. Do not raise the global floor. The still-unresolved problem is
+  medium-small faces (face_h ≥ 0.07) that use the global floor ≈0.40, which is too permissive.
 - **`CAP_PROP_POS_MSEC`** is used for accurate video PTS timestamps — do not replace with
   `frame_idx / fps * 1000` which drifts on variable-frame-rate videos.
 - **`_make_signal()` in `base_rule_engine.py`** never returns None — it always returns a dict.

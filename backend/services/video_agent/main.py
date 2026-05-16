@@ -24,6 +24,7 @@ import uuid
 import asyncio
 import logging
 import tempfile
+import subprocess
 import concurrent.futures
 from pathlib import Path
 from typing import Optional
@@ -43,7 +44,8 @@ from shared.redis_layer import (
 )
 
 from .feature_extractor import (
-    VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures, FaceEmbeddingExtractor,
+    VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures,
+    FaceEmbeddingExtractor, LightASDClassifier,
 )
 from .calibration import VideoCalibrationModule, FacialBaseline, BodyBaseline, GazeBaseline
 from .facial_rules import FacialRuleEngine
@@ -304,12 +306,79 @@ class VideoPipeline:
 
         duration_sec = (windows[-1].window_end_ms - windows[0].window_start_ms) / 1000.0
 
-        # ── Step 2: Map windows → speakers (lip-sync correlation) ─────────────
+        # ── Inject active-tile tags into mapper ───────────────────────────────
+        # _extract_frames tags large-tile faces by diarization time-overlap and
+        # stores the result on the extractor.  The mapper needs it before assign()
+        # so it can pre-assign those faces without relying on lip-sync (which fails
+        # on prominent tiles due to jaw-open saturation).
+        active_tile_tags = getattr(self._extractor, "_active_tile_face_to_speaker", {})
+        self._mapper.set_active_tile_tags(active_tile_tags)
+        if active_tile_tags:
+            logger.info(
+                f"[{session_id}] Active-tile tags → mapper: "
+                f"{len(active_tile_tags)} face(s) {{{', '.join(f'Face_{k}: {v}' for k, v in active_tile_tags.items())}}}"
+            )
+        else:
+            logger.warning(
+                f"[{session_id}] No active-tile tags from extractor — "
+                f"mapper will use lip-sync only (may produce weak linkage)"
+            )
+
+        # ── Step 1b: Light-ASD active speaker scoring (optional) ─────────────
+        # Replaces MediaPipe jawOpen lip-sync correlation with a learned AV model
+        # (94.1% precision on AVA-ActiveSpeaker).  Falls back silently to lip-sync
+        # when the model file is absent or audio extraction fails.
+        asd_scores: dict | None = None
+        _asd = LightASDClassifier.get_instance(
+            model_dir=os.path.join(os.path.dirname(__file__), "..", "..", "models")
+        )
+        if _asd.available:
+            _tmp_audio = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            _tmp_audio.close()
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-i", video_path,
+                        "-vn", "-ar", "16000", "-ac", "1",
+                        _tmp_audio.name,
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                _face_crops = getattr(self._extractor, "_face_crops_sequence", {})
+                _fps = getattr(self._extractor, "_last_video_fps", 5.0)
+                if _face_crops:
+                    asd_scores = _asd.score(_face_crops, _tmp_audio.name, fps=_fps)
+                    logger.info(
+                        "[%s] Light-ASD: scored %d tracks", session_id, len(asd_scores)
+                    )
+                else:
+                    logger.warning(
+                        "[%s] Light-ASD: no face crops buffered — "
+                        "falling back to lip-sync", session_id
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Light-ASD audio extraction failed (non-fatal): %s",
+                    session_id, exc,
+                )
+            finally:
+                try:
+                    os.unlink(_tmp_audio.name)
+                except OSError:
+                    pass
+
+        # ── Step 2: Map windows → speakers ────────────────────────────────────
+        # Uses ASD scores when available; falls back to lip-sync, then time-overlap.
         windows_by_speaker, lip_sync_scores, face_to_speaker = self._mapper.assign(
-            windows, diar_segments, lip_activity_map
+            windows, diar_segments, lip_activity_map,
+            asd_scores=asd_scores,
         )
         speakers = sorted(windows_by_speaker.keys())
-        logger.info(f"[{session_id}] Speakers detected: {speakers}")
+        logger.info(
+            f"[{session_id}] Speakers: {speakers} | "
+            f"face_to_speaker={face_to_speaker} | lip_sync_scores={lip_sync_scores}"
+        )
 
         # ── Step 3: Per-speaker baselines (parallel — stateless, each speaker independent) ─
         # VideoCalibrationModule has no mutable instance state; each call only reads
@@ -353,6 +422,24 @@ class VideoPipeline:
         )
 
         all_signals: list[dict] = facial_signals + gaze_signals + body_signals
+
+        # One presence_detected marker per speaker — spans their first to last window.
+        # Consumed by the gateway whitelist and frontend left panel to show a thumbnail
+        # from first appearance, before calibration produces any behavioral signals.
+        for spk, spk_wins in windows_by_speaker.items():
+            if not spk_wins:
+                continue
+            all_signals.append({
+                "signal_type":    "presence_detected",
+                "speaker_id":     spk,
+                "window_start_ms": min(w.window_start_ms for w in spk_wins),
+                "window_end_ms":   max(w.window_end_ms   for w in spk_wins),
+                "confidence":     1.0,
+                "value":          1.0,
+                "value_text":     "present",
+                "metadata":       {},
+            })
+
         # Persist all signals in one Redis call instead of three separate connections
         _push_signals_to_redis(session_id, all_signals)
 
@@ -381,20 +468,11 @@ class VideoPipeline:
                 source = "none"
 
             for track_id, (embedding, thumbnail) in emb_results.items():
-                # Prefer a named Speaker_N label over Face_N when both exist
-                # (can happen if residual non-canonical windows survived).
-                speaker_label = next(
-                    (wf.speaker_id for wf in windows
-                     if wf.face_index == track_id
-                     and wf.speaker_id
-                     and not wf.speaker_id.startswith("Face_")),
-                    next(
-                        (wf.speaker_id for wf in windows
-                         if wf.face_index == track_id and wf.speaker_id),
-                        f"Face_{track_id}",
-                    ),
-                )
-                face_embeddings_data[speaker_label] = {
+                # Always key by Face_N — SpeakerFaceMapper guarantees wf.speaker_id
+                # is Face_N for every window. _build_session_face_locks looks up
+                # face_embeddings_data by Face_N key; a Speaker_N key here would
+                # make the lookup miss and silently drop the face→speaker link.
+                face_embeddings_data[f"Face_{track_id}"] = {
                     "embedding":     embedding,
                     "thumbnail_b64": base64.b64encode(thumbnail).decode(),
                     "track_id":      track_id,

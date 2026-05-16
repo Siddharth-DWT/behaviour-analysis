@@ -49,7 +49,7 @@ logger = logging.getLogger("nexus.backend.pipeline")
 
 _UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/recordings"))
 _RECORDING_RETENTION_DAYS = int(os.getenv("RECORDING_RETENTION_DAYS", "3"))
-_SESSION_FACE_LOCK_MIN_SCORE = float(os.getenv("SESSION_FACE_LOCK_MIN_SCORE", "0.10"))
+_SESSION_FACE_LOCK_MIN_SCORE = float(os.getenv("SESSION_FACE_LOCK_MIN_SCORE", "0.06"))
 
 
 class AnalysisPipeline:
@@ -112,12 +112,16 @@ class AnalysisPipeline:
             session_id, meeting_type, analysis_config.get("sensitivity", 0.5),
         )
 
+        t_pipeline = time.monotonic()
+        _t_voice = _t_lang_video = _t_conv = _t_fusion = 0.0
+
         run_sentiment = analysis_config.get("run_sentiment", False)
         run_entity_extraction = analysis_config.get("run_entity_extraction", True)
 
         # ── Step 1: Voice Agent ───────────────────────────────────────────────
         await self._set_step(session_id, "transcribing")
         voice_result: dict = {}
+        _t0 = time.monotonic()
         try:
             resp = await self._voice.analyse(
                 VoiceAnalysisRequest(
@@ -130,11 +134,13 @@ class AnalysisPipeline:
                 )
             )
             voice_result = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+            _t_voice = time.monotonic() - _t0
             logger.info(
-                "[%s] Voice: %.0fs, %d speakers",
+                "[%s] Voice: %.0fs audio, %d speakers, stage=%.0fs",
                 session_id,
                 voice_result.get("duration_seconds", 0),
                 len(voice_result.get("speakers", [])),
+                _t_voice,
             )
         except Exception as exc:
             logger.error("[%s] Voice Agent failed: %s", session_id, exc)
@@ -265,9 +271,11 @@ class AnalysisPipeline:
                 logger.warning("[%s] Video Agent failed (continuing): %s", session_id, exc)
                 return [], {}, {}, {}
 
+        _t0 = time.monotonic()
         lang_outcome, (vid_signals, face_embeddings_from_video, face_to_speaker, lip_sync_scores) = (
             await asyncio.gather(_run_language(), _run_video())
         )
+        _t_lang_video = time.monotonic() - _t0
 
         language_signals: list[dict] = []
         language_summary: dict = {}
@@ -281,6 +289,7 @@ class AnalysisPipeline:
         await self._set_step(session_id, "conversation")
         conversation_signals: list[dict] = []
         conversation_summary: dict = {}
+        _t0 = time.monotonic()
 
         if run_conversation:
             try:
@@ -307,6 +316,7 @@ class AnalysisPipeline:
             logger.info("[%s] Behavioural off — skipping Conversation", session_id)
         else:
             logger.info("[%s] < 2 speakers — skipping Conversation", session_id)
+        _t_conv = time.monotonic() - _t0
 
         # ── Step 4: Video signal filtering + registry matching ────────────────
         video_signals: list[dict] = []
@@ -322,8 +332,12 @@ class AnalysisPipeline:
             for sig in video_signals:
                 spk = sig.get("speaker_id", "")
                 if spk.startswith("Face_"):
-                    face_signal_counts[spk] = face_signal_counts.get(spk, 0) + 1
                     face_ids_in_signals.add(spk)
+                    # presence_detected is a marker, not a behavioral signal —
+                    # exclude from the weak-face count so a face with only a
+                    # presence marker still passes the MIN_FACE_SIGNALS filter.
+                    if sig.get("signal_type") != "presence_detected":
+                        face_signal_counts[spk] = face_signal_counts.get(spk, 0) + 1
 
             # Drop Face_* with < MIN_FACE_SIGNALS before anything else
             weak_faces: set[str] = {fid for fid, cnt in face_signal_counts.items() if cnt < MIN_FACE_SIGNALS}
@@ -445,6 +459,38 @@ class AnalysisPipeline:
                         "source_speaker_label": speaker_label,
                     }
 
+        # Persist speaker_appearances DB row for each linked Face_N.
+        # The aliasing above writes Face_N into speaker_identity_map in memory,
+        # but /video-signals JOINs on speaker_appearances to resolve registry_id.
+        # Without this row Face_N signals have registry_id = NULL and the
+        # dashboard canonical merge cannot group Face_N with its Speaker_N.
+        if locked_face_to_speaker:
+            try:
+                from core.speaker_registry import _upsert_appearance
+                for face_label, speaker_label in locked_face_to_speaker.items():
+                    if face_label not in speaker_identity_map:
+                        continue
+                    reg_id = speaker_identity_map[face_label].get("registry_id")
+                    if not reg_id:
+                        continue
+                    score = float(lip_sync_scores.get(speaker_label, 0.0) or 0.0)
+                    await _upsert_appearance(
+                        pool, reg_id, session_id,
+                        video_speaker_map.get(face_label),
+                        face_label,
+                        "session_lip_sync_lock",
+                        min(0.95, score),
+                    )
+                    logger.info(
+                        "[%s] speaker_appearances persisted: %s → %s (registry_id=%s)",
+                        session_id, face_label, speaker_label, reg_id,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Linked face appearance persist failed (non-fatal): %s",
+                    session_id, exc,
+                )
+
         # Persist video signals — after registry so unregistered faces are excluded
         if vid_signals:
             registered_face_labels: set[str] = {
@@ -479,6 +525,7 @@ class AnalysisPipeline:
 
         # ── Step 5: Fusion ────────────────────────────────────────────────────
         await self._set_step(session_id, "fusion")
+        _t0 = time.monotonic()
         fusion_signals: list[dict] = []
         alerts: list[dict] = []
         report: Optional[dict] = None
@@ -538,6 +585,7 @@ class AnalysisPipeline:
                 logger.warning("[%s] Fusion Agent failed (continuing): %s", session_id, exc)
         else:
             logger.info("[%s] Behavioural off — skipping Fusion", session_id)
+        _t_fusion = time.monotonic() - _t0
 
         await self._persist_signals(session_id, fusion_signals, video_speaker_map, "fusion", pool)
 
@@ -594,6 +642,11 @@ class AnalysisPipeline:
             duration_ms=int(duration_seconds * 1000),
             speaker_count=speaker_count,
             participant_count=speaker_count,
+        )
+        logger.info(
+            "[%s] Stage timings (s): voice=%.0f lang+video=%.0f convo=%.0f fusion=%.0f total=%.0f",
+            session_id, _t_voice, _t_lang_video, _t_conv, _t_fusion,
+            time.monotonic() - t_pipeline,
         )
         logger.info("[%s] Pipeline complete status=%s agents=%s", session_id, final_status, agent_status)
 

@@ -24,8 +24,10 @@ Research basis:
   - Ekman & Friesen 1978: FACS Action Units (blendshapes approximate AU scores)
 """
 import logging
+import os
 import urllib.request
-from collections import defaultdict
+import bisect
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -1009,6 +1011,11 @@ class TiledFrameProcessor:
                 logger.debug(f"[tiled] face crop error: {exc}")
 
             # ── Body crop (face bbox extended downward, clamped to tile) ──────
+            # Skip pose for tiny tiles: body crop < ~200 px tall produces noisy
+            # or empty MediaPipe Pose output — face landmarks already appended above.
+            if fbh < 80:
+                continue
+
             bc_x1 = max(0, fx - px)
             bc_y1 = max(0, fy - py)
             bc_x2 = min(fw, fx + fbw + px)
@@ -1233,16 +1240,23 @@ class InteractionDetector:
                 break
 
         if speaking_face is None:
-            active_speaker_label: str | None = None
-            for seg in diar_segments:
-                if seg.get("start_ms", 0) <= timestamp_ms <= seg.get("end_ms", 0):
-                    active_speaker_label = seg.get("speaker")
-                    break
-            if active_speaker_label:
+            # Diarization fallback: diar_segments tells us *which* speaker label is
+            # active, but FrameFeatures has no speaker_id field — that attribute is
+            # assigned later by SpeakerFaceMapper on WindowFeatures after the full
+            # extraction loop.  Matching by speaker_id here always fails silently.
+            # Instead, pick the face with the highest jaw activity at this timestamp
+            # as the most likely speaker (best proxy available during extraction).
+            active_at_ts = any(
+                seg.get("start_ms", 0) <= timestamp_ms <= seg.get("end_ms", 0)
+                for seg in diar_segments
+            )
+            if active_at_ts:
+                best_jaw = -1.0
                 for ff in frame_features_list:
-                    if getattr(ff, "speaker_id", "") == active_speaker_label:
+                    jaw = ff.blendshapes.get("jawOpen", 0.0)
+                    if ff.face_detected and jaw > best_jaw:
+                        best_jaw = jaw
                         speaking_face = ff
-                        break
 
         if speaking_face is None:
             return interactions
@@ -1868,6 +1882,281 @@ class OverlayRenderer:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Identity swap detection — IdentitySwapEvent / IdentityVerifier / TrackletSplitter
+# ══════════════════════════════════════════════════════════════════════════════
+
+class IdentitySwapEvent:
+    """
+    Immutable record of a detected identity change within a CentroidTracker track.
+
+    __slots__ used for memory efficiency — IdentityVerifier may accumulate many
+    events across a long session (one per detected swap per track).
+    """
+    __slots__ = ("track_id", "timestamp_ms", "old_embedding", "new_embedding")
+
+    def __init__(
+        self,
+        track_id: int,
+        timestamp_ms: int,
+        old_embedding: "np.ndarray",
+        new_embedding: "np.ndarray",
+    ) -> None:
+        self.track_id = track_id
+        self.timestamp_ms = timestamp_ms
+        self.old_embedding = old_embedding
+        self.new_embedding = new_embedding
+
+
+class IdentityVerifier:
+    """
+    Periodic ArcFace identity verification during the frame extraction loop.
+
+    Detects identity swaps within CentroidTracker tracks by comparing face
+    embeddings at regular intervals.  Catches BOTH speaker-boundary swaps
+    (when a tile changes occupant at a diarization boundary) AND silent swaps
+    (layout changes, join/leave, screen-share, pin/unpin) that diarization
+    cannot detect.
+
+    Design:
+      - Single Responsibility: only detects swaps; does not split tracks.
+      - Strategy Pattern: configurable check_interval and similarity_threshold.
+      - HashMap: dict[int, np.ndarray] — O(1) track_id → embedding lookup.
+      - Chronological output: swap_events property returns events sorted by time.
+
+    Cost model (21-min video, 5fps, check_interval=30):
+      total_sampled_frames ≈ 6300  →  checks ≈ 210
+      210 × ~50ms per InsightFace call = ~10.5s  →  <1% of total loop time.
+    """
+
+    def __init__(
+        self,
+        embedder_app,
+        check_interval: int = 30,
+        similarity_threshold: float = 0.50,
+        min_face_area: float = 0.005,
+    ) -> None:
+        self._app = embedder_app
+        self._check_interval = check_interval
+        self._sim_threshold = similarity_threshold
+        self._min_face_area = min_face_area
+
+        # HashMap: track_id → last verified L2-normalised ArcFace embedding
+        self._track_embeddings: dict[int, "np.ndarray"] = {}
+        self._swap_events: list[IdentitySwapEvent] = []
+        self._frames_since_check: int = 0
+
+    def check_frame(
+        self,
+        bgr: "np.ndarray",
+        timestamp_ms: int,
+        tracker: "CentroidTracker",
+        frame_w: int,
+        frame_h: int,
+        current_layout: str = "",
+    ) -> None:
+        """
+        Called on every sampled frame.  Runs InsightFace every check_interval
+        frames; O(0) on intermediate frames.
+
+        Matches each detected face to the nearest CentroidTracker track by
+        normalised centroid distance, then compares the embedding against the
+        stored reference.  A drop below similarity_threshold records a swap event.
+
+        Layout-aware interval:
+          screenshare  → skip (faces are tiny sidebars, embeddings unreliable)
+          gallery_*    → half interval (tiles can swap occupants, check more often)
+          active_speaker / solo → double interval (one large stable face, low swap risk)
+          unknown / ""  → nominal interval
+        """
+        if current_layout == "screenshare":
+            return
+
+        if current_layout in ("gallery_2x2", "gallery_3x3"):
+            effective_interval = max(1, self._check_interval // 2)
+        elif current_layout in ("active_speaker", "solo"):
+            effective_interval = self._check_interval * 2
+        else:
+            effective_interval = self._check_interval
+
+        self._frames_since_check += 1
+        if self._frames_since_check < effective_interval:
+            return
+        self._frames_since_check = 0
+
+        if not self._app or frame_w == 0 or frame_h == 0:
+            return
+
+        try:
+            faces = self._app.get(bgr)
+        except Exception as exc:
+            logger.debug("IdentityVerifier ArcFace error at %dms: %s", timestamp_ms, exc)
+            return
+
+        if not faces:
+            return
+
+        import numpy as np
+
+        for face in faces:
+            embedding = getattr(face, "embedding", None)
+            if embedding is None or len(embedding) < 512:
+                continue
+
+            # InsightFace returns raw (unnormalized) embeddings; normalize to unit
+            # vector so np.dot() == cosine similarity in [-1, 1].
+            norm = float(np.linalg.norm(embedding))
+            if norm <= 0:
+                continue
+            embedding = embedding / norm
+
+            bbox = face.bbox  # [x1, y1, x2, y2] pixels
+            # Normalised centroid of this detected face
+            cx = ((bbox[0] + bbox[2]) / 2.0) / frame_w
+            cy = ((bbox[1] + bbox[3]) / 2.0) / frame_h
+
+            # Skip faces too small for reliable embedding (tiny sidebar tiles)
+            face_area = ((bbox[2] - bbox[0]) / frame_w) * ((bbox[3] - bbox[1]) / frame_h)
+            if face_area < self._min_face_area:
+                continue
+
+            # Large faces (main pinned tile, face_area > 4% of frame) produce
+            # stable ArcFace embeddings — only a genuine occupant change drives
+            # similarity below 0.35.  Normal head movement keeps sim in 0.40-0.60,
+            # so using the standard 0.50 threshold triggers false splits every few
+            # seconds on the main tile.  Small faces use the full threshold because
+            # their noisier embeddings need the wider range to catch real swaps.
+            effective_threshold = (
+                min(self._sim_threshold, 0.35)
+                if face_area > 0.04
+                else self._sim_threshold
+            )
+
+            # Match to nearest active CentroidTracker track by position.
+            # O(T) where T = number of active tracks — typically ≤ 10.
+            best_tid: Optional[int] = None
+            best_dist = float("inf")
+            for tid, (tx, ty) in tracker._tracks.items():
+                d = ((tx - cx) ** 2 + (ty - cy) ** 2) ** 0.5
+                if d < best_dist and d < 0.15:
+                    best_dist = d
+                    best_tid = tid
+
+            if best_tid is None:
+                continue
+
+            # Compare against stored embedding; ArcFace embeddings are
+            # L2-normalised so dot product == cosine similarity directly.
+            if best_tid in self._track_embeddings:
+                sim = float(np.dot(self._track_embeddings[best_tid], embedding))
+                if abs(sim) < 0.15:
+                    # Near-zero cosine similarity means ArcFace produced noise
+                    # (tiny face tile — embedding unreliable). Skip check and
+                    # do not overwrite stored embedding with a noisy one.
+                    continue
+                if sim < effective_threshold:
+                    self._swap_events.append(IdentitySwapEvent(
+                        track_id=best_tid,
+                        timestamp_ms=timestamp_ms,
+                        old_embedding=self._track_embeddings[best_tid].copy(),
+                        new_embedding=embedding.copy(),
+                    ))
+                    logger.info(
+                        "IdentityVerifier: swap on track %d at %dms (sim=%.3f < %.2f, face_area=%.3f)",
+                        best_tid, timestamp_ms, sim, effective_threshold, face_area,
+                    )
+
+            # Always update stored embedding to track the current occupant
+            self._track_embeddings[best_tid] = embedding.copy()
+
+    @property
+    def swap_events(self) -> list[IdentitySwapEvent]:
+        """Swap events sorted chronologically (O(E log E), called once after loop)."""
+        return sorted(self._swap_events, key=lambda e: e.timestamp_ms)
+
+    def force_check_next_frame(self) -> None:
+        """Force an identity check on the very next sampled frame.
+
+        Called when face count changes — a new person appearing at a position
+        previously occupied by someone else is the earliest signal of an occupant
+        swap. Without this, the periodic interval (up to 6s) delays detection and
+        contaminates the joining person's first windows with the wrong track ID.
+        """
+        self._frames_since_check = self._check_interval
+
+    def clear(self) -> None:
+        """Reset all state for re-use."""
+        self._track_embeddings.clear()
+        self._swap_events.clear()
+        self._frames_since_check = 0
+
+
+class TrackletSplitter:
+    """
+    Splits contaminated CentroidTracker tracks at identity swap points (in-place).
+
+    Consumes IdentitySwapEvent records from IdentityVerifier and rewrites
+    ff.face_index on all FrameFeatures at or after each swap timestamp, giving
+    the post-swap frames a fresh track_id.  Must run BEFORE best-crop selection
+    so the subsequent ArcFace step receives clean, single-person tracks.
+
+    Design:
+      - Single Responsibility: only splits tracks; detection and linking are elsewhere.
+      - HashMap: dict[int, list[int]] — O(1) track → swap-point list.
+      - Chronological processing: events sorted so multiple swaps on the same
+        track produce independent clean segments (tid chain: A → B → C).
+      - O(E × F): E swap events (typically 5–20), F frames (≈ 6300) → ≤ 126,000
+        integer comparisons → < 0.1 s wall-clock.
+    """
+
+    def __init__(self, centroid_tracker: "CentroidTracker") -> None:
+        self._tracker = centroid_tracker
+
+    def split_tracks(
+        self,
+        frames: list["FrameFeatures"],
+        swap_events: list[IdentitySwapEvent],
+    ) -> None:
+        """
+        Rewrite face_index on frames in-place.  Each swap creates a new track_id
+        allocated from centroid_tracker._next_id.
+
+        Args:
+            frames:       All FrameFeatures extracted during the loop (mutated).
+            swap_events:  Chronologically sorted events from IdentityVerifier.
+        """
+        if not swap_events:
+            return
+
+        # Build HashMap: track_id → sorted list of swap timestamps
+        # Sorting inside the grouping step ensures chronological processing
+        # even if caller provides unsorted events.  O(E log E).
+        swap_map: dict[int, list[int]] = {}
+        for event in swap_events:
+            swap_map.setdefault(event.track_id, []).append(event.timestamp_ms)
+        for timestamps in swap_map.values():
+            timestamps.sort()
+
+        for original_tid, timestamps in swap_map.items():
+            current_tid = original_tid
+            for swap_ts in timestamps:
+                new_tid = self._tracker._next_id
+                self._tracker._next_id += 1
+
+                rewritten = 0
+                for ff in frames:
+                    if ff.face_index == current_tid and ff.timestamp_ms >= swap_ts:
+                        ff.face_index = new_tid
+                        rewritten += 1
+
+                logger.info(
+                    "TrackletSplitter: Face_%d split at %dms → Face_%d (%d frames rewritten)",
+                    current_tid, swap_ts, new_tid, rewritten,
+                )
+                # Future swaps from the same position target the new track
+                current_tid = new_tid
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CentroidTracker  — stable face IDs across frames
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1965,6 +2254,134 @@ class CentroidTracker:
         self._next_id += 1
         return tid
 
+    def reset(self) -> None:
+        """
+        Kill all active tracks on a layout change event.
+
+        _next_id is intentionally preserved — post-reset tracks must NOT reuse
+        pre-reset IDs, or ArcFace merge would conflate tracks from different
+        layout epochs into the same canonical identity.
+        """
+        self._tracks.clear()
+        self._disappeared.clear()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LayoutClassifier  — per-frame meeting layout detection
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LayoutClassifier:
+    """
+    Classifies each frame into a meeting layout type and emits a layout_changed
+    event when the stable classification transitions.
+
+    Observer Pattern: layout_changed property is consumed by CentroidTracker.reset()
+    and IdentityVerifier interval adjustment in _extract_frames.
+
+    Sliding window of WINDOW_SIZE frames with Counter majority vote prevents
+    single-frame misclassifications from triggering unnecessary tracker resets.
+
+    Layout types:
+      active_speaker  — one face clearly dominates (area ratio >= 1.5)
+      gallery_2x2     — 2-4 equal-sized tiles
+      gallery_3x3     — 5+ equal-sized tiles
+      screenshare     — all faces tiny (screen content shared, faces in sidebar)
+      solo            — single face detected
+      unknown         — insufficient data
+    """
+
+    ACTIVE_SPEAKER_RATIO: float = 1.5   # largest / second-largest area for dominant tile
+    SCREENSHARE_MAX_AREA: float = 0.005 # face_box_area below this → screenshare mode
+    WINDOW_SIZE: int = 15               # frames for majority-vote stabilisation (3s at 5fps)
+    COOLDOWN_FRAMES: int = 25           # min frames between reset events (~5s at 5fps)
+
+    # O(1) layout → family lookup.  Resets only fire on cross-family transitions:
+    #   single  : solo ↔ active_speaker — same person, tile size changed slightly
+    #   gallery : gallery_2x2 ↔ gallery_3x3 — tile count changed, same grid epoch
+    _FAMILY_MAP: "dict[str, str]" = {
+        "active_speaker": "single",
+        "solo":           "single",
+        "gallery_2x2":    "gallery",
+        "gallery_3x3":    "gallery",
+        "screenshare":    "screenshare",
+        "unknown":        "unknown",
+    }
+
+    def __init__(self) -> None:
+        self._window: "deque[str]" = deque(maxlen=self.WINDOW_SIZE)
+        self._stable_layout: str = "unknown"
+        self._layout_changed: bool = False
+        self._cooldown_remaining: int = 0
+
+    @classmethod
+    def _layout_family(cls, layout: str) -> str:
+        return cls._FAMILY_MAP.get(layout, "unknown")
+
+    def classify_frame(self, frame_features_list: list) -> str:
+        """
+        Classify this frame and update the stable layout via majority vote.
+        Sets layout_changed=True only on cross-family transitions with cooldown.
+
+        Cooldown + family grouping prevents rapid gallery↔active_speaker
+        oscillations (every 200ms) from triggering hundreds of tracker resets,
+        which cause track ID fragmentation and inflate post-loop ArcFace work.
+        """
+        raw = self._classify_raw(frame_features_list)
+        self._window.append(raw)
+
+        if self._cooldown_remaining > 0:
+            self._cooldown_remaining -= 1
+
+        if len(self._window) < self.WINDOW_SIZE:
+            self._layout_changed = False
+            return raw
+
+        majority, _ = Counter(self._window).most_common(1)[0]
+        prev = self._stable_layout
+        self._stable_layout = majority  # always update for current_layout accuracy
+
+        if (prev != majority
+                and self._cooldown_remaining == 0
+                and (prev == "screenshare" or majority == "screenshare")):
+            # Reset only on screenshare transitions — faces physically disappear/
+            # reappear in different counts and positions. Gallery ↔ active_speaker
+            # transitions reposition the same faces; the centroid tracker assigns
+            # new IDs naturally (distance > match_threshold) and ArcFace merge
+            # re-associates them, so a full wipe is unnecessary and harmful.
+            self._layout_changed = True
+            self._cooldown_remaining = self.COOLDOWN_FRAMES
+        else:
+            self._layout_changed = False
+
+        return majority
+
+    def _classify_raw(self, frame_features_list: list) -> str:
+        areas = sorted(
+            [ff.face_box_area for ff in frame_features_list if ff.face_detected],
+            reverse=True,
+        )
+        if not areas:
+            return "screenshare"
+        # Screenshare check before solo: a single tiny face (area < 0.5%) is a
+        # sidebar thumbnail during screenshare, not a solo speaker tile.
+        if all(a < self.SCREENSHARE_MAX_AREA for a in areas):
+            return "screenshare"
+        if len(areas) == 1:
+            return "solo"
+        if areas[0] / max(areas[1], 0.001) >= self.ACTIVE_SPEAKER_RATIO:
+            return "active_speaker"
+        if len(areas) <= 4:
+            return "gallery_2x2"
+        return "gallery_3x3"
+
+    @property
+    def layout_changed(self) -> bool:
+        return self._layout_changed
+
+    @property
+    def stable_layout(self) -> str:
+        return self._stable_layout
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FaceEmbeddingExtractor  — ArcFace embeddings for cross-session identity
@@ -1999,7 +2416,7 @@ class FaceEmbeddingExtractor:
                 name="buffalo_l",
                 providers=["CPUExecutionProvider"],
             )
-            self._app.prepare(ctx_id=0, det_size=(640, 640))
+            self._app.prepare(ctx_id=0, det_size=(320, 320))
             self._available = True
             logger.info("InsightFace ArcFace (buffalo_l) loaded for face identification")
         except Exception as exc:
@@ -2086,6 +2503,341 @@ class FaceEmbeddingExtractor:
         thumb = cv2.resize(face_crop, (size, size), interpolation=cv2.INTER_AREA)
         _, jpeg_bytes = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return jpeg_bytes.tobytes()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LightASDClassifier  — audio-visual active speaker detection
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LightASDClassifier:
+    """
+    Active Speaker Detection via Light-ASD (Liao et al., ICASSP 2023).
+
+    Replaces MediaPipe jawOpen lip-sync correlation with a learned audio-visual
+    model.  94.1% precision on AVA-ActiveSpeaker benchmark.
+
+    Pipeline:
+      face_crops_sequence + audio  →  per-frame speaking probabilities
+      →  Viterbi 2-state HMM smoothing  →  per-(face, speaker) scores
+      →  Hungarian assignment  →  face_to_speaker mapping
+
+    Fixes three failure modes that defeat lip-sync correlation:
+      • Small tiles (face_area < 0.02) — jawOpen landmarks noisy at low res
+      • Large/active-speaker tiles    — jaw saturation (always near open)
+      • Side profiles                 — jawOpen not visible at yaw > 60°
+
+    Model loading (priority order):
+      1. ONNX        — <model_dir>/light_asd/light_asd.onnx  (onnxruntime)
+      2. TorchScript — <model_dir>/light_asd/light_asd.pt   (torch.jit)
+      3. Disabled    — falls back to MediaPipe lip-sync correlation
+
+    Audio features: 40-dim log-mel filterbank, AUDIO_FRAMES_PER_VIDEO
+    sub-frames per sampled video frame (librosa required).
+
+    Obtain model: https://github.com/Junhua-Liao/Light-ASD
+    Export to ONNX and place at models/light_asd/light_asd.onnx.
+
+    Singleton — model loaded once per process, reused across sessions.
+    """
+
+    CROP_SIZE: int = 96               # Light-ASD standard face crop (96×96 gray)
+    N_MELS: int = 40                  # log-mel filterbank dimensions
+    AUDIO_FRAMES_PER_VIDEO: int = 4   # audio temporal resolution per video frame
+    VITERBI_SELF_TRANS: float = 0.92  # HMM self-transition — high = smoother labels
+    _LOG_EPS: float = 1e-7
+
+    _instance: Optional["LightASDClassifier"] = None
+
+    @classmethod
+    def get_instance(cls, model_dir: str = "models") -> "LightASDClassifier":
+        if cls._instance is None:
+            cls._instance = cls(model_dir=model_dir)
+        return cls._instance
+
+    def __init__(self, model_dir: str = "models") -> None:
+        self._sess = None           # onnxruntime.InferenceSession
+        self._torch_model = None    # torch TorchScript model
+        self._available: bool = False
+        self._librosa_ok: bool = False
+        self._sr: int = 16000
+
+        onnx_path = Path(model_dir) / "light_asd" / "light_asd.onnx"
+        pt_path   = Path(model_dir) / "light_asd" / "light_asd.pt"
+
+        if onnx_path.exists():
+            try:
+                import onnxruntime as ort
+                self._sess = ort.InferenceSession(
+                    str(onnx_path), providers=["CPUExecutionProvider"]
+                )
+                self._available = True
+                logger.info("LightASD: ONNX model loaded — %s", onnx_path)
+            except Exception as exc:
+                logger.warning("LightASD: ONNX load failed: %s", exc)
+
+        if not self._available and pt_path.exists():
+            try:
+                import torch
+                self._torch_model = torch.jit.load(str(pt_path), map_location="cpu")
+                self._torch_model.eval()
+                self._available = True
+                logger.info("LightASD: TorchScript model loaded — %s", pt_path)
+            except Exception as exc:
+                logger.warning("LightASD: PyTorch load failed: %s", exc)
+
+        if not self._available:
+            logger.info(
+                "LightASD model not found at %s — "
+                "active speaker detection disabled, using lip-sync fallback",
+                Path(model_dir) / "light_asd",
+            )
+
+        try:
+            import librosa as _lr  # noqa: F401
+            self._librosa_ok = True
+        except ImportError:
+            logger.debug("LightASD: librosa unavailable — ASD disabled")
+
+    @property
+    def available(self) -> bool:
+        return self._available and self._librosa_ok
+
+    def score(
+        self,
+        face_crops_sequence: "dict[int, list[tuple[int, np.ndarray]]]",
+        audio_path: str,
+        fps: float = 5.0,
+    ) -> "dict[int, list[tuple[int, float]]]":
+        """
+        Score all face tracks; return Viterbi-smoothed per-frame speaking labels.
+
+        Args:
+            face_crops_sequence: {track_id: [(ts_ms, gray_96x96), ...]} sorted by ts_ms.
+                                 Built by _extract_frames and stored on the extractor.
+            audio_path:          16kHz mono WAV extracted from the source video.
+            fps:                 video sampling rate used during _extract_frames.
+
+        Returns:
+            {track_id: [(ts_ms, 0.0_or_1.0), ...]} — Viterbi binary labels.
+            Empty dict on model/audio failure (triggers lip-sync fallback in assign()).
+        """
+        if not self.available or not face_crops_sequence:
+            return {}
+
+        try:
+            log_mel = self._load_log_mel(audio_path, fps)   # [N_MELS, T_audio]
+        except Exception as exc:
+            logger.warning("LightASD: audio feature extraction failed: %s", exc)
+            return {}
+
+        results: "dict[int, list[tuple[int, float]]]" = {}
+        for track_id, crops in face_crops_sequence.items():
+            if len(crops) < 3:
+                continue
+            try:
+                smoothed = self._score_track(crops, log_mel, fps)
+                if smoothed:
+                    results[track_id] = smoothed
+            except Exception as exc:
+                logger.debug("LightASD: track %d failed: %s", track_id, exc)
+
+        logger.info(
+            "LightASD: scored %d / %d tracks", len(results), len(face_crops_sequence)
+        )
+        return results
+
+    # ── Private helpers ────────────────────────────────────────────────────
+
+    def _load_log_mel(self, audio_path: str, fps: float) -> np.ndarray:
+        """
+        Compute log-mel spectrogram aligned to video frames.
+
+        hop_length = sr / (fps × AUDIO_FRAMES_PER_VIDEO)
+        → exactly AUDIO_FRAMES_PER_VIDEO columns per sampled video frame.
+        Returns shape [N_MELS, T_audio].
+        """
+        import librosa
+        y, _ = librosa.load(audio_path, sr=self._sr, mono=True)
+        hop = max(1, int(self._sr / (fps * self.AUDIO_FRAMES_PER_VIDEO)))
+        mel = librosa.feature.melspectrogram(
+            y=y, sr=self._sr,
+            n_mels=self.N_MELS,
+            n_fft=min(512, len(y)),
+            hop_length=hop,
+        )
+        return np.log(mel + self._LOG_EPS).astype(np.float32)
+
+    def _score_track(
+        self,
+        crops: "list[tuple[int, np.ndarray]]",
+        log_mel: np.ndarray,
+        fps: float,
+    ) -> "list[tuple[int, float]]":
+        """
+        Chunk track into 1000-frame blocks, run inference, apply Viterbi,
+        return smoothed binary labels sorted by timestamp.
+        """
+        CHUNK = 1000
+        all_probs: list[float] = []
+        for start in range(0, len(crops), CHUNK):
+            all_probs.extend(
+                self._infer_chunk(crops[start : start + CHUNK], log_mel, fps)
+            )
+
+        raw = np.array(all_probs, dtype=np.float32)
+        smoothed = self._viterbi_smooth(raw)
+        return [(crops[i][0], float(smoothed[i])) for i in range(len(crops))]
+
+    def _infer_chunk(
+        self,
+        crops: "list[tuple[int, np.ndarray]]",
+        log_mel: np.ndarray,
+        fps: float,
+    ) -> list[float]:
+        """
+        Build audio [1, T×4, N_MELS] and visual [1, T, 1, H, W] tensors,
+        run one model forward pass, return per-frame speaking probabilities.
+        """
+        import cv2 as _cv2
+
+        T = len(crops)
+        n_audio = T * self.AUDIO_FRAMES_PER_VIDEO
+
+        # ── Visual ────────────────────────────────────────────────────────
+        frames_arr: list[np.ndarray] = []
+        for _, crop in crops:
+            gray = (
+                _cv2.cvtColor(crop, _cv2.COLOR_BGR2GRAY)
+                if crop.ndim == 3 else crop
+            )
+            if gray.shape != (self.CROP_SIZE, self.CROP_SIZE):
+                gray = _cv2.resize(
+                    gray,
+                    (self.CROP_SIZE, self.CROP_SIZE),
+                    interpolation=_cv2.INTER_AREA,
+                )
+            frames_arr.append(gray.astype(np.float32) / 255.0)
+        vis_batch = (
+            np.stack(frames_arr, axis=0)[:, np.newaxis, :, :][np.newaxis]
+        )  # [1, T, 1, H, W]
+
+        # ── Audio — align first sub-frame to crops[0] timestamp ──────────
+        first_ts_ms = crops[0][0]
+        a_start = int(round(first_ts_ms / 1000.0 * fps * self.AUDIO_FRAMES_PER_VIDEO))
+        a_end = a_start + n_audio
+        a_slice = log_mel[:, max(0, a_start) : min(log_mel.shape[1], a_end)]
+        if a_slice.shape[1] < n_audio:
+            a_slice = np.pad(a_slice, ((0, 0), (0, n_audio - a_slice.shape[1])), mode="edge")
+        audio_batch = a_slice.T[np.newaxis]  # [1, T*4, N_MELS]
+
+        # ── Inference ─────────────────────────────────────────────────────
+        if self._sess is not None:
+            out = self._run_onnx(audio_batch, vis_batch)
+        else:
+            out = self._run_torch(audio_batch, vis_batch)
+
+        if out is None or out.size == 0:
+            return [0.5] * T
+
+        # expected: [1, T, 2] logits or [1, T] probs
+        o = out[0]   # [T, 2] or [T]
+        if o.ndim == 2 and o.shape[-1] == 2:
+            exp = np.exp(o - o.max(axis=1, keepdims=True))
+            probs = (exp[:, 1] / exp.sum(axis=1)).astype(np.float32)
+        elif o.ndim == 1:
+            probs = np.clip(o, 0.0, 1.0).astype(np.float32)
+        else:
+            return [0.5] * T
+
+        probs = np.clip(probs[:T], 0.0, 1.0)
+        if len(probs) < T:
+            probs = np.pad(probs, (0, T - len(probs)), mode="edge")
+        return probs.tolist()
+
+    def _run_onnx(
+        self,
+        audio_batch: np.ndarray,
+        vis_batch: np.ndarray,
+    ) -> "np.ndarray | None":
+        """Run ONNX session; match inputs to audio/visual by name."""
+        try:
+            feeds: dict = {}
+            for inp in self._sess.get_inputs():
+                feeds[inp.name] = (
+                    audio_batch if "audio" in inp.name.lower() else vis_batch
+                )
+            return np.array(self._sess.run(None, feeds)[0], dtype=np.float32)
+        except Exception as exc:
+            logger.debug("LightASD ONNX error: %s", exc)
+            return None
+
+    def _run_torch(
+        self,
+        audio_batch: np.ndarray,
+        vis_batch: np.ndarray,
+    ) -> "np.ndarray | None":
+        """Run PyTorch TorchScript model."""
+        try:
+            import torch
+            with torch.no_grad():
+                out = self._torch_model(
+                    torch.from_numpy(audio_batch),
+                    torch.from_numpy(vis_batch),
+                )
+            return out.numpy() if hasattr(out, "numpy") else np.array(out, dtype=np.float32)
+        except Exception as exc:
+            logger.debug("LightASD PyTorch error: %s", exc)
+            return None
+
+    def _viterbi_smooth(self, probs: np.ndarray) -> np.ndarray:
+        """
+        2-state HMM Viterbi decoder.
+
+        Corrects isolated per-frame mis-classifications by enforcing temporal
+        consistency: if 9 of 10 consecutive frames say speaking, the 1 outlier
+        that disagrees is corrected.
+
+        States: 0=silent, 1=speaking
+        Emission: P(obs | silent) = 1-p,  P(obs | speaking) = p
+        Transition: VITERBI_SELF_TRANS on diagonal (0.92 → strong persistence)
+
+        Returns binary float array (0.0 = silent, 1.0 = speaking).  O(T).
+        """
+        T = len(probs)
+        if T == 0:
+            return probs.copy()
+
+        eps = self._LOG_EPS
+        st = self.VITERBI_SELF_TRANS
+        log_trans = np.log(
+            np.array([[st, 1.0 - st], [1.0 - st, st]], dtype=np.float64)
+        )
+
+        dp = np.full((T, 2), -np.inf, dtype=np.float64)
+        bp = np.zeros((T, 2), dtype=np.int8)
+
+        p0 = float(probs[0])
+        dp[0, 0] = np.log(0.5) + np.log(max(1.0 - p0, eps))
+        dp[0, 1] = np.log(0.5) + np.log(max(p0, eps))
+
+        for t in range(1, T):
+            p = float(probs[t])
+            log_emit = np.array(
+                [np.log(max(1.0 - p, eps)), np.log(max(p, eps))],
+                dtype=np.float64,
+            )
+            for s in range(2):
+                candidates = dp[t - 1] + log_trans[:, s]
+                bp[t, s] = int(np.argmax(candidates))
+                dp[t, s] = float(np.max(candidates)) + log_emit[s]
+
+        # Viterbi traceback
+        path = np.zeros(T, dtype=np.float32)
+        path[-1] = float(np.argmax(dp[-1]))
+        for t in range(T - 2, -1, -1):
+            path[t] = float(bp[t + 1, int(path[t + 1])])
+
+        return path
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2364,6 +3116,21 @@ class VideoFeatureExtractor:
                                   # above 0.08 to survive moderate head turns between sampled frames
         )
 
+        # Frame dimensions for IdentityVerifier centroid normalisation
+        _frame_w: int = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        _frame_h: int = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Identity verifier — periodic ArcFace swap detection during frame loop.
+        # Reuses the singleton FaceEmbeddingExtractor already loaded for post-loop
+        # embedding extraction; no additional model load.
+        _embedder = FaceEmbeddingExtractor.get_instance()
+        identity_verifier = IdentityVerifier(
+            embedder_app=_embedder._app if _embedder.available else None,
+            check_interval=30,        # every 6s at 5fps — 210 checks per 21-min video
+            similarity_threshold=0.50,
+            min_face_area=0.005,      # skip tiny sidebar tiles (face_area < 0.5%)
+        )
+
         # Cache last MediaPipe results — reused for overlay on non-sampled frames
         last_face_result = None
         last_pose_result = None
@@ -2374,6 +3141,39 @@ class VideoFeatureExtractor:
 
         # Diarization segments (populated by caller via _diar_segments attribute if set)
         diar_segments: list[dict] = getattr(self, "_diar_segments", [])
+
+        # Active-tile tagger — collects diarization-based face→speaker tags during
+        # the frame loop for faces that dominate screen space (pinned/spotlight tiles).
+        # A second rebuild pass after TrackletSplitter rewrites face_index produces the
+        # final mapping injected into SpeakerFaceMapper.
+        active_tagger = ActiveTileTagger(
+            diar_segments=diar_segments,
+            min_face_area=ActiveTileTagger.ACTIVE_TILE_MIN_AREA,
+        )
+
+        # Layout classifier — detects layout transitions (gallery ↔ active_speaker)
+        # and triggers CentroidTracker reset + IdentityVerifier interval adjustment.
+        layout_classifier = LayoutClassifier()
+
+        # Tracks face count frame-to-frame so identity_verifier.force_check_next_frame()
+        # fires immediately when a new person appears (count increases).
+        _prev_face_count: int = 0
+        # Tracks stable layout value to detect any layout change (even within-family).
+        # When the large tile changes occupant (solo→active_speaker, gallery→active_speaker),
+        # face count stays 1 because the small tile is filtered by area < 0.02 — so the
+        # face count check misses the swap. Any layout value change triggers a force check.
+        _prev_stable_layout: str = ""
+
+        # Border detector — platform-native active-speaker signal (Zoom/Meet/Teams).
+        # Cheap O(P) per frame; complements ActiveTileTagger in gallery mode.
+        border_detector = ActiveSpeakerBorderDetector(
+            platform=os.environ.get("VIDEO_PLATFORM", "auto")
+        )
+
+        # Keyed by (timestamp_ms, cx_int, cy_int) — a physical face position that
+        # is invariant through TrackletSplitter and ArcFace merge.  After the loop,
+        # remapped to canonical face IDs and stored as self._face_crops_sequence.
+        _crop_by_position: "dict[tuple[int, int, int], np.ndarray]" = {}
 
         try:
             while cap.isOpened():
@@ -2401,6 +3201,29 @@ class VideoFeatureExtractor:
                             prev_pose_lm_data,
                         )
 
+                        # ── Layout classification — BEFORE tracker update ──────
+                        # Must run first: if the layout just changed, all face
+                        # positions shifted simultaneously.  Resetting the tracker
+                        # before update() prevents the new faces being matched to
+                        # stale tracks from the previous layout epoch.
+                        layout_classifier.classify_frame(frame_features_list)
+                        current_layout = layout_classifier.stable_layout
+                        if layout_classifier.layout_changed:
+                            centroid_tracker.reset()
+                            identity_verifier.clear()
+                            active_tagger.reset()
+                            logger.info(
+                                "Layout → %s at %dms — tracker reset",
+                                current_layout, timestamp_ms,
+                            )
+                        elif current_layout != _prev_stable_layout and _prev_stable_layout != "":
+                            # Layout value changed within the same family (e.g. solo →
+                            # active_speaker when Mirko joins). Tiles rearranged — large tile
+                            # occupant may have swapped. Force immediate identity check so
+                            # the swap is caught within one frame instead of up to 6s later.
+                            identity_verifier.force_check_next_frame()
+                        _prev_stable_layout = current_layout
+
                         # ── Apply temporal face tracking ──────────────────────
                         # Replace area-sorted face_index with stable track_id so
                         # WindowAggregator always groups the same physical person.
@@ -2417,6 +3240,14 @@ class VideoFeatureExtractor:
                                     ff.face_index = track_ids[ci]
                                     ci += 1
 
+                            # If face count increased, a new person just appeared.
+                            # Force an immediate identity check so their join is
+                            # detected within one frame rather than up to 6s later.
+                            curr_face_count = len(centroids)
+                            if curr_face_count > _prev_face_count:
+                                identity_verifier.force_check_next_frame()
+                            _prev_face_count = curr_face_count
+
                         # Detect cross-speaker interactions for this frame
                         last_interactions = InteractionDetector.detect_interactions(
                             frame_features_list, diar_segments, timestamp_ms
@@ -2430,6 +3261,72 @@ class VideoFeatureExtractor:
                             ]
 
                         frames.extend(frame_features_list)
+
+                        # ── Platform border detection ─────────────────────────
+                        # Build pixel bounding boxes from normalised coords for all
+                        # detected faces; preserves order matching frame_features_list.
+                        detected_ffs = [
+                            ff for ff in frame_features_list if ff.face_detected
+                        ]
+                        face_boxes_px: list[tuple[int, int, int, int]] = []
+                        for ff in detected_ffs:
+                            side = ff.face_box_area ** 0.5
+                            cx_px = int(ff.face_centre_x * _frame_w)
+                            cy_px = int(ff.face_centre_y * _frame_h)
+                            half_w = int(side * _frame_w * 0.5)
+                            half_h = int(side * _frame_h * 0.5)
+                            face_boxes_px.append((
+                                max(0, cx_px - half_w),
+                                max(0, cy_px - half_h),
+                                min(2 * half_w, _frame_w),
+                                min(2 * half_h, _frame_h),
+                            ))
+
+                        # ── Buffer face crops for Light-ASD inference ────────
+                        # Grayscale 96×96; ~9KB per crop.
+                        # Key = physical position (ts_ms, cx_int, cy_int) — stable
+                        # through TrackletSplitter; remapped to canonical IDs after loop.
+                        import cv2 as _cv2
+                        for _ff, (_x, _y, _w, _h) in zip(detected_ffs, face_boxes_px):
+                            if _w > 0 and _h > 0 and _ff.face_box_area >= 0.001:
+                                _raw = bgr[_y : _y + _h, _x : _x + _w]
+                                if _raw.size > 0:
+                                    _gray = _cv2.cvtColor(_raw, _cv2.COLOR_BGR2GRAY)
+                                    _crop = _cv2.resize(
+                                        _gray,
+                                        (LightASDClassifier.CROP_SIZE,
+                                         LightASDClassifier.CROP_SIZE),
+                                        interpolation=_cv2.INTER_AREA,
+                                    )
+                                    _crop_by_position[(
+                                        timestamp_ms,
+                                        int(_ff.face_centre_x * 1000),
+                                        int(_ff.face_centre_y * 1000),
+                                    )] = _crop
+
+                        border_box_idx = border_detector.detect_active_speaker(
+                            bgr, face_boxes_px
+                        ) if face_boxes_px else None
+                        # Map box list index → track_id (ff.face_index)
+                        border_face_idx: "int | None" = (
+                            detected_ffs[border_box_idx].face_index
+                            if border_box_idx is not None else None
+                        )
+
+                        # Tag large-tile faces to diarization speakers in-loop.
+                        # Uses pre-split face_index; rebuilt post-split after loop.
+                        active_tagger.tag_frame(
+                            frame_features_list, timestamp_ms,
+                            border_face_idx=border_face_idx,
+                        )
+
+                        # Periodic identity verification — every check_interval
+                        # sampled frames; O(0) cost on intermediate frames.
+                        identity_verifier.check_frame(
+                            bgr, timestamp_ms, centroid_tracker, _frame_w, _frame_h,
+                            current_layout=current_layout,
+                        )
+
                         last_frame_features_list = frame_features_list
                         for ff in frame_features_list:
                             if ff.face_index == 0:
@@ -2472,6 +3369,19 @@ class VideoFeatureExtractor:
             f"Extracted {len(frames)} frames from {Path(video_path).name} "
             f"({frame_idx} total, every {skip}th frame at video_fps={video_fps:.1f})"
         )
+
+        # ── Split contaminated tracks at ArcFace-verified swap points ────────
+        # Must run BEFORE best-crop selection so crops are always from clean,
+        # single-person track segments.
+        _swap_events = identity_verifier.swap_events
+        if _swap_events:
+            logger.info(
+                "IdentityVerifier: %d swap(s) on %d track(s) — splitting now",
+                len(_swap_events),
+                len(set(e.track_id for e in _swap_events)),
+            )
+            TrackletSplitter(centroid_tracker).split_tracks(frames, _swap_events)
+        identity_verifier.clear()
 
         # ── Select best frame per tracked face for ArcFace embedding extraction ─
         # Quality = frontal (low yaw+pitch) × large bbox × well-lit (luminance).
@@ -2551,16 +3461,23 @@ class VideoFeatureExtractor:
             if ff.face_detected:
                 frame_counts[ff.face_index] = frame_counts.get(ff.face_index, 0) + 1
 
-        # Per-track avg face height and centroid — used for tiny-face-aware merge.
+        # Per-track avg face height, centroid, and pose quality — used for merge.
         # Computed from all frames (not just best-frame crop) for accuracy.
         _track_face_areas: dict[int, list[float]] = {}
         _track_cx: dict[int, list[float]] = {}
         _track_cy: dict[int, list[float]] = {}
+        _track_pose_quality: dict[int, list[float]] = {}
         for ff in frames:
             if ff.face_detected and ff.face_box_area > 0.0:
-                _track_face_areas.setdefault(ff.face_index, []).append(ff.face_box_area)
-                _track_cx.setdefault(ff.face_index, []).append(ff.face_centre_x)
-                _track_cy.setdefault(ff.face_index, []).append(ff.face_centre_y)
+                tid = ff.face_index
+                _track_face_areas.setdefault(tid, []).append(ff.face_box_area)
+                _track_cx.setdefault(tid, []).append(ff.face_centre_x)
+                _track_cy.setdefault(tid, []).append(ff.face_centre_y)
+                # Pose quality: 1.0 = frontal, <0.5 = profile.
+                # |yaw| > 30° → quality below 0.7; |yaw| > 45° → below 0.5.
+                yaw_pen = 1.0 / (1.0 + abs(ff.head_yaw) * 0.03)
+                pitch_pen = 1.0 / (1.0 + abs(ff.head_pitch) * 0.02)
+                _track_pose_quality.setdefault(tid, []).append(yaw_pen * pitch_pen)
         track_face_heights: dict[int, float] = {
             tid: float(np.mean([a ** 0.5 for a in areas]))
             for tid, areas in _track_face_areas.items()
@@ -2568,6 +3485,10 @@ class VideoFeatureExtractor:
         track_centroids: dict[int, tuple[float, float]] = {
             tid: (float(np.mean(_track_cx[tid])), float(np.mean(_track_cy[tid])))
             for tid in _track_face_areas
+        }
+        track_pose_quality: dict[int, float] = {
+            tid: float(np.mean(vals))
+            for tid, vals in _track_pose_quality.items()
         }
 
         # Face size + duration: computed once, used by merge threshold AND
@@ -2611,6 +3532,7 @@ class VideoFeatureExtractor:
                             frame_counts=frame_counts,
                             track_face_heights=track_face_heights,
                             track_centroids=track_centroids,
+                            pose_quality=track_pose_quality,
                         )
                         merges = {k: v for k, v in canonical.items() if k != v}
 
@@ -2637,6 +3559,13 @@ class VideoFeatureExtractor:
                                 if canon_tid not in merged_embs:
                                     merged_embs[canon_tid] = data
                             self._cached_embeddings = merged_embs
+
+                        # NOTE: No remap of _active_tile_face_to_speaker through the
+                        # ArcFace canonical dict is needed here. ArcFace merge (above)
+                        # already rewrote ff.face_index on every frame to canonical IDs.
+                        # The post-split rebuild (below) iterates these rewritten frames,
+                        # so its output mapping references final canonical track IDs
+                        # directly.
 
                         unique_count = len(set(canonical.values()))
                         logger.info(
@@ -2697,6 +3626,76 @@ class VideoFeatureExtractor:
                 f"{sorted(true_transients)} — dropped {before - len(frames)} frames"
             )
 
+        # ── Build face→speaker mapping from active-tile tags (post-split) ───────
+        # Rebuild from FINAL frames (post-TrackletSplitter + post-ArcFace-merge
+        # canonical IDs) so the mapping uses the track IDs windows actually see.
+        # Applies the same gallery guard as the in-loop tagger: only tag frames
+        # where one face clearly dominates (ratio >= 1.5 over second face).
+        #
+        # DSA: HashMap keyed by timestamp_ms → dominant face_index (or None)
+        # built in O(F); per-frame lookup during tagging is O(1).
+        if active_tagger.tags:
+            post_split_tagger = ActiveTileTagger(
+                diar_segments=diar_segments,
+                min_face_area=ActiveTileTagger.ACTIVE_TILE_MIN_AREA,
+            )
+
+            # Step 1: Group detected frames by timestamp, find dominant face per ts.
+            frames_by_ts: dict[int, list] = defaultdict(list)
+            for ff in frames:
+                if ff.face_detected:
+                    frames_by_ts[ff.timestamp_ms].append(ff)
+
+            dominant_at_ts: dict[int, int | None] = {}
+            for ts, ff_list in frames_by_ts.items():
+                areas = sorted(
+                    [ff.face_box_area for ff in ff_list], reverse=True
+                )
+                if not areas or areas[0] < ActiveTileTagger.ACTIVE_TILE_MIN_AREA:
+                    dominant_at_ts[ts] = None
+                    continue
+                if len(areas) >= 2 and areas[0] / max(areas[1], 0.001) < 1.5:
+                    dominant_at_ts[ts] = None  # gallery layout — no dominant face
+                    continue
+                dominant_at_ts[ts] = max(ff_list, key=lambda f: f.face_box_area).face_index
+
+            # Step 2: Tag only the dominant face at each timestamp.
+            for ff in frames:
+                dom_idx = dominant_at_ts.get(ff.timestamp_ms)
+                if dom_idx is not None and ff.face_index == dom_idx:
+                    spk = post_split_tagger.find_speaker_at(ff.timestamp_ms)
+                    if spk:
+                        post_split_tagger.record_tag(ff.face_index, ff.timestamp_ms, spk)
+
+            self._active_tile_face_to_speaker: dict[int, str] = post_split_tagger.build_mapping()
+        else:
+            self._active_tile_face_to_speaker = {}
+        active_tagger.clear()
+
+        # ── Remap face crops to canonical (post-split + post-ArcFace) IDs ──────
+        # _crop_by_position uses (ts_ms, cx_int, cy_int) — invariant through splits.
+        # Iterating final `frames` gives us each ff's canonical face_index, allowing
+        # a clean O(F) rebuild without a second VideoCapture pass.
+        _face_crops_seq: "dict[int, list[tuple[int, np.ndarray]]]" = defaultdict(list)
+        for ff in frames:
+            if not ff.face_detected or ff.face_box_area < 0.001:
+                continue
+            pos_key = (
+                ff.timestamp_ms,
+                int(ff.face_centre_x * 1000),
+                int(ff.face_centre_y * 1000),
+            )
+            crop = _crop_by_position.get(pos_key)
+            if crop is not None:
+                _face_crops_seq[ff.face_index].append((ff.timestamp_ms, crop))
+        for seq in _face_crops_seq.values():
+            seq.sort(key=lambda x: x[0])
+        self._face_crops_sequence: "dict[int, list[tuple[int, np.ndarray]]]" = dict(
+            _face_crops_seq
+        )
+        self._last_video_fps: float = float(self._target_fps)
+        del _crop_by_position   # free ~9KB × n_face_frames before returning
+
         return frames
 
     def _build_landmarkers(self, mp):
@@ -2750,6 +3749,38 @@ class VideoFeatureExtractor:
     def _build_tiled_processor(self, mp) -> "TiledFrameProcessor":
         """Create a TiledFrameProcessor for the current face budget."""
         return TiledFrameProcessor.create(mp, self._model_mgr, self._num_faces)
+
+    def warmup(self) -> None:
+        """
+        Pre-load all heavy models so the first real session has no cold-start delay.
+
+        Two stages run sequentially in the caller's thread-pool thread:
+          1. MediaPipe — builds + discards a TiledFrameProcessor to page the 6
+             model files into the OS cache (~2-5s, CPU-bound).
+          2. ArcFace (InsightFace buffalo_l) — initialises the singleton
+             FaceEmbeddingExtractor, which downloads the model weights if absent
+             and calls app.prepare() to load ONNX models into memory (~2-5s on
+             first run, ~0.5s on subsequent runs from disk cache).
+
+        Both stages are non-fatal: a failure logs a warning and the first real
+        session falls back to cold initialisation.
+        """
+        try:
+            import mediapipe as mp
+            proc = self._build_tiled_processor(mp)
+            del proc
+            logger.info("MediaPipe warmup complete — models page-cached.")
+        except Exception as exc:
+            logger.warning("MediaPipe warmup failed (non-fatal): %s", exc)
+
+        try:
+            embedder = FaceEmbeddingExtractor.get_instance()
+            if embedder.available:
+                logger.info("ArcFace warmup complete — buffalo_l model loaded.")
+            else:
+                logger.warning("ArcFace warmup: InsightFace not available — face ID disabled.")
+        except Exception as exc:
+            logger.warning("ArcFace warmup failed (non-fatal): %s", exc)
 
     @staticmethod
     def _compute_frame_behavioral_state(ff: "FrameFeatures") -> None:
@@ -3573,6 +4604,7 @@ class VideoFeatureExtractor:
         frame_counts: dict[int, int] | None = None,
         track_face_heights: dict[int, float] | None = None,
         track_centroids: dict[int, tuple[float, float]] | None = None,
+        pose_quality: dict[int, float] | None = None,
     ) -> dict[int, int]:
         """
         Merge CentroidTracker track_ids that belong to the same physical person.
@@ -3588,8 +4620,11 @@ class VideoFeatureExtractor:
         Tiny-face guard: when either track in a pair has avg face height < 0.07
         (face_area < 0.005, ~70px in 1080p), ArcFace produces noisy embeddings
         that score 0.40-0.49 against unrelated faces. The effective threshold is
-        raised to 0.60 for those pairs, above all observed false-match scores,
-        while still allowing legitimate same-person tiny-face merges at 0.60+.
+        raised (floor 0.55 symmetric, 0.45 asymmetric) for those pairs.
+
+        Pose discount: off-angle tracks (|yaw| > 30°) have degraded embeddings.
+        _effective_thresh lowers the floor by up to 0.05 so same-person profile
+        pairs can merge when embedding noise is from pose, not identity mismatch.
 
         Returns {track_id: canonical_track_id} for ALL input track_ids.
         Tracks that match nothing keep their own ID as canonical.
@@ -3603,30 +4638,51 @@ class VideoFeatureExtractor:
         counts = frame_counts or {}
         face_hs = track_face_heights or {}
         centroids = track_centroids or {}
+        pq = pose_quality or {}
 
         def _effective_thresh(tid_a: int, tid_b: int, sim: float) -> float:
-            """Return merge threshold for this track pair, with tiny-face guard
-            and position-based fallback for ambiguous embedding scores."""
+            """Return merge threshold for this track pair, with tiny-face guard,
+            pose-quality discount, and position-based fallback."""
             fh_a = face_hs.get(tid_a, 1.0)
             fh_b = face_hs.get(tid_b, 1.0)
             min_fh = min(fh_a, fh_b)
             max_fh = max(fh_a, fh_b)
+
+            # Pose discount: poor pose (profile angle) degrades embedding quality.
+            # If either track is off-angle, lower the threshold by up to 0.05 so
+            # same-person profile pairs aren't blocked by embedding noise.
+            # max discount = (0.7 - 0.0) * 0.10 = 0.07, capped conservatively.
+            pq_a = pq.get(tid_a, 1.0)
+            pq_b = pq.get(tid_b, 1.0)
+            pose_discount = max(0.0, (0.7 - min(pq_a, pq_b)) * 0.10)
+
             if min_fh >= 0.07:
-                # Both normal-sized: use standard threshold
-                return threshold
+                # Both normal-sized: standard threshold minus pose discount
+                effective = max(threshold - pose_discount, 0.35)
+                # Cross-tile guard: if two normal-sized tracks sit at clearly
+                # different grid positions (dist > 0.20) with similarity below 0.55,
+                # they are almost certainly different people. Raise the bar to 0.55
+                # to block false merges (sim 0.40-0.49) without affecting same-tile
+                # same-person pairs (dist < 0.05) or high-confidence matches.
+                if sim < 0.55 and centroids:
+                    ca = centroids.get(tid_a)
+                    cb = centroids.get(tid_b)
+                    if ca and cb:
+                        pos_dist = ((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5
+                        if pos_dist > 0.20:
+                            effective = max(effective, 0.55)
+                return effective
             if max_fh < 0.07:
-                # SYMMETRIC: both tiny → both embeddings noisy; strict floor blocks
-                # false merges between different people (false scores 0.40–0.49)
-                floor = max(threshold, 0.55)
+                # SYMMETRIC: both tiny → strict floor minus small pose discount
+                floor = max(threshold, 0.55) - pose_discount
+                floor = max(floor, 0.40)
             else:
-                # ASYMMETRIC: one tiny (noisy), one large (clean). The large embedding
-                # is reliable; noise from the small crop depresses similarity without
-                # indicating a different person. Lower floor to 0.45.
-                # Different-person tiny-vs-large scores are typically < 0.35.
-                floor = max(threshold, 0.45)
+                # ASYMMETRIC: one tiny (noisy), one large (clean).
+                floor = max(threshold, 0.45) - pose_discount
+                floor = max(floor, 0.35)
             if sim >= floor:
                 return floor
-            # Score is below floor but above noise floor (0.35): use grid position
+            # Score below floor but above noise floor (0.35): use grid position
             # as a second signal. Same grid tile (dist < 0.05) means same person.
             if sim > 0.35 and centroids:
                 ca = centroids.get(tid_a)
@@ -3634,7 +4690,7 @@ class VideoFeatureExtractor:
                 if ca and cb:
                     pos_dist = ((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5
                     if pos_dist < 0.05:
-                        return threshold  # drop floor, same tile → allow merge
+                        return threshold  # same tile → allow merge
             return floor
 
         # Dominant tracks (most frames) become canonical anchors first so that
@@ -3656,7 +4712,7 @@ class VideoFeatureExtractor:
                 fh_top = face_hs.get(top_tid, 1.0)
                 eff_thresh = _effective_thresh(tid, top_tid, top)
                 pos_note = ""
-                if min(fh_tid, fh_top) < 0.07 and top < max(threshold, 0.55) and top > 0.35:
+                if min(fh_tid, fh_top) < 0.07 and top < eff_thresh and top > 0.35:
                     ca, cb = centroids.get(tid), centroids.get(top_tid)
                     if ca and cb:
                         d = ((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5
@@ -3683,6 +4739,246 @@ class VideoFeatureExtractor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ActiveSpeakerBorderDetector  — platform-native border color detection
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ActiveSpeakerBorderDetector:
+    """
+    Detects the platform-drawn active-speaker highlight border around face tiles.
+
+    Zoom draws a yellow (#FFD700) or blue (#0E71EB) border ~3-4px wide.
+    Google Meet draws a blue (#1A73E8) or white border ~2-3px wide.
+    Microsoft Teams uses a thin colored ring.
+
+    Detection: sample pixels along the perimeter of each face bounding box.
+    If >30% of perimeter pixels match the highlight color (HSV range),
+    this face is the platform-asserted active speaker.
+
+    Strategy Pattern: platform-specific HSV ranges are configurable via
+    the platform constructor arg; 'auto' tries all known ranges.
+
+    O(P) per face per frame where P = perimeter pixel count (~200-400).
+    Total per session: ~6300 frames × 3 faces × 300 pixels = negligible.
+    """
+
+    ZOOM_YELLOW_HSV  = ((20,  150, 150), (35,  255, 255))
+    ZOOM_BLUE_HSV    = ((100, 150, 150), (120, 255, 255))
+    MEET_BLUE_HSV    = ((100, 100, 150), (125, 255, 255))
+    MEET_WHITE_HSV   = ((0,   0,   200), (180, 30,  255))
+
+    def __init__(self, platform: str = "auto") -> None:
+        self._platform = platform
+        if platform == "zoom":
+            self._hsv_ranges = [self.ZOOM_YELLOW_HSV, self.ZOOM_BLUE_HSV]
+        elif platform == "meet":
+            self._hsv_ranges = [self.MEET_BLUE_HSV, self.MEET_WHITE_HSV]
+        elif platform == "teams":
+            self._hsv_ranges = [self.MEET_BLUE_HSV]
+        else:  # auto — try all
+            self._hsv_ranges = [
+                self.ZOOM_YELLOW_HSV, self.ZOOM_BLUE_HSV,
+                self.MEET_BLUE_HSV,   self.MEET_WHITE_HSV,
+            ]
+
+    def detect_active_speaker(
+        self,
+        bgr: "np.ndarray",
+        face_boxes: list[tuple[int, int, int, int]],
+        border_width: int = 5,
+        match_ratio: float = 0.30,
+    ) -> int | None:
+        """
+        Return the index into face_boxes of the face with an active-speaker border,
+        or None if no border detected.
+
+        Args:
+            bgr:          full frame (BGR)
+            face_boxes:   [(x, y, w, h), ...] pixel bounding boxes
+            border_width: pixels outside the face box to sample
+            match_ratio:  fraction of perimeter pixels that must match
+        """
+        import cv2
+
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        fh, fw = bgr.shape[:2]
+
+        best_idx: int | None = None
+        best_match: float = 0.0
+
+        for idx, (x, y, w, h) in enumerate(face_boxes):
+            x1 = max(0, x - border_width)
+            y1 = max(0, y - border_width)
+            x2 = min(fw, x + w + border_width)
+            y2 = min(fh, y + h + border_width)
+
+            border_strips = [
+                hsv[y1:y,       x1:x2].reshape(-1, 3),   # top
+                hsv[y + h:y2,   x1:x2].reshape(-1, 3),   # bottom
+                hsv[y:y + h,    x1:x ].reshape(-1, 3),   # left
+                hsv[y:y + h, x + w:x2].reshape(-1, 3),   # right
+            ]
+            all_border = np.vstack([s for s in border_strips if s.size > 0])
+            if len(all_border) == 0:
+                continue
+
+            total_match = 0
+            for lo, hi in self._hsv_ranges:
+                mask = cv2.inRange(
+                    all_border.reshape(1, -1, 3),
+                    np.array(lo), np.array(hi),
+                )
+                total_match = max(total_match, int(np.count_nonzero(mask)))
+
+            ratio = total_match / len(all_border)
+            if ratio > match_ratio and ratio > best_match:
+                best_match = ratio
+                best_idx = idx
+
+        return best_idx
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ActiveTileTagger  — diarization-based face→speaker tags for prominent tiles
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ActiveTileTagger:
+    """
+    Tags large-tile faces to diarization speakers using bisect-based O(log N) lookup.
+
+    Strategy:
+      1. During the frame loop, tag_frame() calls _find_speaker_at(timestamp_ms) for
+         every face whose face_box_area >= ACTIVE_TILE_MIN_AREA (prominent/pinned tile).
+         This uses bisect_right on sorted interval start times — O(log N) per frame.
+      2. After the loop, build_mapping() applies a Counter majority vote per track ID
+         to produce {track_id: "Speaker_N"}.
+      3. _extract_frames calls tag_frame() in-loop with pre-split face_index values,
+         then rebuilds from the final (post-split) frames so track IDs are canonical.
+      4. After ArcFace merge, _active_tile_face_to_speaker is remapped through the
+         canonical dict so pre-merge track IDs map to their merged canonical ID.
+
+    Rationale: Large tiles (face_area > 8%) produce jaw saturation in MediaPipe
+    blendshapes — the jaw is nearly always open, so lip-sync correlation near zero.
+    Direct diarization time-overlap is more reliable for these faces than lip-sync.
+    """
+
+    ACTIVE_TILE_MIN_AREA: float = 0.08
+
+    def __init__(
+        self,
+        diar_segments: list[dict],
+        min_face_area: float = ACTIVE_TILE_MIN_AREA,
+    ) -> None:
+        self._min_face_area = min_face_area
+        # Pre-sort intervals once; bisect reuses the sorted list each frame.
+        self._intervals: list[tuple[int, int, str]] = sorted(
+            (
+                (
+                    int(s.get("start_ms", 0)),
+                    int(s.get("end_ms", 0)),
+                    str(s.get("speaker", "")),
+                )
+                for s in diar_segments
+                if s.get("speaker") and s.get("start_ms") is not None
+            ),
+            key=lambda x: x[0],
+        )
+        # Parallel list of start times for bisect (avoids attribute access in hot path)
+        self._interval_starts: list[int] = [iv[0] for iv in self._intervals]
+        # {track_id: [(timestamp_ms, speaker_label), ...]}
+        self._tags: dict[int, list[tuple[int, str]]] = defaultdict(list)
+
+    @property
+    def tags(self) -> dict[int, list[tuple[int, str]]]:
+        return self._tags
+
+    def reset(self) -> None:
+        """Clear accumulated frame tags on layout change events."""
+        self.clear()
+
+    def record_tag(self, face_index: int, timestamp_ms: int, speaker: str) -> None:
+        """Record one face→speaker tag directly — used by the post-split rebuild
+        which has already resolved the canonical face_index externally."""
+        self._tags[face_index].append((timestamp_ms, speaker))
+
+    def find_speaker_at(self, timestamp_ms: int) -> str:
+        """Public accessor for diarization speaker at timestamp_ms."""
+        return self._find_speaker_at(timestamp_ms)
+
+    def tag_frame(
+        self,
+        frame_features_list: list,
+        timestamp_ms: int,
+        border_face_idx: "int | None" = None,
+    ) -> None:
+        """
+        Tag the active-speaker face in this frame to the diarization speaker.
+
+        border_face_idx: track_id identified by ActiveSpeakerBorderDetector.
+          When provided, this is a platform-native signal (more reliable than tile
+          size ratio) and bypasses the gallery guard — used in gallery layout where
+          all tiles are equal-sized and the ratio check would always skip.
+        """
+        spk = self._find_speaker_at(timestamp_ms)
+        if not spk:
+            return
+
+        # Platform-drawn border = definitive active-speaker signal.
+        # Bypasses the gallery guard; does not also apply size-based tags
+        # for this frame to avoid double-counting.
+        if border_face_idx is not None:
+            self._tags[border_face_idx].append((timestamp_ms, spk))
+            return
+
+        # Size-based dominant-tile detection (existing logic).
+        # Gallery/grid views (2×2, 3×3) have all tiles within ~1.1× of each other —
+        # no single "active tile" exists so diarization-based tagging would be noise.
+        areas = sorted(
+            [ff.face_box_area for ff in frame_features_list if ff.face_detected],
+            reverse=True,
+        )
+        if not areas or areas[0] < self._min_face_area:
+            return  # all faces too small (screenshare / no speaker tile)
+        if len(areas) >= 2 and areas[0] / max(areas[1], 0.001) < 1.5:
+            return  # gallery view — tiles roughly equal, no dominant speaker
+
+        # Tag ONLY the single largest face (the active-speaker tile).
+        # Tagging every face >= min_face_area was Bug 1: in a 3-person call
+        # a sidebar face at area=0.10 would also pass >= 0.08 and accumulate
+        # tags from whichever speaker talked longest, corrupting majority vote.
+        largest = max(
+            (ff for ff in frame_features_list if ff.face_detected),
+            key=lambda f: f.face_box_area,
+            default=None,
+        )
+        if largest is not None:
+            self._tags[largest.face_index].append((timestamp_ms, spk))
+
+    def _find_speaker_at(self, timestamp_ms: int) -> str:
+        """Return the diarization speaker active at timestamp_ms, or '' if none."""
+        idx = bisect.bisect_right(self._interval_starts, timestamp_ms) - 1
+        if idx < 0:
+            return ""
+        start, end, speaker = self._intervals[idx]
+        return speaker if start <= timestamp_ms < end else ""
+
+    def build_mapping(self) -> dict[int, str]:
+        """
+        Majority-vote per track ID → {track_id: "Speaker_N"}.
+        Only tracks where the majority speaker starts with 'Speaker_' are included.
+        """
+        mapping: dict[int, str] = {}
+        for tid, tag_list in self._tags.items():
+            if not tag_list:
+                continue
+            majority_speaker, _ = Counter(spk for _, spk in tag_list).most_common(1)[0]
+            if majority_speaker.startswith("Speaker_"):
+                mapping[tid] = majority_speaker
+        return mapping
+
+    def clear(self) -> None:
+        self._tags.clear()
+
+
 # SpeakerFaceMapper  — assigns windows to speakers
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -3704,11 +5000,21 @@ class SpeakerFaceMapper:
     speech in MediaPipe blendshapes (r=0.82 with ground-truth voice activity).
     """
 
+    def __init__(self) -> None:
+        # Pre-computed face→speaker tags from VideoFeatureExtractor._extract_frames.
+        # Injected by run_analysis via set_active_tile_tags() before assign() is called.
+        self._active_tile_face_to_speaker: dict[int, str] = {}
+
+    def set_active_tile_tags(self, tags: dict[int, str]) -> None:
+        """Inject active-tile face→speaker tags from the extractor into the mapper."""
+        self._active_tile_face_to_speaker = dict(tags)
+
     def assign(
         self,
         windows: list[WindowFeatures],
         diar_segments: list[dict],
         lip_activity_map: Optional[dict[int, list[tuple[int, float]]]] = None,
+        asd_scores: Optional[dict[int, list[tuple[int, float]]]] = None,
     ) -> tuple[dict[str, list[WindowFeatures]], dict[str, float], dict[int, str]]:
         """
         Args:
@@ -3716,15 +5022,20 @@ class SpeakerFaceMapper:
             diar_segments:    [{speaker, start_ms, end_ms}, ...] from voice agent.
             lip_activity_map: {face_index: [(timestamp_ms, lip_score), ...]}
                               from VideoFeatureExtractor.build_lip_activity_map().
-                              If None or single face, falls back to time-overlap.
+                              Used when asd_scores is None.
+            asd_scores:       {face_index: [(timestamp_ms, 0.0_or_1.0), ...]}
+                              from LightASDClassifier.score().  When provided, used
+                              in preference to lip_activity_map (more accurate).
 
         Returns:
             (windows_by_face, lip_sync_scores, face_to_speaker) where:
             - windows_by_face:  {Face_N: [WindowFeatures, ...]} — ownership by face track
-            - lip_sync_scores:  {Speaker_N: correlation_score} — only for accepted lip-sync links
-            - face_to_speaker:  {face_index_int: "Speaker_N"} — conservative linkage map for gateway
-              Exported only for sufficiently positive lip-sync matches; time-overlap
-              fallback is used for in-session speaking state only, not identity linking.
+            - lip_sync_scores:  {Speaker_N: correlation_score} — accepted linkage scores
+            - face_to_speaker:  {face_index_int: "Speaker_N"} — conservative linkage map
+              Exported only for sufficiently positive scores; time-overlap fallback is
+              used for is_speaking state only, not identity linking.
+
+        Assignment priority: asd > lip_sync > time_overlap
         """
         result: dict[str, list[WindowFeatures]] = defaultdict(list)
 
@@ -3736,56 +5047,95 @@ class SpeakerFaceMapper:
             speakers = ["Speaker_0"]
 
         face_indices = sorted(set(getattr(wf, "face_index", 0) for wf in windows))
+        multi = len(face_indices) > 1 and len(speakers) > 1
 
+        use_asd = asd_scores is not None and multi
         use_lip_sync = (
-            lip_activity_map is not None
-            and len(face_indices) > 1
-            and len(speakers) > 1
+            not use_asd
+            and lip_activity_map is not None
+            and multi
         )
 
-        if use_lip_sync:
+        if use_asd:
+            face_to_speaker, assignment_scores = self._asd_assignment(
+                face_indices, speakers, diar_segments, asd_scores  # type: ignore[arg-type]
+            )
+            method = "asd"
+            confident_face_to_speaker: dict[int, str] = {
+                fi: spk
+                for fi, spk in face_to_speaker.items()
+                if spk.startswith("Speaker_")
+                and assignment_scores.get(fi, 0.0) >= MIN_LIP_SYNC_LINK_SCORE
+            }
+        elif use_lip_sync:
             face_to_speaker, assignment_scores = self._lip_sync_assignment(
                 face_indices, speakers, diar_segments, lip_activity_map  # type: ignore[arg-type]
             )
             method = "lip_sync"
+            # Only promote assignments that cleared the confidence bar.
+            # Low-score assignments exist even when correlation is near zero.
+            # Unconfident faces get "" → is_speaking=False (neutral) rather than
+            # a wrong diarization-derived value.
+            confident_face_to_speaker = {
+                fi: spk
+                for fi, spk in face_to_speaker.items()
+                if spk.startswith("Speaker_")
+                and assignment_scores.get(fi, 0.0) >= MIN_LIP_SYNC_LINK_SCORE
+            }
         else:
             face_to_speaker, assignment_scores = self._time_overlap_assignment(
                 face_indices, speakers, windows, diar_segments
             )
             method = "time_overlap"
+            # time_overlap is reliable (single-speaker or no-data sessions) —
+            # use its mapping directly for is_speaking.
+            confident_face_to_speaker = {
+                fi: spk for fi, spk in face_to_speaker.items()
+                if spk.startswith("Speaker_")
+            }
+
+        # Merge active-tile pre-assignments for any face not already in
+        # confident_face_to_speaker.  Active tiles (large faces) get tagged by
+        # diarization time-overlap in _extract_frames because lip-sync is unreliable
+        # there (jaw saturation).  They take effect only when lip-sync produced no
+        # confident result for that face, so a strong lip-sync score still wins.
+        for fi, spk in self._active_tile_face_to_speaker.items():
+            if fi not in confident_face_to_speaker and spk.startswith("Speaker_"):
+                confident_face_to_speaker[fi] = spk
+                assignment_scores.setdefault(fi, 1.0)  # sentinel — pre-assigned, not scored
 
         # Group windows by Face_N — signal ownership stays on face tracks, not
         # voice speakers. face_to_speaker is returned as a linkage map for the
         # gateway to remap face_embeddings keys before registry matching.
+        # is_speaking uses confident_face_to_speaker only — unconfident lip-sync
+        # assignments are not used to avoid wrong audio-pipeline data on face signals.
         for wf in windows:
             face_idx = getattr(wf, "face_index", 0)
             face_label = f"Face_{face_idx}"
             wf.speaker_id = face_label
             wf.is_speaking = self._is_speaking_in_window(
                 wf.window_start_ms, wf.window_end_ms,
-                face_to_speaker.get(face_idx, ""),
+                confident_face_to_speaker.get(face_idx, ""),
                 diar_segments,
             )
             result[face_label].append(wf)
 
         # lip_sync_scores: face→speaker linkage exported for gateway registry matching
+        # confident_face_to_speaker already has the threshold applied — reuse it.
         lip_sync_scores: dict[str, float] = {}
         confident_mapping: dict[int, str] = {}
-        if method == "lip_sync":
-            for fi, spk in face_to_speaker.items():
+        if method in ("asd", "lip_sync"):
+            for fi, spk in confident_face_to_speaker.items():
                 score = assignment_scores.get(fi, 0.0)
-                if spk.startswith("Speaker_") and score >= MIN_LIP_SYNC_LINK_SCORE:
-                    lip_sync_scores[spk] = round(score, 4)
-                    confident_mapping[fi] = spk
+                lip_sync_scores[spk] = round(score, 4)
+                confident_mapping[fi] = spk
         elif method == "time_overlap":
-            # time_overlap is used for single-speaker sessions or when lip data is absent.
-            # Export any face with positive speaking-time overlap so the gateway can alias
-            # Face_N → Speaker_N for registry matching. Sentinel score 1.0 is above
-            # SESSION_FACE_LOCK_MIN_SCORE=0.10; time-overlap assignment is reliable when
-            # voice diarization is accurate.
-            for fi, spk in face_to_speaker.items():
+            # Export any face with positive speaking-time overlap. Sentinel score 1.0
+            # is above SESSION_FACE_LOCK_MIN_SCORE so the gateway treats it as a
+            # confirmed face→speaker link for registry matching.
+            for fi, spk in confident_face_to_speaker.items():
                 score = assignment_scores.get(fi, 0.0)
-                if spk.startswith("Speaker_") and score > 0.0:
+                if score > 0.0:
                     lip_sync_scores[spk] = 1.0
                     confident_mapping[fi] = spk
 
@@ -3793,7 +5143,67 @@ class SpeakerFaceMapper:
             "SpeakerFaceMapper: %d face(s), method=%s, exported_linkage=%s",
             len(face_indices), method, confident_mapping,
         )
+        # ASD and lip_sync both use the same export structure
         return dict(result), lip_sync_scores, confident_mapping
+
+    def _asd_assignment(
+        self,
+        face_indices: list[int],
+        speakers: list[str],
+        diar_segments: list[dict],
+        asd_scores: dict[int, list[tuple[int, float]]],
+    ) -> tuple[dict[int, str], dict[int, float]]:
+        """
+        Aggregate Viterbi-smoothed ASD binary labels into per-(face, speaker) scores.
+
+        Same correlation structure as _lip_sync_assignment:
+            score = mean(speaking_label) during speaker-active frames
+                  - mean(speaking_label) during speaker-silent frames
+
+        ASD labels are binary (0.0 / 1.0) — derived from the Light-ASD model output
+        after Viterbi smoothing.  More reliable than MediaPipe jawOpen for:
+          • Small tiles   — jawOpen landmarks noisy below face_area 0.02
+          • Large tiles   — jaw saturation makes jawOpen near-constant
+          • Side profiles — jawOpen not visible above 60° yaw
+          • Masked faces  — ASD uses audio-visual fusion, not mouth shape alone
+
+        Delegates to _hungarian_assign for globally-optimal face→speaker pairing.
+        """
+        speaker_intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for seg in diar_segments:
+            spk = seg.get("speaker", "Speaker_0")
+            speaker_intervals[spk].append(
+                (seg.get("start_ms", 0), seg.get("end_ms", 0))
+            )
+
+        scores: dict[tuple[int, str], float] = {}
+        for face_idx in face_indices:
+            track_data = asd_scores.get(face_idx, [])
+            if not track_data:
+                continue
+            for speaker in speakers:
+                intervals = speaker_intervals.get(speaker, [])
+                active_sum = 0.0
+                silent_sum = 0.0
+                active_n   = 0
+                silent_n   = 0
+                for ts_ms, label in track_data:
+                    if self._in_intervals(ts_ms, intervals):
+                        active_sum += label
+                        active_n   += 1
+                    else:
+                        silent_sum += label
+                        silent_n   += 1
+                avg_active = active_sum / max(active_n, 1)
+                avg_silent = silent_sum / max(silent_n, 1)
+                scores[(face_idx, speaker)] = avg_active - avg_silent
+                logger.debug(
+                    "ASD score  face=%d × %s: %.4f  (active=%.4f  silent=%.4f)",
+                    face_idx, speaker,
+                    avg_active - avg_silent, avg_active, avg_silent,
+                )
+
+        return self._hungarian_assign(face_indices, speakers, scores)
 
     def _lip_sync_assignment(
         self,
@@ -3851,7 +5261,7 @@ class SpeakerFaceMapper:
                     avg_speaking - avg_silence, avg_speaking, avg_silence,
                 )
 
-        return self._greedy_assign(face_indices, speakers, scores)
+        return self._hungarian_assign(face_indices, speakers, scores)
 
     def _time_overlap_assignment(
         self,
@@ -3880,7 +5290,7 @@ class SpeakerFaceMapper:
                         )
                 scores[(face_idx, speaker)] = total_ov
 
-        return self._greedy_assign(face_indices, speakers, scores)
+        return self._hungarian_assign(face_indices, speakers, scores)
 
     @staticmethod
     def _greedy_assign(
@@ -3917,6 +5327,64 @@ class SpeakerFaceMapper:
             assigned_faces.add(face_idx)
             assigned_speakers.add(speaker)
 
+        for fi in face_indices:
+            if fi not in mapping:
+                mapping[fi] = f"Face_{fi}"
+                assignment_scores[fi] = 0.0
+
+        return mapping, assignment_scores
+
+    @staticmethod
+    def _hungarian_assign(
+        face_indices: list[int],
+        speakers: list[str],
+        scores: dict[tuple[int, str], float],
+    ) -> tuple[dict[int, str], dict[int, float]]:
+        """
+        Globally optimal face→speaker assignment via the Hungarian algorithm.
+
+        Builds an n_faces × n_speakers cost matrix (negated scores — scipy minimises),
+        then calls scipy.optimize.linear_sum_assignment.  Falls back to _greedy_assign
+        if scipy is unavailable.
+
+        Complexity: O(n³) where n = max(faces, speakers); negligible for n ≤ 10.
+        Advantage over greedy: avoids locally-optimal but globally-suboptimal pairings
+        that occur when the best face for Speaker_0 is also the best face for Speaker_1.
+        """
+        try:
+            from scipy.optimize import linear_sum_assignment
+        except ImportError:
+            logger.debug("scipy not available — falling back to greedy assignment")
+            return SpeakerFaceMapper._greedy_assign(face_indices, speakers, scores)
+
+        if not face_indices or not speakers:
+            return SpeakerFaceMapper._greedy_assign(face_indices, speakers, scores)
+
+        n_f = len(face_indices)
+        n_s = len(speakers)
+        # Build cost matrix: negate scores so minimisation = maximisation
+        cost = np.full((n_f, n_s), fill_value=0.0)
+        for fi_idx, fi in enumerate(face_indices):
+            for spk_idx, spk in enumerate(speakers):
+                cost[fi_idx, spk_idx] = -scores.get((fi, spk), 0.0)
+
+        row_ind, col_ind = linear_sum_assignment(cost)
+
+        mapping: dict[int, str] = {}
+        assignment_scores: dict[int, float] = {}
+        assigned_faces: set[int] = set()
+
+        for ri, ci in zip(row_ind, col_ind):
+            fi = face_indices[ri]
+            spk = speakers[ci]
+            sc = scores.get((fi, spk), 0.0)
+            # Only accept positive-correlation assignments; negatives mean no real link
+            if sc > 0.0:
+                mapping[fi] = spk
+                assignment_scores[fi] = sc
+                assigned_faces.add(fi)
+
+        # Leftover faces (more faces than speakers, or score ≤ 0)
         for fi in face_indices:
             if fi not in mapping:
                 mapping[fi] = f"Face_{fi}"

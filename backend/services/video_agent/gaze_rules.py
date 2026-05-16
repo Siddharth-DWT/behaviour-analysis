@@ -404,6 +404,10 @@ class GazeRuleEngine(BaseVideoRuleEngine):
 
         for w in windows:
             if w.face_detection_rate < self.MIN_GAZE_RATE:
+                # Face out of frame breaks the run — pausing it would stitch
+                # distraction windows across long absences into a false event.
+                _flush_run()
+                run_count = 0
                 continue
             if w.gaze_on_screen_pct < self.GAZE_OFF_THRESHOLD:
                 if run_count == 0:

@@ -70,9 +70,33 @@ class VideoAgentService(BaseAgentService):
             max_workers=min(cpu_count, 8),
             thread_name_prefix="nexus-video",
         )
-        # MediaPipe models download lazily on first extract_all() call — lazy init
-        # avoids a 3s startup delay and lets the app serve health checks immediately.
-        self._log("Video Agent ready (MediaPipe lazy-loads on first request).")
+        asyncio.create_task(self._prewarm_mediapipe())
+        self._log("Video Agent ready (MediaPipe pre-warming in background).")
+
+    async def _prewarm_mediapipe(self) -> None:
+        """Pre-load MediaPipe models in a background thread to eliminate first-session delay."""
+        loop = asyncio.get_running_loop()
+        try:
+            # _warmup_sync runs entirely in the thread pool — including _get_pipeline()
+            # which imports mediapipe and insightface (C-extensions, 2-5s) — so those
+            # heavy imports never block the event loop.
+            await loop.run_in_executor(self._thread_pool, self._warmup_sync)
+            self._log("MediaPipe pre-warm complete — first-session delay eliminated.")
+        except Exception as exc:
+            logger.warning("MediaPipe pre-warm failed (non-fatal): %s", exc)
+
+    def _warmup_sync(self) -> None:
+        """
+        Synchronous warmup body — runs in the thread pool.
+
+        Two steps, both blocking, both safe to run off the event loop:
+          1. _get_pipeline() — imports mediapipe + insightface C-extensions (~2-5s).
+          2. extractor.warmup() — loads MediaPipe model files AND initialises the
+             ArcFace singleton (buffalo_l download + app.prepare()) so neither
+             the frame loop nor the post-loop ArcFace pass pays a cold-start cost.
+        """
+        self._get_pipeline()       # imports C-extensions; sets self._extractor
+        self._extractor.warmup()   # MediaPipe page-cache + ArcFace singleton init
 
     async def shutdown(self) -> None:
         if self._thread_pool:

@@ -25,9 +25,9 @@ from .feature_extractor import WindowFeatures
 logger = logging.getLogger("nexus.video.calibration")
 
 # ─── Calibration constants ─────────────────────────────────────────────────
-# 2-second windows → 45 windows ≈ 90 seconds (same target as voice agent)
-CALIBRATION_MIN_WINDOWS:    int = 5
-CALIBRATION_TARGET_WINDOWS: int = 45
+# 2-second windows → 20 windows ≈ 40 seconds for full confidence; first signals at 3 windows (6s)
+CALIBRATION_MIN_WINDOWS:    int = 3
+CALIBRATION_TARGET_WINDOWS: int = 20
 
 # Bentivoglio 1997: conversational blink rate 26 bpm, silent-reading 15 bpm
 DEFAULT_BLINK_RATE_BPM: float = 20.0

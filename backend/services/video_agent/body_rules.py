@@ -1082,7 +1082,7 @@ class BodyRuleEngine(BaseVideoRuleEngine):
             return []
 
         backward_lean = any(
-            s.get("signal_type") == "lean" and s.get("value_text") == "backward_lean"
+            s.get("signal_type") == "body_lean" and s.get("value_text") == "backward_lean"
             and s.get("speaker_id") == speaker_id
             for s in all_signals
         )

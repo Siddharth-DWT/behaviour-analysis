@@ -10,9 +10,12 @@ startup() calls warm_up() which loads Whisper into memory.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -49,11 +52,18 @@ class VoiceAgentService(BaseAgentService):
         self._extractor = None
         self._transcriber = None
         self._rule_engine = None
+        self._thread_pool: Optional[ThreadPoolExecutor] = None
         self._redis_repo = RedisRepository()
         self._event_store = RedisEventStore()
         self._lock_manager = RedisLockManager()
 
     async def startup(self) -> None:
+        cpu_count = os.cpu_count() or 4
+        self._thread_pool = ThreadPoolExecutor(
+            max_workers=min(cpu_count, 4),
+            thread_name_prefix="nexus-voice",
+        )
+
         from services.voiceAgent.feature_extractor import VoiceFeatureExtractor
         from services.voiceAgent.rules import VoiceRuleEngine
         from services.voiceAgent.transcriber import Transcriber
@@ -62,11 +72,11 @@ class VoiceAgentService(BaseAgentService):
         self._transcriber = Transcriber()
         self._rule_engine = VoiceRuleEngine()
 
-        # Whisper warm-up is synchronous but fast enough to run in startup
         self._log("Voice Agent ready.")
 
     async def shutdown(self) -> None:
-        pass
+        if self._thread_pool:
+            self._thread_pool.shutdown(wait=False)
 
     async def transcribe_only(self, request: VoiceAnalysisRequest) -> dict:
         """
@@ -130,24 +140,18 @@ class VoiceAgentService(BaseAgentService):
         """
         Full voice analysis pipeline (mirrors voiceAgent/main.py::analyse_audio()).
 
-        Pipeline:
-          1. Load audio
-          2. Transcribe + diarise
-          3. Extract acoustic features per speaker per window
-          4. Build per-speaker baselines (calibration)
-          5. Run 5 core rules
-          6. Publish artifacts to Redis
+        The CPU-bound work (transcription, librosa feature extraction, calibration,
+        rules) runs in a thread-pool thread via run_in_executor so the asyncio event
+        loop stays free for health checks and parallel requests during the 5-10 min
+        processing window. Matches the pattern used by VideoAgentService.
         """
-        from services.voiceAgent.calibration import CalibrationModule
-        from services.voiceAgent.rules import VoiceRuleEngine
-
         file_path = Path(request.file_path)
         if not file_path.exists():
             raise FileNotFoundError(f"Audio file not found: {file_path}")
 
         session_id = request.session_id or str(uuid.uuid4())
-        start_time = time.time()
 
+        # ── Async preamble: lock + Redis bookkeeping ──────────────────────────
         lock_token = await self._lock_manager.acquire(session_id, self.name)
         if not lock_token:
             raise RuntimeError(f"Voice agent already processing session {session_id}")
@@ -167,18 +171,92 @@ class VoiceAgentService(BaseAgentService):
                 payload={"file_path": str(file_path)},
             ),
         )
-
         logger.info("[%s] Analysing: %s", session_id, file_path.name)
 
-        # ── Load audio once (reused by diarisation + feature extraction) ────
+        # ── CPU-bound pipeline runs in dedicated thread pool — frees event loop ──
+        loop = asyncio.get_running_loop()
         try:
-            from shared.utils.audio_loader import load_audio
-            audio_data = load_audio(str(file_path), sr=16000)
-        except ImportError:
-            import librosa as _lr
-            audio_data = _lr.load(str(file_path), sr=16000, mono=True)
+            core = await loop.run_in_executor(
+                self._thread_pool, self._analyse_core, request, session_id
+            )
+        except Exception as exc:
+            logger.error("[%s] Voice pipeline failed: %s", session_id, exc)
+            await self._redis_repo.set_agent_status(
+                session_id, self.name,
+                AgentStatusRecord(status="failed", summary_key="summary:voice"),
+            )
+            await self._event_store.append(
+                session_id,
+                EventRecord(
+                    session_id=session_id, agent=self.name,
+                    event_type="agent_failed",
+                    payload={"error": str(exc)},
+                ),
+            )
+            await self._lock_manager.release(session_id, self.name, lock_token)
+            raise
 
+        # ── Async postamble: publish artifacts + cleanup ───────────────────────
+        transcript        = core["transcript"]
+        speaker_data      = core["speaker_data"]
+        signal_dicts      = core["signal_dicts"]
+        summary           = core["summary"]
+        speaker_embeddings = core["speaker_embeddings"]
+        duration_sec      = core["duration_sec"]
+        elapsed           = core["elapsed"]
+
+        await self._publish_voice_outputs(
+            session_id, transcript, speaker_data, signal_dicts, summary, speaker_embeddings
+        )
+        await self._redis_repo.set_agent_status(
+            session_id, self.name,
+            AgentStatusRecord(
+                status="completed",
+                signal_count=len(signal_dicts),
+                summary_key="summary:voice",
+            ),
+        )
+        await self._event_store.append(
+            session_id,
+            EventRecord(
+                session_id=session_id, agent=self.name,
+                event_type="agent_completed",
+                payload={"signal_count": len(signal_dicts)},
+            ),
+        )
+        await self._lock_manager.release(session_id, self.name, lock_token)
+
+        logger.info(
+            "[%s] Voice Agent complete: %d signals in %.1fs",
+            session_id, len(signal_dicts), elapsed,
+        )
+
+        return VoiceAnalysisResponse(
+            session_id=session_id,
+            duration_seconds=duration_sec,
+            speakers=speaker_data,
+            signals=signal_dicts,
+            summary=summary,
+            transcript_segments=transcript["segments"],
+            speaker_embeddings=speaker_embeddings,
+        )
+
+    def _analyse_core(self, request: VoiceAnalysisRequest, session_id: str) -> dict:
+        """
+        Synchronous CPU-bound pipeline body dispatched via run_in_executor.
+
+        Runs in a thread-pool thread. No asyncio awaits here — Redis bookkeeping
+        stays in the async analyse() wrapper above.
+
+        Returns a plain dict consumed by the async postamble.
+        """
+        from services.voiceAgent.calibration import CalibrationModule
+        from services.voiceAgent.rules import VoiceRuleEngine
+
+        file_path = Path(request.file_path)
+        start_time = time.time()
         meeting_type = request.meeting_type or "sales_call"
+
         _profile = None
         try:
             from shared.config.content_type_profile import ContentTypeProfile
@@ -189,6 +267,19 @@ class VoiceAgentService(BaseAgentService):
         tc = request.transcription_config
         ac = request.analysis_config
 
+        # ── Load audio concurrently with transcription ───────────────────────
+        # The transcriber only needs a WAV file path (_ensure_wav handles
+        # conversion using the original file).  The numpy array (audio_data)
+        # is only consumed by the feature extractor at Step 2, which runs
+        # after transcription finishes — loading in a background thread means
+        # both start at the same time and the array is ready when needed.
+        try:
+            from shared.utils.audio_loader import load_audio
+        except ImportError:
+            from librosa import load as load_audio  # type: ignore[assignment]
+        _audio_loader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nexus-audio-load")
+        audio_future = _audio_loader.submit(load_audio, str(file_path), 16000)
+
         # ── Step 1: Transcribe + diarise ─────────────────────────────────────
         t_step = time.time()
         logger.info(
@@ -198,7 +289,7 @@ class VoiceAgentService(BaseAgentService):
         transcript = self._transcriber.transcribe(
             str(file_path),
             num_speakers=request.num_speakers,
-            audio_data=audio_data,
+            audio_data=None,   # WAV: _ensure_wav returns original path; non-WAV: ffmpeg inside _ensure_wav
             meeting_type=meeting_type,
             language=getattr(tc, "language", None) if tc else None,
             model_preference=getattr(tc, "model_preference", None) if tc else None,
@@ -233,9 +324,11 @@ class VoiceAgentService(BaseAgentService):
             for seg in transcript["segments"]:
                 spk = seg["speaker"]
                 word_counts[spk] = word_counts.get(spk, 0) + len(seg.get("text", "").split())
-                transcript_speech_q[spk] = transcript_speech_q.get(spk, 0.0) + (seg["end_ms"] - seg["start_ms"]) / 1000.0
+                transcript_speech_q[spk] = (
+                    transcript_speech_q.get(spk, 0.0)
+                    + (seg["end_ms"] - seg["start_ms"]) / 1000.0
+                )
             total_sec = sum(transcript_speech_q.values()) or duration_sec
-
             speaker_payload = [
                 {
                     "speaker_id": sid,
@@ -248,27 +341,24 @@ class VoiceAgentService(BaseAgentService):
                 for sid in speakers
             ]
             speaker_embeddings = getattr(self._transcriber, "_last_speaker_embeddings", None) or None
-            await self._publish_voice_outputs(session_id, transcript, speaker_payload, [], {}, speaker_embeddings)
-            await self._redis_repo.set_agent_status(
-                session_id, self.name,
-                AgentStatusRecord(status="completed", summary_key="summary:voice"),
-            )
-            await self._event_store.append(
-                session_id,
-                EventRecord(session_id=session_id, agent=self.name, event_type="agent_completed", payload={"signal_count": 0}),
-            )
-            await self._lock_manager.release(session_id, self.name, lock_token)
-            return VoiceAnalysisResponse(
-                session_id=session_id,
-                duration_seconds=duration_sec,
-                speakers=speaker_payload,
-                signals=[],
-                summary={},
-                transcript_segments=transcript["segments"],
-                speaker_embeddings=speaker_embeddings,
-            )
+            _audio_loader.shutdown(wait=False)  # audio_data not needed in transcript-only mode
+            return {
+                "transcript": transcript,
+                "speaker_data": speaker_payload,
+                "signal_dicts": [],
+                "summary": {},
+                "speaker_embeddings": speaker_embeddings,
+                "duration_sec": duration_sec,
+                "elapsed": time.time() - start_time,
+            }
 
         # ── Step 2: Extract acoustic features ────────────────────────────────
+        # Retrieve audio_data loaded concurrently during transcription.
+        # For most formats this call returns instantly — the load finished
+        # while Whisper was running.
+        audio_data = audio_future.result()
+        _audio_loader.shutdown(wait=False)
+
         t_step = time.time()
         logger.info("[%s] Step 2: Extracting acoustic features...", session_id)
         try:
@@ -290,7 +380,10 @@ class VoiceAgentService(BaseAgentService):
         transcript_speech: dict[str, float] = {}
         for seg in transcript["segments"]:
             spk = seg["speaker"]
-            transcript_speech[spk] = transcript_speech.get(spk, 0.0) + (seg["end_ms"] - seg["start_ms"]) / 1000.0
+            transcript_speech[spk] = (
+                transcript_speech.get(spk, 0.0)
+                + (seg["end_ms"] - seg["start_ms"]) / 1000.0
+            )
 
         t_step = time.time()
         calibration = CalibrationModule()
@@ -330,25 +423,30 @@ class VoiceAgentService(BaseAgentService):
 
         logger.info("[%s] Step 4 done: %d signals in %.1fs", session_id, len(all_signals), time.time() - t_step)
 
-        # ── Step 5: Build summary + publish ─────────────────────────────────
+        # ── Step 5: Build summary ────────────────────────────────────────────
         elapsed = time.time() - start_time
+        from collections import Counter
         from services.voiceAgent.main import _build_summary as _voice_summary
         summary = _voice_summary(all_signals, baselines, transcript)
 
-        word_counts: dict[str, int] = {}
+        # O(N) pre-computation avoids O(N×S) repeated scans in the speaker list comprehension
+        _signal_counts: Counter = Counter(
+            s.get("speaker_id") for s in all_signals
+        )
+        word_counts_full: dict[str, int] = {}
         for seg in transcript["segments"]:
             spk = seg["speaker"]
-            word_counts[spk] = word_counts.get(spk, 0) + len(seg.get("text", "").split())
+            word_counts_full[spk] = word_counts_full.get(spk, 0) + len(seg.get("text", "").split())
 
         total_speech_sec = sum(transcript_speech.values()) or duration_sec
         speaker_data = [
             {
                 "speaker_id": sid,
                 "baseline": baselines[sid].to_dict() if sid in baselines else None,
-                "signal_count": len([s for s in all_signals if s.get("speaker_id") == sid]),
+                "signal_count": _signal_counts.get(sid, 0),
                 "talk_time_ms": int(transcript_speech.get(sid, 0.0) * 1000),
                 "talk_time_pct": round(transcript_speech.get(sid, 0.0) / total_speech_sec * 100, 2),
-                "total_words": word_counts.get(sid, 0),
+                "total_words": word_counts_full.get(sid, 0),
                 "calibration_confidence": round(
                     baselines[sid].calibration_confidence if sid in baselines else 0.0, 4
                 ),
@@ -359,32 +457,15 @@ class VoiceAgentService(BaseAgentService):
         signal_dicts = [s if isinstance(s, dict) else s.to_dict() for s in all_signals]
         speaker_embeddings = getattr(self._transcriber, "_last_speaker_embeddings", None) or None
 
-        await self._publish_voice_outputs(session_id, transcript, speaker_data, signal_dicts, summary, speaker_embeddings)
-        await self._redis_repo.set_agent_status(
-            session_id, self.name,
-            AgentStatusRecord(status="completed", signal_count=len(signal_dicts), summary_key="summary:voice"),
-        )
-        await self._event_store.append(
-            session_id,
-            EventRecord(
-                session_id=session_id, agent=self.name,
-                event_type="agent_completed",
-                payload={"signal_count": len(signal_dicts)},
-            ),
-        )
-        await self._lock_manager.release(session_id, self.name, lock_token)
-
-        logger.info("[%s] Voice Agent complete: %d signals in %.1fs", session_id, len(signal_dicts), elapsed)
-
-        return VoiceAnalysisResponse(
-            session_id=session_id,
-            duration_seconds=duration_sec,
-            speakers=speaker_data,
-            signals=signal_dicts,
-            summary=summary,
-            transcript_segments=transcript["segments"],
-            speaker_embeddings=speaker_embeddings,
-        )
+        return {
+            "transcript": transcript,
+            "speaker_data": speaker_data,
+            "signal_dicts": signal_dicts,
+            "summary": summary,
+            "speaker_embeddings": speaker_embeddings,
+            "duration_sec": duration_sec,
+            "elapsed": elapsed,
+        }
 
     async def _publish_voice_outputs(
         self,

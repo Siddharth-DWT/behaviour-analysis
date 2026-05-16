@@ -10,9 +10,17 @@ type SignalConfigEntry = {
   label: (s: VideoSignal) => string;
   color: string | ((s: VideoSignal) => string);
   category: "face" | "body" | "gaze" | "voice" | "compound";
+  hidden?: boolean;
 };
 
 const SIGNAL_CONFIG: Record<string, SignalConfigEntry> = {
+  presence_detected: {
+    icon: "",
+    label: () => "",
+    color: "transparent",
+    category: "face",
+    hidden: true,
+  },
   facial_stress: {
     icon: "●",
     label: (s) =>
@@ -789,7 +797,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
           const resolvedId = canon[s.speaker_id ?? ""] ?? s.speaker_id ?? "";
           if (resolvedId !== selectedSpeaker && s.speaker_id !== selectedSpeaker) return false;
         }
-        if (s.confidence < 0.3) return false;
+        if (s.confidence < 0.15) return false;
         return true;
       });
       // Multiple overlapping 2-second windows can each emit the same signal_type for the
@@ -926,8 +934,9 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
 
       const canonId = toCanonical[rawId] ?? rawId;
       const rosterEntry = speakerRoster[canonId];
-      const cx = (s.metadata?.face_centre_x as number) ?? 0;
-      const cy = (s.metadata?.face_centre_y as number) ?? 0;
+      const hasFacePos = s.metadata?.face_centre_x != null && s.metadata?.face_centre_y != null;
+      const cx = hasFacePos ? (s.metadata!.face_centre_x as number) : undefined;
+      const cy = hasFacePos ? (s.metadata!.face_centre_y as number) : undefined;
 
       const g = groups[canonId];
       if (!g) {
@@ -935,17 +944,21 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
           rawId: canonId,
           label: resolveDisplayLabel(rosterEntry, canonId),
           signals: [s],
-          faceCentreX: cx,
-          faceCentreY: cy,
+          faceCentreX: cx ?? 0,
+          faceCentreY: cy ?? 0,
         };
       } else {
         g.signals.push(s);
-        const latest = g.signals.reduce((a, b) =>
-          (a.start_ms ?? 0) > (b.start_ms ?? 0) ? a : b
-        );
-        if (latest === s) {
-          g.faceCentreX = cx;
-          g.faceCentreY = cy;
+        if (cx != null && cy != null) {
+          // Only update face position from signals that carry actual face metadata,
+          // using the most recent such signal to follow natural head movement.
+          const latestWithPos = g.signals
+            .filter((x) => x.metadata?.face_centre_x != null)
+            .reduce((a, b) => ((a.start_ms ?? 0) > (b.start_ms ?? 0) ? a : b));
+          if (latestWithPos === s) {
+            g.faceCentreX = cx;
+            g.faceCentreY = cy;
+          }
         }
       }
     }
@@ -983,12 +996,14 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
               {Object.entries(visibleByFace).map(([speakerId, { label, rawId, signals: sigs }]) => {
                 const prioritySigs = sigs
                   .filter((s: VideoSignal) => {
+                    if (SIGNAL_CONFIG[s.signal_type]?.hidden) return false;
                     const display = getSignalDisplay(s.signal_type, s.value_text ?? "");
                     return display.priority <= (showExpanded ? 2 : 1);
                   })
                   .sort((a: VideoSignal, b: VideoSignal) => (b.confidence || 0) - (a.confidence || 0));
                 const visibleSigs = showExpanded ? prioritySigs : prioritySigs.slice(0, 3);
-                if (visibleSigs.length === 0) return null;
+                const hasPresence = sigs.some((s: VideoSignal) => s.signal_type === "presence_detected");
+                if (visibleSigs.length === 0 && !hasPresence) return null;
                 return (
                   <div key={speakerId} className="flex flex-col gap-1">
                     <SpeakerGroupHeader

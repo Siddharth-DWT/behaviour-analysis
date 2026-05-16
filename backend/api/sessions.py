@@ -92,6 +92,7 @@ _VIDEO_OVERLAY_TYPES = [
     "speech_rate_anomaly", "energy_level", "pitch_elevation_flag",
     "monotone_flag", "interruption_event",
     "sentiment_score",
+    "presence_detected",
 ]
 
 _GENERIC_SPEAKER_LABEL_RE = re.compile(r'^(Speaker|Face)_\d+$')
