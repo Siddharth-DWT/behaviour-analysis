@@ -292,6 +292,50 @@ class FusionAgentService(BaseAgentService):
                 )
                 all_fusion_signals.extend(temporal_sigs)
 
+        # ── Step 2.6: Interrogation compound patterns (session-level) ─────────
+        if content_type == "interrogation_video":
+            try:
+                from services.fusion_agent.interrogation_patterns import InterrogationCompoundPatterns
+                all_source = pure_voice_dicts + language_dicts + video_dicts
+                interrog_compound = InterrogationCompoundPatterns().evaluate(
+                    all_signals=all_source + all_fusion_signals,
+                    speakers=speakers,
+                    session_id=session_id,
+                )
+                all_fusion_signals.extend(interrog_compound)
+                if interrog_compound:
+                    logger.info(
+                        "[%s] Interrogation compound patterns: %d signal(s)",
+                        session_id, len(interrog_compound),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Interrogation compound patterns failed (non-fatal): %s",
+                    session_id, exc,
+                )
+
+        # ── Step 2.7: False confession risk assessment (session-level) ────────
+        if content_type == "interrogation_video":
+            try:
+                from services.fusion_agent.interrogation_patterns import FalseConfessionRiskAssessor
+                all_source = pure_voice_dicts + language_dicts + video_dicts
+                risk_signals = FalseConfessionRiskAssessor().evaluate(
+                    all_signals=all_source + all_fusion_signals,
+                    speakers=speakers,
+                    session_id=session_id,
+                )
+                all_fusion_signals.extend(risk_signals)
+                if risk_signals:
+                    logger.info(
+                        "[%s] FalseConfessionRisk: %d assessment(s)",
+                        session_id, len(risk_signals),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] False confession risk assessment failed (non-fatal): %s",
+                    session_id, exc,
+                )
+
         # ── Step 3: Publish to Redis Streams ────────────────────────────────
         if _HAS_BUS:
             published = 0

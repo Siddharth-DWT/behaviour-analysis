@@ -267,6 +267,29 @@ class VoiceRuleEngine:
                          isig["confidence_raw"] * cal_conf,
                          isig.get("evidence", {}))
 
+        # ── AGITATED-TONE-01: Agitated/High-Arousal Tone (interrogation_video only) ──
+        if profile and getattr(profile, "content_type", None) == "interrogation_video":
+            agitated = self._rule_agitated_tone(features, baseline)
+            if agitated is not None:
+                signals.append(_make_signal(
+                    speaker_id, "agitated_high_arousal_tone",
+                    agitated["confidence_raw"], "high_arousal",
+                    agitated["confidence_raw"] * cal_conf,
+                    window_start, window_end,
+                    {
+                        "rule_id":        "AGITATED-TONE-01",
+                        "f0_ratio":       agitated["f0_ratio"],
+                        "rate_ratio":     agitated["rate_ratio"],
+                        "energy_diff_db": agitated["energy_diff_db"],
+                        "research":       "PMC (2024): elevated F0 + accelerated rate + high intensity = documented anxiety manifestation",
+                        "interpretations": [
+                            "Anxiety and stress response to interrogation pressure",
+                            "Anger or frustration at accusations",
+                            "Genuine emotional arousal — common in both innocent and guilty subjects under high-stakes questioning (Criminal Legal News 2023)",
+                        ],
+                    },
+                ))
+
         return signals
     
     # ════════════════════════════════════════════════════════
@@ -824,6 +847,39 @@ class VoiceRuleEngine:
             "confidence_raw": min(score, 0.55),
             "evidence": evidence,
         }
+
+    # ════════════════════════════════════════════════════════
+    # AGITATED-TONE-01: Agitated / High-Arousal Tone
+    # Research: PMC (2024) — elevated F0 + accelerated rate +
+    # high intensity = anxiety manifestation in interrogation.
+    # Used only for interrogation_video content type.
+    # ════════════════════════════════════════════════════════
+
+    def _rule_agitated_tone(self, f: dict, b: SpeakerBaseline) -> Optional[dict]:
+        """
+        Detect combined high-arousal vocal profile.
+        All three conditions must hold simultaneously:
+          - F0 >= 130% of baseline (30%+ pitch elevation)
+          - Speech rate >= 140% of baseline (40%+ faster)
+          - Energy >= baseline + 1.5 dB (≈ 20%+ amplitude increase)
+        Confidence: 0.50 (spec cap — identical profile in innocent and guilty subjects).
+        """
+        if b.f0_mean <= 0 or b.speech_rate_wpm <= 0:
+            return None
+
+        f0_ratio   = f.get("f0_mean", 0) / b.f0_mean
+        rate_ratio = f.get("speech_rate_wpm", 0) / b.speech_rate_wpm
+        # energy_rms_db is already in dB; 1.5 dB ≈ 20% amplitude increase (intensity_ratio ≥ 1.2)
+        energy_diff_db = f.get("energy_rms_db", 0) - b.energy_rms_db
+
+        if f0_ratio >= 1.3 and rate_ratio >= 1.4 and energy_diff_db >= 1.5:
+            return {
+                "f0_ratio":       round(f0_ratio, 3),
+                "rate_ratio":     round(rate_ratio, 3),
+                "energy_diff_db": round(energy_diff_db, 2),
+                "confidence_raw": 0.50,
+            }
+        return None
 
     # ════════════════════════════════════════════════════════
     # VOICE-PITCH-02: Monotone Detection

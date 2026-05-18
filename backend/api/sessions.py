@@ -93,6 +93,32 @@ _VIDEO_OVERLAY_TYPES = [
     "monotone_flag", "interruption_event",
     "sentiment_score",
     "presence_detected",
+    # ── Interrogation video signals ───────────────────────────────────────────
+    "blink_suppression_spike",
+    "motor_inhibition",
+    "smile_context_incongruence",
+    "erratic_gaze_pattern",
+    "freezing_response",
+    "barrier_behavior",
+    "low_autonomic_reactivity",
+]
+
+# Language-agent signals surfaced on the video timeline for interrogation sessions.
+_LANGUAGE_OVERLAY_TYPES = [
+    "pronoun_distancing",
+    "tense_inconsistency",
+    "statement_contamination",
+    "denial_weakening",
+]
+
+# Voice-agent interrogation signals surfaced on the video timeline.
+_VOICE_INTERROG_TYPES = [
+    "agitated_high_arousal_tone",
+]
+
+# Conversation-agent interrogation signals surfaced on the video timeline.
+_CONVERSATION_INTERROG_TYPES = [
+    "evidence_response_processing_delay",
 ]
 
 _GENERIC_SPEAKER_LABEL_RE = re.compile(r'^(Speaker|Face)_\d+$')
@@ -477,12 +503,19 @@ async def get_video_signals(
               AND sa.speaker_label = sp.speaker_label
         LEFT JOIN speakers_registry sr ON sr.id = sa.registry_id
         WHERE s.session_id = $1
-          AND s.agent IN ('video', 'fusion')
-          AND s.signal_type = ANY($2::text[])
+          AND (
+            (s.agent IN ('video', 'fusion') AND s.signal_type = ANY($2::text[]))
+            OR (s.agent = 'language'      AND s.signal_type = ANY($3::text[]))
+            OR (s.agent = 'voice'         AND s.signal_type = ANY($4::text[]))
+            OR (s.agent = 'conversation'  AND s.signal_type = ANY($5::text[]))
+          )
         ORDER BY s.window_start_ms ASC
         """,
         _uuid_module.UUID(session_id),
         _VIDEO_OVERLAY_TYPES,
+        _LANGUAGE_OVERLAY_TYPES,
+        _VOICE_INTERROG_TYPES,
+        _CONVERSATION_INTERROG_TYPES,
     )
 
     signals = []

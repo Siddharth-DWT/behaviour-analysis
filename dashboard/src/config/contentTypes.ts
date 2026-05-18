@@ -42,6 +42,15 @@ export const CONTENT_TYPES: Record<string, ContentTypeConfig> = {
     entityFields: ["topics", "key_terms"],
     speakerStats: { all: ["talk_time_pct", "stress_avg"] },
   },
+  interrogation_video: {
+    label: "Interrogation Video",
+    roles: ["Interrogator", "Suspect"],
+    entityFields: ["denial_statements", "contradiction_markers", "case_facts_introduced", "false_confession_indicators"],
+    speakerStats: {
+      Suspect: ["denial_strength", "contamination_count", "stress_avg"],
+      Interrogator: ["tactic_type", "evidence_disclosure_count"],
+    },
+  },
 };
 
 export function getConfig(contentType: string): ContentTypeConfig {

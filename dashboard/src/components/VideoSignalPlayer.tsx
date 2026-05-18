@@ -577,6 +577,90 @@ const SIGNAL_CONFIG: Record<string, SignalConfigEntry> = {
     color: (s) => (s.value_text === "competitive" ? "#EF4444" : "#F59E0B"),
     category: "voice" as const,
   },
+
+  // ── Interrogation video signals ───────────────────────────────────────────────
+  blink_suppression_spike: {
+    icon: "◦",
+    label: () => "Blink: Suppression → Spike",
+    color: "#EF4444",
+    category: "gaze",
+  },
+  motor_inhibition: {
+    icon: "⊖",
+    label: () => "Motor Inhibition",
+    color: "#6B7280",
+    category: "body",
+  },
+  smile_context_incongruence: {
+    icon: "◑",
+    label: () => "Smile: Wrong Context",
+    color: "#EF4444",
+    category: "face",
+  },
+  erratic_gaze_pattern: {
+    icon: "⇝",
+    label: () => "Erratic Gaze",
+    color: "#F59E0B",
+    category: "gaze",
+  },
+  freezing_response: {
+    icon: "❄",
+    label: (s) => `Freeze: ${s.value_text?.replace(/_/g, " ") ?? "detected"}`,
+    color: "#8B5CF6",
+    category: "body",
+  },
+  barrier_behavior: {
+    icon: "⊠",
+    label: () => "Barrier Posture",
+    color: "#F59E0B",
+    category: "body",
+  },
+
+  // ── Interrogation voice / conversation signals ───────────────────────────────
+  agitated_high_arousal_tone: {
+    icon: "⚡",
+    label: () => "Agitated High Arousal",
+    color: "#EF4444",
+    category: "compound",
+  },
+  evidence_response_processing_delay: {
+    icon: "⏱",
+    label: (s) => `Evidence Response Delay: ${((s.value ?? 0) * 10).toFixed(1)}s`,
+    color: "#F59E0B",
+    category: "compound",
+  },
+  low_autonomic_reactivity: {
+    icon: "◉",
+    label: () => "Low Autonomic Reactivity",
+    color: "#6B7280",
+    category: "body",
+  },
+
+  // ── Interrogation language signals (shown in Patterns row) ───────────────────
+  pronoun_distancing: {
+    icon: "↔",
+    label: () => "Pronoun Distancing",
+    color: "#EF4444",
+    category: "compound",
+  },
+  tense_inconsistency: {
+    icon: "⚠",
+    label: () => "Tense Inconsistency",
+    color: "#F59E0B",
+    category: "compound",
+  },
+  statement_contamination: {
+    icon: "⊗",
+    label: () => "Statement Contamination",
+    color: "#EF4444",
+    category: "compound",
+  },
+  denial_weakening: {
+    icon: "↓",
+    label: () => "Denial Weakening",
+    color: "#EF4444",
+    category: "compound",
+  },
 };
 
 const CATEGORIES: { key: string; label: string }[] = [

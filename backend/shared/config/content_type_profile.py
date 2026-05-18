@@ -229,6 +229,87 @@ PROFILES: dict[str, ContentTypeConfig] = {
             "normal": "deliberative",
         },
     ),
+
+    "interrogation_video": ContentTypeConfig(
+        label="Interrogation Video",
+        intent_categories=[
+            "INFORM", "QUESTION", "ANSWER", "DENY", "ACKNOWLEDGE",
+            "CLARIFY", "ELABORATE", "CONTRADICT", "CONFESS", "RESIST",
+            "DEFLECT", "INVOKE_RIGHTS",
+        ],
+        rules={
+            # ── GATED: commercial/relationship context not applicable ──────────
+            "LANG-BUY-01":     RuleProfile(gated=True),   # buying signals irrelevant
+            "LANG-PERS-01":    RuleProfile(gated=True),   # sales persuasion ≠ interrogation tactics
+            "LANG-NEG-01":     RuleProfile(gated=True),   # Gottman Four Horsemen (relationship model)
+            "TEMPORAL-06":     RuleProfile(gated=True),   # buying decision sequence
+            "FUSION-13":       RuleProfile(gated=True),   # urgency/persuasion authenticity
+            "FUSION-05":       RuleProfile(gated=True),   # purchase intent validation
+            # ── GATED: produces false positives / uninformative in interrogation ─
+            "COMPOUND-12":     RuleProfile(gated=True),   # deception detection compound (spec §4)
+            "CONVO-CONF-01":   RuleProfile(gated=True),   # conflict expected — not diagnostic
+            "FUSION-07":       RuleProfile(gated=True),   # hedge×positive sentiment — common innocuously
+            "FUSION-GRAPH-03": RuleProfile(gated=True),   # persistent incongruence — universal here
+            # ── THRESHOLD ADAPTATIONS ─────────────────────────────────────────
+            # Interrogation elevates baseline stress for everyone — raise spike threshold
+            "VOICE-FILLER-01": RuleProfile(thresholds={"spike_delta": 0.40}),
+            # Extended thinking time expected when answering difficult questions
+            "VOICE-PAUSE-01":  RuleProfile(thresholds={"extended_pause_ms": 3000.0}),
+            # Interrogator dominance up to 70% is structurally normal
+            "VOICE-TALK-01":   RuleProfile(thresholds={"significant_pct": 70.0}),
+            # Interrogator interruptions are a Reid tactic — higher overlap threshold
+            "VOICE-INT-01":    RuleProfile(thresholds={"overlap_ms": 600.0}),
+            # Deliberate response latency is expected — flag only clearly evasive delays
+            "CONVO-LAT-01":    RuleProfile(thresholds={"delayed_ms": 4000.0}),
+            # Structural asymmetry: one asks, one answers — wide Gini range is normal
+            "CONVO-BAL-01":    RuleProfile(
+                thresholds={"expected_gini_low": 0.30, "expected_gini_high": 0.70}
+            ),
+            # Interrogator structural dominance expected
+            "CONVO-DOM-01":    RuleProfile(thresholds={"expected_dominant_pct": 75.0}),
+            # ── CONFIDENCE MULTIPLIERS ────────────────────────────────────────
+            # Stress is ubiquitous — individual stress events are less diagnostic
+            "VOICE-STRESS-01": RuleProfile(confidence_multiplier=0.65),
+            # Defensiveness expected — less diagnostic than in commercial context
+            "FUSION-02":       RuleProfile(confidence_multiplier=1.15),  # credibility more relevant
+            # Cognitive load cues (filler+gaze) are specifically meaningful here
+            "FUSION-04":       RuleProfile(confidence_multiplier=1.20),
+            # Response latency × facial stress is highly relevant in interrogation
+            "FUSION-10":       RuleProfile(confidence_multiplier=1.15),
+            # Tension clusters are the primary fusion signal in interrogation
+            "FUSION-GRAPH-01": RuleProfile(confidence_multiplier=1.10),
+            # Smile × negative sentiment could be nervous laughter — reduce confidence
+            "FUSION-09":       RuleProfile(confidence_multiplier=0.70),
+        },
+        signal_renames={
+            # Reframe commercial signals for interrogation context
+            "objection_signal":           "denial",
+            "buying_signal":              "cooperation_signal",
+            "persuasion_technique":       "interrogation_tactic",
+            "conflict_score":             "confrontation_level",
+            "rapport_indicator":          "cooperation_level",
+            "tension_cluster":            "high_stress_event",
+            "verbal_incongruence":        "statement_inconsistency",
+            "credibility_assessment":     "statement_credibility",
+            "momentum_shift":             "interrogation_phase_shift",
+            "stonewalling":               "non_cooperation",
+            "disagreement":               "denial_response",
+            "aggressive":                 "confrontational",
+            "normal":                     "baseline_response",
+            "buying_decision_sequence":   "cooperation_sequence",
+            "decision_readiness":         "confession_readiness",
+            "objection_formation":        "denial_formation",
+        },
+        interpretations={
+            "vocal_stress_score":   "Ubiquitous in interrogation for guilty and innocent alike. Diagnostic only as deviation from that individual's neutral-phase baseline.",
+            "filler_detection":     "Cognitive load under questioning. Common in both guilty and innocent suspects. Not a deception cue per DePaulo 2003 meta-analysis.",
+            "interruption_event":   "Interrogator interruptions are a standard Reid/cognitive load tactic. Not indicative of conflict.",
+            "persuasion_technique": "Interrogation tactics detected. Evaluate for coercive elements (Reid vs. PEACE compliance).",
+            "rapport_indicator":    "Suspect cooperation level. Low rapport may indicate resistance, distress, or coercive pressure.",
+            "verbal_incongruence":  "Statement inconsistency flagged. Human review required — innocent suspects give inconsistent statements under pressure (Gudjonsson 2003).",
+            "sentiment_score":      "Negative sentiment is expected in interrogation context. Only extreme or sudden shifts are diagnostic.",
+        },
+    ),
 }
 
 

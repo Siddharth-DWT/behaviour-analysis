@@ -57,6 +57,18 @@ CONTENT_TYPE_CONFIG = {
         "entity_fields": ["topics", "key_terms"],
         "speaker_stats": {"all": ["talk_time_pct", "stress_avg"]},
     },
+    "interrogation_video": {
+        "label": "Interrogation Video",
+        "roles": ["Interrogator", "Suspect"],
+        "entity_fields": [
+            "denial_statements", "contradiction_markers",
+            "case_facts_introduced", "false_confession_indicators",
+        ],
+        "speaker_stats": {
+            "Suspect":      ["denial_strength", "contamination_count", "stress_avg"],
+            "Interrogator": ["tactic_type", "evidence_disclosure_count"],
+        },
+    },
 }
 
 
@@ -74,6 +86,7 @@ SPEAKER_DEFAULTS: dict[str, dict] = {
     "presentation":          {"default": 1, "min": 1, "max": 3,  "turn_gap_ms": 1000},
     "debate":                {"default": 2, "min": 2, "max": 4,  "turn_gap_ms": 400},
     "casual_conversation":   {"default": 2, "min": 2, "max": 4,  "turn_gap_ms": 400},
+    "interrogation_video":   {"default": 2, "min": 2, "max": 4,  "turn_gap_ms": 800},
 }
 
 _SPEAKER_DEFAULTS_FALLBACK = {"default": 2, "min": 2, "max": 8, "turn_gap_ms": 600}

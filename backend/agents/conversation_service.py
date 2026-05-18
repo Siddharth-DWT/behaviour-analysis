@@ -156,6 +156,47 @@ class ConversationAgentService(BaseAgentService):
         )
         logger.info("[%s] Rule engine: %d signals", session_id, len(signals))
 
+        # ── Step 2b: Interrogation-specific conversation rules ──────────────
+        if content_type == "interrogation_video":
+            try:
+                from services.conversation_agent.interrogation_rules import InterrogationConversationRules
+                interrog_signals = InterrogationConversationRules().evaluate(
+                    segments=segments,
+                    session_id=session_id,
+                )
+                signals.extend(interrog_signals)
+                if interrog_signals:
+                    logger.info(
+                        "[%s] Interrogation conversation rules: %d signals",
+                        session_id, len(interrog_signals),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Interrogation conversation rules failed (non-fatal): %s",
+                    session_id, exc,
+                )
+
+        # ── Step 2c: Interrogator technique classification ───────────────────
+        if content_type == "interrogation_video":
+            try:
+                from services.conversation_agent.interrogation_rules import InterrogatorTechniqueClassifier
+                technique_signals = InterrogatorTechniqueClassifier().evaluate(
+                    segments=segments,
+                    session_id=session_id,
+                )
+                signals.extend(technique_signals)
+                if technique_signals:
+                    technique = technique_signals[0].get("value_text", "unknown")
+                    logger.info(
+                        "[%s] InterrogatorTechnique: %s",
+                        session_id, technique,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Interrogator technique classification failed (non-fatal): %s",
+                    session_id, exc,
+                )
+
         # ── Step 3: Build Summary ───────────────────────────────────────────
         summary = _build_summary(per_speaker, per_pair, session_features, signals, detected_speakers)
 

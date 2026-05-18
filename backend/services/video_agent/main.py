@@ -109,6 +109,33 @@ def _publish_video_artifacts(session_id: str, analysis: "VideoAnalysisResponse")
     )
 
 
+def _detect_handcuffed(windows_by_speaker: dict, session_id: str) -> bool:
+    """
+    Heuristic handcuff detection using existing WindowFeatures data.
+    No extra MediaPipe pass — uses arms_crossed_pct already computed.
+
+    Hands locked in front (standard interrogation table posture) appear as
+    crossed-arm posture to MediaPipe.  Signal: consistently very high
+    arms_crossed_pct (> 0.85) with low variance from the first window onward,
+    indicating the posture is structural rather than behavioural.
+    """
+    for spk, windows in windows_by_speaker.items():
+        if len(windows) < 6:
+            continue
+        sample = [w.arms_crossed_pct for w in windows[:10]]
+        mean_cross = sum(sample) / len(sample)
+        if mean_cross < 0.85:
+            continue
+        variance = sum((x - mean_cross) ** 2 for x in sample) / len(sample)
+        if variance < 0.03:
+            logger.info(
+                "[%s] Handcuff heuristic: %s arms_crossed_pct=%.2f (var=%.4f) — HANDCUFFED",
+                session_id, spk, mean_cross, variance,
+            )
+            return True
+    return False
+
+
 def _push_signals_to_redis(session_id: str, signals: list[dict]) -> None:
     """Persist signals to the canonical Redis stream for this session."""
     if not signals:
@@ -429,6 +456,39 @@ class VideoPipeline:
         )
 
         all_signals: list[dict] = facial_signals + gaze_signals + body_signals
+
+        # ── Step 4b: Interrogation-specific video rules ───────────────────────
+        if meeting_type == "interrogation_video":
+            try:
+                import cv2 as _cv2
+                _cap = _cv2.VideoCapture(video_path)
+                _real_fps = _cap.get(_cv2.CAP_PROP_FPS) or 30.0
+                _cap.release()
+
+                # Handcuff detection — uses existing windows_by_speaker data,
+                # no extra MediaPipe pass needed.  If arms_crossed_pct is very
+                # high (> 0.85) AND low-variance across the first 10 windows for
+                # any speaker, physical restraints are likely (hands locked in
+                # front of body appear as crossed-arm posture to MediaPipe).
+                _handcuffed = _detect_handcuffed(windows_by_speaker, session_id)
+
+                from .interrogation_rules import InterrogationVideoRules
+                interrog_signals = InterrogationVideoRules().evaluate(
+                    windows_by_speaker=windows_by_speaker,
+                    baselines=baselines,
+                    diar_segments=diar_segments,
+                    session_id=session_id,
+                    video_fps=_real_fps,
+                    handcuffed=_handcuffed,
+                )
+                all_signals.extend(interrog_signals)
+                if interrog_signals:
+                    logger.info(
+                        "[%s] Interrogation video rules: %d signals (handcuffed=%s)",
+                        session_id, len(interrog_signals), _handcuffed,
+                    )
+            except Exception as exc:
+                logger.warning("[%s] Interrogation video rules failed (non-fatal): %s", session_id, exc)
 
         # One presence_detected marker per speaker — spans their first to last window.
         # Consumed by the gateway whitelist and frontend left panel to show a thumbnail

@@ -2080,8 +2080,13 @@ class IdentityVerifier:
         previously occupied by someone else is the earliest signal of an occupant
         swap. Without this, the periodic interval (up to 6s) delays detection and
         contaminates the joining person's first windows with the wrong track ID.
+
+        999_999 exceeds any effective_interval (max = check_interval * 2 = 60)
+        so the very next check_frame call always passes the < effective_interval
+        guard, including in active_speaker/solo layout where effective_interval=60.
+        Previously using self._check_interval (30) meant 30+1=31 < 60 → skipped.
         """
-        self._frames_since_check = self._check_interval
+        self._frames_since_check = 999_999
 
     def clear(self) -> None:
         """Reset all state for re-use."""

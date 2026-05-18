@@ -208,6 +208,24 @@ class LanguageAgentService(BaseAgentService):
 
         all_signals.extend(intent_signals)
 
+        # ── Step 4b: Interrogation-specific rules ────────────────────────────
+        if content_type == "interrogation_video":
+            try:
+                from services.language_agent.interrogation_rules import InterrogationLanguageRules
+                interrog_signals = InterrogationLanguageRules().evaluate_all(
+                    segments=segments,
+                    features_list=features_list,
+                    profile=_profile,
+                )
+                all_signals.extend(interrog_signals)
+                if interrog_signals:
+                    logger.info(
+                        "[%s] Interrogation language rules: %d signals",
+                        session_id, len(interrog_signals),
+                    )
+            except Exception as exc:
+                logger.warning("[%s] Interrogation language rules failed (non-fatal): %s", session_id, exc)
+
         # ── Step 5: Publish to Redis Streams ────────────────────────────────
         if _HAS_BUS:
             published = 0

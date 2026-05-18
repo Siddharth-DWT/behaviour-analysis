@@ -421,6 +421,25 @@ class VoiceAgentService(BaseAgentService):
         talk_time_signals = VoiceRuleEngine._emit_talk_time_signals(features_by_speaker, duration_sec)
         all_signals.extend(talk_time_signals)
 
+        # ── Step 4b: Interrogation-specific voice adjustments ─────────────────
+        if meeting_type == "interrogation_video":
+            try:
+                from services.voiceAgent.interrogation_rules import InterrogationVoiceRules
+                ivr = InterrogationVoiceRules()
+                all_signals = ivr.apply(
+                    signals=all_signals,
+                    audio_path=str(file_path),
+                    session_id=session_id,
+                )
+                delay_signals = ivr.derive_evidence_response_delays(
+                    voice_signals=all_signals,
+                    diar_segments=transcript["segments"],
+                    session_id=session_id,
+                )
+                all_signals.extend(delay_signals)
+            except Exception as exc:
+                logger.warning("[%s] Interrogation voice rules failed (non-fatal): %s", session_id, exc)
+
         logger.info("[%s] Step 4 done: %d signals in %.1fs", session_id, len(all_signals), time.time() - t_step)
 
         # ── Step 5: Build summary ────────────────────────────────────────────
