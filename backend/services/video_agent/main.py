@@ -24,6 +24,7 @@ import uuid
 import asyncio
 import logging
 import tempfile
+import threading
 import subprocess
 import concurrent.futures
 from pathlib import Path
@@ -262,16 +263,20 @@ class VideoPipeline:
 
     def __init__(
         self,
-        extractor:  VideoFeatureExtractor,
-        mapper:     SpeakerFaceMapper,
-        calibrator: VideoCalibrationModule,
+        extractor:      VideoFeatureExtractor,
+        mapper:         SpeakerFaceMapper,
+        calibrator:     VideoCalibrationModule,
+        extractor_lock: Optional[threading.Lock] = None,
     ) -> None:
-        self._extractor    = extractor
-        self._mapper       = mapper
-        self._calibrator   = calibrator
-        self._facial_rules = FacialRuleEngine()
-        self._gaze_rules   = GazeRuleEngine()
-        self._body_rules   = BodyRuleEngine()
+        self._extractor      = extractor
+        self._mapper         = mapper
+        self._calibrator     = calibrator
+        self._facial_rules   = FacialRuleEngine()
+        self._gaze_rules     = GazeRuleEngine()
+        self._body_rules     = BodyRuleEngine()
+        # Protects shared extractor state (_diar_segments, _active_tile_face_to_speaker)
+        # from concurrent mutation when multiple sessions run simultaneously.
+        self._extractor_lock = extractor_lock or threading.Lock()
 
     def run_analysis(
         self,
@@ -291,14 +296,20 @@ class VideoPipeline:
         start = time.time()
 
         # ── Step 1: Frame extraction (no overlay — fast path) ─────────────────
+        # Lock guards shared extractor state: _diar_segments (written before
+        # extract_all) and _active_tile_face_to_speaker (read after). Without
+        # the lock, concurrent sessions would race on these attributes.
         logger.info(f"[{session_id}] Extracting video features from {Path(video_path).name}")
-        self._extractor._diar_segments = diar_segments  # active-speaker fallback in InteractionDetector
-        try:
-            windows, lip_activity_map = self._extractor.extract_all(
-                video_path, overlay_output_path=None, meeting_type=meeting_type
-            )
-        finally:
-            self._extractor._diar_segments = []  # prevent leaking into next request
+        with self._extractor_lock:
+            self._extractor._diar_segments = diar_segments
+            try:
+                windows, lip_activity_map = self._extractor.extract_all(
+                    video_path, overlay_output_path=None, meeting_type=meeting_type
+                )
+            finally:
+                self._extractor._diar_segments = []
+            active_tile_tags = getattr(self._extractor, "_active_tile_face_to_speaker", {})
+
         logger.info(f"[{session_id}] {len(windows)} windows extracted")
 
         if not windows:
@@ -307,11 +318,7 @@ class VideoPipeline:
         duration_sec = (windows[-1].window_end_ms - windows[0].window_start_ms) / 1000.0
 
         # ── Inject active-tile tags into mapper ───────────────────────────────
-        # _extract_frames tags large-tile faces by diarization time-overlap and
-        # stores the result on the extractor.  The mapper needs it before assign()
-        # so it can pre-assign those faces without relying on lip-sync (which fails
-        # on prominent tiles due to jaw-open saturation).
-        active_tile_tags = getattr(self._extractor, "_active_tile_face_to_speaker", {})
+        # Mapper is a fresh instance per pipeline call — no shared state risk.
         self._mapper.set_active_tile_tags(active_tile_tags)
         if active_tile_tags:
             logger.info(
@@ -430,6 +437,7 @@ class VideoPipeline:
             if not spk_wins:
                 continue
             all_signals.append({
+                "agent":          "video",
                 "signal_type":    "presence_detected",
                 "speaker_id":     spk,
                 "window_start_ms": min(w.window_start_ms for w in spk_wins),

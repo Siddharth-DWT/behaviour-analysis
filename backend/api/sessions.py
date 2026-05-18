@@ -219,6 +219,10 @@ async def create_session_endpoint(
         org_id=current_user.get("org_id", DEV_ORG_ID),
         user_id=current_user["id"],
         run_behavioural=analysis_config.get("run_behavioural", True),
+        title=title,
+        transcription_config=transcription_config,
+        analysis_config=analysis_config,
+        user_email=current_user.get("email", ""),
     )
 
     return {

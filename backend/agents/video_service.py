@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -57,12 +58,14 @@ class VideoAgentService(BaseAgentService):
 
     def __init__(self) -> None:
         self._extractor = None
-        self._mapper = None
         self._calibrator = None
         self._thread_pool: Optional[ThreadPoolExecutor] = None
         self._redis_repo = SyncRedisRepository()     # thread-safe sync client
         self._event_store = RedisEventStore()
         self._lock_manager = RedisLockManager()
+        # Guards shared VideoFeatureExtractor (heavy MediaPipe models — not safe
+        # to mutate _diar_segments concurrently from multiple session threads).
+        self._extractor_lock = threading.Lock()
 
     async def startup(self) -> None:
         cpu_count = os.cpu_count() or 4
@@ -113,12 +116,18 @@ class VideoAgentService(BaseAgentService):
         if self._extractor is None:
             model_dir = os.getenv("MEDIAPIPE_MODEL_DIR", "models/mediapipe")
             self._extractor = VideoFeatureExtractor(model_dir=model_dir)
-        if self._mapper is None:
-            self._mapper = SpeakerFaceMapper()
         if self._calibrator is None:
             self._calibrator = VideoCalibrationModule()
 
-        return VideoPipeline(self._extractor, self._mapper, self._calibrator)
+        # SpeakerFaceMapper is lightweight and holds per-session state
+        # (_active_tile_face_to_speaker). Creating a fresh instance per pipeline
+        # call prevents that state from leaking across concurrent sessions.
+        return VideoPipeline(
+            self._extractor,
+            SpeakerFaceMapper(),
+            self._calibrator,
+            extractor_lock=self._extractor_lock,
+        )
 
     async def analyse(
         self,

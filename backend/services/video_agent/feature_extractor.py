@@ -4979,6 +4979,41 @@ class ActiveTileTagger:
         self._tags.clear()
 
 
+class IntervalSet:
+    """Sorted interval container with O(log n) point membership test.
+
+    Diarization segments for a single speaker are sorted by start time at
+    construction. contains() uses bisect_right to find the candidate interval
+    in O(log n) instead of the O(n) linear scan that _in_intervals() used.
+
+    DSA: binary search on sorted start times; at most one candidate interval
+    to inspect per query (assumes non-overlapping diarization segments).
+    """
+
+    __slots__ = ("_intervals", "_starts")
+
+    def __init__(self, intervals: list[tuple[int, int]]) -> None:
+        self._intervals: list[tuple[int, int]] = sorted(intervals, key=lambda x: x[0])
+        self._starts: list[int] = [s for s, _ in self._intervals]
+
+    def contains(self, ts_ms: int) -> bool:
+        """Return True if ts_ms falls within any stored interval. O(log n)."""
+        idx = bisect.bisect_right(self._starts, ts_ms) - 1
+        if idx >= 0:
+            _, end = self._intervals[idx]
+            return ts_ms <= end
+        return False
+
+    @classmethod
+    def from_segments(cls, segments: list[dict], speaker: str) -> "IntervalSet":
+        """Build from diarization segment dicts filtered to one speaker."""
+        return cls([
+            (seg.get("start_ms", 0), seg.get("end_ms", 0))
+            for seg in segments
+            if seg.get("speaker") == speaker
+        ])
+
+
 # SpeakerFaceMapper  — assigns windows to speakers
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -5046,15 +5081,16 @@ class SpeakerFaceMapper:
         if not speakers:
             speakers = ["Speaker_0"]
 
-        face_indices = sorted(set(getattr(wf, "face_index", 0) for wf in windows))
-        multi = len(face_indices) > 1 and len(speakers) > 1
+        face_indices  = sorted(set(getattr(wf, "face_index", 0) for wf in windows))
+        multi_face    = len(face_indices) > 1
+        multi_speaker = len(speakers) > 1
 
-        use_asd = asd_scores is not None and multi
-        use_lip_sync = (
-            not use_asd
-            and lip_activity_map is not None
-            and multi
-        )
+        # ASD is reliable with any number of speakers — binary speaking labels
+        # work even with one speaker (the speaker's face scores high, others low).
+        # Lip-sync correlation needs a silence baseline that only exists when
+        # multiple speakers alternate, so it requires multi_speaker as well.
+        use_asd      = asd_scores is not None and multi_face
+        use_lip_sync = not use_asd and lip_activity_map is not None and multi_face and multi_speaker
 
         if use_asd:
             face_to_speaker, assignment_scores = self._asd_assignment(
@@ -5102,7 +5138,7 @@ class SpeakerFaceMapper:
         for fi, spk in self._active_tile_face_to_speaker.items():
             if fi not in confident_face_to_speaker and spk.startswith("Speaker_"):
                 confident_face_to_speaker[fi] = spk
-                assignment_scores.setdefault(fi, 1.0)  # sentinel — pre-assigned, not scored
+                assignment_scores[fi] = 1.0  # sentinel — pre-assigned; always overwrite stale score
 
         # Group windows by Face_N — signal ownership stays on face tracks, not
         # voice speakers. face_to_speaker is returned as a linkage map for the
@@ -5169,12 +5205,12 @@ class SpeakerFaceMapper:
 
         Delegates to _hungarian_assign for globally-optimal face→speaker pairing.
         """
-        speaker_intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
-        for seg in diar_segments:
-            spk = seg.get("speaker", "Speaker_0")
-            speaker_intervals[spk].append(
-                (seg.get("start_ms", 0), seg.get("end_ms", 0))
-            )
+        # Build IntervalSet per speaker once — O(k log k) sort paid once,
+        # then each contains() call is O(log k) instead of O(k) linear scan.
+        speaker_isets: dict[str, IntervalSet] = {
+            spk: IntervalSet.from_segments(diar_segments, spk)
+            for spk in speakers
+        }
 
         scores: dict[tuple[int, str], float] = {}
         for face_idx in face_indices:
@@ -5182,13 +5218,13 @@ class SpeakerFaceMapper:
             if not track_data:
                 continue
             for speaker in speakers:
-                intervals = speaker_intervals.get(speaker, [])
+                iset = speaker_isets[speaker]
                 active_sum = 0.0
                 silent_sum = 0.0
                 active_n   = 0
                 silent_n   = 0
                 for ts_ms, label in track_data:
-                    if self._in_intervals(ts_ms, intervals):
+                    if iset.contains(ts_ms):
                         active_sum += label
                         active_n   += 1
                     else:
@@ -5224,10 +5260,11 @@ class SpeakerFaceMapper:
         Near zero → face moves equally regardless             (listener / background)
         Negative  → face moves less when this speaker talks   (wrong face)
         """
-        speaker_intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
-        for seg in diar_segments:
-            spk = seg.get("speaker", "Speaker_0")
-            speaker_intervals[spk].append((seg.get("start_ms", 0), seg.get("end_ms", 0)))
+        # Build IntervalSet per speaker once — O(k log k) sort, O(log k) per lookup.
+        speaker_isets: dict[str, IntervalSet] = {
+            spk: IntervalSet.from_segments(diar_segments, spk)
+            for spk in speakers
+        }
 
         scores: dict[tuple[int, str], float] = {}
 
@@ -5237,14 +5274,14 @@ class SpeakerFaceMapper:
                 continue
 
             for speaker in speakers:
-                intervals = speaker_intervals.get(speaker, [])
+                iset = speaker_isets[speaker]
                 speaking_sum = 0.0
                 silence_sum  = 0.0
                 speaking_n   = 0
                 silence_n    = 0
 
                 for ts_ms, lip_score in lip_data:
-                    if self._in_intervals(ts_ms, intervals):
+                    if iset.contains(ts_ms):
                         speaking_sum += lip_score
                         speaking_n   += 1
                     else:
@@ -5391,14 +5428,6 @@ class SpeakerFaceMapper:
                 assignment_scores[fi] = 0.0
 
         return mapping, assignment_scores
-
-    @staticmethod
-    def _in_intervals(ts_ms: int, intervals: list[tuple[int, int]]) -> bool:
-        """Return True if ts_ms falls within any (start, end) interval."""
-        for start, end in intervals:
-            if start <= ts_ms <= end:
-                return True
-        return False
 
     @staticmethod
     def _is_speaking_in_window(

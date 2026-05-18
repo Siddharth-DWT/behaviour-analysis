@@ -191,10 +191,11 @@ async def complete_chunked_upload(
     except json.JSONDecodeError:
         config_dict = {}
 
-    analysis_config = config_dict.get("analysis", {})
-    meeting_type    = session.get("meeting_type") or config_dict.get("meeting_type", "sales_call")
-    title           = session.get("title") or Path(session["filename"]).stem
-    num_speakers    = config_dict.get("num_speakers") or None
+    analysis_config      = config_dict.get("analysis", {})
+    transcription_config = config_dict.get("transcription", {})
+    meeting_type         = session.get("meeting_type") or config_dict.get("meeting_type", "sales_call")
+    title                = session.get("title") or Path(session["filename"]).stem
+    num_speakers         = config_dict.get("num_speakers") or None
 
     try:
         _is_lightweight = not analysis_config.get("run_behavioural", True)
@@ -223,6 +224,10 @@ async def complete_chunked_upload(
         org_id=current_user.get("org_id", DEV_ORG_ID),
         user_id=current_user["id"],
         run_behavioural=analysis_config.get("run_behavioural", True),
+        title=title,
+        transcription_config=transcription_config,
+        analysis_config=analysis_config,
+        user_email=current_user.get("email", ""),
     )
 
     return {

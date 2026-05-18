@@ -1602,9 +1602,12 @@ class FusionRuleEngine:
             for cluster in graph_insights.get("tension_clusters", []):
                 if cluster["signal_count"] >= min_signals:
                     conf = min(0.50 + (cluster["signal_count"] - min_signals) * 0.05, 0.75)
+                    spk_id = cluster["speaker_id"]
+                    if not spk_id or spk_id == "multiple":
+                        spk_id = "session"
                     signals.append({
                         "agent": "fusion",
-                        "speaker_id": cluster["speaker_id"],
+                        "speaker_id": spk_id,
                         "signal_type": "tension_cluster",
                         "value": round(cluster["signal_count"] / 10.0, 3),
                         "value_text": "high_tension" if cluster["signal_count"] >= min_signals + 2 else "moderate_tension",
