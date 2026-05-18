@@ -112,6 +112,17 @@ def _extract_content_words(text: str) -> set[str]:
     return {w for w in words if w not in _STOPWORDS}
 
 
+def _seg_ms(seg: dict) -> tuple[int, int]:
+    """Return (start_ms, end_ms) from a segment regardless of format.
+
+    Handles both TranscriptSegment format (start_ms/end_ms as int milliseconds)
+    and legacy float-seconds format (start/end as float seconds).
+    """
+    if "start_ms" in seg:
+        return int(seg["start_ms"]), int(seg["end_ms"])
+    return int(float(seg.get("start", 0)) * 1_000), int(float(seg.get("end", 0)) * 1_000)
+
+
 def _classify_denial(text: str) -> Optional[tuple[str, float]]:
     """Return (label, strength) for the strongest denial pattern found, or None."""
     if _DENIAL_CATEGORICAL.search(text):
@@ -191,8 +202,7 @@ class InterrogationLanguageRules:
         for seg in segments:
             text  = seg.get("text", "") or ""
             spk   = seg.get("speaker", seg.get("speaker_id", ""))
-            start = int(seg.get("start", 0) * 1000)
-            end   = int(seg.get("end", 0) * 1000)
+            start, end = _seg_ms(seg)
             words = len(text.split())
 
             if words < 10 or spk not in baselines:
@@ -245,8 +255,7 @@ class InterrogationLanguageRules:
         for seg in segments:
             text  = seg.get("text", "") or ""
             spk   = seg.get("speaker", seg.get("speaker_id", ""))
-            start = int(seg.get("start", 0) * 1000)
-            end   = int(seg.get("end", 0) * 1000)
+            start, end = _seg_ms(seg)
 
             # Only analyse segments that appear to be past-event narrations
             if not _PAST_EVENT_TRIGGERS.search(text):
@@ -306,7 +315,7 @@ class InterrogationLanguageRules:
         for seg in segments:
             spk   = seg.get("speaker", seg.get("speaker_id", ""))
             text  = seg.get("text", "") or ""
-            start = int(seg.get("start", 0) * 1000)
+            start, _ = _seg_ms(seg)
             if spk != interrogator_id:
                 continue
             for word in _extract_content_words(text):
@@ -324,8 +333,7 @@ class InterrogationLanguageRules:
         for seg in segments:
             spk   = seg.get("speaker", seg.get("speaker_id", ""))
             text  = seg.get("text", "") or ""
-            start = int(seg.get("start", 0) * 1000)
-            end   = int(seg.get("end", 0) * 1000)
+            start, end = _seg_ms(seg)
 
             if spk == interrogator_id:
                 continue   # skip interrogator's own speech
@@ -381,7 +389,7 @@ class InterrogationLanguageRules:
         for seg in segments:
             spk   = seg.get("speaker", seg.get("speaker_id", ""))
             text  = seg.get("text", "") or ""
-            start = int(seg.get("start", 0) * 1000)
+            start, _ = _seg_ms(seg)
 
             if spk == interrogator_id:
                 continue
