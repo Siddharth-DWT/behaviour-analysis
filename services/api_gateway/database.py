@@ -389,6 +389,8 @@ async def upsert_speakers(
             """
             SELECT id FROM speakers
             WHERE session_id = $1 AND speaker_label = $2
+            ORDER BY created_at ASC
+            LIMIT 1
             """,
             session_id, label,
         )
@@ -423,6 +425,9 @@ async def upsert_speakers(
                 json.dumps(baseline_data) if baseline_data else None,
                 talk_time_ms, talk_time_pct, total_words, cal_conf,
             )
+            if row is None:
+                logger.error("INSERT INTO speakers returned no row for label=%s session=%s", label, session_id)
+                continue
             speaker_uuid = str(row["id"])
 
         label_to_id[label] = speaker_uuid

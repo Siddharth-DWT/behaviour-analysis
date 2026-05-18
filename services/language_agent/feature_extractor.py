@@ -127,20 +127,24 @@ def _predict_sentiment_local(texts: list[str]) -> list[dict | None]:
         import numpy as np
         results = []
         BATCH_SIZE = 32
-        for i in range(0, len(texts), BATCH_SIZE):
-            batch = texts[i:i + BATCH_SIZE]
-            inputs = _sentiment_tokenizer(
-                batch, return_tensors="np", padding=True, truncation=True, max_length=128,
-            )
-            outputs = _sentiment_model(**inputs)
-            logits = outputs.logits
-            exp_logits = np.exp(logits - np.max(logits, axis=1, keepdims=True))
-            probs = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
-            for j in range(len(batch)):
-                pred_idx = int(np.argmax(probs[j]))
-                pred_score = float(probs[j][pred_idx])
-                label = "POSITIVE" if pred_idx == 1 else "NEGATIVE"
-                results.append({"label": label, "score": pred_score})
+        try:
+            for i in range(0, len(texts), BATCH_SIZE):
+                batch = texts[i:i + BATCH_SIZE]
+                inputs = _sentiment_tokenizer(
+                    batch, return_tensors="np", padding=True, truncation=True, max_length=128,
+                )
+                outputs = _sentiment_model(**inputs)
+                logits = outputs.logits
+                exp_logits = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+                probs = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+                for j in range(len(batch)):
+                    pred_idx = int(np.argmax(probs[j]))
+                    pred_score = float(probs[j][pred_idx])
+                    label = "POSITIVE" if pred_idx == 1 else "NEGATIVE"
+                    results.append({"label": label, "score": pred_score})
+        except Exception as e:
+            logger.warning("Sentiment analysis failed: %s", e)
+            return [None] * len(texts)
         return results
 
     if _sentiment_backend == "pytorch":
@@ -360,8 +364,8 @@ class LanguageFeatureExtractor:
         """Pre-load the sentiment model so first analysis isn't slow."""
         try:
             _load_sentiment_model()
-        except Exception:
-            pass  # VADER fallback is automatic
+        except Exception as e:
+            logger.warning("Sentiment model warm-up failed (VADER fallback is automatic): %s", e)
         # Also ensure VADER is ready as fallback
         _get_vader_analyzer()
         self._sentiment_ready = True
@@ -388,7 +392,9 @@ class LanguageFeatureExtractor:
 
         # Merge sentiment into features
         for i, features in enumerate(features_list):
-            sent = sentiments[i] if i < len(sentiments) else {"label": "NEUTRAL", "score": 0.0}
+            sent = sentiments[i] if i < len(sentiments) else None
+            if not sent or "label" not in sent:
+                sent = {"label": "NEUTRAL", "score": 0.0}
             features["sentiment_label"] = sent["label"]
             features["sentiment_score"] = sent["score"]
             features["sentiment_value"] = sent["score"]

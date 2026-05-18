@@ -23,6 +23,7 @@ Research basis:
   - Bentivoglio 1997: resting blink rate 15-26 bpm (mode ~15 silent, ~26 conversation)
   - Ekman & Friesen 1978: FACS Action Units (blendshapes approximate AU scores)
 """
+import concurrent.futures
 import logging
 import urllib.request
 from collections import Counter, defaultdict
@@ -766,6 +767,291 @@ class _HandResult:
         self.hand_gestures  = hand_gestures  or [""] * len(self.hand_landmarks)
 
 
+class FaceCropWorker:
+    """
+    One set of IMAGE-mode MediaPipe instances for per-face crop processing.
+
+    Object Pool Pattern: pre-created once per video, reused across all frames.
+    Each worker is assigned to exactly one thread — no shared mutable state.
+    MediaPipe C++ inference releases the Python GIL, enabling true parallelism.
+    """
+
+    __slots__ = ("_worker_id", "_face_lm", "_pose_lm", "_gesture_rec")
+
+    # Pose landmark indices (MediaPipe 33-point model)
+    _WRIST_L,     _WRIST_R     = 15, 16
+    _INDEX_MCP_L, _PINKY_MCP_L = 17, 19
+    _INDEX_MCP_R, _PINKY_MCP_R = 18, 20
+
+    def __init__(
+        self, worker_id: int, mp, model_mgr: "MediaPipeModelManager"
+    ) -> None:
+        self._worker_id = worker_id
+        BaseOptions = mp.tasks.BaseOptions
+        Mode = mp.tasks.vision.RunningMode
+        self._face_lm = mp.tasks.vision.FaceLandmarker.create_from_options(
+            mp.tasks.vision.FaceLandmarkerOptions(
+                base_options=BaseOptions(
+                    model_asset_path=model_mgr.get_face_landmarker_path()
+                ),
+                running_mode=Mode.IMAGE,
+                num_faces=1,
+                output_face_blendshapes=True,
+                output_facial_transformation_matrixes=True,
+                min_face_detection_confidence=0.1,
+                min_face_presence_confidence=0.1,
+                min_tracking_confidence=0.1,
+            )
+        )
+        self._pose_lm = mp.tasks.vision.PoseLandmarker.create_from_options(
+            mp.tasks.vision.PoseLandmarkerOptions(
+                base_options=BaseOptions(
+                    model_asset_path=model_mgr.get_pose_landmarker_path()
+                ),
+                running_mode=Mode.IMAGE,
+                num_poses=1,
+                min_pose_detection_confidence=0.2,
+                min_pose_presence_confidence=0.2,
+                min_tracking_confidence=0.2,
+            )
+        )
+        self._gesture_rec = mp.tasks.vision.GestureRecognizer.create_from_options(
+            mp.tasks.vision.GestureRecognizerOptions(
+                base_options=BaseOptions(
+                    model_asset_path=model_mgr.get_gesture_recognizer_path()
+                ),
+                running_mode=Mode.IMAGE,
+                num_hands=2,
+                min_hand_detection_confidence=0.15,
+                min_hand_presence_confidence=0.15,
+                min_tracking_confidence=0.15,
+            )
+        )
+
+    def process_face(
+        self,
+        mp,
+        rgb: np.ndarray,
+        face_crop: np.ndarray,
+        body_crop: np.ndarray,
+        fc_x1: int, fc_y1: int, fc_w: int, fc_h: int,
+        bc_x1: int, bc_y1: int, bc_w: int, bc_h: int,
+        frame_w: int, frame_h: int,
+        face_box_w: int,
+    ) -> dict:
+        """
+        FaceLandmarker + PoseLandmarker + GestureRecognizer for one face's crops.
+
+        Wrist crop coordinates are derived from PoseLandmarker output inside this
+        method; rgb (full frame, read-only) is sliced for the wrist crops so a
+        second VideoCapture pass is never needed.
+
+        Returns landmarks remapped to full-frame normalised coordinates — same
+        format as TiledFrameProcessor.detect() output so callers are unchanged.
+        """
+        result: dict = {
+            "face_landmarks":  None,
+            "face_blendshapes": None,
+            "face_matrix":     None,
+            "pose_landmarks":  None,
+            "wrist_landmarks": [],
+            "wrist_gestures":  [],
+        }
+
+        # ── FaceLandmarker ────────────────────────────────────────────────
+        if face_crop.size >= 64:
+            try:
+                fc_mp = mp.Image(
+                    image_format=mp.ImageFormat.SRGB,
+                    data=np.ascontiguousarray(face_crop),
+                )
+                fc_res = self._face_lm.detect(fc_mp)
+                if fc_res.face_landmarks:
+                    result["face_landmarks"] = [
+                        _Pt(
+                            x=(fc_x1 + lm.x * fc_w) / frame_w,
+                            y=(fc_y1 + lm.y * fc_h) / frame_h,
+                            z=lm.z,
+                        )
+                        for lm in fc_res.face_landmarks[0]
+                    ]
+                    result["face_blendshapes"] = (
+                        fc_res.face_blendshapes[0] if fc_res.face_blendshapes else None
+                    )
+                    result["face_matrix"] = (
+                        fc_res.facial_transformation_matrixes[0]
+                        if fc_res.facial_transformation_matrixes else None
+                    )
+            except Exception as exc:
+                logger.debug(f"[worker-{self._worker_id}] face crop error: {exc}")
+
+        # ── PoseLandmarker + wrist crop collection ────────────────────────
+        if body_crop.size >= 64:
+            try:
+                bc_mp = mp.Image(
+                    image_format=mp.ImageFormat.SRGB,
+                    data=np.ascontiguousarray(body_crop),
+                )
+                bc_res = self._pose_lm.detect(bc_mp)
+                if bc_res.pose_landmarks:
+                    result["pose_landmarks"] = [
+                        _Pt(
+                            x=(bc_x1 + lm.x * bc_w) / frame_w,
+                            y=(bc_y1 + lm.y * bc_h) / frame_h,
+                            z=lm.z,
+                            visibility=getattr(lm, "visibility", 1.0),
+                        )
+                        for lm in bc_res.pose_landmarks[0]
+                    ]
+                    # ── Wrist crops derived from pose output ──────────────
+                    plm_raw = bc_res.pose_landmarks[0]
+                    for wrist_idx in (self._WRIST_L, self._WRIST_R):
+                        if wrist_idx >= len(plm_raw):
+                            continue
+                        if getattr(plm_raw[wrist_idx], "visibility", 0) < 0.3:
+                            continue
+                        wx_px = int(bc_x1 + plm_raw[wrist_idx].x * bc_w)
+                        wy_px = int(bc_y1 + plm_raw[wrist_idx].y * bc_h)
+                        hand_size = max(int(face_box_w * 1.5), 80)
+                        mcp_pair = (
+                            (self._INDEX_MCP_L, self._PINKY_MCP_L)
+                            if wrist_idx == self._WRIST_L
+                            else (self._INDEX_MCP_R, self._PINKY_MCP_R)
+                        )
+                        for mcp_idx in mcp_pair:
+                            if (mcp_idx < len(plm_raw)
+                                    and getattr(plm_raw[mcp_idx], "visibility", 0) > 0.3):
+                                mx = int(bc_x1 + plm_raw[mcp_idx].x * bc_w)
+                                my = int(bc_y1 + plm_raw[mcp_idx].y * bc_h)
+                                wrist_to_mcp = int(
+                                    ((wx_px - mx) ** 2 + (wy_px - my) ** 2) ** 0.5
+                                )
+                                if wrist_to_mcp > 10:
+                                    hand_size = max(int(wrist_to_mcp * 2.7), hand_size)
+                                break
+                        hx1 = max(0, wx_px - hand_size)
+                        hy1 = max(0, wy_px - hand_size)
+                        hx2 = min(frame_w, wx_px + hand_size)
+                        hy2 = min(frame_h, wy_px + hand_size)
+                        if (hx2 - hx1) <= 40 or (hy2 - hy1) <= 40:
+                            continue
+                        wrist_crop = rgb[hy1:hy2, hx1:hx2]
+                        if wrist_crop.size < 64:
+                            continue
+                        try:
+                            hc_h, hc_w = wrist_crop.shape[:2]
+                            hc_mp = mp.Image(
+                                image_format=mp.ImageFormat.SRGB,
+                                data=np.ascontiguousarray(wrist_crop),
+                            )
+                            gr_res = self._gesture_rec.recognize(hc_mp)
+                            if gr_res and gr_res.hand_landmarks:
+                                for idx, hlm in enumerate(gr_res.hand_landmarks):
+                                    remapped_hand = [
+                                        _Pt(
+                                            x=(hx1 + lm.x * hc_w) / frame_w,
+                                            y=(hy1 + lm.y * hc_h) / frame_h,
+                                            z=lm.z,
+                                        )
+                                        for lm in hlm
+                                    ]
+                                    gesture_str = ""
+                                    if (gr_res.gestures
+                                            and idx < len(gr_res.gestures)
+                                            and gr_res.gestures[idx]):
+                                        cat = gr_res.gestures[idx][0].category_name
+                                        if cat != "None":
+                                            gesture_str = cat
+                                    result["wrist_landmarks"].append(remapped_hand)
+                                    result["wrist_gestures"].append(gesture_str)
+                        except Exception as exc:
+                            logger.debug(
+                                f"[worker-{self._worker_id}] wrist gesture error: {exc}"
+                            )
+            except Exception as exc:
+                logger.debug(f"[worker-{self._worker_id}] body crop error: {exc}")
+
+        return result
+
+    def close(self) -> None:
+        for attr in ("_face_lm", "_pose_lm", "_gesture_rec"):
+            instance = getattr(self, attr, None)
+            if instance is not None:
+                try:
+                    instance.close()
+                except Exception:
+                    pass
+
+
+class FaceCropWorkerPool:
+    """
+    Object Pool of FaceCropWorker instances for parallel per-face processing.
+
+    One worker per face slot (pool_size = num_faces) — each face always routes to
+    its dedicated worker so no two threads ever share a MediaPipe instance.
+    ThreadPoolExecutor caps actual parallelism at min(num_faces, 4) threads;
+    for >4 faces the extra workers queue and run after a thread becomes free.
+
+    DSA: list indexed by face position for O(1) worker lookup without locking.
+    """
+
+    def __init__(
+        self, pool_size: int, mp, model_mgr: "MediaPipeModelManager"
+    ) -> None:
+        self._pool_size = pool_size
+        self._workers: list[FaceCropWorker] = [
+            FaceCropWorker(i, mp, model_mgr) for i in range(pool_size)
+        ]
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(pool_size, 4),
+            thread_name_prefix="face-crop",
+        )
+        logger.info(
+            f"FaceCropWorkerPool: {pool_size} workers, "
+            f"{min(pool_size, 4)} threads (~{pool_size * 90}MB)"
+        )
+
+    def process_faces_parallel(
+        self, mp, face_jobs: list[dict]
+    ) -> list[dict]:
+        """
+        Process face crops in parallel. Returns results in the same order as
+        face_jobs — order preservation is critical so face_landmarks[i]
+        corresponds to face_boxes[i] (largest-first CentroidTracker order).
+        """
+        if not face_jobs:
+            return []
+        # Single face: skip thread dispatch overhead
+        if len(face_jobs) == 1:
+            return [self._workers[0].process_face(mp=mp, **face_jobs[0])]
+
+        futures: list[tuple[int, "concurrent.futures.Future[dict]"]] = []
+        for i, job in enumerate(face_jobs):
+            # Worker i is dedicated to face slot i — no modulo, no sharing
+            future = self._executor.submit(self._workers[i].process_face, mp=mp, **job)
+            futures.append((i, future))
+
+        results: list[dict] = [None] * len(face_jobs)  # type: ignore[list-item]
+        for i, future in futures:
+            try:
+                results[i] = future.result(timeout=5.0)
+            except Exception as exc:
+                logger.warning(f"Face crop worker {i} failed: {exc}")
+                results[i] = {
+                    "face_landmarks": None, "face_blendshapes": None,
+                    "face_matrix": None, "pose_landmarks": None,
+                    "wrist_landmarks": [], "wrist_gestures": [],
+                }
+        return results
+
+    def close(self) -> None:
+        # wait=True ensures all running tasks finish before we close the workers'
+        # MediaPipe instances — avoids destroying instances while threads use them.
+        self._executor.shutdown(wait=True)
+        for w in self._workers:
+            w.close()
+
+
 class TiledFrameProcessor:
     """
     Grid-agnostic multi-person landmark detection via two-pass MediaPipe.
@@ -798,14 +1084,15 @@ class TiledFrameProcessor:
     _FACE_PAD   = 0.30   # expand detected bbox by this fraction on all sides
     _BODY_SCALE = 2.5    # extend bbox this many face-heights downward for pose (was 3.0)
 
-    def __init__(self, face_det, face_det_img, face_lm, pose_lm, hand_lm, gesture_rec_img, num_faces: int) -> None:
-        self._face_det        = face_det         # FaceDetector      — VIDEO mode, full frame
-        self._face_det_img    = face_det_img     # FaceDetector      — IMAGE mode, quadrant passes
-        self._face_lm         = face_lm          # FaceLandmarker    — IMAGE mode, per crop
-        self._pose_lm         = pose_lm          # PoseLandmarker    — IMAGE mode, per crop
-        self._hand_lm         = hand_lm          # HandLandmarker    — VIDEO mode, full frame (fallback)
-        self._gesture_rec_img = gesture_rec_img  # GestureRecognizer — IMAGE mode, per wrist crop
-        self._num_faces       = num_faces
+    def __init__(
+        self, face_det, face_det_img, hand_lm, num_faces: int,
+        worker_pool: Optional["FaceCropWorkerPool"] = None,
+    ) -> None:
+        self._face_det    = face_det      # FaceDetector   — VIDEO mode, full frame
+        self._face_det_img = face_det_img # FaceDetector   — IMAGE mode, quadrant passes
+        self._hand_lm     = hand_lm      # HandLandmarker — VIDEO mode, full frame fallback
+        self._num_faces   = num_faces
+        self._worker_pool = worker_pool  # parallel per-face crop processor
 
     @classmethod
     def create(
@@ -830,28 +1117,6 @@ class TiledFrameProcessor:
                 min_detection_confidence=0.15,
             )
         )
-        face_lm = mp.tasks.vision.FaceLandmarker.create_from_options(
-            mp.tasks.vision.FaceLandmarkerOptions(
-                base_options=BaseOptions(model_asset_path=model_mgr.get_face_landmarker_path()),
-                running_mode=Mode.IMAGE,
-                num_faces=1,
-                output_face_blendshapes=True,
-                output_facial_transformation_matrixes=True,
-                min_face_detection_confidence=0.1,
-                min_face_presence_confidence=0.1,
-                min_tracking_confidence=0.1,
-            )
-        )
-        pose_lm = mp.tasks.vision.PoseLandmarker.create_from_options(
-            mp.tasks.vision.PoseLandmarkerOptions(
-                base_options=BaseOptions(model_asset_path=model_mgr.get_pose_landmarker_path()),
-                running_mode=Mode.IMAGE,
-                num_poses=1,
-                min_pose_detection_confidence=0.2,
-                min_pose_presence_confidence=0.2,
-                min_tracking_confidence=0.2,
-            )
-        )
         hand_lm = mp.tasks.vision.HandLandmarker.create_from_options(
             mp.tasks.vision.HandLandmarkerOptions(
                 base_options=BaseOptions(model_asset_path=model_mgr.get_hand_landmarker_path()),
@@ -862,19 +1127,10 @@ class TiledFrameProcessor:
                 min_tracking_confidence=0.3,
             )
         )
-        # IMAGE mode GestureRecognizer — replaces per-crop HandLandmarker;
-        # returns hand landmarks + gesture category in one call.
-        gesture_rec_img = mp.tasks.vision.GestureRecognizer.create_from_options(
-            mp.tasks.vision.GestureRecognizerOptions(
-                base_options=BaseOptions(model_asset_path=model_mgr.get_gesture_recognizer_path()),
-                running_mode=Mode.IMAGE,
-                num_hands=2,
-                min_hand_detection_confidence=0.15,
-                min_hand_presence_confidence=0.15,
-                min_tracking_confidence=0.15,
-            )
-        )
-        return cls(face_det, face_det_img, face_lm, pose_lm, hand_lm, gesture_rec_img, num_faces)
+        # One worker per face slot — each face routes to a dedicated worker thread.
+        # ThreadPoolExecutor inside FaceCropWorkerPool caps threads at min(num_faces, 4).
+        worker_pool = FaceCropWorkerPool(num_faces, mp, model_mgr)
+        return cls(face_det, face_det_img, hand_lm, num_faces, worker_pool=worker_pool)
 
     def _detect_all_faces(self, rgb: np.ndarray, ts_ms: int, mp) -> list[tuple]:
         """
@@ -901,6 +1157,12 @@ class TiledFrameProcessor:
                                    int(bb.width), int(bb.height)))
         except Exception as exc:
             logger.debug(f"[tiled] full-frame detect error: {exc}")
+
+        # Strategy Pattern: skip quadrant pass when full-frame found enough faces.
+        # Quadrants exist to catch small sidebar faces that full-frame misses — if
+        # all expected faces are already found, the 4-quadrant scan (~12ms) is waste.
+        if len(raw_boxes) >= self._num_faces:
+            return _nms_boxes(raw_boxes, iou_threshold=0.35)[:self._num_faces]
 
         # Pass 2: 2×2 quadrants with 12.5% overlap to catch faces near edges
         half_w, half_h = fw // 2, fh // 2
@@ -941,14 +1203,18 @@ class TiledFrameProcessor:
         Returns _FaceResult/_PoseResult/_HandResult with all landmark coordinates
         remapped to full-frame normalised space (drop-in for direct MediaPipe calls).
         Faces are ordered largest-first so face_landmarks[0] = dominant speaker.
+
+        Per-face crop processing (FaceLandmarker + PoseLandmarker + GestureRecognizer)
+        runs in parallel via FaceCropWorkerPool. Face detection (VIDEO mode) and
+        full-frame hand detection (VIDEO mode) stay serial — temporal state.
         """
         import mediapipe as mp
         fh, fw = rgb.shape[:2]
 
-        # ── Face bounding boxes: full-frame + quadrant passes ─────────────────
+        # ── Face bounding boxes: full-frame + conditional quadrant pass ───────
         face_boxes = self._detect_all_faces(rgb, ts_ms, mp)
 
-        all_hand_lm:      list = []
+        all_hand_lm:       list = []
         all_hand_gestures: list = []
 
         if not face_boxes:
@@ -963,17 +1229,15 @@ class TiledFrameProcessor:
                 pass
             return _FaceResult([]), _PoseResult([]), _HandResult(all_hand_lm, all_hand_gestures)
 
-        all_face_lm:  list = []
-        all_face_bs:  list = []
-        all_face_mat: list = []
-        all_pose_lm:  list = []
-        wrist_crops:  list[tuple[int, int, int, int]] = []  # (x1,y1,x2,y2) full-frame px
-
+        # ── Build face jobs: crop coordinates + pixel arrays (serial) ────────
+        # Body crop clamping (nearest_below_top) needs all face_boxes — must be
+        # computed before dispatching to workers.
+        face_jobs: list[dict] = []
         for fx, fy, fbw, fbh in face_boxes:
             px = int(fbw * self._FACE_PAD)
             py = int(fbh * self._FACE_PAD)
 
-            # ── Face crop (bbox + padding on all sides) ───────────────────────
+            # Face crop (bbox + padding on all sides)
             fc_x1 = max(0, fx - px)
             fc_y1 = max(0, fy - py)
             fc_x2 = min(fw, fx + fbw + px)
@@ -982,46 +1246,13 @@ class TiledFrameProcessor:
             if face_crop.size < 64:
                 continue
 
-            try:
-                fc_h, fc_w = face_crop.shape[:2]
-                fc_mp  = mp.Image(
-                    image_format=mp.ImageFormat.SRGB,
-                    data=np.ascontiguousarray(face_crop),
-                )
-                fc_res = self._face_lm.detect(fc_mp)
-                if fc_res.face_landmarks:
-                    remapped_face = [
-                        _Pt(
-                            x=(fc_x1 + lm.x * fc_w) / fw,
-                            y=(fc_y1 + lm.y * fc_h) / fh,
-                            z=lm.z,
-                        )
-                        for lm in fc_res.face_landmarks[0]
-                    ]
-                    all_face_lm.append(remapped_face)
-                    all_face_bs.append(
-                        fc_res.face_blendshapes[0] if fc_res.face_blendshapes else None
-                    )
-                    all_face_mat.append(
-                        fc_res.facial_transformation_matrixes[0]
-                        if fc_res.facial_transformation_matrixes else None
-                    )
-            except Exception as exc:
-                logger.debug(f"[tiled] face crop error: {exc}")
-
-            # ── Body crop (face bbox extended downward, clamped to tile) ──────
+            # Body crop (face bbox extended downward, clamped to tile boundary)
             bc_x1 = max(0, fx - px)
             bc_y1 = max(0, fy - py)
             bc_x2 = min(fw, fx + fbw + px)
-
             raw_bc_y2 = fy + int(fbh * self._BODY_SCALE)
-
-            # Clamp to midpoint between this face's bottom and the nearest face
-            # directly below in the same column — prevents body crop from bleeding
-            # into adjacent tiles in multi-person grid layouts.
             face_bottom = fy + fbh
-            nearest_below_top = fh  # default: frame bottom
-
+            nearest_below_top = fh
             for ofx, ofy, ofbw, _ in face_boxes:
                 if ofy > face_bottom and abs((ofx + ofbw / 2) - (fx + fbw / 2)) < fw * 0.4:
                     # Stop at the face TOP of the tile below — not the midpoint.
@@ -1030,113 +1261,67 @@ class TiledFrameProcessor:
                     # gives the full inter-tile gap as body crop space while still
                     # stopping before the next person's face begins.
                     nearest_below_top = min(nearest_below_top, ofy)
-
             bc_y2 = min(fh, raw_bc_y2, nearest_below_top)
             # Ensure we capture at least chin + shoulders (1.5× face height from face top).
             bc_y2 = max(bc_y2, fy + int(fbh * 1.5))
-
             body_crop = rgb[bc_y1:bc_y2, bc_x1:bc_x2]
-            if body_crop.size < 64:
-                continue
 
-            try:
-                bc_h, bc_w = body_crop.shape[:2]
-                bc_mp  = mp.Image(
-                    image_format=mp.ImageFormat.SRGB,
-                    data=np.ascontiguousarray(body_crop),
+            fc_h, fc_w = face_crop.shape[:2]
+            bc_h, bc_w = body_crop.shape[:2]
+
+            face_jobs.append({
+                "rgb":      rgb,        # read-only full-frame ref for wrist crop slicing
+                "face_crop": face_crop,
+                "body_crop": body_crop,
+                "fc_x1": fc_x1, "fc_y1": fc_y1, "fc_w": fc_w, "fc_h": fc_h,
+                "bc_x1": bc_x1, "bc_y1": bc_y1, "bc_w": bc_w, "bc_h": bc_h,
+                "frame_w": fw,  "frame_h": fh,
+                "face_box_w": fbw,
+            })
+
+        # ── Dispatch to worker pool (parallel per-face inference) ─────────────
+        if self._worker_pool and face_jobs:
+            worker_results = self._worker_pool.process_faces_parallel(mp, face_jobs)
+        else:
+            worker_results = []
+            if face_jobs:
+                logger.warning("[tiled] worker_pool is None — per-face crops skipped")
+
+        # ── Merge worker results ──────────────────────────────────────────────
+        all_face_lm:  list = []
+        all_face_bs:  list = []
+        all_face_mat: list = []
+        all_pose_lm:  list = []
+
+        for wr in worker_results:
+            if wr.get("face_landmarks"):
+                all_face_lm.append(wr["face_landmarks"])
+                all_face_bs.append(wr.get("face_blendshapes"))   # None preserved: index alignment
+                all_face_mat.append(wr.get("face_matrix"))
+            if wr.get("pose_landmarks"):
+                all_pose_lm.append(wr["pose_landmarks"])
+            # Wrist hand landmarks — dup check across all faces collected so far
+            for wlm, wgest in zip(
+                wr.get("wrist_landmarks", []), wr.get("wrist_gestures", [])
+            ):
+                dup = any(
+                    ((wlm[0].x - ex[0].x) ** 2 +
+                     (wlm[0].y - ex[0].y) ** 2) ** 0.5 < 0.05
+                    for ex in all_hand_lm
                 )
-                bc_res = self._pose_lm.detect(bc_mp)
-                if bc_res.pose_landmarks:
-                    remapped_pose = [
-                        _Pt(
-                            x=(bc_x1 + lm.x * bc_w) / fw,
-                            y=(bc_y1 + lm.y * bc_h) / fh,
-                            z=lm.z,
-                            visibility=getattr(lm, "visibility", 1.0),
-                        )
-                        for lm in bc_res.pose_landmarks[0]
-                    ]
-                    all_pose_lm.append(remapped_pose)
+                if not dup:
+                    all_hand_lm.append(wlm)
+                    all_hand_gestures.append(wgest)
 
-                    # ── Collect wrist positions for pose-guided hand crops ─────
-                    _WRIST_L, _WRIST_R = 15, 16
-                    _INDEX_MCP_L, _PINKY_MCP_L = 17, 19
-                    _INDEX_MCP_R, _PINKY_MCP_R = 18, 20
-                    plm_raw = bc_res.pose_landmarks[0]
-                    for wrist_idx in (_WRIST_L, _WRIST_R):
-                        if wrist_idx >= len(plm_raw):
-                            continue
-                        if getattr(plm_raw[wrist_idx], "visibility", 0) < 0.3:
-                            continue
-                        wx_px = int(bc_x1 + plm_raw[wrist_idx].x * bc_w)
-                        wy_px = int(bc_y1 + plm_raw[wrist_idx].y * bc_h)
-                        hand_size = max(int(fbw * 1.5), 80)
-                        mcp_pair = (_INDEX_MCP_L, _PINKY_MCP_L) if wrist_idx == _WRIST_L else (_INDEX_MCP_R, _PINKY_MCP_R)
-                        for mcp_idx in mcp_pair:
-                            if mcp_idx < len(plm_raw) and getattr(plm_raw[mcp_idx], "visibility", 0) > 0.3:
-                                mx = int(bc_x1 + plm_raw[mcp_idx].x * bc_w)
-                                my = int(bc_y1 + plm_raw[mcp_idx].y * bc_h)
-                                wrist_to_mcp = int(((wx_px - mx) ** 2 + (wy_px - my) ** 2) ** 0.5)
-                                if wrist_to_mcp > 10:
-                                    hand_size = max(int(wrist_to_mcp * 2.7), hand_size)
-                                break
-                        hx1_w = max(0, wx_px - hand_size)
-                        hy1_w = max(0, wy_px - hand_size)
-                        hx2_w = min(fw, wx_px + hand_size)
-                        hy2_w = min(fh, wy_px + hand_size)
-                        if (hx2_w - hx1_w) > 40 and (hy2_w - hy1_w) > 40:
-                            wrist_crops.append((hx1_w, hy1_w, hx2_w, hy2_w))
-            except Exception as exc:
-                logger.debug(f"[tiled] pose crop error: {exc}")
-
-        # ── Pose-guided hand detection (full-res crops around each wrist) ────
-        # Crops are tight ROIs from the original frame — hand occupies ~200×200px
-        # instead of ~60×60px in body crops, matching HandLandmarker's 256×256 sweet spot.
-        for hx1_c, hy1_c, hx2_c, hy2_c in wrist_crops:
-            hand_crop = rgb[hy1_c:hy2_c, hx1_c:hx2_c]
-            if hand_crop.size < 64:
-                continue
-            try:
-                hc_h, hc_w = hand_crop.shape[:2]
-                hc_mp = mp.Image(
-                    image_format=mp.ImageFormat.SRGB,
-                    data=np.ascontiguousarray(hand_crop),
-                )
-                gr_raw = self._gesture_rec_img.recognize(hc_mp)
-                if gr_raw and gr_raw.hand_landmarks:
-                    for idx, hlm in enumerate(gr_raw.hand_landmarks):
-                        remapped_hand = [
-                            _Pt(
-                                x=(hx1_c + lm.x * hc_w) / fw,
-                                y=(hy1_c + lm.y * hc_h) / fh,
-                                z=lm.z,
-                            )
-                            for lm in hlm
-                        ]
-                        gesture_str = ""
-                        if gr_raw.gestures and idx < len(gr_raw.gestures) and gr_raw.gestures[idx]:
-                            cat = gr_raw.gestures[idx][0].category_name
-                            if cat != "None":
-                                gesture_str = cat
-                        dup = any(
-                            ((remapped_hand[0].x - ex[0].x) ** 2 +
-                             (remapped_hand[0].y - ex[0].y) ** 2) ** 0.5 < 0.05
-                            for ex in all_hand_lm
-                        )
-                        if not dup:
-                            all_hand_lm.append(remapped_hand)
-                            all_hand_gestures.append(gesture_str)
-            except Exception as exc:
-                logger.debug(f"[tiled] pose-guided hand crop error: {exc}")
-
-        # ── Full-frame fallback (catches hands where pose wrist is not visible) ──
+        # ── Full-frame hand fallback: catches hands where pose wrist not visible ──
         try:
             mp_full = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             hand_raw_full = self._hand_lm.detect_for_video(mp_full, ts_ms)
             if hand_raw_full and hand_raw_full.hand_landmarks:
                 for hlm in hand_raw_full.hand_landmarks:
                     dup = any(
-                        ((hlm[0].x - ex[0].x) ** 2 + (hlm[0].y - ex[0].y) ** 2) ** 0.5 < 0.05
+                        ((hlm[0].x - ex[0].x) ** 2 +
+                         (hlm[0].y - ex[0].y) ** 2) ** 0.5 < 0.05
                         for ex in all_hand_lm
                     )
                     if not dup:
@@ -1148,20 +1333,21 @@ class TiledFrameProcessor:
         return (
             _FaceResult(
                 face_landmarks=all_face_lm,
-                face_blendshapes=all_face_bs,       # keep None entries so face_landmarks[i] ↔ face_blendshapes[i]
-                facial_transformation_matrixes=all_face_mat,  # same reason
+                face_blendshapes=all_face_bs,          # None entries preserved: face_landmarks[i] ↔ face_blendshapes[i]
+                facial_transformation_matrixes=all_face_mat,
             ),
             _PoseResult(pose_landmarks=all_pose_lm),
             _HandResult(all_hand_lm, all_hand_gestures),
         )
 
     def close(self) -> None:
-        for obj in (self._face_det, self._face_det_img, self._face_lm,
-                    self._pose_lm, self._hand_lm, self._gesture_rec_img):
+        for obj in (self._face_det, self._face_det_img, self._hand_lm):
             try:
                 obj.close()
             except Exception:
                 pass
+        if self._worker_pool:
+            self._worker_pool.close()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1869,6 +2055,223 @@ class OverlayRenderer:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# IdentitySwapEvent + IdentityVerifier  — periodic ArcFace swap detection
+# ══════════════════════════════════════════════════════════════════════════════
+
+class IdentitySwapEvent:
+    """Immutable record of a detected identity change within a CentroidTracker track."""
+    __slots__ = ("track_id", "timestamp_ms", "old_embedding", "new_embedding")
+
+    def __init__(
+        self,
+        track_id: int,
+        timestamp_ms: int,
+        old_embedding: "np.ndarray",
+        new_embedding: "np.ndarray",
+    ) -> None:
+        self.track_id = track_id
+        self.timestamp_ms = timestamp_ms
+        self.old_embedding = old_embedding
+        self.new_embedding = new_embedding
+
+
+class LayoutType:
+    """Meeting video layout type constants."""
+    ACTIVE_SPEAKER = "active_speaker"
+    GALLERY        = "gallery"
+    SCREENSHARE    = "screenshare"
+    SOLO           = "solo"
+    UNKNOWN        = "unknown"
+
+
+class LayoutClassifier:
+    """
+    Per-frame layout classifier from face detection geometry.
+
+    Smooths raw per-frame classification with a 5-frame sliding-window
+    Counter majority vote. Emits layout_changed=True on the first frame
+    where the smoothed layout transitions, so callers can reset downstream
+    state (CentroidTracker, IdentityVerifier) to prevent track contamination
+    after join/leave/screenshare layout shifts.
+
+    Design:
+      - Sliding Window: deque(maxlen=5) + Counter.most_common(1) — O(1)/frame
+      - Strategy Pattern: returned layout type governs IdentityVerifier interval
+    """
+
+    def __init__(self, window_size: int = 5) -> None:
+        from collections import deque
+        self._window: deque[str] = deque(maxlen=window_size)
+        self._current: str = LayoutType.UNKNOWN
+        self._changed: bool = False
+
+    def classify(self, face_areas: list[float]) -> str:
+        """Classify from face areas sorted largest-first. Returns smoothed LayoutType."""
+        n = len(face_areas)
+        if n == 0:
+            raw = LayoutType.SCREENSHARE
+        elif n == 1:
+            raw = LayoutType.SOLO if face_areas[0] > 0.15 else LayoutType.SCREENSHARE
+        else:
+            ratio = face_areas[0] / max(face_areas[1], 0.001)
+            if face_areas[0] < 0.03:
+                raw = LayoutType.SCREENSHARE
+            elif ratio >= 1.5:
+                raw = LayoutType.ACTIVE_SPEAKER
+            else:
+                raw = LayoutType.GALLERY
+
+        self._window.append(raw)
+        majority = Counter(self._window).most_common(1)[0][0]
+        self._changed = (
+            majority != self._current and self._current != LayoutType.UNKNOWN
+        )
+        self._current = majority
+        return majority
+
+    @property
+    def current(self) -> str:
+        return self._current
+
+    @property
+    def layout_changed(self) -> bool:
+        return self._changed
+
+
+class IdentityVerifier:
+    """
+    Periodic ArcFace identity verification during the frame extraction loop.
+
+    Detects identity swaps within CentroidTracker tracks by comparing face
+    embeddings at regular intervals. Catches BOTH speaker-boundary swaps
+    (tile changes occupant at a diarization boundary) AND silent swaps
+    (layout changes, join/leave, screen-share, pin/unpin) that diarization
+    cannot detect.
+
+    Design:
+      - Single Responsibility: only detects swaps; does not split tracks.
+      - Strategy Pattern: configurable check_interval and similarity_threshold.
+      - HashMap: dict[int, np.ndarray] — O(1) track_id → embedding lookup.
+      - Chronological output: swap_events property returns events sorted by time.
+
+    Cost model (21-min video, 5fps, check_interval=30):
+      total_sampled_frames ≈ 6300  →  checks ≈ 210
+      210 × ~50ms per InsightFace call = ~10.5s  →  <1% of total loop time.
+    """
+
+    def __init__(
+        self,
+        embedder_app,
+        check_interval: int = 30,
+        similarity_threshold: float = 0.50,
+        min_face_area: float = 0.005,
+    ) -> None:
+        self._app = embedder_app
+        self._check_interval = check_interval
+        self._sim_threshold = similarity_threshold
+        self._min_face_area = min_face_area
+
+        # HashMap: track_id → last verified L2-normalised ArcFace embedding
+        self._track_embeddings: dict[int, "np.ndarray"] = {}
+        self._swap_events: list[IdentitySwapEvent] = []
+        self._frames_since_check: int = 0
+
+    def check_frame(
+        self,
+        bgr: "np.ndarray",
+        timestamp_ms: int,
+        tracker: "CentroidTracker",
+        frame_w: int,
+        frame_h: int,
+        current_layout: str = "",
+    ) -> None:
+        """
+        Called on every sampled frame. Runs InsightFace every check_interval
+        frames; O(0) on intermediate frames.
+
+        Matches each detected face to the nearest CentroidTracker track by
+        normalised centroid distance, then compares the embedding against the
+        stored reference. A drop below similarity_threshold records a swap event.
+        """
+        if current_layout == LayoutType.ACTIVE_SPEAKER:
+            interval = min(self._check_interval, 10)   # 2s — fast tile swaps
+        elif current_layout == LayoutType.GALLERY:
+            interval = max(self._check_interval, 50)   # 10s — stable positions
+        else:
+            interval = self._check_interval
+        self._frames_since_check += 1
+        if self._frames_since_check < interval:
+            return
+        self._frames_since_check = 0
+
+        if not self._app or frame_w == 0 or frame_h == 0:
+            return
+
+        try:
+            faces = self._app.get(bgr)
+        except Exception as exc:
+            logger.debug("IdentityVerifier ArcFace error at %dms: %s", timestamp_ms, exc)
+            return
+
+        if not faces:
+            return
+
+        for face in faces:
+            embedding = getattr(face, "embedding", None)
+            if embedding is None or len(embedding) < 512:
+                continue
+
+            bbox = face.bbox  # [x1, y1, x2, y2] pixels
+            cx = ((bbox[0] + bbox[2]) / 2.0) / frame_w
+            cy = ((bbox[1] + bbox[3]) / 2.0) / frame_h
+
+            face_area = ((bbox[2] - bbox[0]) / frame_w) * ((bbox[3] - bbox[1]) / frame_h)
+            if face_area < self._min_face_area:
+                continue
+
+            # Match to nearest active CentroidTracker track by position (O(T))
+            best_tid: Optional[int] = None
+            best_dist = float("inf")
+            for tid, (tx, ty) in tracker.tracks.items():
+                d = ((tx - cx) ** 2 + (ty - cy) ** 2) ** 0.5
+                if d < best_dist and d < 0.15:
+                    best_dist = d
+                    best_tid = tid
+
+            if best_tid is None:
+                continue
+
+            # L2-normalised embeddings → dot product == cosine similarity
+            if best_tid in self._track_embeddings:
+                sim = float(np.dot(self._track_embeddings[best_tid], embedding))
+                if sim < self._sim_threshold:
+                    self._swap_events.append(IdentitySwapEvent(
+                        track_id=best_tid,
+                        timestamp_ms=timestamp_ms,
+                        old_embedding=self._track_embeddings[best_tid].copy(),
+                        new_embedding=embedding.copy(),
+                    ))
+                    logger.info(
+                        "IdentityVerifier: swap on track %d at %dms (sim=%.3f < %.2f)",
+                        best_tid, timestamp_ms, sim, self._sim_threshold,
+                    )
+
+            # Always update — tracks the current occupant after a swap
+            self._track_embeddings[best_tid] = embedding.copy()
+
+    @property
+    def swap_events(self) -> list[IdentitySwapEvent]:
+        """Swap events sorted chronologically (O(E log E), called once after loop)."""
+        return sorted(self._swap_events, key=lambda e: e.timestamp_ms)
+
+    def clear(self) -> None:
+        """Reset all state for re-use."""
+        self._track_embeddings.clear()
+        self._swap_events.clear()
+        self._frames_since_check = 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CentroidTracker  — stable face IDs across frames
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1965,6 +2368,176 @@ class CentroidTracker:
         self._disappeared[tid] = 0
         self._next_id += 1
         return tid
+
+    @property
+    def tracks(self) -> dict[int, tuple[float, float]]:
+        """Read-only view of active track centroids for external position matching."""
+        return self._tracks
+
+    def allocate_id(self) -> int:
+        """Atomically allocate and return the next fresh track_id."""
+        tid = self._next_id
+        self._next_id += 1
+        return tid
+
+    def reset(self) -> None:
+        """Kill all active tracks on layout change. Preserves _next_id for fresh IDs."""
+        count = len(self._tracks)
+        self._tracks.clear()
+        self._disappeared.clear()
+        if count:
+            logger.info(
+                "CentroidTracker reset: %d tracks killed (next_id=%d)",
+                count, self._next_id,
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TrackletSplitter  — splits contaminated tracks at swap points
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TrackletSplitter:
+    """
+    Splits contaminated CentroidTracker tracks at identity swap points in-place.
+
+    Processes two sources of swap evidence:
+      1. IdentityVerifier swap_events — ArcFace-verified, catches silent swaps
+         (layout changes, join/leave, pin/unpin, screen-share).
+      2. active_tile_tags from diar segments — catches speaker-boundary swaps.
+
+    When both sources flag the same swap (within ±6 s), the diar entry is
+    dropped; the ArcFace timestamp is kept (ground truth). When only one
+    source detects a swap, it is used as-is.
+
+    Design:
+      - Single Responsibility: splits tracks; detection and speaker linking are
+        handled by IdentityVerifier and SpeakerFaceMapper respectively.
+      - HashMap: O(1) track_id lookup via dict.
+      - Chronological processing: swap timestamps sorted ascending so a track
+        split at t₁ and t₂ produces three clean non-overlapping segments
+        (tid chain: A → B → C).
+      - O(E × F): E swap events (typically 5–20), F frames (~6300) → < 0.1 s.
+    """
+
+    def __init__(self, centroid_tracker: "CentroidTracker") -> None:
+        self._tracker = centroid_tracker
+
+    def split_tracks(
+        self,
+        frames: list["FrameFeatures"],
+        arcface_events: list[IdentitySwapEvent],
+        diar_tags: dict[int, list[tuple[int, str]]],
+        best_face_crops: dict[int, "np.ndarray"],
+        best_crop_timestamp: dict[int, int],
+    ) -> dict[int, str]:
+        """
+        Rewrite face_index on FrameFeatures in-place and return face→speaker map.
+
+        Args:
+            frames:              All FrameFeatures from the frame loop (mutated).
+            arcface_events:      Chronologically sorted events from IdentityVerifier.
+            diar_tags:           {track_id: [(timestamp_ms, speaker_label), ...]}
+            best_face_crops:     {track_id: BGR crop} — updated when crops move
+                                 to a new track after a split.
+            best_crop_timestamp: {track_id: timestamp_ms} — updated in parallel
+                                 with best_face_crops.
+
+        Returns:
+            face_to_speaker: {track_id: "Speaker_N"} for active-tile-tagged faces.
+                             New track_ids from diar splits carry their speaker.
+                             ArcFace-only new tracks have no entry here — speaker
+                             is resolved later by SpeakerFaceMapper lip-sync.
+        """
+        face_to_speaker: dict[int, str] = {}
+
+        # ── Step 1: Index ArcFace swap timestamps per track ───────────────────
+        # HashMap: O(1) lookup when deduplicating against diar boundaries.
+        arcface_ts_by_track: dict[int, list[int]] = {}
+        for event in arcface_events:
+            arcface_ts_by_track.setdefault(event.track_id, []).append(event.timestamp_ms)
+
+        # ── Step 2: Build diar-based swap points (speaker known per segment) ──
+        # For each contaminated track, record the timestamp where speaker changed
+        # and the new speaker for frames at or after that timestamp.
+        # {track_id: [(swap_timestamp_ms, new_speaker), ...]}
+        diar_swap_points: dict[int, list[tuple[int, str]]] = {}
+
+        for tid, tags in diar_tags.items():
+            if not tags:
+                continue
+            speaker_counts = Counter(spk for _, spk in tags)
+            if len(speaker_counts) == 1:
+                face_to_speaker[tid] = next(iter(speaker_counts))
+                continue
+
+            # Contaminated: find timestamps where diar speaker changed
+            sorted_tags = sorted(tags, key=lambda t: t[0])
+            first_speaker = sorted_tags[0][1]
+            # tid retains the first-seen speaker's frames (before the first split)
+            face_to_speaker[tid] = first_speaker
+
+            arcface_nearby = arcface_ts_by_track.get(tid, [])
+            prev_speaker = first_speaker
+            for ts, spk in sorted_tags[1:]:
+                if spk == prev_speaker:
+                    continue
+                # Drop if ArcFace already covers this boundary (within ±6 s)
+                if not any(abs(ts - ae) < 6000 for ae in arcface_nearby):
+                    diar_swap_points.setdefault(tid, []).append((ts, spk))
+                prev_speaker = spk
+
+        # ── Step 3: Build unified swap schedule (ArcFace + diar, deduplicated) ─
+        # Each entry: (timestamp_ms, speaker_label_or_None)
+        # speaker is None for ArcFace-only swaps (no diar speaker info available)
+        swap_schedule: dict[int, list[tuple[int, Optional[str]]]] = {}
+
+        for tid, infos in diar_swap_points.items():
+            for ts, spk in infos:
+                swap_schedule.setdefault(tid, []).append((ts, spk))
+
+        for tid, tss in arcface_ts_by_track.items():
+            existing_ts = [t for t, _ in swap_schedule.get(tid, [])]
+            for ts in tss:
+                if not any(abs(ts - e) < 6000 for e in existing_ts):
+                    swap_schedule.setdefault(tid, []).append((ts, None))
+                    existing_ts.append(ts)
+
+        # ── Step 4: Apply all splits chronologically ───────────────────────────
+        # For each track, process swap timestamps in ascending order so that the
+        # tid chain is: original → first_new → second_new → ...
+        # Each new track contains exactly the frames from its swap point forward
+        # until the next swap (or end of video).
+        for tid, swap_list in swap_schedule.items():
+            swap_list.sort(key=lambda x: x[0])
+            current_tid = tid
+
+            for swap_ts, speaker in swap_list:
+                new_tid = self._tracker.allocate_id()
+                if speaker is not None:
+                    face_to_speaker[new_tid] = speaker
+
+                rewritten = 0
+                for ff in frames:
+                    if ff.face_index == current_tid and ff.timestamp_ms >= swap_ts:
+                        ff.face_index = new_tid
+                        rewritten += 1
+
+                # Move best-crop to new track if the captured frame is post-swap
+                crop_ts = best_crop_timestamp.get(current_tid, -1)
+                if crop_ts >= swap_ts and current_tid in best_face_crops:
+                    best_face_crops[new_tid] = best_face_crops.pop(current_tid)
+                    best_crop_timestamp[new_tid] = best_crop_timestamp.pop(current_tid)
+
+                logger.info(
+                    "TrackletSplitter: Face_%d split at %dms → Face_%d "
+                    "(%s, %d frames rewritten)",
+                    current_tid, swap_ts, new_tid,
+                    speaker if speaker else "ArcFace-only", rewritten,
+                )
+                # Chain: subsequent swap timestamps target the latest segment
+                current_tid = new_tid
+
+        return face_to_speaker
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2351,11 +2924,33 @@ class VideoFeatureExtractor:
         # {face_index: [(timestamp_ms, "Speaker_0"), ...]}
         active_tile_tags: dict[int, list[tuple[int, str]]] = {}
 
+        # ── Best-quality face crop per track (for ArcFace, single-pass) ──────
+        # Retained in memory during the frame loop — avoids re-reading the video.
+        # Each crop is ~250×250px (~187KB); total < 3MB for 15 faces.
+        self._best_face_crops: dict[int, np.ndarray] = {}
+        best_crop_quality: dict[int, float] = {}
+        best_crop_timestamp: dict[int, int] = {}   # tid → timestamp_ms of best crop
+        _frame_w: int = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        _frame_h: int = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
         centroid_tracker = CentroidTracker(
             max_disappeared=30,   # ~6s at 5fps — limits ID inheritance when a tile changes occupant
             match_threshold=0.10, # below half inter-tile distance (0.16) to avoid cross-tile matches;
                                   # above 0.08 to survive moderate head turns between sampled frames
         )
+
+        # Identity verifier — periodic ArcFace swap detection during frame loop.
+        # Reuses the FaceEmbeddingExtractor singleton; no additional model load.
+        _embedder = FaceEmbeddingExtractor.get_instance()
+        identity_verifier = IdentityVerifier(
+            embedder_app=_embedder._app if _embedder.available else None,
+            check_interval=30,        # every 6 s at 5fps — ~210 checks per 21-min video
+            similarity_threshold=0.50,
+            min_face_area=0.005,      # skip tiny sidebar tiles (face_area < 0.5%)
+        )
+        layout_classifier = LayoutClassifier()
+        _RESET_COOLDOWN_FRAMES = 25  # ~5s at 5fps — prevents oscillation resets
+        _frames_since_reset: int = _RESET_COOLDOWN_FRAMES  # allow first reset immediately
 
         # Cache last MediaPipe results — reused for overlay on non-sampled frames
         last_face_result = None
@@ -2402,6 +2997,25 @@ class VideoFeatureExtractor:
                             for ff in frame_features_list
                             if ff.face_detected and ff.face_box_area > 0.02
                         ]
+
+                        # ── Layout classification + tracker reset ──────────────
+                        _face_areas = sorted(
+                            (ff.face_box_area for ff in frame_features_list
+                             if ff.face_detected),
+                            reverse=True,
+                        )
+                        current_layout = layout_classifier.classify(_face_areas)
+                        _frames_since_reset += 1
+                        if (layout_classifier.layout_changed
+                                and _frames_since_reset >= _RESET_COOLDOWN_FRAMES):
+                            logger.info(
+                                "Layout change → %s at %dms — resetting tracker",
+                                current_layout, timestamp_ms,
+                            )
+                            centroid_tracker.reset()
+                            identity_verifier.clear()
+                            _frames_since_reset = 0
+
                         if centroids:
                             track_ids = centroid_tracker.update(centroids)
                             ci = 0
@@ -2425,19 +3039,57 @@ class VideoFeatureExtractor:
                         frames.extend(frame_features_list)
 
                         # ── Tag largest face with current diar speaker ────────
+                        # Gallery guard: only tag when one tile dominates (ratio >= 1.5).
+                        # In gallery mode all tiles are equal-sized; tagging the
+                        # slightly-largest face introduces wrong speaker assignments.
                         if diar_segments and frame_features_list:
-                            largest = max(
-                                (ff for ff in frame_features_list if ff.face_detected),
-                                key=lambda f: f.face_box_area,
-                                default=None,
+                            _detected = [ff for ff in frame_features_list if ff.face_detected]
+                            if _detected:
+                                _areas = sorted(
+                                    (ff.face_box_area for ff in _detected), reverse=True
+                                )
+                                _largest = max(_detected, key=lambda f: f.face_box_area)
+                                _second = _areas[1] if len(_areas) >= 2 else 0.0
+                                _dominant = (
+                                    _largest.face_box_area > ACTIVE_TILE_MIN_AREA
+                                    and _largest.face_box_area / max(_second, 0.001) >= 1.5
+                                )
+                                if _dominant:
+                                    for seg in diar_segments:
+                                        if seg["start_ms"] <= timestamp_ms < seg["end_ms"]:
+                                            active_tile_tags.setdefault(
+                                                _largest.face_index, []
+                                            ).append((timestamp_ms, seg["speaker"]))
+                                            break
+
+                        # ── Capture best face crop per track (single-pass) ────
+                        # bgr is in memory now — crop while it's available instead
+                        # of re-reading the video in a second pass after the loop.
+                        for ff in frame_features_list:
+                            if not ff.face_detected or ff.face_box_area < 0.001:
+                                continue
+                            tid = ff.face_index
+                            frontal = 1.0 / (
+                                1.0 + abs(ff.head_yaw) * 0.05 + abs(ff.head_pitch) * 0.05
                             )
-                            if largest and largest.face_box_area > ACTIVE_TILE_MIN_AREA:
-                                for seg in diar_segments:
-                                    if seg["start_ms"] <= timestamp_ms < seg["end_ms"]:
-                                        active_tile_tags.setdefault(
-                                            largest.face_index, []
-                                        ).append((timestamp_ms, seg["speaker"]))
-                                        break
+                            quality = frontal * ff.face_box_area * max(ff.face_luminance, 0.2)
+                            if quality > best_crop_quality.get(tid, -1.0):
+                                best_crop_quality[tid] = quality
+                                best_crop_timestamp[tid] = timestamp_ms
+                                face_size = max(
+                                    int((ff.face_box_area ** 0.5) * _frame_w * 1.15), 250
+                                )
+                                x1 = max(0, int(ff.face_centre_x * _frame_w) - face_size // 2)
+                                y1 = max(0, int(ff.face_centre_y * _frame_h) - face_size // 2)
+                                x2 = min(_frame_w, x1 + face_size)
+                                y2 = min(_frame_h, y1 + face_size)
+                                self._best_face_crops[tid] = bgr[y1:y2, x1:x2].copy()
+
+                        # Periodic identity verification (O(0) on skipped frames)
+                        identity_verifier.check_frame(
+                            bgr, timestamp_ms, centroid_tracker, _frame_w, _frame_h,
+                            current_layout=current_layout,
+                        )
 
                         last_frame_features_list = frame_features_list
                         for ff in frame_features_list:
@@ -2476,108 +3128,27 @@ class VideoFeatureExtractor:
             f"({frame_idx} total, every {skip}th frame at video_fps={video_fps:.1f})"
         )
 
-        # ── Face→Speaker: split contaminated active-speaker tracks ────────────
-        # If one face_index was tagged with multiple speakers, the active tile
-        # changed occupant mid-track. Split so each person gets clean frames.
-        split_face_to_speaker: dict[int, str] = {}
-
-        for tid, tags in active_tile_tags.items():
-            speaker_counts = Counter(spk for _, spk in tags)
-
-            if len(speaker_counts) == 1:
-                # Clean track — one speaker
-                split_face_to_speaker[tid] = next(iter(speaker_counts))
-                continue
-
-            # Contaminated: multiple speakers in same track
-            majority_speaker = speaker_counts.most_common(1)[0][0]
-            split_face_to_speaker[tid] = majority_speaker
-
-            for minority_speaker, count in speaker_counts.items():
-                if minority_speaker == majority_speaker:
-                    continue
-
-                minority_timestamps = {
-                    ts for ts, spk in tags if spk == minority_speaker
-                }
-
-                new_tid = centroid_tracker._next_id
-                centroid_tracker._next_id += 1
-                split_face_to_speaker[new_tid] = minority_speaker
-
-                rewritten = 0
-                for ff in frames:
-                    if (ff.face_index == tid
-                            and ff.timestamp_ms in minority_timestamps):
-                        ff.face_index = new_tid
-                        rewritten += 1
-
-                logger.info(
-                    f"Face→Speaker split: Face_{tid} ({majority_speaker}) "
-                    f"→ new Face_{new_tid} ({minority_speaker}), "
-                    f"{rewritten} frames rewritten"
-                )
-
-        # Store for return via run_analysis
+        # ── Split contaminated tracks: ArcFace-verified + diar-based swaps ────
+        _swap_events = identity_verifier.swap_events
+        if _swap_events:
+            logger.info(
+                "IdentityVerifier: %d swap(s) detected on %d track(s)",
+                len(_swap_events),
+                len(set(e.track_id for e in _swap_events)),
+            )
+        split_face_to_speaker = TrackletSplitter(centroid_tracker).split_tracks(
+            frames=frames,
+            arcface_events=_swap_events,
+            diar_tags=active_tile_tags,
+            best_face_crops=self._best_face_crops,
+            best_crop_timestamp=best_crop_timestamp,
+        )
+        identity_verifier.clear()
         self._active_tile_face_to_speaker = split_face_to_speaker
 
-        # ── Select best frame per tracked face for ArcFace embedding extraction ─
-        # Quality = frontal (low yaw+pitch) × large bbox × well-lit (luminance).
-        # Stored on self so run_analysis can access after extract_all() returns.
-        self._best_face_crops: dict[int, np.ndarray] = {}
-        best_quality: dict[int, float] = {}
-        best_frame_info: dict[int, tuple[float, int, float, float, float]] = {}
-        # track_id → (quality, frame_idx, cx, cy, face_box_area)
-
-        for ff in frames:
-            if not ff.face_detected or ff.face_box_area < 0.001:
-                continue
-            tid = ff.face_index
-            frontal = 1.0 / (1.0 + abs(ff.head_yaw) * 0.05 + abs(ff.head_pitch) * 0.05)
-            quality = frontal * ff.face_box_area * max(ff.face_luminance, 0.2)
-            if quality > best_quality.get(tid, -1.0):
-                best_quality[tid] = quality
-                best_frame_info[tid] = (
-                    quality, ff.frame_idx,
-                    ff.face_centre_x, ff.face_centre_y, ff.face_box_area,
-                )
-
-        if best_frame_info:
-            import cv2 as _cv2
-            _cap = _cv2.VideoCapture(video_path)
-            if _cap.isOpened():
-                _fw = int(_cap.get(_cv2.CAP_PROP_FRAME_WIDTH))
-                _fh = int(_cap.get(_cv2.CAP_PROP_FRAME_HEIGHT))
-
-                # Build frame_idx → list[track_ids] so each frame is read once
-                frames_to_read: dict[int, list[int]] = {}
-                for tid, (_, fidx, _, _, _) in best_frame_info.items():
-                    frames_to_read.setdefault(fidx, []).append(tid)
-
-                target_indices = sorted(frames_to_read.keys())
-                target_pos = 0
-                read_idx = 0
-
-                while _cap.isOpened() and target_pos < len(target_indices):
-                    ret, bgr = _cap.read()
-                    if not ret:
-                        break
-                    if read_idx == target_indices[target_pos]:
-                        for tid in frames_to_read[read_idx]:
-                            _, _, cx, cy, area = best_frame_info[tid]
-                            face_size = max(int((area ** 0.5) * _fw * 1.15), 250)
-                            x1 = max(0, int(cx * _fw) - face_size // 2)
-                            y1 = max(0, int(cy * _fh) - face_size // 2)
-                            x2 = min(_fw, x1 + face_size)
-                            y2 = min(_fh, y1 + face_size)
-                            self._best_face_crops[tid] = bgr[y1:y2, x1:x2].copy()
-                        target_pos += 1
-                    read_idx += 1
-                _cap.release()
-            logger.info(
-                f"Best-frame crops selected: {len(self._best_face_crops)} faces "
-                f"from {len(best_frame_info)} tracked identities"
-            )
+        logger.info(
+            f"Best-frame crops: {len(self._best_face_crops)} faces captured during extraction"
+        )
 
         # ── Identity-based track deduplication via ArcFace ────────────────────
         # Run ArcFace on ALL tracks including short 1-2 frame ones.
@@ -2682,6 +3253,33 @@ class VideoFeatureExtractor:
                                 if canon_tid not in merged_embs:
                                     merged_embs[canon_tid] = data
                             self._cached_embeddings = merged_embs
+
+                            # Rewrite active-tile face→speaker map through canonical
+                            # IDs. TrackletSplitter ran before ArcFace merge so its
+                            # output keys are pre-merge track IDs. Without this rewrite
+                            # the mapper lookups miss every merged track: the windows
+                            # have canonical face_index values but the map still keys
+                            # by the old non-canonical IDs → active-tile evidence is
+                            # silently discarded for every merged track.
+                            #
+                            # Conflict rule: if two pre-merge tracks map to the same
+                            # canonical and disagree on speaker, the canonical track's
+                            # own entry wins (it has the most frames and the cleanest
+                            # ArcFace embedding — it is the ground-truth identity).
+                            if self._active_tile_face_to_speaker:
+                                _before_atfs = len(self._active_tile_face_to_speaker)
+                                _rewritten_atfs: dict[int, str] = {}
+                                for tid, spk in self._active_tile_face_to_speaker.items():
+                                    canon = canonical.get(tid, tid)
+                                    if canon not in _rewritten_atfs or tid == canon:
+                                        _rewritten_atfs[canon] = spk
+                                self._active_tile_face_to_speaker = _rewritten_atfs
+                                logger.info(
+                                    "Active-tile map rewritten through canonicals: "
+                                    "%d → %d entries",
+                                    _before_atfs,
+                                    len(_rewritten_atfs),
+                                )
 
                         unique_count = len(set(canonical.values()))
                         logger.info(
@@ -3826,17 +4424,18 @@ class SpeakerFaceMapper:
                 face_to_speaker[fi] = spk
                 combined_scores[spk] = lip_scores.get(spk, 0.0)
 
-        # ── Group windows by Face_N — no speaker_id rewrite ───────────────
+        # ── Group windows — use Speaker_N label when mapped, else Face_N ────
         for wf in windows:
             face_idx = getattr(wf, "face_index", 0)
-            face_label = f"Face_{face_idx}"
-            wf.speaker_id = face_label
+            mapped = face_to_speaker.get(face_idx)
+            label = mapped if mapped else f"Face_{face_idx}"
+            wf.speaker_id = label
             wf.is_speaking = self._is_speaking_in_window(
                 wf.window_start_ms, wf.window_end_ms,
-                face_to_speaker.get(face_idx, ""),
+                mapped or "",
                 diar_segments,
             )
-            result[face_label].append(wf)
+            result[label].append(wf)
 
         logger.info(
             "SpeakerFaceMapper: %d faces, "
@@ -3902,7 +4501,7 @@ class SpeakerFaceMapper:
                     avg_speaking - avg_silence, avg_speaking, avg_silence,
                 )
 
-        return self._greedy_assign(face_indices, speakers, scores)
+        return self._hungarian_assign(face_indices, speakers, scores)
 
     def _time_overlap_assignment(
         self,
@@ -3931,7 +4530,7 @@ class SpeakerFaceMapper:
                         )
                 scores[(face_idx, speaker)] = total_ov
 
-        return self._greedy_assign(face_indices, speakers, scores)
+        return self._hungarian_assign(face_indices, speakers, scores)
 
     @staticmethod
     def _greedy_assign(
@@ -3967,6 +4566,59 @@ class SpeakerFaceMapper:
             assignment_scores[face_idx] = score
             assigned_faces.add(face_idx)
             assigned_speakers.add(speaker)
+
+        for fi in face_indices:
+            if fi not in mapping:
+                mapping[fi] = f"Face_{fi}"
+                assignment_scores[fi] = 0.0
+
+        return mapping, assignment_scores
+
+    @staticmethod
+    def _hungarian_assign(
+        face_indices: list[int],
+        speakers: list[str],
+        scores: dict[tuple[int, str], float],
+    ) -> tuple[dict[int, str], dict[int, float]]:
+        """
+        Globally optimal face→speaker assignment via the Hungarian algorithm.
+
+        Uses scipy.optimize.linear_sum_assignment on a negated score matrix
+        (Hungarian minimises cost; we maximise correlation score).
+
+        DSA: O(n³) where n = max(faces, speakers). For meetings (3-10
+        participants), n³ = 27-1000 — negligible compute.
+
+        Handles unequal counts:
+          - More faces than speakers: unmatched faces get "Face_N" labels
+          - More speakers than faces: extra speakers remain unmapped
+        """
+        from scipy.optimize import linear_sum_assignment
+
+        n_faces = len(face_indices)
+        n_speakers = len(speakers)
+
+        if n_faces == 0 or n_speakers == 0:
+            return (
+                {fi: f"Face_{fi}" for fi in face_indices},
+                {fi: 0.0 for fi in face_indices},
+            )
+
+        cost = np.zeros((n_faces, n_speakers), dtype=np.float64)
+        for i, fi in enumerate(face_indices):
+            for j, spk in enumerate(speakers):
+                cost[i, j] = -scores.get((fi, spk), 0.0)
+
+        row_ind, col_ind = linear_sum_assignment(cost)
+
+        mapping: dict[int, str] = {}
+        assignment_scores: dict[int, float] = {}
+
+        for r, c in zip(row_ind, col_ind):
+            fi = face_indices[r]
+            spk = speakers[c]
+            mapping[fi] = spk
+            assignment_scores[fi] = scores.get((fi, spk), 0.0)
 
         for fi in face_indices:
             if fi not in mapping:

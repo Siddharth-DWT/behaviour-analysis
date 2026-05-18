@@ -1797,6 +1797,18 @@ async def _run_pipeline(
                     f"score={score:.4f})"
                 )
 
+    # ── Persist speaker_appearances for lip-sync-linked Face_N labels ────────
+    if locked_face_to_speaker:
+        try:
+            await _persist_linked_face_appearances(
+                session_id, locked_face_to_speaker,
+                speaker_identity_map, video_speaker_map, lip_sync_scores,
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{session_id}] Linked face appearance persist failed (non-fatal): {e}"
+            )
+
     # ── Persist video signals (after registry so unregistered faces are excluded) ──
     # Registry matching (fused + face-only + non-speaking) is now complete.
     # Any Face_* not in speaker_identity_map has no ArcFace embedding — MediaPipe
@@ -1825,6 +1837,29 @@ async def _run_pipeline(
                 f"{sorted(unregistered_faces)} — "
                 f"dropped {before - len(video_signals)} signals"
             )
+
+        # Rewrite Face_N → Speaker_N speaker_ids on video signals using session
+        # face locks so video signals share the same DB speaker row as the
+        # voice/fusion signals for the same physical person. Without this rewrite,
+        # Face_2 and Speaker_0 persist as separate speaker rows and the dashboard
+        # renders them as two distinct people.
+        #
+        # O(S) over signals — locked_face_to_speaker is a dict so each lookup
+        # is O(1). Only touches signals whose speaker_id has a confirmed lock;
+        # unmatched Face_N and all Speaker_N are left unchanged.
+        if locked_face_to_speaker and video_signals:
+            _rewrites = 0
+            for _sig in video_signals:
+                _face_label = _sig.get("speaker_id", "")
+                if _face_label in locked_face_to_speaker:
+                    _sig["speaker_id"] = locked_face_to_speaker[_face_label]
+                    _rewrites += 1
+            if _rewrites:
+                logger.info(
+                    f"[{session_id}] Rewrote {_rewrites} video signal speaker_ids "
+                    f"via {len(locked_face_to_speaker)} session face lock(s)"
+                )
+
         await _persist_agent_signals(session_id, video_signals, video_speaker_map, "video")
 
     # ── Post display names to video agent for burned-in overlay ──────────────
@@ -2829,6 +2864,41 @@ async def _persist_agent_signals(
     except Exception as e:
         logger.warning(f"[{session_id}] {label} signal persist failed: {e}")
 
+
+
+async def _persist_linked_face_appearances(
+    session_id: str,
+    locked_face_to_speaker: dict[str, str],
+    speaker_identity_map: dict[str, dict],
+    video_speaker_map: dict[str, str],
+    lip_sync_scores: dict[str, float],
+) -> None:
+    """Write speaker_appearances rows for Face_N labels linked via lip-sync lock.
+
+    The aliasing loop in _run_pipeline copies registry metadata into
+    speaker_identity_map (memory only). Without this, the /video-signals JOIN
+    through speaker_appearances returns NULL registry_id for linked faces and
+    the frontend cannot group Face_N with its Speaker_N counterpart.
+    """
+    from speaker_registry import _upsert_appearance
+    pool = await get_pool()
+    for face_label, speaker_label in locked_face_to_speaker.items():
+        if face_label not in speaker_identity_map:
+            continue
+        reg_id = speaker_identity_map[face_label].get("registry_id")
+        if not reg_id:
+            continue
+        speaker_db_id = video_speaker_map.get(face_label)
+        score = float(lip_sync_scores.get(speaker_label, 0.0) or 0.0)
+        await _upsert_appearance(
+            pool, reg_id, session_id,
+            speaker_db_id, face_label,
+            "session_lip_sync_lock", min(0.95, score),
+        )
+        logger.info(
+            f"[{session_id}] speaker_appearances persisted for linked "
+            f"{face_label} → {speaker_label} (registry_id={reg_id})"
+        )
 
 
 async def _post_process_pipeline(

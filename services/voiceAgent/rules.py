@@ -420,6 +420,9 @@ class VoiceRuleEngine:
         f0_current = f.get("f0_mean", 0)
         if f0_current == 0 or b.f0_mean == 0:
             return None
+        # Guard against zero f0_std so downstream std-based deviation is safe
+        if getattr(b, "f0_std", 0) == 0:
+            return None
         
         delta_pct = self.cal.compute_delta(f0_current, b.f0_mean) * 100
         
@@ -1152,7 +1155,10 @@ class VoiceRuleEngine:
                 continue  # Below content-type threshold (podcast=400ms, default=500ms)
 
             # Backchannel filter: if interrupting segment has <= 2 words, skip
-            interrupter_words = len(seg_b.get("text", "").split())
+            _interrupter_text = seg_b.get("text") or ""
+            interrupter_words = len(
+                [w for w in _interrupter_text.split() if w is not None]
+            )
             if interrupter_words <= 2:
                 continue
 

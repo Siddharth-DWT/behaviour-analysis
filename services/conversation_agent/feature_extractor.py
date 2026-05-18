@@ -298,7 +298,7 @@ class ConversationFeatureExtractor:
                         continue
 
                     turn_exchanges += 1
-                    latency = curr["start_ms"] - prev["end_ms"]
+                    latency = curr.get("start_ms", 0) - prev.get("end_ms", 0)
                     latencies.append(latency)
 
                     if latency < 0:
