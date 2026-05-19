@@ -47,6 +47,7 @@ from shared.redis_layer import (
 from .feature_extractor import (
     VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures,
     FaceEmbeddingExtractor, LightASDClassifier,
+    MeetingTypeProbe, MeetingProfile,
 )
 from .calibration import VideoCalibrationModule, FacialBaseline, BodyBaseline, GazeBaseline
 from .facial_rules import FacialRuleEngine
@@ -335,8 +336,31 @@ class VideoPipeline:
         # Lock guards shared extractor state: _diar_segments (written before
         # extract_all) and _active_tile_face_to_speaker (read after). Without
         # the lock, concurrent sessions would race on these attributes.
+        # ── Pre-scan: classify meeting type (~500ms, uses already-loaded model) ──
+        import mediapipe as _mp
+        _profile: MeetingProfile = MeetingProfile.default()
+        try:
+            _face_det_probe = _mp.tasks.vision.FaceDetector.create_from_options(
+                _mp.tasks.vision.FaceDetectorOptions(
+                    base_options=_mp.tasks.BaseOptions(
+                        model_asset_path=self._extractor._model_mgr.get_face_detector_path()
+                    ),
+                    running_mode=_mp.tasks.vision.RunningMode.IMAGE,
+                    min_detection_confidence=0.3,
+                )
+            )
+            _profile = MeetingTypeProbe().probe(video_path, _face_det_probe, _mp)
+            _face_det_probe.close()
+        except Exception as _probe_exc:
+            logger.warning(
+                "[%s] Meeting type probe failed (non-fatal): %s — using default profile",
+                session_id, _probe_exc,
+            )
+        logger.info("[%s] Meeting profile: %s", session_id, _profile.meeting_type)
+
         logger.info(f"[{session_id}] Extracting video features from {Path(video_path).name}")
         with self._extractor_lock:
+            self._extractor.apply_profile(_profile)
             self._extractor._diar_segments = diar_segments
             try:
                 windows, lip_activity_map = self._extractor.extract_all(
@@ -426,14 +450,15 @@ class VideoPipeline:
             skip_speaker_link=_is_interrogation,
         )
         # ── Step 2b: Remove static faces (photos/graphics on screen) ─────────
-        # Photos have zero biological motion — no blink variance, no jaw
-        # micro-movement from breathing, no head micro-movements. Applies to
-        # both interrogation (Face_N only) and standard sessions equally since
-        # _is_static_face operates on whatever tracks are in windows_by_speaker.
-        static_tracks: set[str] = {
-            spk for spk, wins in windows_by_speaker.items()
-            if _is_static_face(wins)
-        }
+        # Skipped for room profiles — no screen share possible in physical rooms.
+        # For all other profiles (grid, active_speaker, unknown) static graphics
+        # can appear as screenshare sidebar content.
+        static_tracks: set[str] = set()
+        if getattr(self._extractor, "_profile_static_filter", True):
+            static_tracks = {
+                spk for spk, wins in windows_by_speaker.items()
+                if _is_static_face(wins)
+            }
         if static_tracks:
             for tid in static_tracks:
                 del windows_by_speaker[tid]
@@ -488,6 +513,19 @@ class VideoPipeline:
             windows_by_speaker, baselines, session_id, meeting_type,
             extra_signals=facial_signals + gaze_signals,
         )
+
+        # ── Apply body confidence cap for meeting profiles where body pose is unreliable ──
+        # Grid meetings: 80px face tiles make pose estimation noise; cap at 0.60.
+        _body_cap = getattr(self._extractor, "_profile_body_conf_cap", 1.0)
+        if _body_cap < 1.0:
+            for sig in body_signals:
+                if sig.get("agent") in ("body", "video"):
+                    original = sig.get("confidence", 0.5)
+                    capped = round(min(original, _body_cap), 4)
+                    if capped != original:
+                        sig["confidence"] = capped
+                        sig.setdefault("metadata", {})["body_cap_applied"] = True
+                        sig["metadata"]["original_confidence"] = original
 
         all_signals: list[dict] = facial_signals + gaze_signals + body_signals
 

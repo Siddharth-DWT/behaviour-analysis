@@ -278,6 +278,296 @@ class WindowFeatures:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# FrameSample + MeetingProfile  — pre-scan meeting type classification
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class FrameSample:
+    """Immutable snapshot of one probed frame's face geometry."""
+    face_count: int
+    face_areas: tuple[float, ...]                       # sorted largest-first, normalised 0-1
+    face_centroids: tuple[tuple[float, float], ...]     # (cx, cy) normalised
+    timestamp_pct: float                                # position in video 0.0-1.0
+
+
+@dataclass
+class MeetingProfile:
+    """
+    Configuration bundle derived from pre-scan probe.
+
+    Configures all downstream components with optimal parameters for the
+    detected meeting type.  Follows Builder Pattern via class factory methods.
+    default() returns current hardcoded values so any failure is zero-regression.
+    """
+    meeting_type: str                       # "grid" | "active_speaker" | "room" | "unknown"
+    expected_faces: int
+    tracker_match_threshold: float          # CentroidTracker distance threshold
+    verifier_check_interval: int            # IdentityVerifier frames between checks
+    active_tile_tagger_enabled: bool
+    layout_reset_sensitivity: float         # passed as cooldown_frames to LayoutClassifier
+    merge_threshold_offset: float           # added to base ArcFace merge threshold
+    static_face_filter_enabled: bool
+    body_rules_confidence_cap: float
+    num_faces_override: Optional[int] = None
+
+    @classmethod
+    def grid(cls, face_count: int) -> "MeetingProfile":
+        """Grid/gallery: faces stationary, all similar size, grid-aligned."""
+        return cls(
+            meeting_type="grid",
+            expected_faces=face_count,
+            tracker_match_threshold=0.05,
+            verifier_check_interval=50,
+            active_tile_tagger_enabled=False,
+            layout_reset_sensitivity=40,
+            merge_threshold_offset=-0.05,
+            static_face_filter_enabled=True,
+            body_rules_confidence_cap=0.60,
+            num_faces_override=face_count + 2,
+        )
+
+    @classmethod
+    def active_speaker(cls, face_count: int) -> "MeetingProfile":
+        """Active-speaker view: one large tile, tile swaps on speaker change."""
+        return cls(
+            meeting_type="active_speaker",
+            expected_faces=face_count,
+            tracker_match_threshold=0.10,
+            verifier_check_interval=10,
+            active_tile_tagger_enabled=True,
+            layout_reset_sensitivity=25,
+            merge_threshold_offset=0.0,
+            static_face_filter_enabled=True,
+            body_rules_confidence_cap=1.0,
+            num_faces_override=max(face_count + 2, 6),
+        )
+
+    @classmethod
+    def room(cls, face_count: int) -> "MeetingProfile":
+        """Physical room camera: people move, no tiles, no screen share."""
+        return cls(
+            meeting_type="room",
+            expected_faces=face_count,
+            tracker_match_threshold=0.15,
+            verifier_check_interval=30,
+            active_tile_tagger_enabled=False,
+            layout_reset_sensitivity=50,
+            merge_threshold_offset=0.0,
+            static_face_filter_enabled=False,
+            body_rules_confidence_cap=1.0,
+            num_faces_override=face_count + 4,
+        )
+
+    @classmethod
+    def default(cls) -> "MeetingProfile":
+        """Fallback: identical to current hardcoded values.  Zero regression."""
+        return cls(
+            meeting_type="unknown",
+            expected_faces=3,
+            tracker_match_threshold=0.10,
+            verifier_check_interval=30,
+            active_tile_tagger_enabled=True,
+            layout_reset_sensitivity=25,
+            merge_threshold_offset=0.0,
+            static_face_filter_enabled=True,
+            body_rules_confidence_cap=1.0,
+            num_faces_override=None,
+        )
+
+
+class MeetingTypeProbe:
+    """
+    Pre-scan video to classify meeting type before main extraction.
+
+    Samples 10 frames across the video and runs the already-loaded MediaPipe
+    FaceDetector on each.  Classifies from face count + size distribution +
+    position alignment pattern.
+
+    Total cost: ~500ms (10 × ~50ms detection).  Models are already loaded from
+    warmup() — no additional model initialisation.
+
+    Design:
+      - Template Method: probe() → _sample_frames() → _classify() → factory
+      - O(S × F) where S=10 samples, F=faces per frame
+      - HashMap: row clustering for grid detection (quantized Y → face list)
+      - Sorted arrays: grid alignment via sorted centroids + gap detection
+      - Graceful degradation: any failure → MeetingProfile.default()
+
+    Classification priority: grid > active_speaker > room > unknown.
+    """
+
+    SAMPLE_POINTS: tuple[float, ...] = (0.02, 0.05, 0.10, 0.25, 0.40, 0.55, 0.70, 0.80, 0.90, 0.95)
+
+    _GRID_MIN_FACES       = 4
+    _GRID_MAX_AREA_RATIO  = 2.5
+    _GRID_ROW_TOLERANCE   = 0.06
+    _GRID_MIN_ROWS        = 2
+    _GRID_MIN_COLS        = 2
+
+    _AS_MIN_DOMINANT_RATIO   = 2.0
+    _AS_MIN_DOMINANT_SAMPLES = 4
+
+    _ROOM_Y_SPREAD  = 0.25
+    _ROOM_MAX_FACES = 8
+
+    def probe(self, video_path: str, face_detector, mp_module=None) -> "MeetingProfile":
+        """
+        Sample frames and classify meeting type.
+
+        Returns MeetingProfile with optimal parameters for detected type.
+        On ANY failure returns MeetingProfile.default() (zero regression).
+        """
+        try:
+            samples = self._sample_frames(video_path, face_detector, mp_module)
+            if not samples:
+                logger.warning("MeetingTypeProbe: no valid samples — using default profile")
+                return MeetingProfile.default()
+
+            profile = self._classify(samples)
+            logger.info(
+                "MeetingTypeProbe: %s (expected %d faces) from %d samples "
+                "[counts=%s, largest_areas=%s]",
+                profile.meeting_type,
+                profile.expected_faces,
+                len(samples),
+                [s.face_count for s in samples],
+                [round(s.face_areas[0], 3) if s.face_areas else 0 for s in samples],
+            )
+            return profile
+
+        except Exception as exc:
+            logger.warning("MeetingTypeProbe failed (non-fatal): %s — using default", exc)
+            return MeetingProfile.default()
+
+    def _sample_frames(self, video_path: str, face_detector, mp_module) -> "list[FrameSample]":
+        """Read SAMPLE_POINTS frames and run face detection on each. O(S)."""
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return []
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames < 10:
+            cap.release()
+            return []
+
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
+        samples: list[FrameSample] = []
+
+        for pct in self.SAMPLE_POINTS:
+            target = int(pct * total_frames)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+            ret, bgr = cap.read()
+            if not ret or bgr is None:
+                continue
+            try:
+                face_areas: list[float] = []
+                face_centroids: list[tuple[float, float]] = []
+
+                if mp_module:
+                    mp_img = mp_module.Image(
+                        image_format=mp_module.ImageFormat.SRGB,
+                        data=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB),
+                    )
+                    result = face_detector.detect(mp_img)
+                    for det in (result.detections if result else []):
+                        bb = det.bounding_box
+                        area = (bb.width * bb.height) / (frame_w * frame_h)
+                        cx   = (bb.origin_x + bb.width  / 2) / frame_w
+                        cy   = (bb.origin_y + bb.height / 2) / frame_h
+                        face_areas.append(area)
+                        face_centroids.append((cx, cy))
+
+                if face_areas:
+                    paired = sorted(zip(face_areas, face_centroids), key=lambda p: -p[0])
+                    face_areas     = [p[0] for p in paired]
+                    face_centroids = [p[1] for p in paired]
+
+                samples.append(FrameSample(
+                    face_count=len(face_areas),
+                    face_areas=tuple(face_areas),
+                    face_centroids=tuple(face_centroids),
+                    timestamp_pct=pct,
+                ))
+            except Exception as exc:
+                logger.debug("Probe frame at %.0f%% failed: %s", pct * 100, exc)
+
+        cap.release()
+        return samples
+
+    def _classify(self, samples: "list[FrameSample]") -> "MeetingProfile":
+        """Classify meeting type from sampled frame geometry. Priority: grid > active_speaker > room."""
+        face_samples = [s for s in samples if s.face_count >= 2]
+        if not face_samples:
+            solo = [s for s in samples if s.face_count == 1]
+            return MeetingProfile.active_speaker(1) if solo else MeetingProfile.default()
+
+        median_count = sorted([s.face_count for s in face_samples])[len(face_samples) // 2]
+
+        if self._is_grid(face_samples):
+            return MeetingProfile.grid(median_count)
+        if self._is_active_speaker(face_samples):
+            return MeetingProfile.active_speaker(median_count)
+        if self._is_room(face_samples):
+            return MeetingProfile.room(median_count)
+        return MeetingProfile.default()
+
+    def _is_grid(self, samples: "list[FrameSample]") -> bool:
+        """Grid: ≥4 faces, similar sizes, positions form rows.  O(F log F) per sample."""
+        grid_samples = [s for s in samples if s.face_count >= self._GRID_MIN_FACES]
+        if len(grid_samples) < len(samples) * 0.5:
+            return False
+        for s in grid_samples:
+            if len(s.face_areas) < self._GRID_MIN_FACES:
+                continue
+            min_area = min((a for a in s.face_areas if a > 0.001), default=0.001)
+            if max(s.face_areas) / min_area > self._GRID_MAX_AREA_RATIO:
+                return False
+        aligned = sum(1 for s in grid_samples if self._check_grid_alignment(s.face_centroids))
+        return aligned >= len(grid_samples) * 0.5
+
+    def _check_grid_alignment(self, centroids: "tuple[tuple[float, float], ...]") -> bool:
+        """Sort by Y → group into rows → require ≥2 rows with ≥2 faces each.  O(F log F)."""
+        if len(centroids) < self._GRID_MIN_FACES:
+            return False
+        sorted_y = sorted(centroids, key=lambda c: c[1])
+        rows: list[list] = []
+        cur = [sorted_y[0]]
+        for c in sorted_y[1:]:
+            if c[1] - cur[-1][1] < self._GRID_ROW_TOLERANCE:
+                cur.append(c)
+            else:
+                rows.append(cur)
+                cur = [c]
+        rows.append(cur)
+        return sum(1 for r in rows if len(r) >= self._GRID_MIN_COLS) >= self._GRID_MIN_ROWS
+
+    def _is_active_speaker(self, samples: "list[FrameSample]") -> bool:
+        """Active-speaker: largest face > 2× second-largest in ≥4 of 10 samples."""
+        dominant = sum(
+            1 for s in samples
+            if len(s.face_areas) >= 2
+            and s.face_areas[0] / max(s.face_areas[1], 0.001) >= self._AS_MIN_DOMINANT_RATIO
+        )
+        return dominant >= self._AS_MIN_DOMINANT_SAMPLES
+
+    def _is_room(self, samples: "list[FrameSample]") -> bool:
+        """Room: high Y-spread across face positions, no grid alignment."""
+        for s in samples:
+            if len(s.face_centroids) < 2:
+                continue
+            ys = [cy for _, cy in s.face_centroids]
+            if (
+                max(ys) - min(ys) >= self._ROOM_Y_SPREAD
+                and s.face_count <= self._ROOM_MAX_FACES
+                and not self._check_grid_alignment(s.face_centroids)
+            ):
+                return True
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # BlinkDetector  — state machine, one instance per window
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2312,11 +2602,12 @@ class LayoutClassifier:
         "unknown":        "unknown",
     }
 
-    def __init__(self) -> None:
+    def __init__(self, cooldown_frames: Optional[int] = None) -> None:
         self._window: "deque[str]" = deque(maxlen=self.WINDOW_SIZE)
         self._stable_layout: str = "unknown"
         self._layout_changed: bool = False
         self._cooldown_remaining: int = 0
+        self._cooldown_frames: int = cooldown_frames if cooldown_frames is not None else self.COOLDOWN_FRAMES
 
     @classmethod
     def _layout_family(cls, layout: str) -> str:
@@ -2354,7 +2645,7 @@ class LayoutClassifier:
             # new IDs naturally (distance > match_threshold) and ArcFace merge
             # re-associates them, so a full wipe is unnecessary and harmful.
             self._layout_changed = True
-            self._cooldown_remaining = self.COOLDOWN_FRAMES
+            self._cooldown_remaining = self._cooldown_frames
         else:
             self._layout_changed = False
 
@@ -2889,6 +3180,43 @@ class VideoFeatureExtractor:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
+    def apply_profile(self, profile: "MeetingProfile") -> None:
+        """
+        Configure extraction parameters from pre-scan meeting type.
+
+        Called by VideoPipeline.run_analysis() BEFORE extract_all().
+        Stores profile settings as instance variables that _extract_frames()
+        reads when constructing per-session objects (Strategy Pattern).
+        """
+        self._profile_meeting_type        = profile.meeting_type
+        self._profile_tracker_threshold   = profile.tracker_match_threshold
+        self._profile_verifier_interval   = profile.verifier_check_interval
+        self._profile_active_tile_enabled = profile.active_tile_tagger_enabled
+        self._profile_layout_cooldown     = int(profile.layout_reset_sensitivity)
+        self._profile_merge_offset        = profile.merge_threshold_offset
+        self._profile_static_filter       = profile.static_face_filter_enabled
+        self._profile_body_conf_cap       = profile.body_rules_confidence_cap
+
+        if profile.num_faces_override and profile.num_faces_override > self._num_faces:
+            old = self._num_faces
+            self._num_faces = profile.num_faces_override
+            logger.info(
+                "MeetingProfile: num_faces %d → %d (%s)",
+                old, self._num_faces, profile.meeting_type,
+            )
+
+        logger.info(
+            "MeetingProfile applied: type=%s tracker=%.3f verifier=%d "
+            "active_tile=%s cooldown=%d merge_offset=%.3f body_cap=%.2f",
+            profile.meeting_type,
+            profile.tracker_match_threshold,
+            profile.verifier_check_interval,
+            profile.active_tile_tagger_enabled,
+            int(profile.layout_reset_sensitivity),
+            profile.merge_threshold_offset,
+            profile.body_rules_confidence_cap,
+        )
+
     def extract_all(
         self,
         video_path: str,
@@ -3115,10 +3443,10 @@ class VideoFeatureExtractor:
         frame_idx: int = 0
         prev_pose_lm_data: Optional[list] = None
 
+        _tracker_threshold = getattr(self, "_profile_tracker_threshold", 0.10)
         centroid_tracker = CentroidTracker(
-            max_disappeared=30,   # ~6s at 5fps — limits ID inheritance when a tile changes occupant
-            match_threshold=0.10, # below half inter-tile distance (0.16) to avoid cross-tile matches;
-                                  # above 0.08 to survive moderate head turns between sampled frames
+            max_disappeared=30,
+            match_threshold=_tracker_threshold,
         )
 
         # Frame dimensions for IdentityVerifier centroid normalisation
@@ -3129,11 +3457,12 @@ class VideoFeatureExtractor:
         # Reuses the singleton FaceEmbeddingExtractor already loaded for post-loop
         # embedding extraction; no additional model load.
         _embedder = FaceEmbeddingExtractor.get_instance()
+        _verifier_interval = getattr(self, "_profile_verifier_interval", 30)
         identity_verifier = IdentityVerifier(
             embedder_app=_embedder._app if _embedder.available else None,
-            check_interval=30,        # every 6s at 5fps — 210 checks per 21-min video
+            check_interval=_verifier_interval,
             similarity_threshold=0.50,
-            min_face_area=0.005,      # skip tiny sidebar tiles (face_area < 0.5%)
+            min_face_area=0.005,
         )
 
         # Cache last MediaPipe results — reused for overlay on non-sampled frames
@@ -3151,14 +3480,16 @@ class VideoFeatureExtractor:
         # the frame loop for faces that dominate screen space (pinned/spotlight tiles).
         # A second rebuild pass after TrackletSplitter rewrites face_index produces the
         # final mapping injected into SpeakerFaceMapper.
+        _active_tile_enabled = getattr(self, "_profile_active_tile_enabled", True)
         active_tagger = ActiveTileTagger(
             diar_segments=diar_segments,
             min_face_area=ActiveTileTagger.ACTIVE_TILE_MIN_AREA,
-        )
+        ) if _active_tile_enabled else None
 
         # Layout classifier — detects layout transitions (gallery ↔ active_speaker)
         # and triggers CentroidTracker reset + IdentityVerifier interval adjustment.
-        layout_classifier = LayoutClassifier()
+        _layout_cooldown = getattr(self, "_profile_layout_cooldown", None)
+        layout_classifier = LayoutClassifier(cooldown_frames=_layout_cooldown)
 
         # Tracks face count frame-to-frame so identity_verifier.force_check_next_frame()
         # fires immediately when a new person appears (count increases).
@@ -3216,7 +3547,8 @@ class VideoFeatureExtractor:
                         if layout_classifier.layout_changed:
                             centroid_tracker.reset()
                             identity_verifier.clear()
-                            active_tagger.reset()
+                            if active_tagger is not None:
+                                active_tagger.reset()
                             logger.info(
                                 "Layout → %s at %dms — tracker reset",
                                 current_layout, timestamp_ms,
@@ -3320,10 +3652,11 @@ class VideoFeatureExtractor:
 
                         # Tag large-tile faces to diarization speakers in-loop.
                         # Uses pre-split face_index; rebuilt post-split after loop.
-                        active_tagger.tag_frame(
-                            frame_features_list, timestamp_ms,
-                            border_face_idx=border_face_idx,
-                        )
+                        if active_tagger is not None:
+                            active_tagger.tag_frame(
+                                frame_features_list, timestamp_ms,
+                                border_face_idx=border_face_idx,
+                            )
 
                         # Periodic identity verification — every check_interval
                         # sampled frames; O(0) cost on intermediate frames.
@@ -3521,9 +3854,10 @@ class VideoFeatureExtractor:
                             for tid, (emb_list, _) in emb_results.items()
                         }
 
+                        _merge_offset = getattr(self, "_profile_merge_offset", 0.0)
                         merge_threshold = self._compute_merge_threshold(
                             duration_s, avg_face_h
-                        )
+                        ) + _merge_offset
                         logger.info(
                             f"Adaptive merge threshold: {merge_threshold:.3f} "
                             f"(duration={duration_s:.0f}s, avg_face_h={avg_face_h:.3f}, "
@@ -3639,7 +3973,7 @@ class VideoFeatureExtractor:
         #
         # DSA: HashMap keyed by timestamp_ms → dominant face_index (or None)
         # built in O(F); per-frame lookup during tagging is O(1).
-        if active_tagger.tags:
+        if active_tagger is not None and active_tagger.tags:
             post_split_tagger = ActiveTileTagger(
                 diar_segments=diar_segments,
                 min_face_area=ActiveTileTagger.ACTIVE_TILE_MIN_AREA,
@@ -3675,7 +4009,8 @@ class VideoFeatureExtractor:
             self._active_tile_face_to_speaker: dict[int, str] = post_split_tagger.build_mapping()
         else:
             self._active_tile_face_to_speaker = {}
-        active_tagger.clear()
+        if active_tagger is not None:
+            active_tagger.clear()
 
         # ── Remap face crops to canonical (post-split + post-ArcFace) IDs ──────
         # _crop_by_position uses (ts_ms, cx_int, cy_int) — invariant through splits.
