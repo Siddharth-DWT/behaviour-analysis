@@ -308,6 +308,7 @@ class MeetingProfile:
     merge_threshold_offset: float           # added to base ArcFace merge threshold
     static_face_filter_enabled: bool
     body_rules_confidence_cap: float
+    tracker_max_disappeared: int = 90       # CentroidTracker expiry; 90 = 18s at 5fps (CLAUDE.md min)
     num_faces_override: Optional[int] = None
 
     @classmethod
@@ -510,6 +511,11 @@ class MeetingTypeProbe:
         if self._is_active_speaker(face_samples):
             return MeetingProfile.active_speaker(median_count)
         if self._is_room(face_samples):
+            return MeetingProfile.room(median_count)
+        # Fallback: if 2+ faces consistently detected and not grid/active_speaker,
+        # treat as physical room. Covers seated 2-person scenes where faces are at
+        # the same height (Y-spread < _ROOM_Y_SPREAD) — e.g., interrogation rooms.
+        if len(face_samples) >= 3:
             return MeetingProfile.room(median_count)
         return MeetingProfile.default()
 
@@ -3196,6 +3202,7 @@ class VideoFeatureExtractor:
         self._profile_merge_offset        = profile.merge_threshold_offset
         self._profile_static_filter       = profile.static_face_filter_enabled
         self._profile_body_conf_cap       = profile.body_rules_confidence_cap
+        self._profile_tracker_max_disapp  = profile.tracker_max_disappeared
 
         if profile.num_faces_override and profile.num_faces_override > self._num_faces:
             old = self._num_faces
@@ -3444,8 +3451,9 @@ class VideoFeatureExtractor:
         prev_pose_lm_data: Optional[list] = None
 
         _tracker_threshold = getattr(self, "_profile_tracker_threshold", 0.10)
+        _tracker_max_disapp = getattr(self, "_profile_tracker_max_disapp", 90)
         centroid_tracker = CentroidTracker(
-            max_disappeared=30,
+            max_disappeared=_tracker_max_disapp,
             match_threshold=_tracker_threshold,
         )
 

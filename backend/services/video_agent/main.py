@@ -339,24 +339,37 @@ class VideoPipeline:
         # ── Pre-scan: classify meeting type (~500ms, uses already-loaded model) ──
         import mediapipe as _mp
         _profile: MeetingProfile = MeetingProfile.default()
-        try:
-            _face_det_probe = _mp.tasks.vision.FaceDetector.create_from_options(
-                _mp.tasks.vision.FaceDetectorOptions(
-                    base_options=_mp.tasks.BaseOptions(
-                        model_asset_path=self._extractor._model_mgr.get_face_detector_path()
-                    ),
-                    running_mode=_mp.tasks.vision.RunningMode.IMAGE,
-                    min_detection_confidence=0.3,
+        # For explicitly known meeting types, bypass the visual probe — the probe
+        # can misclassify (e.g., 2-person seated interrogation room → active_speaker
+        # when the subject is closer to the camera than the interviewer).
+        _FORCED_PROFILES: dict[str, MeetingProfile] = {
+            "interrogation_video": MeetingProfile.room(2),
+        }
+        if meeting_type in _FORCED_PROFILES:
+            _profile = _FORCED_PROFILES[meeting_type]
+            logger.info(
+                "[%s] Meeting profile forced by meeting_type=%r → %s",
+                session_id, meeting_type, _profile.meeting_type,
+            )
+        else:
+            try:
+                _face_det_probe = _mp.tasks.vision.FaceDetector.create_from_options(
+                    _mp.tasks.vision.FaceDetectorOptions(
+                        base_options=_mp.tasks.BaseOptions(
+                            model_asset_path=self._extractor._model_mgr.get_face_detector_path()
+                        ),
+                        running_mode=_mp.tasks.vision.RunningMode.IMAGE,
+                        min_detection_confidence=0.3,
+                    )
                 )
-            )
-            _profile = MeetingTypeProbe().probe(video_path, _face_det_probe, _mp)
-            _face_det_probe.close()
-        except Exception as _probe_exc:
-            logger.warning(
-                "[%s] Meeting type probe failed (non-fatal): %s — using default profile",
-                session_id, _probe_exc,
-            )
-        logger.info("[%s] Meeting profile: %s", session_id, _profile.meeting_type)
+                _profile = MeetingTypeProbe().probe(video_path, _face_det_probe, _mp)
+                _face_det_probe.close()
+            except Exception as _probe_exc:
+                logger.warning(
+                    "[%s] Meeting type probe failed (non-fatal): %s — using default profile",
+                    session_id, _probe_exc,
+                )
+            logger.info("[%s] Meeting profile: %s", session_id, _profile.meeting_type)
 
         logger.info(f"[{session_id}] Extracting video features from {Path(video_path).name}")
         with self._extractor_lock:
