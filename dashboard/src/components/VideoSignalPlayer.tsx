@@ -1144,10 +1144,11 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                 const visibleSigs = showExpanded ? prioritySigs : prioritySigs.slice(0, 3);
                 const hasPresence = sigs.some((s: VideoSignal) => s.signal_type === "presence_detected");
                 if (visibleSigs.length === 0 && !hasPresence) return null;
-                // Face_N speakers with no stored thumbnail are unconfirmed detections
-                // (photos on screen, background faces, ArcFace failures) — hide them.
-                // Speaker_N (voice-matched) always show regardless of thumbnail.
-                if (rawId.startsWith("Face_") && !speakerRoster[rawId]?.thumbnail_url) return null;
+                // Hide any speaker with no face thumbnail from the video sidebar.
+                // Face_N without thumbnail = unconfirmed detection (ArcFace failure, photo).
+                // Speaker_N without thumbnail = voice-only speaker, no face matched — their
+                // signals belong in the voice/language panels, not the video player sidebar.
+                if (!speakerRoster[rawId]?.thumbnail_url) return null;
                 return (
                   <div key={speakerId} className="flex flex-col gap-1">
                     <SpeakerGroupHeader
