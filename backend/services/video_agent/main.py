@@ -110,6 +110,41 @@ def _publish_video_artifacts(session_id: str, analysis: "VideoAnalysisResponse")
     )
 
 
+def _static_variance(vals: list[float]) -> float:
+    if len(vals) < 2:
+        return 0.0
+    mean = sum(vals) / len(vals)
+    return sum((x - mean) ** 2 for x in vals) / len(vals)
+
+
+def _is_static_face(windows: list) -> bool:
+    """
+    Detect photo/graphic faces vs real faces using biological motion variance.
+
+    A photo on screen has zero biological motion: no blinks, no breathing-driven
+    jaw micro-movement, no head micro-movements. Real faces have measurable
+    variance in at least one of these signals across multiple windows.
+
+    Uses three MediaPipe-derived signals from WindowFeatures:
+      - blink_rate_bpm variance across windows (blinks change over time)
+      - blendshapes_mean["jawOpen"] variance (breathing moves jaw slightly)
+      - head_pose_variance mean (within-window orientation spread, 0 for static images)
+
+    DSA: O(W) single pass where W = windows for this track.
+    Returns False (not static) when fewer than 5 detected windows to avoid
+    false-positives on briefly visible faces.
+    """
+    active = [w for w in windows if w.face_detection_rate > 0.5]
+    if len(active) < 5:
+        return False
+
+    blink_var = _static_variance([w.blink_rate_bpm for w in active])
+    jaw_var   = _static_variance([w.blendshapes_mean.get("jawOpen", 0.0) for w in active])
+    head_avg  = sum(w.head_pose_variance for w in active) / len(active)
+
+    return blink_var < 0.001 and jaw_var < 0.0005 and head_avg < 0.01
+
+
 def _push_signals_to_redis(session_id: str, signals: list[dict]) -> None:
     """Persist signals to the canonical Redis stream for this session."""
     if not signals:
@@ -390,6 +425,23 @@ class VideoPipeline:
             asd_scores=asd_scores,
             skip_speaker_link=_is_interrogation,
         )
+        # ── Step 2b: Remove static faces (photos/graphics on screen) ─────────
+        # Photos have zero biological motion — no blink variance, no jaw
+        # micro-movement from breathing, no head micro-movements. Applies to
+        # both interrogation (Face_N only) and standard sessions equally since
+        # _is_static_face operates on whatever tracks are in windows_by_speaker.
+        static_tracks: set[str] = {
+            spk for spk, wins in windows_by_speaker.items()
+            if _is_static_face(wins)
+        }
+        if static_tracks:
+            for tid in static_tracks:
+                del windows_by_speaker[tid]
+            logger.info(
+                "[%s] Static face(s) removed before signal computation: %s",
+                session_id, sorted(static_tracks),
+            )
+
         speakers = sorted(windows_by_speaker.keys())
         logger.info(
             f"[{session_id}] Speakers: {speakers} | "

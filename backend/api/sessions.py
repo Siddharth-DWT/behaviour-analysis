@@ -557,8 +557,15 @@ async def get_video_signals(
             "metadata":     meta,
         })
 
-    # Filter session-spanning temporal signals (>120 s)
-    signals = [s for s in signals if (s["end_ms"] - s["start_ms"]) <= 120_000]
+    # Session-level interrogation panel signals span the full session duration and must
+    # not be filtered by the 120s window guard (which targets temporal overlay signals).
+    _PANEL_SIGNAL_TYPES = frozenset(
+        _FUSION_INTERROG_TYPES + _LANGUAGE_OVERLAY_TYPES + _CONVERSATION_INTERROG_TYPES
+    )
+    signals = [
+        s for s in signals
+        if (s["end_ms"] - s["start_ms"]) <= 120_000 or s["signal_type"] in _PANEL_SIGNAL_TYPES
+    ]
 
     # Merge duplicate speaker labels that share the same registry identity.
     # Canonical preference: Speaker_* before Face_*, then alphabetical.
@@ -622,7 +629,11 @@ async def get_video_speakers(
         SELECT DISTINCT ON (sp.speaker_label)
                sp.speaker_label,
                sa.registry_id, sr.display_name, sr.role, sr.company,
-               sa.match_method, sa.match_confidence
+               sa.match_method, sa.match_confidence,
+               EXISTS(
+                   SELECT 1 FROM face_thumbnails ft
+                   WHERE ft.registry_id = sa.registry_id
+               ) AS has_thumbnail
         FROM   speakers sp
         LEFT JOIN speaker_appearances sa
                ON sa.session_id    = sp.session_id
@@ -693,7 +704,7 @@ async def get_video_speakers(
             "registry_id":      registry_id,
             "match_method":     r["match_method"] or "",
             "match_confidence": float(r["match_confidence"]) if r["match_confidence"] else 0.0,
-            "thumbnail_url":    f"/speakers/{registry_id}/thumbnail" if registry_id else "",
+            "thumbnail_url":    f"/speakers/{registry_id}/thumbnail" if registry_id and r["has_thumbnail"] else "",
         })
 
     return {"session_id": session_id, "speakers": speakers}

@@ -2,6 +2,7 @@ import { useRef, useState, useEffect, useCallback, useMemo } from "react";
 import { getAccessToken, getVideoSpeakers } from "../api/client";
 import type { VideoSignal, SpeakerInfo } from "../api/client";
 import { getSignalDisplay } from "../config/signalDisplayConfig";
+import InterrogationSummaryPanel from "./InterrogationSummaryPanel";
 
 // ── Signal display configuration ──────────────────────────────────────────────
 
@@ -660,6 +661,33 @@ const SIGNAL_CONFIG: Record<string, SignalConfigEntry> = {
     label: () => "Denial Weakening",
     color: "#EF4444",
     category: "compound",
+    hidden: true,
+  },
+  capitulation_cascade: {
+    icon: "📉",
+    label: () => "Capitulation Pattern",
+    color: "#EF4444",
+    category: "compound",
+  },
+  resistance_hardening: {
+    icon: "📈",
+    label: () => "Resistance Pattern",
+    color: "#3B82F6",
+    category: "compound",
+  },
+  false_confession_risk: {
+    icon: "⚖",
+    label: () => "False Confession Risk",
+    color: "#EF4444",
+    category: "compound",
+    hidden: true,
+  },
+  interrogator_technique: {
+    icon: "◈",
+    label: (s) => `Technique: ${s.value_text ?? "unknown"}`,
+    color: "#6B7280",
+    category: "compound",
+    hidden: true,
   },
 };
 
@@ -766,9 +794,14 @@ interface FaceHighlightProps {
 }
 
 function FaceHighlight({ speaker, signals }: FaceHighlightProps) {
-  const sig = signals.find(
-    (s) => s.speaker_id === speaker && s.metadata?.face_centre_x != null
-  );
+  // Use the most recently started active signal for face position — avoids
+  // showing stale coordinates from older windows when newer detections exist.
+  const sig = signals
+    .filter((s) => s.speaker_id === speaker && s.metadata?.face_centre_x != null)
+    .reduce<VideoSignal | null>(
+      (best, s) => (!best || Number(s.start_ms) > Number(best.start_ms) ? s : best),
+      null
+    );
   if (!sig) return null;
 
   const cx = sig.metadata!.face_centre_x as number;
@@ -1015,6 +1048,10 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
       if (!rawId) continue;
       const cfg = SIGNAL_CONFIG[s.signal_type];
       if (cfg?.category === "voice") continue;
+      // Session-spanning hidden signals (denial_weakening, false_confession_risk, etc.)
+      // feed InterrogationSummaryPanel but must not keep face entries alive in the
+      // sidebar after the person's face is gone from frame.
+      if (cfg?.hidden) continue;
 
       const canonId = toCanonical[rawId] ?? rawId;
       const rosterEntry = speakerRoster[canonId];
@@ -1065,6 +1102,25 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
     return cfg && enabledCategories.has(cfg.category);
   });
 
+  const handcuffedDetected = useMemo(
+    () =>
+      signals.some(
+        (s) => s.signal_type === "presence_detected" && s.metadata?.handcuffed === true
+      ),
+    [signals]
+  );
+
+  const KEY_INTERROGATION_EVENTS = useMemo(
+    () =>
+      new Set([
+        "evidence_response_processing_delay",
+        "statement_contamination",
+        "capitulation_cascade",
+        "freezing_response",
+      ]),
+    []
+  );
+
 
   return (
     <div className="w-full space-y-3">
@@ -1088,6 +1144,10 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                 const visibleSigs = showExpanded ? prioritySigs : prioritySigs.slice(0, 3);
                 const hasPresence = sigs.some((s: VideoSignal) => s.signal_type === "presence_detected");
                 if (visibleSigs.length === 0 && !hasPresence) return null;
+                // Face_N speakers with no stored thumbnail are unconfirmed detections
+                // (photos on screen, background faces, ArcFace failures) — hide them.
+                // Speaker_N (voice-matched) always show regardless of thumbnail.
+                if (rawId.startsWith("Face_") && !speakerRoster[rawId]?.thumbnail_url) return null;
                 return (
                   <div key={speakerId} className="flex flex-col gap-1">
                     <SpeakerGroupHeader
@@ -1174,10 +1234,18 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                 ! Incongruence Detected
               </div>
             )}
+            {handcuffedDetected && (
+              <div className="pointer-events-none absolute left-2 top-2 rounded-full bg-amber-500/70 px-3 py-1.5 text-xs font-medium text-white backdrop-blur-sm">
+                Handcuffed — upper-body gesture analysis adjusted
+              </div>
+            )}
           </div>
         </div>
 
       </div>
+
+      {/* Interrogation summary panel — mounts only when interrogation signals present */}
+      <InterrogationSummaryPanel signals={signals} durationMs={durationMs} />
 
       {/* Signal timeline bar */}
       <div className="rounded-lg border border-nexus-border bg-nexus-surface p-3">
@@ -1237,12 +1305,28 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                       const left = Math.max(0, Math.min((segStart / effectiveDuration) * 100, 100));
                       const rawWidth = Math.max(((segEnd - segStart) / effectiveDuration) * 100, 0.5);
                       const width = Math.min(rawWidth, 100 - left);
+                      const isKeyEvent = KEY_INTERROGATION_EVENTS.has(s.signal_type);
+                      const title = `${getSignalDisplay(s.signal_type, s.value_text ?? "").label} @ ${(s.start_ms / 1000).toFixed(1)}s`;
+                      if (isKeyEvent) {
+                        return (
+                          <div
+                            key={`${s.signal_type}-${s.start_ms}-${i}`}
+                            className="absolute flex flex-col items-center opacity-90 hover:opacity-100 transition-opacity cursor-pointer"
+                            style={{ left: `${left}%`, width: 6, top: 0, bottom: 0, marginLeft: -3 }}
+                            title={title}
+                            onClick={(e) => { e.stopPropagation(); seekTo(s.start_ms); }}
+                          >
+                            <div style={{ width: 0, height: 0, borderLeft: '3px solid transparent', borderRight: '3px solid transparent', borderBottom: `5px solid ${color}`, flexShrink: 0 }} />
+                            <div style={{ flex: 1, width: 2, backgroundColor: color }} />
+                          </div>
+                        );
+                      }
                       return (
                         <div
                           key={`${s.signal_type}-${s.start_ms}-${i}`}
                           className="absolute rounded-sm opacity-80 hover:opacity-100 transition-opacity"
                           style={{ left: `${left}%`, width: `${width}%`, minWidth: '3px', top: 1, bottom: 1, backgroundColor: color }}
-                          title={`${getSignalDisplay(s.signal_type, s.value_text ?? "").label} @ ${(s.start_ms / 1000).toFixed(1)}s`}
+                          title={title}
                           onClick={(e) => { e.stopPropagation(); seekTo(s.start_ms); }}
                         />
                       );
