@@ -68,6 +68,9 @@ def _tier_from_fps(fps: float) -> VideoQualityTier:
 _ROOM_CAMERA_GATED: frozenset[str] = frozenset({
     "erratic_gaze_pattern",     # gaze direction/saccades invalid from room camera angle
     "low_autonomic_reactivity", # composite includes gaze component — unreliable at room angle
+    "sustained_distraction",    # requires subject to be looking at a screen — no screen in interrogation room
+    "screen_contact",           # "eye contact with camera/screen" has no meaning in CCTV angle
+    "attention_level",          # derived from screen_contact + gaze direction — both unreliable here
 })
 
 # Master confidence table — source: INTERROGATION_UPDATES1.MD §5.

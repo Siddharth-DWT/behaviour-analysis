@@ -791,4 +791,96 @@ const SIGNAL_MAP: Record<string, SignalDisplay> = {
     description: 'Vocal tone — warm, cold, aggressive, excited, nervous, or confident',
     icon: '🎭', color: '#6366F1', category: 'voice', priority: 1,
   },
+
+  // ── Interrogation: per-window behavioral signals ──────────────────────────────
+  // Category matches the modality (face/body/gaze). Purple (#8B5CF6) distinguishes
+  // interrogation-specific signals from standard behavioral signals.
+  'blink_suppression_spike': {
+    label: 'Blink Pattern',
+    description: 'Blink suppression followed by rapid blinking — cognitive load response during questioning. Common in both truthful and deceptive subjects under pressure.',
+    icon: '👁️', color: '#8B5CF6', category: 'face', priority: 1,
+  },
+  'motor_inhibition': {
+    label: 'Movement Control',
+    description: 'Unusually still body despite elevated stress — may indicate conscious movement suppression, freeze response, or simply focused attention.',
+    icon: '🧊', color: '#8B5CF6', category: 'body', priority: 1,
+  },
+  'freezing_response': {
+    label: 'Freeze Response',
+    description: 'Sudden body stillness after accusatory statement — threat-detection freeze. Equally common in truthful and deceptive subjects under accusation.',
+    icon: '❄️', color: '#8B5CF6', category: 'body', priority: 1,
+  },
+  'barrier_behavior': {
+    label: 'Barrier Posture',
+    description: 'Sustained crossed-arm posture with tension — defensive posture, self-comfort, or habitual position. Cannot distinguish cause from posture alone.',
+    icon: '🛡️', color: '#8B5CF6', category: 'body', priority: 2,
+  },
+  'barrier_behavior:torso_lean_away': {
+    label: 'Leaning Away',
+    description: 'Torso backward lean (handcuffed subject — arms unavailable for barrier measurement). Distancing behavior or postural fatigue.',
+    icon: '↩️', color: '#8B5CF6', category: 'body', priority: 2,
+  },
+  'erratic_gaze_pattern': {
+    label: 'Erratic Gaze',
+    description: 'Elevated gaze randomness during questioning — may indicate cognitive load, visual search, avoidance, or simply looking around the room.',
+    icon: '👀', color: '#8B5CF6', category: 'gaze', priority: 2,
+  },
+  'low_autonomic_reactivity': {
+    label: 'Unusually Calm',
+    description: 'No visible stress markers during confrontational questioning — high emotional control, genuine composure, or dissociation.',
+    icon: '😐', color: '#6B7280', category: 'face', priority: 1,
+  },
+
+  // ── Interrogation: per-segment language signals ───────────────────────────────
+  // Category 'pattern' so they appear in the sidebar and timeline.
+  'pronoun_distancing': {
+    label: 'Distancing Language',
+    description: 'Shift from first-person ("I/me") to third-person ("one/they") — psychological distance from narrative. Also common in formal speech and fatigue.',
+    icon: '↔️', color: '#A78BFA', category: 'pattern', priority: 2,
+  },
+  'tense_inconsistency': {
+    label: 'Tense Shift',
+    description: 'Switching past/present tense in same narrative — may indicate real-time construction, trauma recall, or natural storytelling style.',
+    icon: '⏳', color: '#A78BFA', category: 'pattern', priority: 2,
+  },
+  'evidence_response_processing_delay': {
+    label: 'Delayed Response',
+    description: 'Extended pause (>2s) after evidence presented — processing time. Equally present in innocent suspects confronted with unexpected information.',
+    icon: '⏸️', color: '#EF4444', category: 'pattern', priority: 1,
+  },
+  'statement_contamination': {
+    label: 'Information Adopted',
+    description: 'Suspect using case-specific terms first introduced by interrogator — strongest false confession risk indicator (Garrett 2011: present in 97.5% of proven false confessions).',
+    icon: '⚠️', color: '#EF4444', category: 'pattern', priority: 1,
+  },
+
+  // ── Interrogation: per-phase compound signals ─────────────────────────────────
+  'capitulation_cascade': {
+    label: 'Capitulation Pattern',
+    description: 'Stress peak → freeze → weakening denial sequence — breakdown pattern. May indicate genuine breakdown, exhaustion, or pressure-induced compliance.',
+    icon: '📉', color: '#EF4444', category: 'pattern', priority: 1,
+  },
+  'resistance_hardening': {
+    label: 'Resistance Pattern',
+    description: 'Increasing defensive behaviors over time — adopted resistance strategy. May indicate deception or genuine innocent resistance to false accusations.',
+    icon: '📈', color: '#3B82F6', category: 'pattern', priority: 1,
+  },
+
+  // ── Interrogation: session-level signals ──────────────────────────────────────
+  // Priority 3 = hidden from sidebar; consumed by InterrogationSummaryPanel only.
+  'denial_weakening': {
+    label: 'Denial Weakening',
+    description: 'Denial strength decreased across session — from strong categorical denials to weak or acquiescent language.',
+    icon: '📊', color: '#F59E0B', category: 'pattern', priority: 3,
+  },
+  'false_confession_risk': {
+    label: 'False Confession Risk',
+    description: 'Multi-factor risk assessment — evaluates duration, contamination, capitulation, denial evolution, processing delays, and technique coerciveness.',
+    icon: '⚖️', color: '#EF4444', category: 'pattern', priority: 3,
+  },
+  'interrogator_technique': {
+    label: 'Interrogation Technique',
+    description: 'Classification of interrogator approach — PEACE (information-gathering), Reid (accusation-based), or Coercive (threats/promises).',
+    icon: '🎭', color: '#6B7280', category: 'pattern', priority: 3,
+  },
 };

@@ -318,69 +318,77 @@ class VideoPipeline:
 
         duration_sec = (windows[-1].window_end_ms - windows[0].window_start_ms) / 1000.0
 
+        _is_interrogation = meeting_type == "interrogation_video"
+
         # ── Inject active-tile tags into mapper ───────────────────────────────
-        # Mapper is a fresh instance per pipeline call — no shared state risk.
-        self._mapper.set_active_tile_tags(active_tile_tags)
-        if active_tile_tags:
-            logger.info(
-                f"[{session_id}] Active-tile tags → mapper: "
-                f"{len(active_tile_tags)} face(s) {{{', '.join(f'Face_{k}: {v}' for k, v in active_tile_tags.items())}}}"
-            )
-        else:
-            logger.warning(
-                f"[{session_id}] No active-tile tags from extractor — "
-                f"mapper will use lip-sync only (may produce weak linkage)"
-            )
+        # Skipped for interrogation videos — no speaker-face mapping is performed.
+        if not _is_interrogation:
+            self._mapper.set_active_tile_tags(active_tile_tags)
+            if active_tile_tags:
+                logger.info(
+                    f"[{session_id}] Active-tile tags → mapper: "
+                    f"{len(active_tile_tags)} face(s) {{{', '.join(f'Face_{k}: {v}' for k, v in active_tile_tags.items())}}}"
+                )
+            else:
+                logger.warning(
+                    f"[{session_id}] No active-tile tags from extractor — "
+                    f"mapper will use lip-sync only (may produce weak linkage)"
+                )
 
         # ── Step 1b: Light-ASD active speaker scoring (optional) ─────────────
-        # Replaces MediaPipe jawOpen lip-sync correlation with a learned AV model
-        # (94.1% precision on AVA-ActiveSpeaker).  Falls back silently to lip-sync
-        # when the model file is absent or audio extraction fails.
+        # Skipped for interrogation videos — no speaker-face mapping is performed.
+        # For other sessions: replaces MediaPipe jawOpen lip-sync correlation with
+        # a learned AV model (94.1% precision on AVA-ActiveSpeaker).
         asd_scores: dict | None = None
-        _asd = LightASDClassifier.get_instance(
-            model_dir=os.path.join(os.path.dirname(__file__), "..", "..", "models")
-        )
-        if _asd.available:
-            _tmp_audio = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            _tmp_audio.close()
-            try:
-                subprocess.run(
-                    [
-                        "ffmpeg", "-y", "-i", video_path,
-                        "-vn", "-ar", "16000", "-ac", "1",
-                        _tmp_audio.name,
-                    ],
-                    check=True,
-                    capture_output=True,
-                )
-                _face_crops = getattr(self._extractor, "_face_crops_sequence", {})
-                _fps = getattr(self._extractor, "_last_video_fps", 5.0)
-                if _face_crops:
-                    asd_scores = _asd.score(_face_crops, _tmp_audio.name, fps=_fps)
-                    logger.info(
-                        "[%s] Light-ASD: scored %d tracks", session_id, len(asd_scores)
-                    )
-                else:
-                    logger.warning(
-                        "[%s] Light-ASD: no face crops buffered — "
-                        "falling back to lip-sync", session_id
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "[%s] Light-ASD audio extraction failed (non-fatal): %s",
-                    session_id, exc,
-                )
-            finally:
+        if not _is_interrogation:
+            _asd = LightASDClassifier.get_instance(
+                model_dir=os.path.join(os.path.dirname(__file__), "..", "..", "models")
+            )
+            if _asd.available:
+                _tmp_audio = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                _tmp_audio.close()
                 try:
-                    os.unlink(_tmp_audio.name)
-                except OSError:
-                    pass
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-y", "-i", video_path,
+                            "-vn", "-ar", "16000", "-ac", "1",
+                            _tmp_audio.name,
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    _face_crops = getattr(self._extractor, "_face_crops_sequence", {})
+                    _fps = getattr(self._extractor, "_last_video_fps", 5.0)
+                    if _face_crops:
+                        asd_scores = _asd.score(_face_crops, _tmp_audio.name, fps=_fps)
+                        logger.info(
+                            "[%s] Light-ASD: scored %d tracks", session_id, len(asd_scores)
+                        )
+                    else:
+                        logger.warning(
+                            "[%s] Light-ASD: no face crops buffered — "
+                            "falling back to lip-sync", session_id
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Light-ASD audio extraction failed (non-fatal): %s",
+                        session_id, exc,
+                    )
+                finally:
+                    try:
+                        os.unlink(_tmp_audio.name)
+                    except OSError:
+                        pass
 
         # ── Step 2: Map windows → speakers ────────────────────────────────────
-        # Uses ASD scores when available; falls back to lip-sync, then time-overlap.
+        # Interrogation videos skip all speaker-face linking — single-camera
+        # ceiling/oblique angle makes lip-sync unreliable (suspect looks down,
+        # interrogator often off-camera). Face_N tracks carry behavioral signals
+        # on their own timeline without being merged to Speaker_N labels.
         windows_by_speaker, lip_sync_scores, face_to_speaker = self._mapper.assign(
             windows, diar_segments, lip_activity_map,
             asd_scores=asd_scores,
+            skip_speaker_link=_is_interrogation,
         )
         speakers = sorted(windows_by_speaker.keys())
         logger.info(

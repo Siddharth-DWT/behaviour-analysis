@@ -119,6 +119,14 @@ _VOICE_INTERROG_TYPES = [
 # Conversation-agent interrogation signals surfaced on the video timeline.
 _CONVERSATION_INTERROG_TYPES = [
     "evidence_response_processing_delay",
+    "interrogator_technique",
+]
+
+# Fusion-agent session-level interrogation signals consumed by InterrogationSummaryPanel.
+_FUSION_INTERROG_TYPES = [
+    "capitulation_cascade",
+    "resistance_hardening",
+    "false_confession_risk",
 ]
 
 _GENERIC_SPEAKER_LABEL_RE = re.compile(r'^(Speaker|Face)_\d+$')
@@ -504,10 +512,11 @@ async def get_video_signals(
         LEFT JOIN speakers_registry sr ON sr.id = sa.registry_id
         WHERE s.session_id = $1
           AND (
-            (s.agent IN ('video', 'fusion') AND s.signal_type = ANY($2::text[]))
-            OR (s.agent = 'language'      AND s.signal_type = ANY($3::text[]))
-            OR (s.agent = 'voice'         AND s.signal_type = ANY($4::text[]))
-            OR (s.agent = 'conversation'  AND s.signal_type = ANY($5::text[]))
+            (s.agent = 'video'         AND s.signal_type = ANY($2::text[]))
+            OR (s.agent = 'fusion'     AND (s.signal_type = ANY($2::text[]) OR s.signal_type = ANY($6::text[])))
+            OR (s.agent = 'language'   AND s.signal_type = ANY($3::text[]))
+            OR (s.agent = 'voice'      AND s.signal_type = ANY($4::text[]))
+            OR (s.agent = 'conversation' AND s.signal_type = ANY($5::text[]))
           )
         ORDER BY s.window_start_ms ASC
         """,
@@ -516,6 +525,7 @@ async def get_video_signals(
         _LANGUAGE_OVERLAY_TYPES,
         _VOICE_INTERROG_TYPES,
         _CONVERSATION_INTERROG_TYPES,
+        _FUSION_INTERROG_TYPES,
     )
 
     signals = []

@@ -5055,6 +5055,7 @@ class SpeakerFaceMapper:
         diar_segments: list[dict],
         lip_activity_map: Optional[dict[int, list[tuple[int, float]]]] = None,
         asd_scores: Optional[dict[int, list[tuple[int, float]]]] = None,
+        skip_speaker_link: bool = False,
     ) -> tuple[dict[str, list[WindowFeatures]], dict[str, float], dict[int, str]]:
         """
         Args:
@@ -5080,6 +5081,22 @@ class SpeakerFaceMapper:
         result: dict[str, list[WindowFeatures]] = defaultdict(list)
 
         if not windows:
+            return dict(result), {}, {}
+
+        # Interrogation videos: skip all speaker-face linking. Group windows by
+        # Face_N only — is_speaking stays False (no lip-sync or diarization
+        # correlation). face_to_speaker returned empty so the gateway performs
+        # no remapping.
+        if skip_speaker_link:
+            for wf in windows:
+                face_label = f"Face_{getattr(wf, 'face_index', 0)}"
+                wf.speaker_id = face_label
+                wf.is_speaking = False
+                result[face_label].append(wf)
+            logger.info(
+                "SpeakerFaceMapper: skip_speaker_link=True — %d face track(s), no speaker linkage",
+                len(result),
+            )
             return dict(result), {}, {}
 
         speakers = sorted(set(seg.get("speaker", "Speaker_0") for seg in diar_segments))
