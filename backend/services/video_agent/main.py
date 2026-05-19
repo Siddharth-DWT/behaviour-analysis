@@ -52,6 +52,7 @@ from .calibration import VideoCalibrationModule, FacialBaseline, BodyBaseline, G
 from .facial_rules import FacialRuleEngine
 from .gaze_rules import GazeRuleEngine
 from .body_rules import BodyRuleEngine
+from .handcuff_detector import HandcuffDetector as _HandcuffDetector
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nexus.video")
@@ -107,33 +108,6 @@ def _publish_video_artifacts(session_id: str, analysis: "VideoAnalysisResponse")
             "face_to_speaker": analysis.face_to_speaker,
         },
     )
-
-
-def _detect_handcuffed(windows_by_speaker: dict, session_id: str) -> bool:
-    """
-    Heuristic handcuff detection using existing WindowFeatures data.
-    No extra MediaPipe pass — uses arms_crossed_pct already computed.
-
-    Hands locked in front (standard interrogation table posture) appear as
-    crossed-arm posture to MediaPipe.  Signal: consistently very high
-    arms_crossed_pct (> 0.85) with low variance from the first window onward,
-    indicating the posture is structural rather than behavioural.
-    """
-    for spk, windows in windows_by_speaker.items():
-        if len(windows) < 6:
-            continue
-        sample = [w.arms_crossed_pct for w in windows[:10]]
-        mean_cross = sum(sample) / len(sample)
-        if mean_cross < 0.85:
-            continue
-        variance = sum((x - mean_cross) ** 2 for x in sample) / len(sample)
-        if variance < 0.03:
-            logger.info(
-                "[%s] Handcuff heuristic: %s arms_crossed_pct=%.2f (var=%.4f) — HANDCUFFED",
-                session_id, spk, mean_cross, variance,
-            )
-            return True
-    return False
 
 
 def _push_signals_to_redis(session_id: str, signals: list[dict]) -> None:
@@ -465,12 +439,16 @@ class VideoPipeline:
                 _real_fps = _cap.get(_cv2.CAP_PROP_FPS) or 30.0
                 _cap.release()
 
-                # Handcuff detection — uses existing windows_by_speaker data,
-                # no extra MediaPipe pass needed.  If arms_crossed_pct is very
-                # high (> 0.85) AND low-variance across the first 10 windows for
-                # any speaker, physical restraints are likely (hands locked in
-                # front of body appear as crossed-arm posture to MediaPipe).
-                _handcuffed = _detect_handcuffed(windows_by_speaker, session_id)
+                # Handcuff detection — visual (pose) + contextual (transcript).
+                _transcript_text = " ".join(
+                    seg.get("text", "") for seg in (diar_segments or [])
+                )
+                _hc_result  = _HandcuffDetector().detect(
+                    windows_by_speaker=windows_by_speaker,
+                    transcript=_transcript_text,
+                    session_id=session_id,
+                )
+                _handcuffed = _hc_result["handcuffs_detected"]
 
                 from .interrogation_rules import InterrogationVideoRules
                 interrog_signals = InterrogationVideoRules().evaluate(
