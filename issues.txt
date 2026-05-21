@@ -1,0 +1,398 @@
+Issue 1: Faces Don't Appear On Time
+Two bugs chained together:
+Bug A: presence_detected check is dead code
+typescript// VideoSignalPlayer.tsx line 1055 (inside visibleByFace loop):
+if (cfg?.hidden) continue;    // presence_detected has hidden=true → SKIPPED
+
+// Line 1145:
+const hasPresence = sigs.some((s) => s.signal_type === "presence_detected");
+if (visibleSigs.length === 0 && !hasPresence) return null;
+presence_detected has hidden: true in SIGNAL_CONFIG (line 22). The visibleByFace loop SKIPS all hidden signals at line 1055. So presence_detected NEVER enters any group's sigs array. Then hasPresence checks sigs.some(...) — but sigs was built from the loop that already excluded it. hasPresence is ALWAYS false. The entire check is dead code.
+A face that has ONLY a presence_detected signal (no behavioral signals yet because calibration hasn't completed) will never appear in the sidebar.
+Bug B: Thumbnail gate kills faces before roster loads
+typescript// Line 1151:
+if (!speakerRoster[rawId]?.thumbnail_url) return null;
+Even if presence_detected were fixed, a face without a thumbnail URL in the roster is hidden. The roster comes from /video-speakers which requires a DB row from match_or_create_speakers. If the face was just detected but face_to_speaker is empty → no registry entry → no roster entry → no thumbnail → hidden.
+Combined effect: A person who joins at 0:22 is invisible until BOTH:
+
+Calibration completes (10s) → first behavioral signal appears
+The face has a roster entry with thumbnail_url
+
+
+Issue 2: Signals Not Grouped for Same Person
+The canonical merge chain has 4 steps, each dependent on the previous:
+Step 1: face_to_speaker = {2: "Speaker_0"}              ← from video agent
+Step 2: locked_face_to_speaker = {"Face_2": "Speaker_0"} ← from _build_session_face_locks
+Step 3: speaker_identity_map["Face_2"] = {registry_id: "abc123"} ← aliased from Speaker_0's entry
+Step 4: _upsert_appearance(pool, "abc123", session_id, ..., "Face_2") ← persists to DB
+If Step 1 fails (face_to_speaker empty — the mapping issue we've been debugging), Steps 2-4 all produce nothing. Face_2 and Speaker_0 get different registry_ids. Frontend's canonical merge at line 1019 groups by registry_id → different groups → separate sidebar entries.
+Even if Step 1 succeeds, Step 2 can fail:
+python# _build_session_face_locks line 940:
+score = float(lip_sync_scores.get(speaker_label, 0.0) or 0.0)
+if score < _SESSION_FACE_LOCK_MIN_SCORE:
+    continue  # REJECTED — score too low
+If lip_sync_scores is empty (which it is when ActiveTileTagger produces the mapping instead of lip-sync), score = 0.0 → below threshold → rejected. Active-tile tags produce face_to_speaker but no lip_sync_scores → _build_session_face_locks rejects every candidate → locked_face_to_speaker = {} → no linkage.
+And Step 4 has a guard:
+python# Line 467:
+if locked_face_to_speaker:  # empty → entire block skipped
+    for face_label, speaker_label in locked_face_to_speaker.items():
+        ...
+        await _upsert_appearance(...)
+No locked faces → no DB rows → /video-signals JOIN returns NULL registry_id → canonical merge can't group.
+
+Issue 3: Signals Don't Come On Time
+Three causes stacked:
+Cause A: Calibration delay (10 seconds)
+CALIBRATION_MIN_WINDOWS = 5 in video calibration. Each window = 2 seconds. Rule engines need calibrated baselines before producing signals. Face joins at 22000ms → calibration completes at ~32000ms → first signal at 32000ms. User sees face in video at 0:22 but sidebar is empty until 0:32.
+Cause B: computeActive temporal filter
+typescript// Line 907-910:
+const start = Number(s.start_ms ?? 0);
+const rawEnd = Number(s.end_ms ?? s.start_ms ?? 0);
+const end = Math.max(rawEnd, start + 1) + FORWARD_GRACE_MS;  // +250ms
+if (ms < start || ms > end) return false;
+Signal at window [32000, 34000] only shows when playhead is 32000-34250ms. When user is watching at 22000ms (when the person joined), no signals exist yet → "No active signals" in sidebar.
+Cause C: Confidence floor
+typescript// Line 919:
+if (s.confidence < 0.15) return false;
+Tiny sidebar faces (~150px) produce low-confidence signals from body/gaze rules. A signal at 0.12 confidence is filtered out even though it was produced.
+Cause D: Unregistered face signal exclusion
+python# analysis_pipeline.py line 504-507:
+unregistered_faces = all_face_labels_in_signals - registered_face_labels
+if unregistered_faces:
+    video_signals = [s for s in video_signals if s.get("speaker_id", "") not in unregistered_faces]
+If a Face_N fails to register (no face_to_speaker → no speaker_identity_map entry → not in registered_face_labels), ALL its signals are DROPPED before persistence. The signals were produced but never saved to DB. The frontend never sees them.
+
+
+Timestamp Modifications During Processing
+1. Voice Feature Extractor — Tightens Window (CORRECT)
+File: feature_extractor.py line 123-126
+pythonfeatures["window_start_ms"] = max(
+    min(s["start_ms"] for s in win_segments), win_start_ms
+)
+features["window_end_ms"] = min(
+    max(s["end_ms"] for s in win_segments), win_end_ms
+)
+Clamps voice signal timestamps to the speaker's actual speaking span within the 2-second grid window. Without this, a signal at grid window [4000, 6000] would show at 4000ms even if the speaker's first word is at 5200ms. The fix tightens to [5200, 6000]. This is correct — prevents badges appearing before speech.
+2. Entity Extractor — Extends Topics to Session Bounds (HARMLESS)
+File: entity_extractor.py line 299-301
+pythontopics[0]["start_ms"] = 0
+topics[-1]["end_ms"] = duration_ms
+Extends first/last topic boundaries to cover the full session. Only affects topic timeline display, not signal timestamps. Harmless.
+3. Temporal Patterns — Session-Spanning Timestamps (BY DESIGN but PROBLEMATIC)
+File: temporal_patterns.py line 270
+pythonreturn self._make_signal(
+    "T-02", "engagement_decay", speaker_id, ...,
+    ss, se,  # ← session_start to session_end
+)
+Temporal patterns span the full speaker's active range. engagement_decay with window_start_ms=120000, window_end_ms=3240000 appears at EVERY timestamp from 2:00 to 54:01. computeActive deduplicates by speaker_id::signal_type so it shows once per face — correct for a session-level trend.
+BUT: If a temporal signal spans [120000, 3240000] and the user scrubs to 0:30, the temporal signal is "active" (30000 > 120000? NO — so this one is correct, it wouldn't show before 2:00). But some temporal patterns use ss = 0 → visible from the start of the video.
+4. Compound Patterns — Inherit Segment Timestamps (CORRECT but SHIFTED)
+File: fusion_service.py line 228-229
+pythoncompound_signals.extend(compound_engine.evaluate(
+    ...,
+    window_start_ms=seg_start,   # ← voice/language segment boundary
+    window_end_ms=seg_end,
+))
+Compound patterns inherit the voice/language segment window. If a compound pattern fires because of video signal at [10000, 12000] combined with voice signal at [11000, 13000], the compound output has [11000, 13000] (the segment boundary, not the video boundary). The compound signal appears at the voice segment's time, not the video signal's time. Could be 1-2 seconds off from the visual event.
+5. NO Code Modifies Existing Signals After Creation ✅
+No code does existing_signal["window_start_ms"] = new_value. All signal dicts are created once and appended to lists. The _to_fusion_input copies fields but doesn't change them. _persist_signals writes to DB without modification.
+The Real Problem Is NOT Timestamp Modification
+The timestamps are set correctly at creation time. The issues are:
+ProblemRoot CauseWhereFace appears latepresence_detected hidden=true in SIGNAL_CONFIG → dead hasPresence check → face invisible until behavioral signal (Bug 1 from previous analysis)VideoSignalPlayer.tsx line 1055Signals appear lateCalibration needs 10s → first signal starts 10s after face appears. Also: unregistered Face_N signals dropped (Bug 5)analysis_pipeline.py line 504Signals not groupedActive-tile mapping produces no lip_sync_scores → _build_session_face_locks rejects all candidates (Bug 3) → no registry linkage → separate entriesanalysis_pipeline.py line 940Compound signals slightly off-timeCompound inherits voice segment boundary, not video signal boundary — 1-2s shiftfusion_service.py line 228
+
+
+1. Compound/Fusion Signals Get Audio Timestamps, Not Video Timestamps
+File: fusion_service.py line 228-229
+python# Video signal was produced at [8000, 10000] (video clock)
+# But compound pattern gets the VOICE segment boundary:
+compound_engine.evaluate(
+    ...,
+    window_start_ms=seg_start,   # ← from voice/language diar segment
+    window_end_ms=seg_end,       # ← NOT the video signal's original timestamp
+)
+A face freeze at video window [8000, 10000] combines with a voice stress at [11000, 13000]. The compound output emotional_suppression gets [11000, 13000]. The visual event is stamped 3 seconds later than it occurred.
+The frontend shows this compound signal at 11s in the sidebar, but the face actually froze at 8s. The user scrubs to 8s → sees freeze in video → no compound badge. Scrubs to 11s → compound badge appears → face is no longer frozen.
+2. Active-Tile Tags Map Video Frames to Audio Timestamps
+File: feature_extractor.py — ActiveTileTagger._find_speaker_at()
+python# Video frame at timestamp_ms = 14200 (video clock)
+# Looks up diar_segments to find who is speaking:
+idx = bisect.bisect_right(self._interval_starts, timestamp_ms) - 1
+speaker = self._intervals[idx][2]  # "Speaker_0"
+If the audio diarization says Speaker_0 speaks from [14000, 16000] but the video shows Mirko already in the tile at 13800ms (200ms earlier because video clock is slightly ahead of audio clock), the tagger assigns Speaker_0 to Mirko's face at 14200ms but misses the first 400ms where Mirko was visible but audio says "no speaker."
+This clock drift compounds: over a 54-minute session, a 200ms initial drift can grow to 500ms+. Faces get tagged to the wrong speaker at turn boundaries.
+3. _build_session_face_locks Uses lip_sync_scores NOT active-tile Scores
+File: analysis_pipeline.py line 940
+pythonscore = float(lip_sync_scores.get(speaker_label, 0.0) or 0.0)
+When ActiveTileTagger produces the face→speaker mapping, assignment_scores[fi] = 1.0 is set in the mapper. But lip_sync_scores is built from the method branch:
+pythonif method in ("asd", "lip_sync"):
+    for fi, spk in confident_face_to_speaker.items():
+        lip_sync_scores[spk] = round(score, 4)
+elif method == "time_overlap":
+    lip_sync_scores[spk] = 1.0
+Active-tile tags are merged INTO confident_face_to_speaker but NOT into lip_sync_scores:
+python# Active-tile merge (line ~after method branches):
+for fi, spk in self._active_tile_face_to_speaker.items():
+    if fi not in confident_face_to_speaker:
+        confident_face_to_speaker[fi] = spk
+        assignment_scores[fi] = 1.0    # ← updates assignment_scores
+        # ❌ BUT lip_sync_scores[spk] is NEVER set for active-tile entries
+So when _build_session_face_locks looks up lip_sync_scores.get("Speaker_0"), it gets 0.0 for active-tile-mapped speakers → rejected below threshold → no linkage.
+Summary: The Signal Timing Chain
+VIDEO CLOCK                          AUDIO CLOCK
+─────────────                        ────────────
+Frame at 8000ms                      
+  → MediaPipe detect face            
+  → WindowAggregator [8000, 10000]   
+  → body_rules: freeze [8000, 10000] 
+                                      Diar: Speaker_0 [11000, 13000]
+                                      
+FUSION (uses AUDIO timestamps):
+  → seg_start=11000, seg_end=13000
+  → compound evaluates with video signals from ±5s zone
+  → freeze at [8000, 10000] included (within zone)
+  → compound output: [11000, 13000]   ← VIDEO event stamped at AUDIO time
+
+FRONTEND:
+  User at 8s: sees freeze → no compound badge (badge is at 11s)
+  User at 11s: sees compound badge → face is not frozen anymore
+The fix: Compound signals should use the EARLIEST contributing signal's start and the LATEST contributing signal's end — not the voice segment boundary:
+python# Instead of:
+window_start_ms=seg_start, window_end_ms=seg_end
+
+# Use:
+all_contributing_starts = [s.get("window_start_ms", seg_start) for s in seg_sigs]
+all_contributing_ends = [s.get("window_end_ms", seg_end) for s in seg_sigs]
+window_start_ms = min(all_contributing_starts)
+window_end_ms = max(all_contributing_ends)
+And: active-tile mapped speakers must populate lip_sync_scores with 1.0 so _build_session_face_locks doesn't reject them.
+
+
+Video Signal Timestamp Flow — End to End
+STEP 1: Frame extraction
+  cv2.CAP_PROP_POS_MSEC = 4200ms
+  → FrameFeatures(timestamp_ms=4200, face_index=2)
+
+STEP 2: WindowAggregator
+  bucket_key = 4200 // 2000 = 2
+  → WindowFeatures(window_start_ms=4000, window_end_ms=6000, face_index=2)
+  
+STEP 3: SpeakerFaceMapper
+  wf.speaker_id = "Face_2"
+  → timestamps UNCHANGED: [4000, 6000]
+
+STEP 4: body_rules.evaluate(windows for Face_2)
+  → signal: {speaker_id: "Face_2", window_start_ms: 4000, window_end_ms: 6000,
+             signal_type: "head_nod_agreement"}
+  → timestamps INHERITED from input window, UNCHANGED
+
+STEP 5: video_service returns signals
+  → same timestamps [4000, 6000]
+
+STEP 6: analysis_pipeline._persist_signals()
+  → INSERT INTO signals (... window_start_ms=4000, window_end_ms=6000 ...)
+
+STEP 7: API endpoint serves /video-signals
+  → returns {start_ms: 4000, end_ms: 6000, ...}  (column rename)
+
+STEP 8: Frontend computeActive(ms=4200)
+  → 4200 >= 4000 ✅ AND 4200 <= 6250 ✅ → signal VISIBLE
+No timestamp modification anywhere in this chain. The timestamps are correct.
+What IS Wrong — Face Grouping After Merge
+The problem is NOT timestamps. It's how merged faces' signals are grouped:
+BEFORE ArcFace merge:
+  Face_2 windows: [0, 2000], [2000, 4000], ..., [12000, 14000]  ← Ansuya
+  Face_5 windows: [14000, 16000], [16000, 18000], ...            ← Ansuya (after split)
+  
+  Face_2 signals: head_nod at [4000, 6000], eye_contact at [8000, 10000]
+  Face_5 signals: head_nod at [16000, 18000], agreeing at [20000, 22000]
+
+AFTER ArcFace merge: canonical = {5: 2}
+  All Face_5 frames rewritten to face_index=2
+  → Face_5 windows become Face_2 windows
+  → BUT signals were already produced BEFORE merge from the ORIGINAL windows
+
+PROBLEM: Were the signals produced from pre-merge or post-merge windows?
+Let me check:Traced signal processing pipeline to confirm timestamps remain accurate throughoutTraced signal processing pipeline to confirm timestamps remain accurate throughoutHere's the complete trace. The timestamps are never modified. The issue is elsewhere.
+The Exact Order of Operations
+_extract_frames() — INSIDE:
+  1. Frame loop → FrameFeatures(timestamp_ms=4200, face_index=2)
+  2. TrackletSplitter → rewrites face_index on FRAMES (not timestamps)
+  3. ArcFace merge → rewrites face_index to canonical (not timestamps)
+  4. Transient filter → removes short tracks
+
+extract_all() — AFTER _extract_frames returns:
+  5. WindowAggregator.aggregate(frames)
+     → groups by CANONICAL face_index (post-merge)
+     → buckets by timestamp_ms // 2000
+     → WindowFeatures(window_start_ms=4000, window_end_ms=6000, face_index=2)
+
+run_analysis() — AFTER extract_all returns:
+  6. SpeakerFaceMapper → wf.speaker_id = "Face_2", timestamps UNCHANGED
+  7. Calibration → reads windows, doesn't modify them
+  8. Rule engines → produce signals with window's original [4000, 6000]
+ArcFace merge happens BEFORE WindowAggregator. Windows are created from MERGED frames. So windows already have correct canonical face_index. Rule engines produce signals for the RIGHT face with the RIGHT timestamp.
+Where the Problem Actually Is
+The timestamps are correct. The problem is which signals reach the frontend and when they become visible:
+Problem 1: Active-tile scores don't populate lip_sync_scores
+python# SpeakerFaceMapper.assign():
+for fi, spk in self._active_tile_face_to_speaker.items():
+    confident_face_to_speaker[fi] = spk
+    assignment_scores[fi] = 1.0         # ← set here
+
+# But lip_sync_scores is built from method branches:
+if method in ("asd", "lip_sync"):
+    lip_sync_scores[spk] = assignment_scores[fi]   # ← only for asd/lip_sync method
+elif method == "time_overlap":
+    lip_sync_scores[spk] = 1.0                      # ← only for time_overlap
+
+# Active-tile entries bypass BOTH branches → lip_sync_scores[spk] = NEVER SET
+_build_session_face_locks reads lip_sync_scores.get(speaker_label, 0.0) → gets 0.0 for active-tile mapped speakers → rejects → no linkage → Face_N and Speaker_N separate → signals split across two entries.
+Problem 2: Unregistered face signals dropped entirely
+python# analysis_pipeline.py line 504:
+unregistered_faces = all_face_labels_in_signals - registered_face_labels
+video_signals = [s for s in video_signals if s.get("speaker_id") not in unregistered_faces]
+If Face_2 has no registry entry (because lip_sync_scores was empty → no lock → no speaker_identity_map entry), Face_2 is "unregistered" → ALL Face_2 signals are DROPPED before DB write. The signals were produced correctly with correct timestamps but never persisted.
+Problem 3: presence_detected hidden → face invisible before first behavioral signal
+typescript// SIGNAL_CONFIG:
+presence_detected: { hidden: true }
+
+// visibleByFace loop:
+if (cfg?.hidden) continue;    // ← skips presence_detected
+
+// hasPresence check:
+const hasPresence = sigs.some(s => s.signal_type === "presence_detected");
+// sigs was built AFTER skipping hidden → presence_detected is NEVER in sigs
+// hasPresence is ALWAYS false → dead code
+Summary
+What User ExpectsWhat Actually HappensRoot CauseFace appears when detectedFace invisible until behavioral signalpresence_detected hidden=true → dead hasPresence checkSignals show at correct timeSignals never reach frontendlip_sync_scores empty for active-tile → no lock → unregistered → signals DROPPEDSame person's signals groupedFace_N and Speaker_N separateNo shared registry_id (no lock → no _upsert_appearance)
+
+
+
+What the Screenshots Show
+TimeSceneFaces in VideoSidebarProblem0:01Interrogation room, suspect alone1 (Justin)Face_0 + Face_1Face_0 has signals but nobody matches Face_0 — only Justin visible0:25Officers enter, cuffing suspect3 (backs to camera)Face_1 + Face_0Officers face AWAY from CCTV — never detected0:38Mugshot photo on screen2 photosFace_1 + Face_0Mugshot photo gets Face_0 — "Tense, Authoritative" on a PHOTO0:44Social media photo full screen1 photoFace_1 + Face_43Photo gets Face_43 — "Agreeing 65%, Tense" on a PHOTO0:48Aerial landscape (river)0 facesFace_1 + Face_0Yellow box on TREES. "Freeze Response" on a LANDSCAPE0:56Two mugshot photos2 photosFace_1 + Face_0 + Face_47 + Face_424 entries — all from PHOTOS1:31Interrogation room, 3 people1 (suspect)Face_0 + Face_42 + Face_1Face_42 = mugshot merged with real Justin via ArcFace2:52Interrogation room, 3 people1 (suspect)Face_1 + Face_0Back to 2 entries — Face_42 track expired5:00Body cam, house, 4 people3-4 facesFace_1 + Face_0Only 2 entries for 4 visible people
+5 Bugs Found
+Bug 1: Static Face Filter DISABLED for Room Profile
+python# MeetingProfile.room():
+static_face_filter_enabled=False    # ← "rooms don't have screen share"
+
+# Step 2b:
+if getattr(self._extractor, "_profile_static_filter", True):
+    static_tracks = {spk for spk, wins in windows_by_speaker.items() if _is_static_face(wins)}
+# _profile_static_filter = False for room → entire block SKIPPED
+The assumption "no screen share in physical rooms" is wrong. This video has embedded news footage with mugshots, social media photos, and aerial shots spliced between interrogation room scenes. The room profile disables the filter → photos get behavioral signals.
+Fix: Enable static filter for ALL profiles including room. Or: only disable for meeting_type == "interrogation_video" when the MeetingTypeProbe confirms it's a single continuous CCTV feed (no scene cuts).
+Bug 2: Static Face Filter Requires 5 Windows (10s) — Photos Pass Through
+pythondef _is_static_face(windows):
+    active = [w for w in windows if w.face_detection_rate > 0.5]
+    if len(active) < 5:      # ← requires 10 seconds of detection
+        return False          # ← photo visible for 3 seconds → NOT filtered
+A mugshot photo visible for 3 seconds produces 1-2 windows. len(active) < 5 → returns False → photo passes through. Every photo in this video is visible for < 10 seconds.
+Fix: Lower to len(active) < 3 (6 seconds). OR: check variance even with 2-3 windows — a photo with 2 windows of identical blendshapes is clearly static. The threshold protects against briefly-visible real faces, but 2 windows of zero variance is sufficient to identify a photo.
+Bug 3: max_disappeared=90 Keeps Dead Tracks Through Scene Cuts
+At 0:38 the video cuts from interrogation room to mugshot photos. Face_0 was tracking the suspect. With max_disappeared=90 (18 seconds at 5fps), Face_0 stays alive for 18 seconds after the cut. During those 18 seconds, any face detected in the mugshot footage could be matched to Face_0's position → CentroidTracker assigns the mugshot to Face_0 → contamination.
+Fix: Scene cuts need to trigger CentroidTracker.reset(). The LayoutClassifier should detect scene cuts (full-frame pixel change) not just layout changes. A room → news footage cut changes >80% of pixels → should reset all tracks.
+Bug 4: ArcFace Merges Photo Faces With Real Faces
+At 0:56 Face_42 = mugshot. At 1:31 Face_42 = real Justin. ArcFace correctly identifies them as the same person → merges tracks. But the mugshot's windows have ZERO biological motion → they contaminate Justin's behavioral baselines. Calibration sees [10 static windows + 50 real windows] → baselines are pulled toward zero → rule engines produce wrong deviations.
+Fix: Static face filter must run BEFORE ArcFace merge. Currently it runs AFTER (Step 2b in run_analysis). But ArcFace merge runs inside _extract_frames() (before run_analysis even starts). By the time _is_static_face runs, the mugshot track is already merged into the real person's track — the merged track has MIXED static + real windows → variance is nonzero → filter doesn't catch it.
+The filter needs to run inside _extract_frames(), after WindowAggregator but BEFORE ArcFace merge:
+python# Current order:
+# 1. Frame loop → FrameFeatures
+# 2. TrackletSplitter
+# 3. ArcFace merge → rewrites face_index     ← mugshot merged here
+# 4. Transient filter
+# 5. Return frames
+# 6. WindowAggregator (in extract_all)
+# 7. _is_static_face in run_analysis          ← TOO LATE
+
+# Correct order:
+# 1. Frame loop → FrameFeatures
+# 2. TrackletSplitter
+# 3. WindowAggregator on PRE-MERGE frames     ← NEW
+# 4. _is_static_face per track                ← BEFORE merge
+# 5. Remove static track frames
+# 6. ArcFace merge (without static frames)
+# 7. Transient filter
+# 8. Return frames
+Bug 5: False Face Detection on Non-Face Content
+At 0:48 the yellow detection box is on an aerial river landscape — no face present. MediaPipe's min_detection_confidence=0.15 is very low. On compressed video with textures (trees, water patterns), low-confidence false positives occur.
+Fix: Raise min_detection_confidence from 0.15 to 0.30 for room/interrogation profiles. In room cameras the faces are large enough (>100px) that 0.30 still detects them. The 0.15 threshold was set for tiny grid faces (60-80px) which don't exist in room cameras.
+Root Cause Chain
+MeetingTypeProbe: meeting_type="interrogation_video" → _FORCED_PROFILES → room profile
+  → static_face_filter_enabled=False                     ← Bug 1
+  → max_disappeared=90                                    ← Bug 3
+  → min_detection_confidence=0.15 (inherited default)    ← Bug 5
+
+Video contains scene cuts (interrogation → news → body cam):
+  Photos detected as faces                                ← Bug 5
+  Static filter disabled                                  ← Bug 1
+  Even if enabled, photos < 10s → too few windows         ← Bug 2
+  Dead tracks survive 18s through scene cuts               ← Bug 3
+  ArcFace merges mugshot with real face BEFORE filter      ← Bug 4
+  
+Result: 2 main tracks (Face_0, Face_1) accumulate signals from
+  real people + mugshots + social media photos + false detections
+  across all scenes. Other people in the video never get persistent
+  tracks because officers face away and house-scene faces are brief.
+
+  
+
+
+Issues Found
+Issue 1 (CRITICAL): Active-Tile Scores Don't Populate lip_sync_scores
+File: Video agent main.py (in SpeakerFaceMapper.assign())
+Active-tile tagged faces set assignment_scores[fi] = 1.0 but NEVER populate lip_sync_scores[spk]. Then in analysis_pipeline.py line 937:
+pythonscore = float(lip_sync_scores.get(speaker_label, 0.0) or 0.0)
+# Active-tile speaker → 0.0 < _SESSION_FACE_LOCK_MIN_SCORE (0.06) → REJECTED
+_SESSION_FACE_LOCK_MIN_SCORE = 0.06 is very low, so even a tiny score would pass. But lip_sync_scores doesn't have active-tile entries at all → score=0.0 → rejected → no lock → no _upsert_appearance → no registry_id → signals DROPPED at line 504.
+Issue 2 (CRITICAL): Unregistered Face Signal Exclusion
+File: analysis_pipeline.py line 497-506
+pythonunregistered_faces = all_face_labels_in_signals - registered_face_labels
+video_signals = [s for s in video_signals if s.get("speaker_id") not in unregistered_faces]
+Any Face_N without a speaker_identity_map entry has ALL its signals removed before DB write. This depends entirely on Issue 1 — if locked_face_to_speaker is empty, the aliasing at line 460 doesn't fire, speaker_identity_map has no Face_N entries, and ALL Face_N signals are dropped.
+The match_or_create_by_face_only at line 405 catches Face_N NOT in locked_face_to_speaker and NOT in speaker_identity_map. But the condition at line 416 is:
+pythonif speaker_embeddings and face_embeddings_from_video:
+If voice embeddings exist (speaker_embeddings is truthy), it takes the match_or_create_speakers path first (line 394). This path receives speaker_keyed_face_embs which is built from locked_face_to_speaker — if locks are empty, speaker_keyed_face_embs is empty → match_or_create_speakers does voice-only registration → Face_N entries NOT in speaker_identity_map → they go to non-speaking face registration at line 419 → match_or_create_by_face_only → they DO get registered.
+So Face_N SHOULD survive if match_or_create_by_face_only succeeds. The issue is whether registered_face_labels at line 496 includes faces registered by match_or_create_by_face_only. Let me check:
+pythonregistered_face_labels = {label for label in speaker_identity_map if label.startswith("Face_")}
+speaker_identity_map is updated by face_only_matches at line 442:
+pythonspeaker_identity_map.update(face_only_matches)
+This should work. If match_or_create_by_face_only registers Face_2, it appears in speaker_identity_map, then in registered_face_labels, and Face_2 signals survive.
+BUT: The non-speaking registration at line 419 has the condition:
+pythonif speaker_embeddings and face_embeddings_from_video:
+    linked_face_labels = set(locked_face_to_speaker.keys())
+    non_speaking = {
+        label: data for label, data in face_embeddings_from_video.items()
+        if label.startswith("Face_") and label not in speaker_identity_map and label not in linked_face_labels
+    }
+If speaker_identity_map already has Face_2 from the match_or_create_speakers call (e.g., voice + face fused), it won't be in non_speaking. But if speaker_keyed_face_embs was empty (because locks empty), match_or_create_speakers did voice-only → Face_2 NOT in speaker_identity_map → Face_2 IS in non_speaking → gets registered. This path works.
+The real scenario where signals are lost: When face_embeddings_from_video is empty (no ArcFace embeddings extracted — e.g., all faces too small, or ArcFace failed). Then match_or_create_by_face_only is never called → Face_N not registered → signals dropped.
+Issue 3 (MEDIUM): 8 Signal Name Mismatches in Interrogation Patterns
+File: interrogation_patterns.py — frozenset lookups
+As traced earlier, 8 of 15 signal types in _STRESS_PEAK_TYPES, _CAPITULATION_TYPES, _RESISTANCE_TYPES don't match actual producer signal names:
+ExpectedActualProducervocal_stress_scorevocal_stressVoicepitch_elevationpitch_shiftVoicevoice_energy_changeenergy_levelVoicetone_shifttone_classificationVoicedenial_weakeningdenial_evolutionLanguagespeech_rate_anomalyspeech_rateVoicetense_inconsistencytense_shiftLanguagevocal_agitation—Nobody
+Issue 4 (MEDIUM): /video-signals Whitelist Missing tense_shift and denial_evolution
+File: sessions.py line 107-112
+python_LANGUAGE_OVERLAY_TYPES = [
+    "pronoun_distancing",
+    "tense_inconsistency",      # ← but language agent produces "tense_shift"
+    "statement_contamination",
+    "denial_weakening",          # ← but language agent produces "denial_evolution"
+]
+The SQL query filters by signal_type = ANY($3::text[]). If language agent persists tense_shift but the whitelist says tense_inconsistency, those signals are in the DB but never returned to the frontend.
+Same issue for voice: _VOICE_INTERROG_TYPES has agitated_high_arousal_tone — check if voice rules actually produce this exact type name.
+Issue 5 (MEDIUM): Narrative Has Interrogation Handling But No Content Type Gate
+File: narrative.py line 304-348
+The narrative builder looks for interrogation signals and adds them to the context:
+python_INTERROG_TYPES = {"false_confession_risk", "denial_weakening", ...}
+interrog_signals = [s for s in fusion_signals if s.get("signal_type") in _INTERROG_TYPES]
+This uses denial_weakening (the mismatched name). If the language agent produces denial_evolution, the narrative won't find it. Same mismatch propagated here.
+Issue 6 (LOW): content_classifier.py Can Auto-Detect Interrogation
+The classifier uses Claude to classify content type from transcript. If the user uploads an interrogation video but selects "sales_call" by mistake, the classifier could override. But:
+python_CLASSIFICATION_PROMPT = """
+...
+- interrogation_video: Law enforcement interrogation or formal interview under caution
+"""
+The auto-classification exists but is only called if no explicit meeting_type is set. If the user sets meeting_type explicitly in UploadSettings, the classifier doesn't run.
+Issue 7 (LOW): Report Generator Has No Interrogation Section
+File: report_generator.py
+The report uses content_type for title but doesn't have interrogation-specific sections (risk gauge, denial trajectory, technique analysis). It renders generic signal summaries. The InterrogationSummaryPanel is frontend-only.
