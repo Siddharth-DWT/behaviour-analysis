@@ -610,10 +610,10 @@ const SIGNAL_CONFIG: Record<string, SignalConfigEntry> = {
     color: "#8B5CF6",
     category: "body",
   },
-  barrier_behavior: {
-    icon: "⊠",
-    label: () => "Barrier Posture",
-    color: "#F59E0B",
+  self_adaptor_increase: {
+    icon: "✋",
+    label: () => "Increasing Self-Touch",
+    color: "#8B5CF6",
     category: "body",
   },
 
@@ -630,24 +630,30 @@ const SIGNAL_CONFIG: Record<string, SignalConfigEntry> = {
     color: "#F59E0B",
     category: "compound",
   },
-  low_autonomic_reactivity: {
-    icon: "◉",
-    label: () => "Low Autonomic Reactivity",
-    color: "#6B7280",
-    category: "body",
+  vocal_hesitation_cluster: {
+    icon: "💬",
+    label: () => "Hesitation Burst",
+    color: "#8B5CF6",
+    category: "compound",
+  },
+  speech_rate_change: {
+    icon: "⏩",
+    label: (s) => `Speech Rate: ${s.value_text?.replace(/_/g, " ") ?? "shift"}`,
+    color: "#8B5CF6",
+    category: "compound",
   },
 
   // ── Interrogation language signals (shown in Patterns row) ───────────────────
-  pronoun_distancing: {
-    icon: "↔",
-    label: () => "Pronoun Distancing",
-    color: "#EF4444",
+  detail_reduction: {
+    icon: "📝",
+    label: () => "Low Detail",
+    color: "#A78BFA",
     category: "compound",
   },
-  tense_inconsistency: {
-    icon: "⚠",
-    label: () => "Tense Inconsistency",
-    color: "#F59E0B",
+  narrative_consistency_drift: {
+    icon: "🔀",
+    label: () => "Story Drift",
+    color: "#A78BFA",
     category: "compound",
   },
   statement_contamination: {
@@ -1142,13 +1148,14 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                   })
                   .sort((a: VideoSignal, b: VideoSignal) => (b.confidence || 0) - (a.confidence || 0));
                 const visibleSigs = showExpanded ? prioritySigs : prioritySigs.slice(0, 3);
-                const hasPresence = sigs.some((s: VideoSignal) => s.signal_type === "presence_detected");
+                const hasPresence = activeSignals.some((s: VideoSignal) => s.signal_type === "presence_detected" && (toCanonical[s.speaker_id ?? ""] ?? s.speaker_id) === speakerId);
                 if (visibleSigs.length === 0 && !hasPresence) return null;
                 // Hide any speaker with no face thumbnail from the video sidebar.
                 // Face_N without thumbnail = unconfirmed detection (ArcFace failure, photo).
                 // Speaker_N without thumbnail = voice-only speaker, no face matched — their
                 // signals belong in the voice/language panels, not the video player sidebar.
-                if (!speakerRoster[rawId]?.thumbnail_url) return null;
+                // Face_N without thumbnail can still show (face detected but not lip-synced).
+                if (rawId.startsWith("Speaker_") && !speakerRoster[rawId]?.thumbnail_url) return null;
                 return (
                   <div key={speakerId} className="flex flex-col gap-1">
                     <SpeakerGroupHeader

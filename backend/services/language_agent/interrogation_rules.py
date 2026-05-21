@@ -1,12 +1,12 @@
 # services/language_agent/interrogation_rules.py
 """
-Interrogation-specific language rules (NEXUS INTERROGATION_IMPLEMENTATION.MD v2.1).
+Interrogation-specific language rules (NEXUS INTERROGATION_IMPLEMENTATION.MD v2.2).
 
 Stateful across segments — instantiate once per session, call evaluate_all().
 
 Rules implemented:
-  INTERROG-LANG-01  Pronoun Distancing           (conf 0.45 — Newman 2003)
-  INTERROG-LANG-02  Tense Shift Detection        (conf 0.35 — Vrij 2005)
+  INTERROG-LANG-01  Detail Reduction             (conf 0.50 — Vrij et al. 2017)
+  INTERROG-LANG-02  Narrative Consistency Drift  (conf 0.40 — Fisher & Geiselman 1992)
   INTERROG-LANG-03  Contamination Detection      (conf 0.80 — Garrett 2011: 97.5%)
   INTERROG-LANG-04  Denial Evolution Tracker     (conf 0.45-0.65 adaptive — Kassin 2010)
 
@@ -15,7 +15,11 @@ CRITICAL DESIGN PRINCIPLE:
   Every signal carries multiple possible interpretations.
   Maximum confidence 0.80 (contamination only — research-validated).
 
-v2.1 changes:
+v2.2 changes:
+  - INTERROG-LANG-01: replaced unreliable pronoun_distancing with detail_reduction
+    (sensory-word density drop ≥40% first→second half; Vrij 2017)
+  - INTERROG-LANG-02: replaced unreliable tense_inconsistency with narrative_consistency_drift
+    (TF-IDF cosine / Jaccard fallback on retelling pairs >5 min apart; Fisher & Geiselman 1992)
   - ContaminationDetector: NER + TF-IDF + validated stopwords (replaces handcrafted list)
   - _denial_evolution: duration-adaptive slope threshold + windowed comparison fallback
 """
@@ -24,6 +28,7 @@ from __future__ import annotations
 import re
 import logging
 from collections import defaultdict
+from itertools import combinations
 from typing import Optional
 
 logger = logging.getLogger("nexus.language.interrogation")
@@ -57,32 +62,28 @@ _INTERROGATION_DOMAIN_STOPWORDS: frozenset[str] = frozenset({
 })
 _ALL_STOPWORDS: frozenset[str] = _VALIDATED_STOPWORDS | _INTERROGATION_DOMAIN_STOPWORDS
 
-# ── Pronoun patterns ──────────────────────────────────────────────────────────
-_FIRST_PERSON_RE = re.compile(
-    r"\b(I|me|my|mine|myself)\b", re.IGNORECASE
-)
-_THIRD_PERSON_RE = re.compile(
-    r"\b(he|him|his|she|her|hers|they|them|their|theirs|it|its)\b", re.IGNORECASE
-)
-
-# ── Verb tense patterns ───────────────────────────────────────────────────────
-_PAST_TENSE_RE = re.compile(
-    r"\b(was|were|had|went|said|did|saw|came|made|took|told|knew|thought|"
-    r"got|gave|found|left|called|tried|asked|needed|seemed|felt|became|"
-    r"\w+ed)\b",
-    re.IGNORECASE,
-)
-_PRESENT_TENSE_RE = re.compile(
-    r"\b(am|is|are|have|has|go|goes|say|says|do|does|see|sees|come|comes|"
-    r"make|makes|take|takes|tell|tells|know|knows|think|thinks|get|gets|"
-    r"give|gives|find|finds)\b",
-    re.IGNORECASE,
-)
-_PAST_EVENT_TRIGGERS = re.compile(
-    r"\b(when|that night|that day|that morning|that evening|yesterday|"
-    r"last (week|month|night|year)|at the time|back then|earlier|before)\b",
-    re.IGNORECASE,
-)
+# ── Sensory vocabulary for detail_reduction (Vrij 2017) ──────────────────────
+# Words that encode episodic/perceptual grounding in a recalled scene.
+# Visual, auditory, tactile, olfactory, spatial, and embodied-action categories.
+_SENSORY_WORDS: frozenset[str] = frozenset({
+    # visual perception
+    "saw", "seen", "look", "looked", "noticed", "watched", "observed", "glimpsed",
+    "color", "colour", "bright", "dark", "light", "shadow", "shape",
+    # auditory
+    "heard", "hear", "sound", "sounds", "noise", "voice", "voices",
+    "loud", "quiet", "yelled", "screamed", "whispered", "bang",
+    # tactile / kinaesthetic
+    "felt", "feel", "touch", "touched", "grabbed", "held", "pushed", "pulled",
+    "smooth", "rough", "hard", "soft", "warm", "cold", "heavy",
+    # olfactory / gustatory
+    "smell", "smelled", "smelt", "odor", "odour", "taste", "tasted",
+    # spatial grounding
+    "left", "right", "behind", "front", "beside", "near", "close", "far",
+    "inside", "outside", "above", "below", "corner", "edge",
+    # embodied scene actions (imply specific imagery)
+    "walked", "ran", "running", "stood", "sitting", "lying",
+    "entered", "opened", "closed", "turned", "reached",
+})
 
 # ── Denial strength patterns ──────────────────────────────────────────────────
 _DENIAL_CATEGORICAL = re.compile(
@@ -357,131 +358,187 @@ class InterrogationLanguageRules:
         interrogator_id = max(question_counts, key=question_counts.get) if question_counts else None
 
         signals: list[dict] = []
-        signals.extend(self._pronoun_distancing(segments, interrogator_id))
-        signals.extend(self._tense_shift(segments, interrogator_id))
+        signals.extend(self._detail_reduction(segments, interrogator_id))
+        signals.extend(self._narrative_consistency_drift(segments, interrogator_id))
         signals.extend(self._contamination_detection(segments, interrogator_id))
         signals.extend(self._denial_evolution(segments, interrogator_id))
         return signals
 
-    # ── INTERROG-LANG-01: Pronoun Distancing ─────────────────────────────────
+    # ── INTERROG-LANG-01: Detail Reduction ───────────────────────────────────
 
-    def _pronoun_distancing(
+    def _detail_reduction(
         self, segments: list[dict], interrogator_id: Optional[str]
     ) -> list[dict]:
         """
-        Newman et al. (2003): deceptive narratives use fewer first-person
-        singular pronouns. Confidence 0.45 — culture/language dependent.
+        Vrij et al. (2017): genuine episodic memories contain rich sensory and
+        contextual detail. A ≥40% drop in sensory-word density from the first
+        half to the second half of a suspect's testimony flags degrading recall
+        richness — consistent with rehearsal exhaustion or fabrication under load.
+        Confidence cap 0.50 — also observed in truthful speakers under fatigue.
         """
-        speaker_fp_ratios: dict[str, list[float]] = defaultdict(list)
+        suspect_segs: dict[str, list[dict]] = defaultdict(list)
         for seg in segments:
-            text = seg.get("text", "") or ""
             spk  = seg.get("speaker", seg.get("speaker_id", ""))
-            words = len(text.split())
-            if words < 5:
-                continue
-            fp = len(_FIRST_PERSON_RE.findall(text))
-            speaker_fp_ratios[spk].append(fp / words)
+            text = seg.get("text", "") or ""
+            if spk and spk != interrogator_id and len(text.split()) >= 5:
+                suspect_segs[spk].append(seg)
 
-        baselines: dict[str, float] = {}
-        for spk, ratios in speaker_fp_ratios.items():
-            if len(ratios) >= _BASELINE_SEGMENTS:
-                baselines[spk] = sum(ratios[:_BASELINE_SEGMENTS]) / _BASELINE_SEGMENTS
+        def _sensory_density(seg_list: list[dict]) -> float:
+            total = sensory = 0
+            for s in seg_list:
+                words = (s.get("text", "") or "").lower().split()
+                total   += len(words)
+                sensory += sum(1 for w in words if w in _SENSORY_WORDS)
+            return sensory / total if total > 0 else 0.0
 
         signals: list[dict] = []
-        for seg in segments:
-            text  = seg.get("text", "") or ""
-            spk   = seg.get("speaker", seg.get("speaker_id", ""))
-            start, end = _seg_ms(seg)
-            words = len(text.split())
-
-            if words < 10 or spk not in baselines:
+        for spk, segs in suspect_segs.items():
+            if len(segs) < 6:
                 continue
-            baseline = baselines[spk]
-            if baseline < 0.01:
+            mid = len(segs) // 2
+            first_density  = _sensory_density(segs[:mid])
+            second_density = _sensory_density(segs[mid:])
+
+            if first_density < 0.01:
+                continue
+            drop = (first_density - second_density) / first_density
+            if drop < 0.40:
                 continue
 
-            fp = len(_FIRST_PERSON_RE.findall(text))
-            current_ratio = fp / words
-
-            if current_ratio < baseline * 0.60:
-                conf = min(0.45, 0.30 + (baseline - current_ratio) * 5)
-                signals.append({
-                    "agent":            "language",
-                    "speaker_id":       spk,
-                    "signal_type":      "pronoun_distancing",
-                    "value":            round(1.0 - (current_ratio / max(baseline, 0.001)), 3),
-                    "value_text":       "reduced_first_person",
-                    "confidence":       round(conf, 3),
-                    "window_start_ms":  start,
-                    "window_end_ms":    end,
-                    "metadata": {
-                        "rule_id":        "INTERROG-LANG-01",
-                        "baseline_ratio": round(baseline, 4),
-                        "current_ratio":  round(current_ratio, 4),
-                        "reduction_pct":  round((1 - current_ratio / max(baseline, 0.001)) * 100, 1),
-                        "interpretations": [
-                            "Psychological distancing from described events",
-                            "Cultural or individual communication style",
-                            "Narrative construction requiring less self-reference",
-                        ],
-                        "note": "Confidence low-moderate. Culture and language dependent. Never interpret alone.",
-                    },
-                })
+            _, end_ms   = _seg_ms(segs[-1])
+            start_ms, _ = _seg_ms(segs[mid])
+            conf = round(min(0.50, 0.28 + drop * 0.30), 3)
+            signals.append({
+                "agent":            "language",
+                "speaker_id":       spk,
+                "signal_type":      "detail_reduction",
+                "value":            round(drop, 3),
+                "value_text":       "sensory_density_drop",
+                "confidence":       conf,
+                "window_start_ms":  start_ms,
+                "window_end_ms":    end_ms,
+                "metadata": {
+                    "rule_id":              "INTERROG-LANG-01",
+                    "first_half_density":   round(first_density, 4),
+                    "second_half_density":  round(second_density, 4),
+                    "drop_pct":             round(drop * 100, 1),
+                    "interpretations": [
+                        "Rehearsed narrative exhausted; maintaining spontaneous detail harder",
+                        "Increasing cognitive load reducing perceptual grounding",
+                        "Truthful speaker under fatigue — detail naturally degrades over long sessions",
+                    ],
+                    "note": "Requires cross-reference with denial evolution and session duration.",
+                },
+            })
         return signals
 
-    # ── INTERROG-LANG-02: Tense Shift Detection ───────────────────────────────
+    # ── INTERROG-LANG-02: Narrative Consistency Drift ─────────────────────────
 
-    def _tense_shift(
+    def _narrative_consistency_drift(
         self, segments: list[dict], interrogator_id: Optional[str]
     ) -> list[dict]:
         """
-        Vrij (2005, 2008): truthful past-event narratives show consistent
-        past tense. Present tense intrusions may indicate real-time construction.
-        Confidence 0.35 — common naturally in storytelling.
+        Fisher & Geiselman (1992): genuine episodic memories produce consistent
+        retellings. Pairs of suspect segments >5 min apart that share ≥3 content
+        words are retelling candidates. Cosine similarity <0.70 (TF-IDF) or
+        Jaccard <0.25 (fallback) flags inconsistent retelling.
+        Confidence cap 0.40 — natural memory decay also causes variation.
+
+        DSA: O(n²) over suspect segments, bounded in practice by session length.
+        Content-word set pre-computed per segment; shared-word check is O(1) via
+        set intersection before the heavier similarity computation.
         """
+        def _content_words(text: str) -> set[str]:
+            return {
+                w for w in re.findall(r"\b[a-z]{4,}\b", text.lower())
+                if w not in _ALL_STOPWORDS
+            }
+
+        suspect_seg_words: list[tuple[dict, set[str]]] = [
+            (seg, _content_words(seg.get("text", "") or ""))
+            for seg in segments
+            if seg.get("speaker", seg.get("speaker_id", "")) != interrogator_id
+            and len((seg.get("text", "") or "").split()) >= 10
+        ]
+
         signals: list[dict] = []
-        for seg in segments:
-            text  = seg.get("text", "") or ""
-            spk   = seg.get("speaker", seg.get("speaker_id", ""))
-            start, end = _seg_ms(seg)
+        seen: set[tuple[int, int]] = set()
 
-            if not _PAST_EVENT_TRIGGERS.search(text):
-                continue
-            if len(text.split()) < 15:
-                continue
+        for i, (seg_a, words_a) in enumerate(suspect_seg_words):
+            for j, (seg_b, words_b) in enumerate(suspect_seg_words):
+                if j <= i:
+                    continue
+                spk_a = seg_a.get("speaker", seg_a.get("speaker_id", ""))
+                spk_b = seg_b.get("speaker", seg_b.get("speaker_id", ""))
+                if spk_a != spk_b:
+                    continue
 
-            past_verbs    = len(_PAST_TENSE_RE.findall(text))
-            present_verbs = len(_PRESENT_TENSE_RE.findall(text))
-            total_verbs   = past_verbs + present_verbs
-            if total_verbs < 3:
-                continue
+                start_a, end_a   = _seg_ms(seg_a)
+                start_b, end_b   = _seg_ms(seg_b)
+                if start_b - end_a < 300_000:   # < 5 min gap
+                    continue
+                if len(words_a & words_b) < 3:  # not a retelling candidate
+                    continue
 
-            present_ratio = present_verbs / total_verbs
-            if present_ratio > 0.30:
+                pair_key = (i, j)
+                if pair_key in seen:
+                    continue
+                seen.add(pair_key)
+
+                sim, method = self._text_similarity(
+                    seg_a.get("text", "") or "",
+                    seg_b.get("text", "") or "",
+                    words_a, words_b,
+                )
+                threshold = 0.70 if method == "cosine" else 0.25
+                if sim >= threshold:
+                    continue
+
+                conf = round(min(0.40, 0.22 + (threshold - sim) * 0.35), 3)
                 signals.append({
                     "agent":            "language",
-                    "speaker_id":       spk,
-                    "signal_type":      "tense_inconsistency",
-                    "value":            round(present_ratio, 3),
-                    "value_text":       "present_tense_intrusion",
-                    "confidence":       0.35,
-                    "window_start_ms":  start,
-                    "window_end_ms":    end,
+                    "speaker_id":       spk_a,
+                    "signal_type":      "narrative_consistency_drift",
+                    "value":            round(1.0 - sim, 3),
+                    "value_text":       "retelling_inconsistency",
+                    "confidence":       conf,
+                    "window_start_ms":  start_b,
+                    "window_end_ms":    end_b,
                     "metadata": {
-                        "rule_id":            "INTERROG-LANG-02",
-                        "present_verb_pct":   round(present_ratio * 100, 1),
-                        "past_verb_count":    past_verbs,
-                        "present_verb_count": present_verbs,
+                        "rule_id":       "INTERROG-LANG-02",
+                        "similarity":    round(sim, 3),
+                        "method":        method,
+                        "gap_minutes":   round((start_b - end_a) / 60_000, 1),
+                        "shared_terms":  sorted(words_a & words_b)[:10],
                         "interpretations": [
-                            "Real-time narrative construction rather than memory retrieval",
-                            "Storytelling or dramatic present style",
-                            "Second-language interference with tense selection",
-                            "Trauma recall causing temporal disorientation",
+                            "Same event described differently — possible confabulation or coached narrative",
+                            "Natural memory reconstruction over extended session duration",
+                            "Emotional state change causing different framing of same event",
                         ],
-                        "note": "Only meaningful when question clearly asked for past-event narration.",
+                        "note": "Only meaningful for retellings of the same event. Gap ≥5 min required.",
                     },
                 })
         return signals
+
+    def _text_similarity(
+        self,
+        text_a: str,
+        text_b: str,
+        words_a: set[str],
+        words_b: set[str],
+    ) -> tuple[float, str]:
+        """TF-IDF cosine similarity with Jaccard fallback. Returns (score, method)."""
+        try:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from sklearn.metrics.pairwise import cosine_similarity as _cos_sim
+            vec = TfidfVectorizer(stop_words=list(_ALL_STOPWORDS), min_df=1)
+            mat = vec.fit_transform([text_a, text_b])
+            return float(_cos_sim(mat[0:1], mat[1:2])[0][0]), "cosine"
+        except Exception:
+            union = words_a | words_b
+            if not union:
+                return 0.0, "jaccard"
+            return len(words_a & words_b) / len(union), "jaccard"
 
     # ── INTERROG-LANG-03: Contamination Detection ─────────────────────────────
 

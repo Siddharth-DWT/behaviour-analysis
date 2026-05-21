@@ -17,8 +17,7 @@ const INTERROGATION_TYPES = new Set([
   "motor_inhibition",
   "freezing_response",
   "evidence_response_processing_delay",
-  "pronoun_distancing",
-  "tense_inconsistency",
+  "narrative_consistency_drift",
 ]);
 
 function fmtMs(ms: number): string {
@@ -66,16 +65,27 @@ function RiskGauge({ score }: { score: number }) {
 }
 
 function RiskFactors({ metadata }: { metadata: Record<string, unknown> }) {
+  const rf = (metadata.risk_factors ?? {}) as Record<string, Record<string, unknown>>;
+
+  const isActive = (key: string): boolean => {
+    const f = rf[key];
+    if (!f) return false;
+    if (key === "duration_risk")        return ((f.contribution as number) ?? 0) > 0;
+    if (key === "resistance_hardening") return !(f.present as boolean);  // absence = risk
+    const sc = (f.signal_count as number) ?? (f.weakening_count as number) ?? 0;
+    return sc > 0;
+  };
+
   const factors: { key: string; label: string }[] = [
-    { key: "contamination", label: "contamination" },
-    { key: "capitulation", label: "capitulation" },
-    { key: "denial_drop", label: "denial drop" },
-    { key: "duration", label: "long duration" },
-    { key: "processing_delays", label: "response delays" },
-    { key: "coercive_technique", label: "coercive technique" },
+    { key: "contamination",        label: "contamination" },
+    { key: "capitulation_cascade", label: "capitulation" },
+    { key: "denial_evolution",     label: "denial drop" },
+    { key: "duration_risk",        label: "long duration" },
+    { key: "processing_delays",    label: "response delays" },
+    { key: "resistance_hardening", label: "no resistance" },
   ];
-  const present = factors.filter((f) => Boolean(metadata[f.key]));
-  const absent = factors.filter((f) => !Boolean(metadata[f.key]));
+  const present = factors.filter((f) => isActive(f.key));
+  const absent  = factors.filter((f) => !isActive(f.key));
   if (present.length === 0 && absent.length === 0) return null;
   return (
     <div className="mt-1 flex flex-wrap gap-1">

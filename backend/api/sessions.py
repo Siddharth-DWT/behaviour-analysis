@@ -99,14 +99,13 @@ _VIDEO_OVERLAY_TYPES = [
     "smile_context_incongruence",
     "erratic_gaze_pattern",
     "freezing_response",
-    "barrier_behavior",
-    "low_autonomic_reactivity",
+    "self_adaptor_increase",
 ]
 
 # Language-agent signals surfaced on the video timeline for interrogation sessions.
 _LANGUAGE_OVERLAY_TYPES = [
-    "pronoun_distancing",
-    "tense_inconsistency",
+    "detail_reduction",
+    "narrative_consistency_drift",
     "statement_contamination",
     "denial_weakening",
 ]
@@ -114,6 +113,8 @@ _LANGUAGE_OVERLAY_TYPES = [
 # Voice-agent interrogation signals surfaced on the video timeline.
 _VOICE_INTERROG_TYPES = [
     "agitated_high_arousal_tone",
+    "vocal_hesitation_cluster",
+    "speech_rate_change",
 ]
 
 # Conversation-agent interrogation signals surfaced on the video timeline.
@@ -536,8 +537,8 @@ async def get_video_signals(
                 meta = json.loads(r["metadata"]) if isinstance(r["metadata"], str) else dict(r["metadata"])
             except Exception:
                 pass
-        cx = float(meta.get("face_centre_x", 0))
-        cy = float(meta.get("face_centre_y", 0))
+        cx = float(meta.get("face_centre_x") or 0)
+        cy = float(meta.get("face_centre_y") or 0)
         if cx > 0 or cy > 0:
             meta["grid_position"] = _speaker_grid_position(cx, cy)
         reg_name  = r["registry_name"] or ""
@@ -559,6 +560,7 @@ async def get_video_signals(
 
     # Session-level interrogation panel signals span the full session duration and must
     # not be filtered by the 120s window guard (which targets temporal overlay signals).
+    # presence_detected is per-window (~2s each) so passes the filter naturally — no bypass needed.
     _PANEL_SIGNAL_TYPES = frozenset(
         _FUSION_INTERROG_TYPES + _LANGUAGE_OVERLAY_TYPES + _CONVERSATION_INTERROG_TYPES
     )

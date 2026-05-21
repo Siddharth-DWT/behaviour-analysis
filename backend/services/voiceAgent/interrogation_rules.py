@@ -18,8 +18,13 @@ segments, speakers). Only acoustic feature signals are affected.
 from __future__ import annotations
 
 import logging
+import re
+from collections import defaultdict, deque
 
 logger = logging.getLogger("nexus.voice.interrogation")
+
+# Filled-pause pattern for vocal_hesitation_cluster (conservative: standalone filler words only)
+_FILLER_RE = re.compile(r"\b(um+|uh+|er+|ah+|hmm+)\b", re.IGNORECASE)
 
 # SNR threshold below which HVAC noise becomes significant (dB)
 _CCTV_AUDIO_SNR_THRESHOLD = 20.0
@@ -27,14 +32,12 @@ _CCTV_AUDIO_SNR_THRESHOLD = 20.0
 # Voice signal types that degrade with HVAC noise per §5 table
 # Full confidence / CCTV audio confidence
 _VOICE_SNR_ADJUSTMENTS: dict[str, tuple[float, float]] = {
-    "pitch_deviation":        (0.50, 0.45),
-    "pitch_elevation":        (0.50, 0.45),
-    "speech_rate_deviation":  (0.50, 0.45),
-    "speech_rate":            (0.50, 0.45),
+    "pitch_elevation_flag":   (0.50, 0.45),
+    "speech_rate_anomaly":    (0.50, 0.45),
     "vocal_stress_score":     (0.50, 0.45),
-    "voice_energy_change":    (0.50, 0.45),
-    "vocal_agitation":        (0.50, 0.45),
-    "tone_shift":             (0.50, 0.45),
+    "energy_level":           (0.50, 0.45),
+    "agitated_high_arousal_tone": (0.50, 0.45),
+    "tone_classification":    (0.50, 0.45),
 }
 
 
@@ -221,6 +224,310 @@ class InterrogationVoiceRules:
         if results:
             logger.info(
                 "[%s] INTERROG-VOICE-02: %d evidence response delay signals",
+                session_id, len(results),
+            )
+        return results
+
+    def vocal_hesitation_cluster(
+        self,
+        voice_signals: list[dict],
+        diar_segments: list[dict],
+        session_id: str = "",
+    ) -> list[dict]:
+        """
+        INTERROG-VOICE-03: Temporal cluster of filled-pause disfluencies.
+
+        Counts filler words (um/uh/er/ah/hmm) in absolute 2s time bins per speaker.
+        Sliding deque of 5 consecutive bins (10s total).  Fires when >= 3/5 bins
+        are elevated AND the window-aggregate rate >= 2x speaker baseline.
+
+        DSA: O(S × B) — speakers × bins; deque O(1) append/pop; regex filler scan.
+        Confidence cap 0.40 per prompt.md (Sporer & Schwandt 2006: small effect).
+        """
+        WINDOW_MS     = 2_000   # 2s bins
+        SLIDE_N       = 5       # 10s sliding window
+        MIN_ELEVATED  = 3       # ≥3/5 bins must be elevated
+        BASELINE_RATIO = 2.0    # cluster rate must be ≥ 2x baseline
+        CONF_CAP      = 0.40
+
+        if not diar_segments:
+            return []
+
+        # Build per-speaker filler timeline: (start_ms, end_ms, filler_count)
+        by_speaker: dict[str, list[tuple[int, int, int]]] = defaultdict(list)
+        for seg in diar_segments:
+            spk = str(seg.get("speaker") or seg.get("speaker_id") or "")
+            if not spk:
+                continue
+            if "start_ms" in seg:
+                start, end = int(seg["start_ms"]), int(seg["end_ms"])
+            else:
+                start = int(float(seg.get("start", 0)) * 1_000)
+                end   = int(float(seg.get("end",   0)) * 1_000)
+            text    = seg.get("text", "") or ""
+            fillers = len(_FILLER_RE.findall(text))
+            by_speaker[spk].append((start, end, fillers))
+
+        results: list[dict] = []
+
+        for spk, segs in by_speaker.items():
+            segs.sort()
+            t_start = segs[0][0]
+            t_end   = segs[-1][1]
+            if t_end - t_start < WINDOW_MS * SLIDE_N * 2:
+                continue
+
+            # Distribute filler counts proportionally into absolute 2s bins
+            n_bins = (t_end - t_start + WINDOW_MS - 1) // WINDOW_MS
+            bins: list[float] = [0.0] * n_bins
+            for s_start, s_end, s_fillers in segs:
+                if s_fillers == 0 or s_end <= s_start:
+                    continue
+                s_dur = s_end - s_start
+                b0 = (s_start - t_start) // WINDOW_MS
+                b1 = (s_end   - t_start) // WINDOW_MS
+                for b in range(max(0, b0), min(n_bins, b1 + 1)):
+                    bin_s = t_start + b * WINDOW_MS
+                    bin_e = bin_s + WINDOW_MS
+                    overlap = min(s_end, bin_e) - max(s_start, bin_s)
+                    if overlap > 0:
+                        bins[b] += s_fillers * (overlap / s_dur)
+
+            # Baseline: mean filler count in first-third bins
+            baseline_n = max(1, n_bins // 3)
+            baseline   = max(0.1, sum(bins[:baseline_n]) / baseline_n)
+
+            # Sliding deque — fire once per non-overlapping cluster
+            dq: deque = deque()
+            fired_ends: set[int] = set()
+
+            for b, count in enumerate(bins):
+                dq.append((b, count))
+                if len(dq) > SLIDE_N:
+                    dq.popleft()
+                if len(dq) < SLIDE_N:
+                    continue
+
+                elevated = sum(1 for _, c in dq if c > baseline)
+                total    = sum(c for _, c in dq)
+                ratio    = total / (baseline * SLIDE_N)
+
+                if elevated >= MIN_ELEVATED and ratio >= BASELINE_RATIO:
+                    end_bin = dq[-1][0]
+                    if end_bin in fired_ends:
+                        continue
+                    fired_ends.add(end_bin)
+
+                    cluster_start_ms = t_start + dq[0][0]  * WINDOW_MS
+                    cluster_end_ms   = t_start + (end_bin + 1) * WINDOW_MS
+                    conf = round(min(CONF_CAP, 0.20 + (ratio - BASELINE_RATIO) * 0.05), 4)
+
+                    results.append({
+                        "agent":           "voice",
+                        "speaker_id":      spk,
+                        "signal_type":     "vocal_hesitation_cluster",
+                        "value":           round(min(ratio / 4.0, 1.0), 4),
+                        "value_text":      "hesitation_burst",
+                        "confidence":      conf,
+                        "window_start_ms": cluster_start_ms,
+                        "window_end_ms":   cluster_end_ms,
+                        "metadata": {
+                            "rule_id":          "INTERROG-VOICE-03",
+                            "baseline_rate":    round(baseline, 3),
+                            "cluster_rate":     round(total / SLIDE_N, 3),
+                            "elevation_ratio":  round(ratio, 2),
+                            "elevated_windows": elevated,
+                            "research": (
+                                "Sporer & Schwandt 2006 Applied Cognitive Psychology "
+                                "20:421-446 — 'speech errors positively related to "
+                                "deception'. Effect sizes described as 'small'."
+                            ),
+                            "effect_note": (
+                                "Direction validated. Exact effect size for filled pause "
+                                "clusters not available. Cluster threshold (3+ in 10s) "
+                                "is an engineering heuristic, not from research."
+                            ),
+                            "interpretation": (
+                                "Burst of speech disfluencies indicating cognitive load "
+                                "spike. Equally occurs during genuine confusion, "
+                                "word-finding difficulty, or high emotional arousal."
+                            ),
+                        },
+                    })
+
+        if results:
+            logger.info(
+                "[%s] INTERROG-VOICE-03: %d vocal_hesitation_cluster signals",
+                session_id, len(results),
+            )
+        return results
+
+    def speech_rate_change(
+        self,
+        voice_signals: list[dict],
+        diar_segments: list[dict],
+        session_id: str = "",
+    ) -> list[dict]:
+        """
+        INTERROG-VOICE-04: Sustained speech rate deviation from speaker baseline.
+
+        Computes per-speaker WPM in 10s absolute-time bins.  Fires when 2+
+        consecutive bins deviate > 30% from the speaker's first-third baseline
+        WPM in the same direction (faster or slower).
+
+        Direction is context-dependent per Sporer & Schwandt 2006 — both
+        acceleration and deceleration are detected.  value_text records direction.
+
+        DSA: O(S × B) — speakers × bins; consecutive-run detection via deque.
+        Confidence cap 0.40 per prompt.md (r≈0.08, approximately d≈0.16).
+        """
+        WINDOW_MS           = 10_000  # 10s bins
+        CONSECUTIVE         = 2       # ≥2 consecutive deviating bins to fire
+        DEVIATION_THRESHOLD = 0.30    # >30% from baseline
+        MIN_SPEAK_FRAC      = 0.30    # bin must have ≥30% actual speech to count
+        CONF_CAP            = 0.40
+
+        if not diar_segments:
+            return []
+
+        # Build per-speaker (start_ms, end_ms, text) list
+        by_speaker: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
+        for seg in diar_segments:
+            spk = str(seg.get("speaker") or seg.get("speaker_id") or "")
+            if not spk:
+                continue
+            if "start_ms" in seg:
+                start, end = int(seg["start_ms"]), int(seg["end_ms"])
+            else:
+                start = int(float(seg.get("start", 0)) * 1_000)
+                end   = int(float(seg.get("end",   0)) * 1_000)
+            text = seg.get("text", "") or ""
+            by_speaker[spk].append((start, end, text))
+
+        results: list[dict] = []
+
+        for spk, segs in by_speaker.items():
+            segs.sort()
+            t_start = segs[0][0]
+            t_end   = segs[-1][1]
+            if t_end - t_start < WINDOW_MS * CONSECUTIVE * 3:
+                continue
+
+            n_bins    = (t_end - t_start + WINDOW_MS - 1) // WINDOW_MS
+            word_bins:  list[float] = [0.0] * n_bins
+            speak_bins: list[float] = [0.0] * n_bins
+
+            for s_start, s_end, text in segs:
+                s_dur = max(s_end - s_start, 1)
+                words = len(text.split())
+                if words == 0:
+                    continue
+                b0 = (s_start - t_start) // WINDOW_MS
+                b1 = (s_end   - t_start) // WINDOW_MS
+                for b in range(max(0, b0), min(n_bins, b1 + 1)):
+                    bin_s   = t_start + b * WINDOW_MS
+                    bin_e   = bin_s + WINDOW_MS
+                    overlap = max(0, min(s_end, bin_e) - max(s_start, bin_s))
+                    if overlap > 0:
+                        frac = overlap / s_dur
+                        word_bins[b]  += words  * frac
+                        speak_bins[b] += overlap
+
+            # Convert bins to WPM (nan when speech fraction < threshold)
+            wpm_bins: list[float] = []
+            for b in range(n_bins):
+                speak_frac = speak_bins[b] / WINDOW_MS
+                if speak_frac < MIN_SPEAK_FRAC:
+                    wpm_bins.append(float("nan"))
+                else:
+                    speak_min = speak_bins[b] / 60_000
+                    wpm_bins.append(word_bins[b] / speak_min)
+
+            # Baseline: mean of first-third valid bins
+            baseline_n    = max(1, n_bins // 3)
+            valid_baseline = [w for w in wpm_bins[:baseline_n] if w == w]  # not nan
+            if not valid_baseline:
+                continue
+            baseline_wpm = sum(valid_baseline) / len(valid_baseline)
+            if baseline_wpm < 10:
+                continue
+
+            # Consecutive-run detector via deque
+            run_dq: deque = deque()
+            fired_ends: set[int] = set()
+
+            for b, wpm in enumerate(wpm_bins):
+                if wpm != wpm:   # nan — reset run
+                    run_dq.clear()
+                    continue
+
+                dev = (wpm - baseline_wpm) / baseline_wpm
+                if abs(dev) > DEVIATION_THRESHOLD:
+                    run_dq.append((b, wpm, dev))
+                else:
+                    run_dq.clear()
+
+                if len(run_dq) < CONSECUTIVE:
+                    continue
+
+                # All deviations must share the same direction
+                signs = {1 if d > 0 else -1 for _, _, d in run_dq}
+                if len(signs) > 1:
+                    run_dq.popleft()
+                    continue
+
+                end_bin = run_dq[-1][0]
+                if end_bin in fired_ends:
+                    continue
+                fired_ends.add(end_bin)
+
+                direction = "faster" if next(iter(signs)) > 0 else "slower"
+                mean_dev  = sum(abs(d) for _, _, d in run_dq) / len(run_dq)
+                mean_wpm  = sum(w for _, w, _ in run_dq) / len(run_dq)
+                conf = round(min(CONF_CAP, 0.25 + mean_dev * 0.15), 4)
+
+                results.append({
+                    "agent":           "voice",
+                    "speaker_id":      spk,
+                    "signal_type":     "speech_rate_change",
+                    "value":           round(min(mean_dev, 1.0), 4),
+                    "value_text":      direction,
+                    "confidence":      conf,
+                    "window_start_ms": t_start + run_dq[0][0]  * WINDOW_MS,
+                    "window_end_ms":   t_start + (end_bin + 1) * WINDOW_MS,
+                    "metadata": {
+                        "rule_id":            "INTERROG-VOICE-04",
+                        "baseline_wpm":       round(baseline_wpm, 1),
+                        "mean_wpm":           round(mean_wpm, 1),
+                        "deviation_pct":      round(mean_dev * 100, 1),
+                        "direction":          direction,
+                        "consecutive_windows": len(run_dq),
+                        "research": (
+                            "Sporer & Schwandt 2006 Applied Cognitive Psychology "
+                            "20:421-446 — 'speech rate slightly positively related "
+                            "to deception after short preparation (r=.082), unrelated "
+                            "after medium preparation'. DePaulo et al. 2003 includes "
+                            "speech rate."
+                        ),
+                        "effect_note": (
+                            "Direction is MIXED — liars may speak faster OR slower "
+                            "depending on preparation time and context. r≈0.08 "
+                            "(approximately d≈0.16). Signal detects significant "
+                            "change in EITHER direction."
+                        ),
+                        "interpretation": (
+                            "Significant speech rate shift from baseline. "
+                            "Acceleration may indicate rehearsed delivery. "
+                            "Deceleration may indicate careful word selection. "
+                            "Both also occur from fatigue, topic change, or "
+                            "emotional arousal."
+                        ),
+                    },
+                })
+
+        if results:
+            logger.info(
+                "[%s] INTERROG-VOICE-04: %d speech_rate_change signals",
                 session_id, len(results),
             )
         return results

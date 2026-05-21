@@ -6,12 +6,18 @@ All rules operate on existing WindowFeatures fields — no new data extraction n
 Confidence caps follow research-validated accuracy rates per the spec.
 
 Rules implemented:
-  BLINK-PATTERN-01       Blink Suppression→Spike Pattern  (conf 0.70 — Leal & Vrij 2008)
-  MOTOR-INHIBIT-01       Motor Inhibition Pattern          (conf 0.35 — DePaulo 2003 meta)
-  INAPPROPRIATE-AFFECT-01 Smile in Severe-Negative Context (conf 0.45 — PMC 2024)
-  GAZE-SACCADES-01       Erratic Gaze Saccades            (conf 0.40 — VPS 2025)
-  INTERROG-BODY-02       Freezing Response                 (conf 0.55 — Navarro 2008)
-  INTERROG-BODY-01       Barrier Behavior                  (conf 0.50 — Navarro 2008)
+  BLINK-PATTERN-01        Blink Suppression→Spike Pattern  (conf 0.70 — Leal & Vrij 2008)
+  MOTOR-INHIBIT-01        Motor Inhibition Pattern          (conf 0.35 — DePaulo 2003 meta)
+  INAPPROPRIATE-AFFECT-01 Smile in Severe-Negative Context  (conf 0.45 — PMC 2024)
+  GAZE-SACCADES-01        Erratic Gaze Saccades             (conf 0.40 — VPS 2025)
+  INTERROG-BODY-02        Freezing Response                 (conf 0.55 — Navarro 2008)
+  INTERROG-BODY-03        Self-Adaptor Increase             (conf 0.35 — Li 2024, d=0.10)
+
+Removed rules (unreliable, per prompt.md evidence review):
+  INTERROG-BODY-01  barrier_behavior — no meta-analytic effect size; arms crossing
+                    is habitual/thermal in majority of cases; not in DePaulo 2003.
+  LOW-AUTONOMIC     low_autonomic_reactivity — NEXUS-original; zero published research;
+                    absence of stress is not a validated deception cue.
 
 Quality-adaptive thresholds (INTERROGATION_UPDATES1.MD §3 & §5):
   HIGH_QUALITY  fps ≥ 60 — lab/broadcast quality, full spec confidences
@@ -22,8 +28,8 @@ Quality-adaptive thresholds (INTERROGATION_UPDATES1.MD §3 & §5):
 Room camera gate (all interrogation_video sessions):
   Interrogation rooms use corner/ceiling-mounted cameras.  The oblique angle
   makes gaze direction tracking unreliable — eye contact cannot be measured.
-  Suppressed: erratic_gaze_pattern, low_autonomic_reactivity (uses gaze).
-  Body and face signals (blink, smile, motor, freeze, barrier) remain active.
+  Suppressed: erratic_gaze_pattern.
+  Body and face signals (blink, smile, motor, freeze, self-adaptor) remain active.
 
 CRITICAL DESIGN PRINCIPLE:
   None of these rules claim deception.  Every signal carries multiple
@@ -66,11 +72,10 @@ def _tier_from_fps(fps: float) -> VideoQualityTier:
 # Interrogation rooms use corner/ceiling-mounted cameras — oblique angle makes
 # gaze direction unreliable regardless of fps. Suppressed for ALL interrogation sessions.
 _ROOM_CAMERA_GATED: frozenset[str] = frozenset({
-    "erratic_gaze_pattern",     # gaze direction/saccades invalid from room camera angle
-    "low_autonomic_reactivity", # composite includes gaze component — unreliable at room angle
-    "sustained_distraction",    # requires subject to be looking at a screen — no screen in interrogation room
-    "screen_contact",           # "eye contact with camera/screen" has no meaning in CCTV angle
-    "attention_level",          # derived from screen_contact + gaze direction — both unreliable here
+    "erratic_gaze_pattern",  # gaze direction/saccades invalid from room camera angle
+    "sustained_distraction", # requires subject to be looking at a screen — no screen in interrogation room
+    "screen_contact",        # "eye contact with camera/screen" has no meaning in CCTV angle
+    "attention_level",       # derived from screen_contact + gaze direction — both unreliable here
 })
 
 # Master confidence table — source: INTERROGATION_UPDATES1.MD §5.
@@ -103,16 +108,11 @@ _QUALITY_CONF: dict[str, dict[VideoQualityTier, float]] = {
         VideoQualityTier.STANDARD_FPS: 0.55,
         VideoQualityTier.CCTV_QUALITY: 0.35,
     },
-    "barrier_behavior": {
-        VideoQualityTier.HIGH_QUALITY: 0.50,
-        VideoQualityTier.STANDARD_FPS: 0.50,
-        VideoQualityTier.CCTV_QUALITY: 0.35,
-    },
-    # 0.45 (not spec 0.65) — visual-only; conf=0.0 at CCTV suppresses entirely
-    "low_autonomic_reactivity": {
-        VideoQualityTier.HIGH_QUALITY: 0.45,
-        VideoQualityTier.STANDARD_FPS: 0.45,
-        VideoQualityTier.CCTV_QUALITY: 0.0,
+    # d=0.10 (DePaulo 2003); temporal-trend concept unvalidated → cap 0.35
+    "self_adaptor_increase": {
+        VideoQualityTier.HIGH_QUALITY: 0.35,
+        VideoQualityTier.STANDARD_FPS: 0.35,
+        VideoQualityTier.CCTV_QUALITY: 0.20,
     },
 }
 
@@ -142,15 +142,9 @@ GAZE_SACCADE_RATIO      = 1.50   # (gaze_x_std + gaze_y_std) > baseline * 1.50
 FREEZE_MOVEMENT_RATIO   = 0.35   # < 35% of baseline body_movement_mean; reduced from 0.20 for ceiling/corner camera geometry
 FREEZE_MIN_WINDOWS      = 3      # must persist for at least 3 consecutive windows
 
-# INTERROG-BODY-01: barrier — arms crossed spike
-BARRIER_RATIO            = 1.5   # arms_crossed_pct > baseline * 1.5; reduced from 2.0 for ceiling-camera geometry
-BARRIER_BASELINE_WINDOWS = 10    # first N windows for habitual-crosser check
-HABITUAL_CROSSER_FREQ    = 0.30  # baseline > 30% → habitual, not diagnostic
-BARRIER_MIN_BASELINE     = 0.10  # floor: near-zero baseline makes threshold = 0 → every window fires
-
-# LOW-AUTONOMIC-REACTIVITY: absence of all visual stress markers during confrontational context
-# Confidence capped at 0.45 (visual-only — voice modality absent; full spec cap 0.65)
-LOW_AUTONOMIC_CALM_BAND  = 0.20  # within ±20% of baseline = "calm" for each marker
+# INTERROG-BODY-03: self-adaptor increase — session-thirds self-touch rate trend
+SELF_ADAPTOR_TREND_RATIO = 1.5   # last-third rate / first-third rate >= 1.5 → fire
+SELF_ADAPTOR_MIN_WINDOWS = 6     # need at least 2 windows per third for reliable trend
 
 _ACCUSATORY_RE = re.compile(
     r"\b(you (did|killed|were there|lied|took|stole|shot|stabbed|hurt|committed)|"
@@ -236,7 +230,7 @@ class InterrogationVideoRules:
 
         handcuffed=True activates the HANDCUFFED tier:
           - motor_inhibition suppressed (arms restrained → gesture velocity invalid)
-          - barrier_behavior switches to torso backward-lean proxy (conf=0.20)
+          - self_adaptor_increase suppressed (wrist restraint blocks self-touch)
           - freezing_response confidence capped at 0.40 (body can still freeze)
           - blink and smile signals unchanged (face is unrestrained)
         """
@@ -263,7 +257,7 @@ class InterrogationVideoRules:
         if handcuffed:
             logger.info(
                 "[%s] HANDCUFFED tier active — motor_inhibition suppressed, "
-                "barrier_behavior → torso-lean proxy (conf=0.20), "
+                "self_adaptor_increase suppressed, "
                 "freezing_response capped at conf=0.40",
                 session_id,
             )
@@ -286,8 +280,7 @@ class InterrogationVideoRules:
             signals.extend(self._inappropriate_affect(spk, windows, diar_segments, tier))
             signals.extend(self._gaze_saccades(spk, windows, gaze_bl, tier))
             signals.extend(self._freezing_response(spk, windows, body_bl, tier, handcuffed=handcuffed))
-            signals.extend(self._barrier_behavior(spk, windows, body_bl, tier, handcuffed=handcuffed))
-            signals.extend(self._low_autonomic_reactivity(spk, windows, body_bl, facial_bl, gaze_bl, diar_segments, tier))
+            signals.extend(self._self_adaptor_increase(spk, windows, tier, handcuffed=handcuffed))
 
         # Room camera gate: oblique angle makes gaze-based signals unreliable
         gated = [s for s in signals if s["signal_type"] in _ROOM_CAMERA_GATED]
@@ -678,215 +671,90 @@ class InterrogationVideoRules:
                 })
         return signals
 
-    # ── INTERROG-BODY-01: Barrier Behavior ───────────────────────────────────
+    # ── INTERROG-BODY-03: Self-Adaptor Increase ──────────────────────────────
 
-    # Head-shoulder distance increase threshold for backward-lean proxy (normalised units).
-    # Mirrors body_rules.py HEAD_SHOULDER_BACK = -0.04 (drop = forward, rise = backward).
-    _HANDCUFFED_LEAN_THRESHOLD = 0.04
-
-    def _barrier_behavior(
+    def _self_adaptor_increase(
         self,
         spk: str,
         windows: list["WindowFeatures"],
-        bl: "BodyBaseline",
         tier: VideoQualityTier,
         handcuffed: bool = False,
     ) -> list[dict]:
         """
-        Navarro (2008): barrier behavior — crossed arms/legs as psychological shield.
-        CRITICAL UPDATE: must compare to baseline (room is intentionally cold).
-        Confidence: 0.50 (HIGH_QUALITY) / 0.35 (CCTV — larger movement required).
+        Li et al. (2024), DePaulo et al. (2003) — d=0.10 (small effect).
+        Liars exhibit higher frequency of self-adaptors (face/hair/arm touching).
+        Temporal trend: last-session-third rate / first-session-third rate >= 1.5.
 
-        HANDCUFFED: arms are physically restrained — arms_crossed_pct is invalid.
-        Switches to torso backward-lean proxy (head_shoulder_dist_mean increase > 0.04
-        from baseline indicates psychological distancing). Confidence capped at 0.20.
+        HANDCUFFED: suppressed — wrist restraint physically prevents self-touch.
+        Confidence: 0.35 (HIGH_QUALITY/STANDARD_FPS) / 0.20 (CCTV).
+        Temporal-trend concept is an engineering application; no paper validates
+        the specific effect size for trend-based self-adaptor detection.
         """
-        if len(windows) < BARRIER_BASELINE_WINDOWS:
-            return []
-
         if handcuffed:
-            return self._barrier_behavior_lean_proxy(spk, windows, bl, tier)
-
-        # Establish habitual baseline from first N windows
-        baseline_windows = windows[:BARRIER_BASELINE_WINDOWS]
-        baseline_crossing = sum(w.arms_crossed_pct for w in baseline_windows) / len(baseline_windows)
-
-        # Habitual crosser: suppressed (room temp / habit — no diagnostic value)
-        if baseline_crossing >= HABITUAL_CROSSER_FREQ:
             return []
 
-        # Floor prevents near-zero baseline (threshold = 0) from firing every window.
-        # A subject who barely crosses arms during baseline still requires a meaningful
-        # absolute crossing level before the rule fires.
-        effective_baseline = max(baseline_crossing, BARRIER_MIN_BASELINE)
-
-        conf = _QUALITY_CONF["barrier_behavior"][tier]
-        disclaimer = (
-            "Confidence reduced from 0.50 to 0.35 — CCTV resolution limits arm "
-            "position accuracy. Only strong barrier formations are reliable."
-        ) if tier == VideoQualityTier.CCTV_QUALITY else None
-
-        signals: list[dict] = []
-        for w in windows[BARRIER_BASELINE_WINDOWS:]:
-            if w.arms_crossed_pct >= effective_baseline * BARRIER_RATIO:
-                meta: dict = {
-                    "rule_id":            "INTERROG-BODY-01",
-                    "quality_tier":       tier.value,
-                    "baseline_crossing":  round(baseline_crossing, 3),
-                    "effective_baseline": round(effective_baseline, 3),
-                    "current_crossing":   round(w.arms_crossed_pct, 3),
-                    "elevation_ratio":    round(w.arms_crossed_pct / effective_baseline, 2),
-                    "interpretation":     "Barrier posture shift above habitual baseline. May indicate discomfort with current topic.",
-                    "context":            "NOT a deception cue. Indicates possible discomfort with question topic, cold temperature, chair discomfort, or normal posture adjustment.",
-                    "environmental_note": "Interrogation rooms are intentionally cold. Baseline comparison applied to suppress thermal-comfort false positives.",
-                }
-                if disclaimer:
-                    meta["quality_disclaimer"] = disclaimer
-                signals.append({
-                    "agent":            "video",
-                    "speaker_id":       spk,
-                    "signal_type":      "barrier_behavior",
-                    "value":            round(w.arms_crossed_pct, 3),
-                    "value_text":       "arms_crossed_above_baseline",
-                    "confidence":       conf,
-                    "window_start_ms":  w.window_start_ms,
-                    "window_end_ms":    w.window_end_ms,
-                    "metadata":         meta,
-                })
-        return signals
-
-    def _barrier_behavior_lean_proxy(
-        self,
-        spk: str,
-        windows: list["WindowFeatures"],
-        bl: "BodyBaseline",
-        tier: VideoQualityTier,
-    ) -> list[dict]:
-        """
-        Handcuffed substitute for barrier_behavior.
-
-        Arms are physically restrained so arms_crossed_pct is not diagnostic.
-        Instead, use torso backward lean (head_shoulder_dist_mean rise from baseline)
-        as a psychological-distance proxy. Mehrabian (1972): backward lean = avoidance.
-
-        Confidence fixed at 0.20 — indirect proxy; lower reliability than direct
-        barrier detection. CCTV stays at 0.20 (already conservative).
-        """
-        baseline_dist = bl.head_shoulder_dist_mean
-        if baseline_dist <= 0:
+        if len(windows) < SELF_ADAPTOR_MIN_WINDOWS:
             return []
 
-        signals: list[dict] = []
-        for w in windows[BARRIER_BASELINE_WINDOWS:]:
-            dist_delta = w.head_shoulder_dist_mean - baseline_dist
-            if dist_delta >= self._HANDCUFFED_LEAN_THRESHOLD:
-                signals.append({
-                    "agent":           "video",
-                    "speaker_id":      spk,
-                    "signal_type":     "barrier_behavior",
-                    "value":           round(dist_delta, 4),
-                    "value_text":      "backward_lean_proxy",
-                    "confidence":      0.20,
-                    "window_start_ms": w.window_start_ms,
-                    "window_end_ms":   w.window_end_ms,
-                    "metadata": {
-                        "rule_id":          "INTERROG-BODY-01",
-                        "quality_tier":     tier.value,
-                        "proxy_mode":       "HANDCUFFED",
-                        "baseline_dist":    round(baseline_dist, 4),
-                        "current_dist":     round(w.head_shoulder_dist_mean, 4),
-                        "dist_delta":       round(dist_delta, 4),
-                        "threshold":        self._HANDCUFFED_LEAN_THRESHOLD,
-                        "interpretation":   "Backward torso lean during restraint. Indicates psychological distancing from interrogator or question topic.",
-                        "proxy_note":       "Arms restrained — arms_crossed_pct invalid. Head-shoulder distance rise used as avoidance proxy (Mehrabian 1972).",
-                        "confidence_note":  "Confidence capped at 0.20 — indirect proxy. Pair with vocal stress and language signals.",
-                    },
-                })
-        return signals
+        n = len(windows)
+        third = max(1, n // 3)
+        first_third = windows[:third]
+        last_third  = windows[n - third:]
 
-    # ── LOW-AUTONOMIC-REACTIVITY ──────────────────────────────────────────────
+        def _mean_self_touch(ws: list) -> float:
+            rates = [getattr(w, "self_touch_pct", 0.0) for w in ws]
+            return sum(rates) / len(rates) if rates else 0.0
 
-    def _low_autonomic_reactivity(
-        self,
-        spk: str,
-        windows: list["WindowFeatures"],
-        body_bl: "BodyBaseline",
-        facial_bl: "FacialBaseline",
-        gaze_bl: "GazeBaseline",
-        diar_segments: list[dict],
-        tier: VideoQualityTier,
-    ) -> list[dict]:
-        """
-        Ekman (1991): some individuals show no physiological arousal markers during
-        confrontational accusation — a profile consistent with both confident innocent
-        subjects AND psychopathic individuals.
-        Confidence: 0.45 (HIGH_QUALITY, visual-only; spec cap 0.65 requires voice).
-        CCTV/SUPPRESSED: returns [] — rule requires all three markers to be reliable.
+        first_rate = _mean_self_touch(first_third)
+        last_rate  = _mean_self_touch(last_third)
 
-        Fires when ALL three visual stress markers are within ±20% of baseline
-        during a window that overlaps with accusatory transcript content.
-        """
-        # Rule requires reliable measurements of all three visual markers.
-        # At CCTV quality, blink and gaze precision drop too far to trust "calm" readings.
-        conf = _QUALITY_CONF["low_autonomic_reactivity"][tier]
-        if conf <= 0.0:
+        denominator = max(first_rate, 0.01)
+        ratio = last_rate / denominator
+
+        if ratio < SELF_ADAPTOR_TREND_RATIO:
             return []
 
-        baseline_movement  = body_bl.body_movement_mean
-        baseline_blink     = facial_bl.blink_rate_bpm
-        baseline_gaze      = gaze_bl.gaze_x_std_mean + gaze_bl.gaze_y_std_mean
+        conf  = _QUALITY_CONF["self_adaptor_increase"][tier]
+        value = round(min(1.0, (ratio - SELF_ADAPTOR_TREND_RATIO) / SELF_ADAPTOR_TREND_RATIO), 4)
 
-        if baseline_movement <= 0 or baseline_blink <= 0:
-            return []
-
-        signals: list[dict] = []
-        for w in windows:
-            # Must be in a confrontational context (accusatory language near this window)
-            context = _segment_text_near_window(
-                diar_segments, w.window_start_ms, w.window_end_ms, context_ms=8_000
-            )
-            if not _ACCUSATORY_RE.search(context):
-                continue
-
-            # Check all three visual stress markers are calm (within ±20% of baseline)
-            movement_ratio = w.body_movement_mean / max(baseline_movement, 1e-6)
-            blink_ratio    = w.blink_rate_bpm    / max(baseline_blink, 1e-6)
-            gaze_spread    = w.gaze_x_std + w.gaze_y_std
-            gaze_ratio     = gaze_spread           / max(baseline_gaze, 1e-6)
-
-            movement_calm = abs(movement_ratio - 1.0) <= LOW_AUTONOMIC_CALM_BAND
-            blink_calm    = abs(blink_ratio    - 1.0) <= LOW_AUTONOMIC_CALM_BAND
-            gaze_calm     = gaze_ratio <= (1.0 + LOW_AUTONOMIC_CALM_BAND)
-
-            if movement_calm and blink_calm and gaze_calm:
-                signals.append({
-                    "agent":           "video",
-                    "speaker_id":      spk,
-                    "signal_type":     "low_autonomic_reactivity",
-                    "value":           round(1.0 - max(
-                        abs(movement_ratio - 1.0),
-                        abs(blink_ratio    - 1.0),
-                        max(gaze_ratio - 1.0, 0.0),
-                    ), 3),
-                    "value_text":      "no_arousal_during_confrontation",
-                    "confidence":      conf,
-                    "window_start_ms": w.window_start_ms,
-                    "window_end_ms":   w.window_end_ms,
-                    "metadata": {
-                        "rule_id":        "LOW-AUTONOMIC-REACTIVITY",
-                        "quality_tier":   tier.value,
-                        "movement_ratio": round(movement_ratio, 3),
-                        "blink_ratio":    round(blink_ratio, 3),
-                        "gaze_ratio":     round(gaze_ratio, 3),
-                        "modality_note":  "Visual markers only. Confidence reduced from spec 0.65 — voice modality unavailable at this layer.",
-                        "interpretations": [
-                            "Confident innocence: innocent subject shows no fear because no threat is perceived",
-                            "Psychopathic calm: reduced limbic response to social threat (requires PCL-R to distinguish)",
-                            "Emotional numbing: prior trauma or dissociation under extreme stress",
-                            "Cultural display rules: subject has trained composure",
-                            "Fatigue: extended interrogation causing emotional suppression",
-                        ],
-                        "recommendation": "Cannot distinguish innocent confidence from psychopathic calm behaviourally. Requires clinical assessment (PCL-R). Cross-reference with contamination and denial evolution.",
-                    },
-                })
-        return signals
+        logger.info(
+            "[%s] INTERROG-BODY-03: %s self_adaptor_increase "
+            "first_rate=%.3f last_rate=%.3f ratio=%.2f conf=%.2f",
+            spk, spk, first_rate, last_rate, ratio, conf,
+        )
+        return [{
+            "agent":            "video",
+            "speaker_id":       spk,
+            "signal_type":      "self_adaptor_increase",
+            "value":            value,
+            "value_text":       "increasing_self_touch_trend",
+            "confidence":       conf,
+            "window_start_ms":  last_third[0].window_start_ms,
+            "window_end_ms":    last_third[-1].window_end_ms,
+            "metadata": {
+                "rule_id":           "INTERROG-BODY-03",
+                "quality_tier":      tier.value,
+                "first_third_rate":  round(first_rate, 4),
+                "last_third_rate":   round(last_rate, 4),
+                "trend_ratio":       round(ratio, 3),
+                "threshold":         SELF_ADAPTOR_TREND_RATIO,
+                "windows_analyzed":  n,
+                "research": (
+                    "Li et al. 2024 Frontiers in Psychology 15 "
+                    "doi:10.3389/fpsyg.2024.1331653 — 'liars exhibited higher "
+                    "frequency of self-adaptors'. DePaulo et al. 2003 Psychological "
+                    "Bulletin 129(1):74-118 — fidgeting d=0.10 (small effect)."
+                ),
+                "effect_note": (
+                    "Direction supported (d=0.10 for absolute fidgeting rate). "
+                    "The 'increasing temporal trend' concept is an engineering "
+                    "application — no study quantifies the effect size of "
+                    "self-adaptor rate change over session duration."
+                ),
+                "interpretation": (
+                    "Rate of face/hair/arm touching increased across the session. "
+                    "Equally present in innocent suspects experiencing mounting "
+                    "pressure, fatigue, or discomfort from prolonged sitting."
+                ),
+            },
+        }]

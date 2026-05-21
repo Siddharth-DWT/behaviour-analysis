@@ -35,10 +35,10 @@ logger = logging.getLogger("nexus.fusion.interrogation")
 _STRESS_PEAK_TYPES: frozenset[str] = frozenset({
     "vocal_stress_score",
     "blink_suppression_spike",
-    "vocal_agitation",
-    "pitch_elevation",
-    "voice_energy_change",
-    "tone_shift",
+    "agitated_high_arousal_tone",
+    "pitch_elevation_flag",
+    "energy_level",
+    "tone_classification",
 })
 
 # Phase-3 weakening/breakdown signals that complete the cascade
@@ -50,12 +50,17 @@ _CAPITULATION_TYPES: frozenset[str] = frozenset({
 })
 
 # Resistance signals tracked across early vs late session for hardening detection
+# Updated per prompt.md: removed barrier_behavior (no meta-analytic effect size),
+# pronoun_distancing (DePaulo 2003 d=0.03), tense_inconsistency (no controlled effect size).
+# Replaced with research-verified signals: self_adaptor_increase (Li 2024, d=0.10),
+# detail_reduction (DePaulo 2003 d≈0.25-0.35), vocal_hesitation_cluster (Sporer & Schwandt 2006).
 _RESISTANCE_TYPES: frozenset[str] = frozenset({
-    "barrier_behavior",
-    "pronoun_distancing",
-    "tense_inconsistency",
-    "motor_inhibition",
-    "blink_suppression_spike",
+    "self_adaptor_increase",      # Li 2024, DePaulo 2003 d=0.10
+    "detail_reduction",           # DePaulo 2003 d≈0.25-0.35
+    "vocal_hesitation_cluster",   # Sporer & Schwandt 2006, small effect
+    "motor_inhibition",           # Vrij 1996 (kept — validated)
+    "blink_suppression_spike",    # Frosina 2018 (kept — validated)
+    "facial_emotion:contempt",    # Ekman 1991 (kept)
 })
 
 # ── Tuning constants ──────────────────────────────────────────────────────────
@@ -263,8 +268,12 @@ class InterrogationCompoundPatterns:
           4. Cross-modal gate: resistance signals must span ≥2 distinct agents.
           5. Emits one signal per speaker spanning the late-session window.
         """
+        def _is_resistance(s: dict) -> bool:
+            st = s.get("signal_type", "")
+            return st in _RESISTANCE_TYPES or f"{st}:{s.get('value_text', '')}" in _RESISTANCE_TYPES
+
         res_sigs = sorted(
-            [s for s in signals if s.get("signal_type") in _RESISTANCE_TYPES],
+            [s for s in signals if _is_resistance(s)],
             key=lambda s: _ms(s, "window_start_ms"),
         )
         if len(res_sigs) < _HARDENING_LATE_MIN:
@@ -331,7 +340,7 @@ class InterrogationCompoundPatterns:
                     "Cannot distinguish between these interpretations behaviorally."
                 ),
                 "recommendation": (
-                    "Compare with linguistic signals (pronoun_distancing, denial_weakening trend). "
+                    "Compare with linguistic signals (detail_reduction, denial_weakening trend). "
                     "Note whether resistance hardened before or after specific evidence was presented."
                 ),
             },
@@ -367,8 +376,10 @@ class FalseConfessionRiskAssessor:
     _HARDENING_TYPES      = frozenset({"resistance_hardening"})
     _PROCESSING_TYPES     = frozenset({"evidence_response_processing_delay"})
     _RESISTANCE_BUILDING  = frozenset({
-        "barrier_behavior", "pronoun_distancing",
-        "tense_inconsistency", "motor_inhibition",
+        "self_adaptor_increase",
+        "detail_reduction",
+        "vocal_hesitation_cluster",
+        "motor_inhibition",
     })
 
     def evaluate(

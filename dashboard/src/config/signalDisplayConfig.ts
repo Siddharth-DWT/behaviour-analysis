@@ -810,38 +810,37 @@ const SIGNAL_MAP: Record<string, SignalDisplay> = {
     description: 'Sudden body stillness after accusatory statement — threat-detection freeze. Equally common in truthful and deceptive subjects under accusation.',
     icon: '❄️', color: '#8B5CF6', category: 'body', priority: 1,
   },
-  'barrier_behavior': {
-    label: 'Barrier Posture',
-    description: 'Sustained crossed-arm posture with tension — defensive posture, self-comfort, or habitual position. Cannot distinguish cause from posture alone.',
-    icon: '🛡️', color: '#8B5CF6', category: 'body', priority: 2,
-  },
-  'barrier_behavior:torso_lean_away': {
-    label: 'Leaning Away',
-    description: 'Torso backward lean (handcuffed subject — arms unavailable for barrier measurement). Distancing behavior or postural fatigue.',
-    icon: '↩️', color: '#8B5CF6', category: 'body', priority: 2,
+  'self_adaptor_increase': {
+    label: 'Increasing Self-Touch',
+    description: 'Self-touch rate increased across the session (Li et al. 2024, DePaulo 2003 d=0.10). Equally present in innocent suspects under prolonged pressure.',
+    icon: '✋', color: '#8B5CF6', category: 'body', priority: 2,
   },
   'erratic_gaze_pattern': {
     label: 'Erratic Gaze',
     description: 'Elevated gaze randomness during questioning — may indicate cognitive load, visual search, avoidance, or simply looking around the room.',
     icon: '👀', color: '#8B5CF6', category: 'gaze', priority: 2,
   },
-  'low_autonomic_reactivity': {
-    label: 'Unusually Calm',
-    description: 'No visible stress markers during confrontational questioning — high emotional control, genuine composure, or dissociation.',
-    icon: '😐', color: '#6B7280', category: 'face', priority: 1,
-  },
-
   // ── Interrogation: per-segment language signals ───────────────────────────────
   // Category 'pattern' so they appear in the sidebar and timeline.
-  'pronoun_distancing': {
-    label: 'Distancing Language',
-    description: 'Shift from first-person ("I/me") to third-person ("one/they") — psychological distance from narrative. Also common in formal speech and fatigue.',
-    icon: '↔️', color: '#A78BFA', category: 'pattern', priority: 2,
+  'detail_reduction': {
+    label: 'Low Detail',
+    description: 'Narrative lacks sensory details compared to earlier accounts. Strongest verbal deception cue (DePaulo 2003, d≈0.25-0.35). Also occurs in genuine memory gaps or fatigue.',
+    icon: '📝', color: '#A78BFA', category: 'pattern', priority: 1,
   },
-  'tense_inconsistency': {
-    label: 'Tense Shift',
-    description: 'Switching past/present tense in same narrative — may indicate real-time construction, trauma recall, or natural storytelling style.',
-    icon: '⏳', color: '#A78BFA', category: 'pattern', priority: 2,
+  'narrative_consistency_drift': {
+    label: 'Story Drift',
+    description: 'Same event described differently at different times (Granhag & Strömwall 1999). Also occurs from memory degradation or different questioning frames. No quantified effect size.',
+    icon: '🔀', color: '#A78BFA', category: 'pattern', priority: 2,
+  },
+  'vocal_hesitation_cluster': {
+    label: 'Hesitation Burst',
+    description: 'Cluster of 3+ speech disfluencies within 10 seconds. Cognitive load indicator (Sporer & Schwandt 2006). Equally occurs during genuine confusion or high emotional arousal.',
+    icon: '💬', color: '#8B5CF6', category: 'pattern', priority: 2,
+  },
+  'speech_rate_change': {
+    label: 'Speech Rate Shift',
+    description: 'Significant speech rate change (>30%) from baseline. Direction is context-dependent (Sporer & Schwandt 2006, r=0.08). Also changes with fatigue or topic difficulty.',
+    icon: '⏩', color: '#8B5CF6', category: 'pattern', priority: 2,
   },
   'evidence_response_processing_delay': {
     label: 'Delayed Response',

@@ -86,7 +86,7 @@ SPEAKER_DEFAULTS: dict[str, dict] = {
     "presentation":          {"default": 1, "min": 1, "max": 3,  "turn_gap_ms": 1000},
     "debate":                {"default": 2, "min": 2, "max": 4,  "turn_gap_ms": 400},
     "casual_conversation":   {"default": 2, "min": 2, "max": 4,  "turn_gap_ms": 400},
-    "interrogation_video":   {"default": 2, "min": 2, "max": 4,  "turn_gap_ms": 800},
+    "interrogation_video":   {"default": 2, "min": 2, "max": 10, "turn_gap_ms": 400},
 }
 
 _SPEAKER_DEFAULTS_FALLBACK = {"default": 2, "min": 2, "max": 8, "turn_gap_ms": 600}

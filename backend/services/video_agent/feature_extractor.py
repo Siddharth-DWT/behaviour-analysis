@@ -310,6 +310,7 @@ class MeetingProfile:
     body_rules_confidence_cap: float
     tracker_max_disappeared: int = 90       # CentroidTracker expiry; 90 = 18s at 5fps (CLAUDE.md min)
     num_faces_override: Optional[int] = None
+    min_detection_confidence: float = 0.15  # Bug 5: 0.30 for room/interrogation (large faces, fewer FPs)
 
     @classmethod
     def grid(cls, face_count: int) -> "MeetingProfile":
@@ -354,9 +355,10 @@ class MeetingProfile:
             active_tile_tagger_enabled=False,
             layout_reset_sensitivity=50,
             merge_threshold_offset=0.0,
-            static_face_filter_enabled=False,
+            static_face_filter_enabled=True,
             body_rules_confidence_cap=1.0,
             num_faces_override=face_count + 4,
+            min_detection_confidence=0.30,
         )
 
     @classmethod
@@ -397,7 +399,7 @@ class MeetingTypeProbe:
     Classification priority: grid > active_speaker > room > unknown.
     """
 
-    SAMPLE_POINTS: tuple[float, ...] = (0.02, 0.05, 0.10, 0.25, 0.40, 0.55, 0.70, 0.80, 0.90, 0.95)
+    SAMPLE_POINTS: tuple[float, ...] = tuple(i / 100.0 for i in range(2, 98, 5))  # 20 points, 2%→97%
 
     _GRID_MIN_FACES       = 4
     _GRID_MAX_AREA_RATIO  = 2.5
@@ -767,6 +769,13 @@ class WindowAggregator:
         if face_frames:
             wf.face_box_area_mean = float(np.mean([f.face_box_area for f in face_frames]))
             wf.face_count = max(f.face_count for f in face_frames)
+            # Clamp window to actual detection span so signals and the face
+            # highlight box disappear when the face leaves the frame, not at
+            # the fixed bucket boundary. Faces detected for only part of a
+            # window no longer bleed their signals into frames where they
+            # are absent.
+            wf.window_start_ms = min(f.timestamp_ms for f in face_frames)
+            wf.window_end_ms   = max(f.timestamp_ms for f in face_frames)
 
         # ── Blendshapes ────────────────────────────────────────────────────────
         if face_frames:
@@ -3203,6 +3212,7 @@ class VideoFeatureExtractor:
         self._profile_static_filter       = profile.static_face_filter_enabled
         self._profile_body_conf_cap       = profile.body_rules_confidence_cap
         self._profile_tracker_max_disapp  = profile.tracker_max_disappeared
+        self._profile_min_det_conf        = profile.min_detection_confidence
 
         if profile.num_faces_override and profile.num_faces_override > self._num_faces:
             old = self._num_faces
@@ -3502,6 +3512,13 @@ class VideoFeatureExtractor:
         # Tracks face count frame-to-frame so identity_verifier.force_check_next_frame()
         # fires immediately when a new person appears (count increases).
         _prev_face_count: int = 0
+        # Scene cut detection — downsampled previous frame for pixel-diff comparison.
+        _prev_small: "np.ndarray | None" = None
+        _SCENE_CUT_THRESH: int = 40    # per-channel absolute diff to count a pixel as "changed"
+        _SCENE_CUT_FRAC: float = 0.65  # fraction of pixels that must change to trigger reset
+        _cut_timestamps: list[int] = []      # ms timestamp of each detected scene cut
+        _track_first_ms: dict[int, int] = {} # track_id → first frame timestamp_ms
+        _track_last_ms:  dict[int, int] = {} # track_id → last frame timestamp_ms
         # Tracks stable layout value to detect any layout change (even within-family).
         # When the large tile changes occupant (solo→active_speaker, gallery→active_speaker),
         # face count stays 1 because the small tile is filtered by area < 0.02 — so the
@@ -3530,6 +3547,26 @@ class VideoFeatureExtractor:
                 if frame_idx % skip == 0:
                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
+                    # ── Scene cut detection (Bug 3) ───────────────────────────
+                    # Hard cuts (interrogation → news footage) change >80% of pixels.
+                    # Reset tracker so dead tracks from the previous scene don't
+                    # absorb faces from the new scene.
+                    _small = cv2.resize(bgr, (80, 45))
+                    if _prev_small is not None:
+                        _diff = np.abs(_small.astype(np.int16) - _prev_small.astype(np.int16))
+                        _changed_frac = float(np.mean(_diff.max(axis=2) > _SCENE_CUT_THRESH))
+                        if _changed_frac >= _SCENE_CUT_FRAC:
+                            _cut_timestamps.append(timestamp_ms)
+                            centroid_tracker.reset()
+                            identity_verifier.clear()
+                            if active_tagger is not None:
+                                active_tagger.reset()
+                            logger.info(
+                                "Scene cut at %dms (%.0f%% pixels changed) — tracker reset",
+                                timestamp_ms, _changed_frac * 100,
+                            )
+                    _prev_small = _small
+
                     try:
                         last_face_result, last_pose_result, last_hand_result = (
                             processor.detect(rgb, timestamp_ms)
@@ -3537,6 +3574,19 @@ class VideoFeatureExtractor:
                     except Exception as exc:
                         logger.debug(f"Tiled detect error frame {frame_idx}: {exc}")
                         last_face_result = last_pose_result = last_hand_result = None
+
+                    # ── Profile detection confidence gate (Bug 5) ────────────
+                    # Room/interrogation cameras have large faces — raise threshold
+                    # from 0.15 to 0.30 to reject false detections on textures.
+                    _min_det = getattr(self, "_profile_min_det_conf", 0.15)
+                    if last_face_result is not None and _min_det > 0.15:
+                        try:
+                            last_face_result.detections = [
+                                d for d in (last_face_result.detections or [])
+                                if d.categories and d.categories[0].score >= _min_det
+                            ]
+                        except (AttributeError, TypeError):
+                            pass
 
                     try:
                         frame_features_list = self._process_frame_from_results(
@@ -3553,13 +3603,20 @@ class VideoFeatureExtractor:
                         layout_classifier.classify_frame(frame_features_list)
                         current_layout = layout_classifier.stable_layout
                         if layout_classifier.layout_changed:
-                            centroid_tracker.reset()
-                            identity_verifier.clear()
-                            if active_tagger is not None:
-                                active_tagger.reset()
+                            # Room-type meetings (interrogation, conference) use fixed
+                            # camera positions — layout changes are camera angle cuts,
+                            # not tile rearrangements. Resetting the tracker on every
+                            # cut fragments face IDs and causes bleed-over signals.
+                            # Cross-shot re-ID (_cross_shot_merge) handles consolidation.
+                            if self._profile_meeting_type != "room":
+                                centroid_tracker.reset()
+                                identity_verifier.clear()
+                                if active_tagger is not None:
+                                    active_tagger.reset()
                             logger.info(
-                                "Layout → %s at %dms — tracker reset",
+                                "Layout → %s at %dms — %s",
                                 current_layout, timestamp_ms,
+                                "tracker reset" if self._profile_meeting_type != "room" else "skipped reset (room profile)",
                             )
                         elif current_layout != _prev_stable_layout and _prev_stable_layout != "":
                             # Layout value changed within the same family (e.g. solo →
@@ -3807,6 +3864,14 @@ class VideoFeatureExtractor:
             if ff.face_detected:
                 frame_counts[ff.face_index] = frame_counts.get(ff.face_index, 0) + 1
 
+        # Track time ranges for cross-shot re-identification
+        for ff in frames:
+            if ff.face_detected:
+                tid = ff.face_index
+                if tid not in _track_first_ms:
+                    _track_first_ms[tid] = ff.timestamp_ms
+                _track_last_ms[tid] = ff.timestamp_ms
+
         # Per-track avg face height, centroid, and pose quality — used for merge.
         # Computed from all frames (not just best-frame crop) for accuracy.
         _track_face_areas: dict[int, list[float]] = {}
@@ -3881,6 +3946,14 @@ class VideoFeatureExtractor:
                             track_centroids=track_centroids,
                             pose_quality=track_pose_quality,
                         )
+                        if _cut_timestamps:
+                            canonical = self._cross_shot_merge(
+                                canonical=canonical,
+                                track_embeddings=track_embs,
+                                track_first_ms=_track_first_ms,
+                                track_last_ms=_track_last_ms,
+                                cut_timestamps=_cut_timestamps,
+                            )
                         merges = {k: v for k, v in canonical.items() if k != v}
 
                         if merges:
@@ -3889,22 +3962,35 @@ class VideoFeatureExtractor:
                                 if ff.face_index in canonical:
                                     ff.face_index = canonical[ff.face_index]
 
-                            # Keep only canonical crops; prefer the larger crop
+                            # Keep only canonical crops; prefer the highest quality frame
+                            # (frontal × large bbox × well-lit) across all merged tracks.
+                            # Using raw crop.size (pixel count) picked the biggest region, not
+                            # the clearest face — causing wrong-person thumbnails after merge.
                             merged_crops: dict[int, np.ndarray] = {}
+                            merged_crop_quality: dict[int, float] = {}
                             for tid, crop in self._best_face_crops.items():
                                 canon_tid = canonical.get(tid, tid)
-                                if (canon_tid not in merged_crops
-                                        or crop.size > merged_crops[canon_tid].size):
+                                q = best_quality.get(tid, 0.0)
+                                if canon_tid not in merged_crop_quality or q > merged_crop_quality[canon_tid]:
                                     merged_crops[canon_tid] = crop
+                                    merged_crop_quality[canon_tid] = q
                             self._best_face_crops = merged_crops
 
-                            # Update cached embeddings to canonical only
-                            # (no second ArcFace pass — reuse extraction results)
+                            # Update cached embeddings to canonical only, then regenerate
+                            # the thumbnail from the selected best crop so the stored image
+                            # matches the face that was actually embedded (avoids mismatch).
                             merged_embs: dict[int, tuple[list[float], bytes]] = {}
                             for tid, data in self._cached_embeddings.items():
                                 canon_tid = canonical.get(tid, tid)
                                 if canon_tid not in merged_embs:
                                     merged_embs[canon_tid] = data
+                            import cv2 as _cv2_t
+                            for canon_tid, (emb_list, _) in list(merged_embs.items()):
+                                if canon_tid in self._best_face_crops:
+                                    crop = self._best_face_crops[canon_tid]
+                                    thumb = _cv2_t.resize(crop, (96, 96), interpolation=_cv2_t.INTER_AREA)
+                                    _, jpeg = _cv2_t.imencode(".jpg", thumb, [_cv2_t.IMWRITE_JPEG_QUALITY, 85])
+                                    merged_embs[canon_tid] = (emb_list, jpeg.tobytes())
                             self._cached_embeddings = merged_embs
 
                         # NOTE: No remap of _active_tile_face_to_speaker through the
@@ -5085,6 +5171,120 @@ class VideoFeatureExtractor:
 
         return canonical
 
+    @staticmethod
+    def _cross_shot_merge(
+        canonical: dict[int, int],
+        track_embeddings: "dict[int, np.ndarray]",
+        track_first_ms: dict[int, int],
+        track_last_ms: dict[int, int],
+        cut_timestamps: list[int],
+        threshold: float = 0.40,
+    ) -> dict[int, int]:
+        """
+        Link canonical track groups that span scene cut boundaries.
+
+        _merge_tracks_by_embedding() handles same-shot same-person merges.
+        This pass handles the cross-shot case: the same person reappears
+        in a different camera angle after a cut. Three conditions must hold:
+          1. Groups are temporally non-overlapping (temporal exclusivity).
+          2. The gap between them straddles at least one cut timestamp.
+          3. Cosine similarity of representative embeddings >= threshold.
+
+        threshold=0.40 is lower than the main merge threshold because temporal
+        exclusivity removes identity ambiguity and cut-induced pose/lighting
+        changes depress ArcFace similarity ~0.05-0.10 below the true value.
+        """
+        if not cut_timestamps or not track_embeddings:
+            return canonical
+
+        from collections import defaultdict
+
+        groups: dict[int, list[int]] = defaultdict(list)
+        for tid, cid in canonical.items():
+            groups[cid].append(tid)
+
+        group_first: dict[int, int]           = {}
+        group_last:  dict[int, int]           = {}
+        group_emb:   "dict[int, np.ndarray]"  = {}
+        group_size:  dict[int, int]           = {}
+
+        for cid, members in groups.items():
+            firsts = [track_first_ms[t] for t in members if t in track_first_ms]
+            lasts  = [track_last_ms[t]  for t in members if t in track_last_ms]
+            if not firsts:
+                continue
+            group_first[cid] = min(firsts)
+            group_last[cid]  = max(lasts)
+            group_size[cid]  = sum(1 for t in members if t in track_first_ms)
+            if cid in track_embeddings:
+                group_emb[cid] = track_embeddings[cid]
+            else:
+                for m in members:
+                    if m in track_embeddings:
+                        group_emb[cid] = track_embeddings[m]
+                        break
+
+        valid_cids = [c for c in group_emb if c in group_first]
+        if len(valid_cids) < 2:
+            return canonical
+
+        parent: dict[int, int] = {c: c for c in valid_cids}
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(a: int, b: int) -> None:
+            ra, rb = _find(a), _find(b)
+            if ra == rb:
+                return
+            if group_size.get(ra, 0) >= group_size.get(rb, 0):
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
+        valid_cids_sorted = sorted(valid_cids, key=lambda c: group_size.get(c, 0), reverse=True)
+        merge_count = 0
+
+        for i, cid_a in enumerate(valid_cids_sorted):
+            emb_a = group_emb.get(cid_a)
+            if emb_a is None:
+                continue
+            fa = group_first[cid_a]
+            la = group_last[cid_a]
+            for cid_b in valid_cids_sorted[i + 1:]:
+                if _find(cid_a) == _find(cid_b):
+                    continue
+                emb_b = group_emb.get(cid_b)
+                if emb_b is None:
+                    continue
+                fb = group_first[cid_b]
+                lb = group_last[cid_b]
+                if min(la, lb) > max(fa, fb):
+                    continue  # tracks overlap in time — cannot be same person
+                gap_start = min(la, lb)
+                gap_end   = max(fa, fb)
+                if not any(gap_start <= ct <= gap_end for ct in cut_timestamps):
+                    continue  # gap contains no scene cut
+                sim = float(np.dot(emb_a, emb_b))
+                if sim >= threshold:
+                    _union(cid_a, cid_b)
+                    merge_count += 1
+                    logger.info(
+                        "Cross-shot merge: %d ← %d (sim=%.3f, gap=[%dms, %dms])",
+                        _find(cid_a), cid_b, sim, gap_start, gap_end,
+                    )
+
+        if merge_count == 0:
+            return canonical
+
+        result: dict[int, int] = {}
+        for tid, cid in canonical.items():
+            result[tid] = _find(cid) if cid in parent else cid
+        return result
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ActiveSpeakerBorderDetector  — platform-native border color detection
@@ -5139,10 +5339,19 @@ class ActiveSpeakerBorderDetector:
         Return the index into face_boxes of the face with an active-speaker border,
         or None if no border detected.
 
+        Two-pass strategy:
+          Pass 1 — face-proximity: sample border_width pixels outside each face box.
+                   Works for platforms that draw borders close to the face (Teams rings).
+          Pass 2 — frame-edge: sample the outermost TILE_EDGE_PX rows/cols of the frame.
+                   Works for Zoom/Meet active_speaker layout where the highlighted tile
+                   fills most of the frame and its border is at the frame edge, far from
+                   the face centre. Assigns the border to whichever face is closest to
+                   the frame centre (the dominant tile's face).
+
         Args:
             bgr:          full frame (BGR)
             face_boxes:   [(x, y, w, h), ...] pixel bounding boxes
-            border_width: pixels outside the face box to sample
+            border_width: pixels outside the face box to sample (Pass 1)
             match_ratio:  fraction of perimeter pixels that must match
         """
         import cv2
@@ -5150,34 +5359,48 @@ class ActiveSpeakerBorderDetector:
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         fh, fw = bgr.shape[:2]
 
+        def _color_match_ratio(pixels: "np.ndarray") -> float:
+            if pixels.size == 0:
+                return 0.0
+            best = 0
+            for lo, hi in self._hsv_ranges:
+                mask = cv2.inRange(
+                    pixels.reshape(1, -1, 3),
+                    np.array(lo), np.array(hi),
+                )
+                best = max(best, int(np.count_nonzero(mask)))
+            return best / len(pixels)
+
+        # ── Tile-aware border sampling ────────────────────────────────────────
+        # Video call platforms draw the active-speaker border around the TILE,
+        # not around the face. Face typically occupies ~50% of each tile dimension,
+        # so the tile border sits ~face_size * 0.5 pixels outside the face box.
+        # Scale the sampling distance proportionally so both large main tiles and
+        # small sidebar tiles are covered without needing separate passes.
         best_idx: int | None = None
         best_match: float = 0.0
 
         for idx, (x, y, w, h) in enumerate(face_boxes):
-            x1 = max(0, x - border_width)
-            y1 = max(0, y - border_width)
-            x2 = min(fw, x + w + border_width)
-            y2 = min(fh, y + h + border_width)
+            # Tile border is roughly half a face-width outside the face bbox.
+            # Clamp to [border_width, 200] to avoid absurd values on huge/tiny faces.
+            tile_pad = max(border_width, min(200, int(max(w, h) * 0.55)))
 
-            border_strips = [
-                hsv[y1:y,       x1:x2].reshape(-1, 3),   # top
-                hsv[y + h:y2,   x1:x2].reshape(-1, 3),   # bottom
-                hsv[y:y + h,    x1:x ].reshape(-1, 3),   # left
-                hsv[y:y + h, x + w:x2].reshape(-1, 3),   # right
+            x1 = max(0, x - tile_pad)
+            y1 = max(0, y - tile_pad)
+            x2 = min(fw, x + w + tile_pad)
+            y2 = min(fh, y + h + tile_pad)
+
+            # Sample only the outer ring of the expanded region (8px thick) so
+            # interior content doesn't dilute the border color ratio.
+            ring = 8
+            strips = [
+                hsv[y1:y1 + ring,    x1:x2       ].reshape(-1, 3),   # top ring
+                hsv[y2 - ring:y2,    x1:x2       ].reshape(-1, 3),   # bottom ring
+                hsv[y1:y2,           x1:x1 + ring].reshape(-1, 3),   # left ring
+                hsv[y1:y2,    x2 - ring:x2       ].reshape(-1, 3),   # right ring
             ]
-            all_border = np.vstack([s for s in border_strips if s.size > 0])
-            if len(all_border) == 0:
-                continue
-
-            total_match = 0
-            for lo, hi in self._hsv_ranges:
-                mask = cv2.inRange(
-                    all_border.reshape(1, -1, 3),
-                    np.array(lo), np.array(hi),
-                )
-                total_match = max(total_match, int(np.count_nonzero(mask)))
-
-            ratio = total_match / len(all_border)
+            all_border = np.vstack([s for s in strips if s.size > 0])
+            ratio = _color_match_ratio(all_border)
             if ratio > match_ratio and ratio > best_match:
                 best_match = ratio
                 best_idx = idx
@@ -5538,6 +5761,16 @@ class SpeakerFaceMapper:
                 score = assignment_scores.get(fi, 0.0)
                 if score > 0.0:
                     lip_sync_scores[spk] = 1.0
+                    confident_mapping[fi] = spk
+
+        # Active-tile entries (merged above) bypass the asd/lip_sync/time_overlap
+        # branches so lip_sync_scores is never set for them. _build_session_face_locks
+        # requires lip_sync_scores to be non-empty and rejects entries with score 0.0.
+        # Export with sentinel 1.0 so the gateway accepts the face→speaker linkage.
+        for fi, spk in self._active_tile_face_to_speaker.items():
+            if fi in confident_face_to_speaker and spk not in lip_sync_scores:
+                lip_sync_scores[spk] = 1.0
+                if fi not in confident_mapping:
                     confident_mapping[fi] = spk
 
         logger.info(

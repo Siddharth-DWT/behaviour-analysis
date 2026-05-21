@@ -68,8 +68,8 @@ class HandcuffDetector:
 
     _SUPPRESSED_RULES: list[str] = [
         "arms_crossed",
-        "barrier_behavior",
         "motor_inhibition",
+        "self_adaptor_increase",
         "self_adaptors",
         "hand_illustrators",
         "fidgeting_hands",
@@ -84,9 +84,7 @@ class HandcuffDetector:
         "BODY-LEAN-01":      0.3,
     }
 
-    _ALTERNATIVE_MEASUREMENTS: dict[str, str] = {
-        "barrier_behavior": "torso_lean_away",
-    }
+    _ALTERNATIVE_MEASUREMENTS: dict[str, str] = {}
 
     # ── Public API ──────────────────────────────────────────────────────────
 

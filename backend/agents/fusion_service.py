@@ -219,14 +219,18 @@ class FusionAgentService(BaseAgentService):
                     ]
                     if len(seg_sigs) < 3:
                         continue
+                    # Timestamps use the earliest/latest contributing signal so compound
+                    # badges align with the visual event, not the voice segment boundary.
+                    _starts = [s.get("window_start_ms", seg_start) for s in seg_sigs]
+                    _ends   = [s.get("window_end_ms",   seg_end)   for s in seg_sigs]
                     compound_signals.extend(compound_engine.evaluate(
                         speaker_id=speaker_id,
                         voice_signals=[s for s in seg_sigs if s.get("agent") == "voice"],
                         language_signals=[s for s in seg_sigs if s.get("agent") == "language"],
                         video_signals=[s for s in seg_sigs if s.get("agent") in ("facial", "body", "gaze", "video")],
                         fusion_signals=[s for s in seg_sigs if s.get("agent") == "fusion"],
-                        window_start_ms=seg_start,
-                        window_end_ms=seg_end,
+                        window_start_ms=min(_starts),
+                        window_end_ms=max(_ends),
                     ))
 
                 # Session-wide frequency cap — highest-confidence per signal_type

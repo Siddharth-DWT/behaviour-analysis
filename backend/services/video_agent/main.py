@@ -136,7 +136,7 @@ def _is_static_face(windows: list) -> bool:
     false-positives on briefly visible faces.
     """
     active = [w for w in windows if w.face_detection_rate > 0.5]
-    if len(active) < 5:
+    if len(active) < 3:
         return False
 
     blink_var = _static_variance([w.blink_rate_bpm for w in active])
@@ -522,6 +522,21 @@ class VideoPipeline:
             facial_signals = facial_future.result()
             gaze_signals   = gaze_future.result()
 
+        # Room-camera gate: corner/ceiling-mounted interrogation cameras make gaze
+        # direction and screen-engagement signals unreliable — suppress them before
+        # body rules consume gaze output and before persistence.
+        if meeting_type == "interrogation_video":
+            from .interrogation_rules import _ROOM_CAMERA_GATED
+            n_before = len(gaze_signals)
+            gaze_signals = [s for s in gaze_signals if s["signal_type"] not in _ROOM_CAMERA_GATED]
+            dropped = n_before - len(gaze_signals)
+            if dropped:
+                logger.info(
+                    "[%s] Room camera gate: suppressed %d standard gaze signal(s) "
+                    "(sustained_distraction / attention_level / screen_contact / erratic_gaze_pattern)",
+                    session_id, dropped,
+                )
+
         body_signals = self._body_rules.evaluate(
             windows_by_speaker, baselines, session_id, meeting_type,
             extra_signals=facial_signals + gaze_signals,
@@ -579,23 +594,30 @@ class VideoPipeline:
             except Exception as exc:
                 logger.warning("[%s] Interrogation video rules failed (non-fatal): %s", session_id, exc)
 
-        # One presence_detected marker per speaker — spans their first to last window.
-        # Consumed by the gateway whitelist and frontend left panel to show a thumbnail
-        # from first appearance, before calibration produces any behavioral signals.
+        # Per-window presence_detected — one signal per speaker per 2s window they appear in.
+        # Replaces the old single session-spanning marker. The frontend activeSignals filter
+        # runs every animation frame, so the speaker panel and face highlight coords are
+        # visible exactly when the face is on screen and hidden when they leave frame.
+        # face_centre_x/y are stored so FaceHighlight always has valid coords even when
+        # no behavioural signal is firing in that window.
         for spk, spk_wins in windows_by_speaker.items():
-            if not spk_wins:
-                continue
-            all_signals.append({
-                "agent":          "video",
-                "signal_type":    "presence_detected",
-                "speaker_id":     spk,
-                "window_start_ms": min(w.window_start_ms for w in spk_wins),
-                "window_end_ms":   max(w.window_end_ms   for w in spk_wins),
-                "confidence":     1.0,
-                "value":          1.0,
-                "value_text":     "present",
-                "metadata":       {},
-            })
+            for w in spk_wins:
+                all_signals.append({
+                    "agent":           "video",
+                    "signal_type":     "presence_detected",
+                    "speaker_id":      spk,
+                    "window_start_ms": w.window_start_ms,
+                    "window_end_ms":   w.window_end_ms,
+                    "confidence":      1.0,
+                    "value":           round(w.face_detection_rate, 3),
+                    "value_text":      "present",
+                    "metadata": {
+                        "face_centre_x":    round(w.face_centre_x, 4) if w.face_centre_x else None,
+                        "face_centre_y":    round(w.face_centre_y, 4) if w.face_centre_y else None,
+                        "face_box_area":    round(w.face_box_area_mean, 5) if w.face_box_area_mean else None,
+                        "face_detect_rate": round(w.face_detection_rate, 3),
+                    },
+                })
 
         # Persist all signals in one Redis call instead of three separate connections
         _push_signals_to_redis(session_id, all_signals)

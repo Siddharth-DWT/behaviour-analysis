@@ -304,7 +304,7 @@ def _build_context(
         "false_confession_risk", "denial_weakening", "interrogator_technique",
         "statement_contamination", "capitulation_cascade", "resistance_hardening",
         "freezing_response", "blink_suppression_spike", "motor_inhibition",
-        "evidence_response_processing_delay", "pronoun_distancing", "tense_inconsistency",
+        "evidence_response_processing_delay", "narrative_consistency_drift",
     }
     interrog_signals = [s for s in fusion_signals if s.get("signal_type") in _INTERROG_TYPES]
     if interrog_signals:
