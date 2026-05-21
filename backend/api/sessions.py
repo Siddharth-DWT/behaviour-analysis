@@ -93,6 +93,41 @@ _VIDEO_OVERLAY_TYPES = [
     "monotone_flag", "interruption_event",
     "sentiment_score",
     "presence_detected",
+    # ── Interrogation video signals ───────────────────────────────────────────
+    "blink_suppression_spike",
+    "motor_inhibition",
+    "smile_context_incongruence",
+    "erratic_gaze_pattern",
+    "freezing_response",
+    "self_adaptor_increase",
+]
+
+# Language-agent signals surfaced on the video timeline for interrogation sessions.
+_LANGUAGE_OVERLAY_TYPES = [
+    "detail_reduction",
+    "narrative_consistency_drift",
+    "statement_contamination",
+    "denial_weakening",
+]
+
+# Voice-agent interrogation signals surfaced on the video timeline.
+_VOICE_INTERROG_TYPES = [
+    "agitated_high_arousal_tone",
+    "vocal_hesitation_cluster",
+    "speech_rate_change",
+]
+
+# Conversation-agent interrogation signals surfaced on the video timeline.
+_CONVERSATION_INTERROG_TYPES = [
+    "evidence_response_processing_delay",
+    "interrogator_technique",
+]
+
+# Fusion-agent session-level interrogation signals consumed by InterrogationSummaryPanel.
+_FUSION_INTERROG_TYPES = [
+    "capitulation_cascade",
+    "resistance_hardening",
+    "false_confession_risk",
 ]
 
 _GENERIC_SPEAKER_LABEL_RE = re.compile(r'^(Speaker|Face)_\d+$')
@@ -477,12 +512,21 @@ async def get_video_signals(
               AND sa.speaker_label = sp.speaker_label
         LEFT JOIN speakers_registry sr ON sr.id = sa.registry_id
         WHERE s.session_id = $1
-          AND s.agent IN ('video', 'fusion')
-          AND s.signal_type = ANY($2::text[])
+          AND (
+            (s.agent = 'video'         AND s.signal_type = ANY($2::text[]))
+            OR (s.agent = 'fusion'     AND (s.signal_type = ANY($2::text[]) OR s.signal_type = ANY($6::text[])))
+            OR (s.agent = 'language'   AND s.signal_type = ANY($3::text[]))
+            OR (s.agent = 'voice'      AND s.signal_type = ANY($4::text[]))
+            OR (s.agent = 'conversation' AND s.signal_type = ANY($5::text[]))
+          )
         ORDER BY s.window_start_ms ASC
         """,
         _uuid_module.UUID(session_id),
         _VIDEO_OVERLAY_TYPES,
+        _LANGUAGE_OVERLAY_TYPES,
+        _VOICE_INTERROG_TYPES,
+        _CONVERSATION_INTERROG_TYPES,
+        _FUSION_INTERROG_TYPES,
     )
 
     signals = []
@@ -493,8 +537,8 @@ async def get_video_signals(
                 meta = json.loads(r["metadata"]) if isinstance(r["metadata"], str) else dict(r["metadata"])
             except Exception:
                 pass
-        cx = float(meta.get("face_centre_x", 0))
-        cy = float(meta.get("face_centre_y", 0))
+        cx = float(meta.get("face_centre_x") or 0)
+        cy = float(meta.get("face_centre_y") or 0)
         if cx > 0 or cy > 0:
             meta["grid_position"] = _speaker_grid_position(cx, cy)
         reg_name  = r["registry_name"] or ""
@@ -514,8 +558,16 @@ async def get_video_signals(
             "metadata":     meta,
         })
 
-    # Filter session-spanning temporal signals (>120 s)
-    signals = [s for s in signals if (s["end_ms"] - s["start_ms"]) <= 120_000]
+    # Session-level interrogation panel signals span the full session duration and must
+    # not be filtered by the 120s window guard (which targets temporal overlay signals).
+    # presence_detected is per-window (~2s each) so passes the filter naturally — no bypass needed.
+    _PANEL_SIGNAL_TYPES = frozenset(
+        _FUSION_INTERROG_TYPES + _LANGUAGE_OVERLAY_TYPES + _CONVERSATION_INTERROG_TYPES
+    )
+    signals = [
+        s for s in signals
+        if (s["end_ms"] - s["start_ms"]) <= 120_000 or s["signal_type"] in _PANEL_SIGNAL_TYPES
+    ]
 
     # Merge duplicate speaker labels that share the same registry identity.
     # Canonical preference: Speaker_* before Face_*, then alphabetical.
@@ -579,7 +631,11 @@ async def get_video_speakers(
         SELECT DISTINCT ON (sp.speaker_label)
                sp.speaker_label,
                sa.registry_id, sr.display_name, sr.role, sr.company,
-               sa.match_method, sa.match_confidence
+               sa.match_method, sa.match_confidence,
+               EXISTS(
+                   SELECT 1 FROM face_thumbnails ft
+                   WHERE ft.registry_id = sa.registry_id
+               ) AS has_thumbnail
         FROM   speakers sp
         LEFT JOIN speaker_appearances sa
                ON sa.session_id    = sp.session_id
@@ -650,7 +706,7 @@ async def get_video_speakers(
             "registry_id":      registry_id,
             "match_method":     r["match_method"] or "",
             "match_confidence": float(r["match_confidence"]) if r["match_confidence"] else 0.0,
-            "thumbnail_url":    f"/speakers/{registry_id}/thumbnail" if registry_id else "",
+            "thumbnail_url":    f"/speakers/{registry_id}/thumbnail" if registry_id and r["has_thumbnail"] else "",
         })
 
     return {"session_id": session_id, "speakers": speakers}

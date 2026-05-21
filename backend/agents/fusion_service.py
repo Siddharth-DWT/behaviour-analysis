@@ -219,14 +219,18 @@ class FusionAgentService(BaseAgentService):
                     ]
                     if len(seg_sigs) < 3:
                         continue
+                    # Timestamps use the earliest/latest contributing signal so compound
+                    # badges align with the visual event, not the voice segment boundary.
+                    _starts = [s.get("window_start_ms", seg_start) for s in seg_sigs]
+                    _ends   = [s.get("window_end_ms",   seg_end)   for s in seg_sigs]
                     compound_signals.extend(compound_engine.evaluate(
                         speaker_id=speaker_id,
                         voice_signals=[s for s in seg_sigs if s.get("agent") == "voice"],
                         language_signals=[s for s in seg_sigs if s.get("agent") == "language"],
                         video_signals=[s for s in seg_sigs if s.get("agent") in ("facial", "body", "gaze", "video")],
                         fusion_signals=[s for s in seg_sigs if s.get("agent") == "fusion"],
-                        window_start_ms=seg_start,
-                        window_end_ms=seg_end,
+                        window_start_ms=min(_starts),
+                        window_end_ms=max(_ends),
                     ))
 
                 # Session-wide frequency cap — highest-confidence per signal_type
@@ -291,6 +295,50 @@ class FusionAgentService(BaseAgentService):
                     session_end_ms=ref_time,
                 )
                 all_fusion_signals.extend(temporal_sigs)
+
+        # ── Step 2.6: Interrogation compound patterns (session-level) ─────────
+        if content_type == "interrogation_video":
+            try:
+                from services.fusion_agent.interrogation_patterns import InterrogationCompoundPatterns
+                all_source = pure_voice_dicts + language_dicts + video_dicts
+                interrog_compound = InterrogationCompoundPatterns().evaluate(
+                    all_signals=all_source + all_fusion_signals,
+                    speakers=speakers,
+                    session_id=session_id,
+                )
+                all_fusion_signals.extend(interrog_compound)
+                if interrog_compound:
+                    logger.info(
+                        "[%s] Interrogation compound patterns: %d signal(s)",
+                        session_id, len(interrog_compound),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Interrogation compound patterns failed (non-fatal): %s",
+                    session_id, exc,
+                )
+
+        # ── Step 2.7: False confession risk assessment (session-level) ────────
+        if content_type == "interrogation_video":
+            try:
+                from services.fusion_agent.interrogation_patterns import FalseConfessionRiskAssessor
+                all_source = pure_voice_dicts + language_dicts + video_dicts
+                risk_signals = FalseConfessionRiskAssessor().evaluate(
+                    all_signals=all_source + all_fusion_signals,
+                    speakers=speakers,
+                    session_id=session_id,
+                )
+                all_fusion_signals.extend(risk_signals)
+                if risk_signals:
+                    logger.info(
+                        "[%s] FalseConfessionRisk: %d assessment(s)",
+                        session_id, len(risk_signals),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] False confession risk assessment failed (non-fatal): %s",
+                    session_id, exc,
+                )
 
         # ── Step 3: Publish to Redis Streams ────────────────────────────────
         if _HAS_BUS:

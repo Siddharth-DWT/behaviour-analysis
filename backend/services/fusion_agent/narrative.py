@@ -299,10 +299,87 @@ def _build_context(
         if response_latency:
             lines.append(f"  Avg response latency: {response_latency.get('avg_ms', 0):.0f} ms")
 
-    # Fusion signals
-    if fusion_signals:
+    # ── Interrogation-specific signal block ──────────────────────────────────
+    _INTERROG_TYPES = {
+        "false_confession_risk", "denial_weakening", "interrogator_technique",
+        "statement_contamination", "capitulation_cascade", "resistance_hardening",
+        "freezing_response", "blink_suppression_spike", "motor_inhibition",
+        "evidence_response_processing_delay", "narrative_consistency_drift",
+    }
+    interrog_signals = [s for s in fusion_signals if s.get("signal_type") in _INTERROG_TYPES]
+    if interrog_signals:
+        lines.append("\n=== INTERROGATION ANALYSIS ===")
+
+        risk_sig = next((s for s in interrog_signals if s["signal_type"] == "false_confession_risk"), None)
+        if risk_sig:
+            meta = risk_sig.get("metadata") or {}
+            lines.append(f"\nFALSE CONFESSION RISK: {risk_sig.get('value_text', '?')} "
+                         f"(score={risk_sig.get('value', 0):.2f}, "
+                         f"confidence={risk_sig.get('confidence', 0):.2f})")
+            factors = {k: meta.get(k) for k in
+                       ("contamination", "capitulation", "denial_drop", "duration",
+                        "coercive_technique", "processing_delays") if meta.get(k)}
+            if factors:
+                lines.append(f"  Risk factors present: {', '.join(factors.keys())}")
+            if meta.get("duration_minutes"):
+                lines.append(f"  Session duration: {meta['duration_minutes']:.0f} min")
+
+        denial_sig = next((s for s in interrog_signals if s["signal_type"] == "denial_weakening"), None)
+        if denial_sig:
+            meta = denial_sig.get("metadata") or {}
+            lines.append(f"\nDENIAL TRAJECTORY: {denial_sig.get('value_text', '?')} "
+                         f"(trigger={meta.get('trigger', '?')})")
+            if meta.get("first_label") and meta.get("last_label"):
+                lines.append(f"  {meta['first_label']} → {meta['last_label']} "
+                             f"over {meta.get('denial_count', 0)} denial statements")
+            if meta.get("windowed_drop"):
+                lines.append(f"  Strength drop: {meta['windowed_drop'] * 100:.0f}%")
+
+        tech_sig = next((s for s in interrog_signals if s["signal_type"] == "interrogator_technique"), None)
+        if tech_sig:
+            meta = tech_sig.get("metadata") or {}
+            lines.append(f"\nINTERROGATOR TECHNIQUE: {tech_sig.get('value_text', '?').upper()} "
+                         f"(confidence={tech_sig.get('confidence', 0):.2f})")
+            if meta.get("peace_count") or meta.get("reid_count") or meta.get("coercive_count"):
+                lines.append(f"  PEACE markers: {meta.get('peace_count', 0)}, "
+                             f"Reid markers: {meta.get('reid_count', 0)}, "
+                             f"Coercive markers: {meta.get('coercive_count', 0)}")
+
+        contam_sigs = [s for s in interrog_signals if s["signal_type"] == "statement_contamination"]
+        if contam_sigs:
+            all_terms: list[str] = []
+            for s in contam_sigs:
+                all_terms.extend((s.get("metadata") or {}).get("contaminated_terms", []))
+            unique_terms = list(dict.fromkeys(all_terms))[:10]
+            lines.append(f"\nSTATEMENT CONTAMINATION: {len(contam_sigs)} event(s)")
+            if unique_terms:
+                lines.append(f"  Adopted terms: {', '.join(unique_terms)}")
+
+        cap_sigs = [s for s in interrog_signals if s["signal_type"] == "capitulation_cascade"]
+        if cap_sigs:
+            lines.append(f"\nCAPITULATION CASCADE: {len(cap_sigs)} event(s)")
+            for s in cap_sigs[:3]:
+                start_s = s.get("window_start_ms", 0) // 1000
+                end_s = s.get("window_end_ms", 0) // 1000
+                lines.append(f"  {start_s}s–{end_s}s: {s.get('value_text', '')}")
+
+        behav = [s for s in interrog_signals if s["signal_type"] in
+                 ("freezing_response", "blink_suppression_spike", "motor_inhibition",
+                  "evidence_response_processing_delay")]
+        if behav:
+            lines.append(f"\nBEHAVIOURAL INDICATORS ({len(behav)} events):")
+            for s in behav[:5]:
+                start_s = s.get("window_start_ms", 0) // 1000
+                lines.append(f"  {start_s}s — {s['signal_type']} "
+                             f"(value={s.get('value', 0):.2f}, "
+                             f"conf={s.get('confidence', 0):.2f})")
+
+    # Fusion signals (non-interrogation)
+    non_interrog = [s for s in fusion_signals if s.get("signal_type") not in _INTERROG_TYPES] \
+        if interrog_signals else fusion_signals
+    if non_interrog:
         lines.append("\n=== CROSS-MODAL FUSION INSIGHTS ===")
-        for s in fusion_signals[:10]:
+        for s in non_interrog[:10]:
             lines.append(
                 f"  {s.get('signal_type', '?')}: "
                 f"{s.get('value_text', '')} "
@@ -497,6 +574,24 @@ def _build_prompt(context: str, meeting_type: str) -> tuple[str, str]:
             "If video data is present: shared smiles, mirroring signals, "
             "head nod synchrony, and facial warmth indicators."
         ),
+        # ── Interrogation ──
+        "interrogation_video": (
+            "This is a law enforcement interrogation session. Focus on: "
+            "false confession risk level and contributing factors (contamination, denial weakening, "
+            "session duration, coercive technique); "
+            "denial trajectory — how denial strength changed from session start to end; "
+            "interrogation technique classification (PEACE / Reid / Coercive) and its implications; "
+            "statement contamination events (case-specific terms the suspect adopted from the interrogator); "
+            "capitulation cascade patterns (multi-signal compliance); "
+            "behavioural indicators (freezing response, blink suppression, motor inhibition, "
+            "evidence-response processing delays). "
+            "CRITICAL ETHICAL CONSTRAINTS: Never claim guilt or deception. All findings are "
+            "probabilistic indicators only, never binary determinations. "
+            "Distinguish between genuine recall difficulty and stress-induced compliance. "
+            "Frame every risk indicator with its alternative innocent explanation. "
+            "If coercive technique detected, flag elevated false confession risk regardless of other signals. "
+            "Research basis: Kassin et al. (2010, 2012), Garrett (2011), Vrij (2005, 2008)."
+        ),
         # ── Legacy types ──
         "client_meeting": (
             "Focus on: rapport trajectory, client satisfaction indicators, "
@@ -637,7 +732,56 @@ def _fallback_narrative(
     cross_modal = []
     for s in fusion_signals:
         sig_type = s.get("signal_type", "")
-        if sig_type == "credibility_assessment" and s.get("value_text") == "credibility_concern":
+        meta = s.get("metadata") or {}
+        if sig_type == "false_confession_risk":
+            score = s.get("value", 0)
+            factors = [k for k in ("contamination", "capitulation", "denial_drop",
+                                   "duration", "coercive_technique") if meta.get(k)]
+            label = s.get("value_text", "").replace("_", " ")
+            cross_modal.append(
+                f"False confession risk: {label} ({score:.0%})"
+                + (f" — factors: {', '.join(factors)}" if factors else "")
+            )
+        elif sig_type == "denial_weakening":
+            first = meta.get("first_label", "strong")
+            last = meta.get("last_label", "weak")
+            cross_modal.append(
+                f"Denial trajectory weakening: {first} → {last} "
+                f"over {meta.get('denial_count', '?')} denial statements"
+            )
+        elif sig_type == "interrogator_technique":
+            technique = s.get("value_text", "unknown").upper()
+            cross_modal.append(f"Interrogator technique classified as: {technique}")
+            if technique in ("REID", "COERCIVE"):
+                cross_modal.append(
+                    f"{technique} technique detected — elevates false confession risk "
+                    "per Kassin et al. (2012)"
+                )
+        elif sig_type == "statement_contamination":
+            terms = meta.get("contaminated_terms", [])
+            cross_modal.append(
+                f"Statement contamination: suspect adopted "
+                f"{meta.get('contaminated_count', len(terms))} case-specific term(s) "
+                f"from interrogator"
+                + (f": {', '.join(terms[:5])}" if terms else "")
+            )
+        elif sig_type == "capitulation_cascade":
+            cross_modal.append(
+                f"Capitulation cascade at "
+                f"{s.get('window_start_ms', 0) // 1000}s–"
+                f"{s.get('window_end_ms', 0) // 1000}s"
+            )
+        elif sig_type == "freezing_response":
+            cross_modal.append(
+                f"Freezing response at {s.get('window_start_ms', 0) // 1000}s — "
+                "motor inhibition consistent with acute stress"
+            )
+        elif sig_type == "evidence_response_processing_delay":
+            cross_modal.append(
+                f"Extended processing delay at {s.get('window_start_ms', 0) // 1000}s "
+                "following evidence presentation"
+            )
+        elif sig_type == "credibility_assessment" and s.get("value_text") == "credibility_concern":
             cross_modal.append(
                 "Detected content-voice incongruence: positive words paired with elevated stress"
             )

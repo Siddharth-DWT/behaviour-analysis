@@ -47,11 +47,13 @@ from shared.redis_layer import (
 from .feature_extractor import (
     VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures,
     FaceEmbeddingExtractor, LightASDClassifier,
+    MeetingTypeProbe, MeetingProfile,
 )
 from .calibration import VideoCalibrationModule, FacialBaseline, BodyBaseline, GazeBaseline
 from .facial_rules import FacialRuleEngine
 from .gaze_rules import GazeRuleEngine
 from .body_rules import BodyRuleEngine
+from .handcuff_detector import HandcuffDetector as _HandcuffDetector
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nexus.video")
@@ -107,6 +109,41 @@ def _publish_video_artifacts(session_id: str, analysis: "VideoAnalysisResponse")
             "face_to_speaker": analysis.face_to_speaker,
         },
     )
+
+
+def _static_variance(vals: list[float]) -> float:
+    if len(vals) < 2:
+        return 0.0
+    mean = sum(vals) / len(vals)
+    return sum((x - mean) ** 2 for x in vals) / len(vals)
+
+
+def _is_static_face(windows: list) -> bool:
+    """
+    Detect photo/graphic faces vs real faces using biological motion variance.
+
+    A photo on screen has zero biological motion: no blinks, no breathing-driven
+    jaw micro-movement, no head micro-movements. Real faces have measurable
+    variance in at least one of these signals across multiple windows.
+
+    Uses three MediaPipe-derived signals from WindowFeatures:
+      - blink_rate_bpm variance across windows (blinks change over time)
+      - blendshapes_mean["jawOpen"] variance (breathing moves jaw slightly)
+      - head_pose_variance mean (within-window orientation spread, 0 for static images)
+
+    DSA: O(W) single pass where W = windows for this track.
+    Returns False (not static) when fewer than 5 detected windows to avoid
+    false-positives on briefly visible faces.
+    """
+    active = [w for w in windows if w.face_detection_rate > 0.5]
+    if len(active) < 3:
+        return False
+
+    blink_var = _static_variance([w.blink_rate_bpm for w in active])
+    jaw_var   = _static_variance([w.blendshapes_mean.get("jawOpen", 0.0) for w in active])
+    head_avg  = sum(w.head_pose_variance for w in active) / len(active)
+
+    return blink_var < 0.001 and jaw_var < 0.0005 and head_avg < 0.01
 
 
 def _push_signals_to_redis(session_id: str, signals: list[dict]) -> None:
@@ -299,8 +336,44 @@ class VideoPipeline:
         # Lock guards shared extractor state: _diar_segments (written before
         # extract_all) and _active_tile_face_to_speaker (read after). Without
         # the lock, concurrent sessions would race on these attributes.
+        # ── Pre-scan: classify meeting type (~500ms, uses already-loaded model) ──
+        import mediapipe as _mp
+        _profile: MeetingProfile = MeetingProfile.default()
+        # For explicitly known meeting types, bypass the visual probe — the probe
+        # can misclassify (e.g., 2-person seated interrogation room → active_speaker
+        # when the subject is closer to the camera than the interviewer).
+        _FORCED_PROFILES: dict[str, MeetingProfile] = {
+            "interrogation_video": MeetingProfile.room(2),
+        }
+        if meeting_type in _FORCED_PROFILES:
+            _profile = _FORCED_PROFILES[meeting_type]
+            logger.info(
+                "[%s] Meeting profile forced by meeting_type=%r → %s",
+                session_id, meeting_type, _profile.meeting_type,
+            )
+        else:
+            try:
+                _face_det_probe = _mp.tasks.vision.FaceDetector.create_from_options(
+                    _mp.tasks.vision.FaceDetectorOptions(
+                        base_options=_mp.tasks.BaseOptions(
+                            model_asset_path=self._extractor._model_mgr.get_face_detector_path()
+                        ),
+                        running_mode=_mp.tasks.vision.RunningMode.IMAGE,
+                        min_detection_confidence=0.3,
+                    )
+                )
+                _profile = MeetingTypeProbe().probe(video_path, _face_det_probe, _mp)
+                _face_det_probe.close()
+            except Exception as _probe_exc:
+                logger.warning(
+                    "[%s] Meeting type probe failed (non-fatal): %s — using default profile",
+                    session_id, _probe_exc,
+                )
+            logger.info("[%s] Meeting profile: %s", session_id, _profile.meeting_type)
+
         logger.info(f"[{session_id}] Extracting video features from {Path(video_path).name}")
         with self._extractor_lock:
+            self._extractor.apply_profile(_profile)
             self._extractor._diar_segments = diar_segments
             try:
                 windows, lip_activity_map = self._extractor.extract_all(
@@ -317,70 +390,96 @@ class VideoPipeline:
 
         duration_sec = (windows[-1].window_end_ms - windows[0].window_start_ms) / 1000.0
 
+        _is_interrogation = meeting_type == "interrogation_video"
+
         # ── Inject active-tile tags into mapper ───────────────────────────────
-        # Mapper is a fresh instance per pipeline call — no shared state risk.
-        self._mapper.set_active_tile_tags(active_tile_tags)
-        if active_tile_tags:
-            logger.info(
-                f"[{session_id}] Active-tile tags → mapper: "
-                f"{len(active_tile_tags)} face(s) {{{', '.join(f'Face_{k}: {v}' for k, v in active_tile_tags.items())}}}"
-            )
-        else:
-            logger.warning(
-                f"[{session_id}] No active-tile tags from extractor — "
-                f"mapper will use lip-sync only (may produce weak linkage)"
-            )
+        # Skipped for interrogation videos — no speaker-face mapping is performed.
+        if not _is_interrogation:
+            self._mapper.set_active_tile_tags(active_tile_tags)
+            if active_tile_tags:
+                logger.info(
+                    f"[{session_id}] Active-tile tags → mapper: "
+                    f"{len(active_tile_tags)} face(s) {{{', '.join(f'Face_{k}: {v}' for k, v in active_tile_tags.items())}}}"
+                )
+            else:
+                logger.warning(
+                    f"[{session_id}] No active-tile tags from extractor — "
+                    f"mapper will use lip-sync only (may produce weak linkage)"
+                )
 
         # ── Step 1b: Light-ASD active speaker scoring (optional) ─────────────
-        # Replaces MediaPipe jawOpen lip-sync correlation with a learned AV model
-        # (94.1% precision on AVA-ActiveSpeaker).  Falls back silently to lip-sync
-        # when the model file is absent or audio extraction fails.
+        # Skipped for interrogation videos — no speaker-face mapping is performed.
+        # For other sessions: replaces MediaPipe jawOpen lip-sync correlation with
+        # a learned AV model (94.1% precision on AVA-ActiveSpeaker).
         asd_scores: dict | None = None
-        _asd = LightASDClassifier.get_instance(
-            model_dir=os.path.join(os.path.dirname(__file__), "..", "..", "models")
-        )
-        if _asd.available:
-            _tmp_audio = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            _tmp_audio.close()
-            try:
-                subprocess.run(
-                    [
-                        "ffmpeg", "-y", "-i", video_path,
-                        "-vn", "-ar", "16000", "-ac", "1",
-                        _tmp_audio.name,
-                    ],
-                    check=True,
-                    capture_output=True,
-                )
-                _face_crops = getattr(self._extractor, "_face_crops_sequence", {})
-                _fps = getattr(self._extractor, "_last_video_fps", 5.0)
-                if _face_crops:
-                    asd_scores = _asd.score(_face_crops, _tmp_audio.name, fps=_fps)
-                    logger.info(
-                        "[%s] Light-ASD: scored %d tracks", session_id, len(asd_scores)
-                    )
-                else:
-                    logger.warning(
-                        "[%s] Light-ASD: no face crops buffered — "
-                        "falling back to lip-sync", session_id
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "[%s] Light-ASD audio extraction failed (non-fatal): %s",
-                    session_id, exc,
-                )
-            finally:
+        if not _is_interrogation:
+            _asd = LightASDClassifier.get_instance(
+                model_dir=os.path.join(os.path.dirname(__file__), "..", "..", "models")
+            )
+            if _asd.available:
+                _tmp_audio = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                _tmp_audio.close()
                 try:
-                    os.unlink(_tmp_audio.name)
-                except OSError:
-                    pass
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-y", "-i", video_path,
+                            "-vn", "-ar", "16000", "-ac", "1",
+                            _tmp_audio.name,
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    _face_crops = getattr(self._extractor, "_face_crops_sequence", {})
+                    _fps = getattr(self._extractor, "_last_video_fps", 5.0)
+                    if _face_crops:
+                        asd_scores = _asd.score(_face_crops, _tmp_audio.name, fps=_fps)
+                        logger.info(
+                            "[%s] Light-ASD: scored %d tracks", session_id, len(asd_scores)
+                        )
+                    else:
+                        logger.warning(
+                            "[%s] Light-ASD: no face crops buffered — "
+                            "falling back to lip-sync", session_id
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Light-ASD audio extraction failed (non-fatal): %s",
+                        session_id, exc,
+                    )
+                finally:
+                    try:
+                        os.unlink(_tmp_audio.name)
+                    except OSError:
+                        pass
 
         # ── Step 2: Map windows → speakers ────────────────────────────────────
-        # Uses ASD scores when available; falls back to lip-sync, then time-overlap.
+        # Interrogation videos skip all speaker-face linking — single-camera
+        # ceiling/oblique angle makes lip-sync unreliable (suspect looks down,
+        # interrogator often off-camera). Face_N tracks carry behavioral signals
+        # on their own timeline without being merged to Speaker_N labels.
         windows_by_speaker, lip_sync_scores, face_to_speaker = self._mapper.assign(
             windows, diar_segments, lip_activity_map,
             asd_scores=asd_scores,
+            skip_speaker_link=_is_interrogation,
         )
+        # ── Step 2b: Remove static faces (photos/graphics on screen) ─────────
+        # Skipped for room profiles — no screen share possible in physical rooms.
+        # For all other profiles (grid, active_speaker, unknown) static graphics
+        # can appear as screenshare sidebar content.
+        static_tracks: set[str] = set()
+        if getattr(self._extractor, "_profile_static_filter", True):
+            static_tracks = {
+                spk for spk, wins in windows_by_speaker.items()
+                if _is_static_face(wins)
+            }
+        if static_tracks:
+            for tid in static_tracks:
+                del windows_by_speaker[tid]
+            logger.info(
+                "[%s] Static face(s) removed before signal computation: %s",
+                session_id, sorted(static_tracks),
+            )
+
         speakers = sorted(windows_by_speaker.keys())
         logger.info(
             f"[{session_id}] Speakers: {speakers} | "
@@ -423,30 +522,102 @@ class VideoPipeline:
             facial_signals = facial_future.result()
             gaze_signals   = gaze_future.result()
 
+        # Room-camera gate: corner/ceiling-mounted interrogation cameras make gaze
+        # direction and screen-engagement signals unreliable — suppress them before
+        # body rules consume gaze output and before persistence.
+        if meeting_type == "interrogation_video":
+            from .interrogation_rules import _ROOM_CAMERA_GATED
+            n_before = len(gaze_signals)
+            gaze_signals = [s for s in gaze_signals if s["signal_type"] not in _ROOM_CAMERA_GATED]
+            dropped = n_before - len(gaze_signals)
+            if dropped:
+                logger.info(
+                    "[%s] Room camera gate: suppressed %d standard gaze signal(s) "
+                    "(sustained_distraction / attention_level / screen_contact / erratic_gaze_pattern)",
+                    session_id, dropped,
+                )
+
         body_signals = self._body_rules.evaluate(
             windows_by_speaker, baselines, session_id, meeting_type,
             extra_signals=facial_signals + gaze_signals,
         )
 
+        # ── Apply body confidence cap for meeting profiles where body pose is unreliable ──
+        # Grid meetings: 80px face tiles make pose estimation noise; cap at 0.60.
+        _body_cap = getattr(self._extractor, "_profile_body_conf_cap", 1.0)
+        if _body_cap < 1.0:
+            for sig in body_signals:
+                if sig.get("agent") in ("body", "video"):
+                    original = sig.get("confidence", 0.5)
+                    capped = round(min(original, _body_cap), 4)
+                    if capped != original:
+                        sig["confidence"] = capped
+                        sig.setdefault("metadata", {})["body_cap_applied"] = True
+                        sig["metadata"]["original_confidence"] = original
+
         all_signals: list[dict] = facial_signals + gaze_signals + body_signals
 
-        # One presence_detected marker per speaker — spans their first to last window.
-        # Consumed by the gateway whitelist and frontend left panel to show a thumbnail
-        # from first appearance, before calibration produces any behavioral signals.
+        # ── Step 4b: Interrogation-specific video rules ───────────────────────
+        if meeting_type == "interrogation_video":
+            try:
+                import cv2 as _cv2
+                _cap = _cv2.VideoCapture(video_path)
+                _real_fps = _cap.get(_cv2.CAP_PROP_FPS) or 30.0
+                _cap.release()
+
+                # Handcuff detection — visual (pose) + contextual (transcript).
+                _transcript_text = " ".join(
+                    seg.get("text", "") for seg in (diar_segments or [])
+                )
+                _hc_result  = _HandcuffDetector().detect(
+                    windows_by_speaker=windows_by_speaker,
+                    transcript=_transcript_text,
+                    session_id=session_id,
+                )
+                _handcuffed = _hc_result["handcuffs_detected"]
+
+                from .interrogation_rules import InterrogationVideoRules
+                interrog_signals = InterrogationVideoRules().evaluate(
+                    windows_by_speaker=windows_by_speaker,
+                    baselines=baselines,
+                    diar_segments=diar_segments,
+                    session_id=session_id,
+                    video_fps=_real_fps,
+                    handcuffed=_handcuffed,
+                )
+                all_signals.extend(interrog_signals)
+                if interrog_signals:
+                    logger.info(
+                        "[%s] Interrogation video rules: %d signals (handcuffed=%s)",
+                        session_id, len(interrog_signals), _handcuffed,
+                    )
+            except Exception as exc:
+                logger.warning("[%s] Interrogation video rules failed (non-fatal): %s", session_id, exc)
+
+        # Per-window presence_detected — one signal per speaker per 2s window they appear in.
+        # Replaces the old single session-spanning marker. The frontend activeSignals filter
+        # runs every animation frame, so the speaker panel and face highlight coords are
+        # visible exactly when the face is on screen and hidden when they leave frame.
+        # face_centre_x/y are stored so FaceHighlight always has valid coords even when
+        # no behavioural signal is firing in that window.
         for spk, spk_wins in windows_by_speaker.items():
-            if not spk_wins:
-                continue
-            all_signals.append({
-                "agent":          "video",
-                "signal_type":    "presence_detected",
-                "speaker_id":     spk,
-                "window_start_ms": min(w.window_start_ms for w in spk_wins),
-                "window_end_ms":   max(w.window_end_ms   for w in spk_wins),
-                "confidence":     1.0,
-                "value":          1.0,
-                "value_text":     "present",
-                "metadata":       {},
-            })
+            for w in spk_wins:
+                all_signals.append({
+                    "agent":           "video",
+                    "signal_type":     "presence_detected",
+                    "speaker_id":      spk,
+                    "window_start_ms": w.window_start_ms,
+                    "window_end_ms":   w.window_end_ms,
+                    "confidence":      1.0,
+                    "value":           round(w.face_detection_rate, 3),
+                    "value_text":      "present",
+                    "metadata": {
+                        "face_centre_x":    round(w.face_centre_x, 4) if w.face_centre_x else None,
+                        "face_centre_y":    round(w.face_centre_y, 4) if w.face_centre_y else None,
+                        "face_box_area":    round(w.face_box_area_mean, 5) if w.face_box_area_mean else None,
+                        "face_detect_rate": round(w.face_detection_rate, 3),
+                    },
+                })
 
         # Persist all signals in one Redis call instead of three separate connections
         _push_signals_to_redis(session_id, all_signals)

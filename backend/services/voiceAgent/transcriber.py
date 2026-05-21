@@ -394,37 +394,50 @@ class Transcriber:
         self._translate_to = translate_to
         self._entity_detection = entity_detection
         self._tmp_wav = None  # Track temp WAV for cleanup
+        self._tmp_cloud_audio = None  # Track temp cloud audio extract for cleanup
 
         try:
-            # Convert to 16kHz mono WAV upfront so all backends get clean audio.
-            effective_path = self._ensure_wav(audio_path)
+            # Cloud backends (AssemblyAI, Deepgram) must receive audio-only, not video.
+            # We extract the audio stream via ffmpeg (stereo, original quality) into a
+            # small temp file — typically 5-30 MB vs 200+ MB for the full video.
+            # Local/GPU backends need a clean 16kHz mono WAV — convert lazily when needed.
+            effective_path = None  # populated on first local/GPU backend call
+            cloud_path: str = audio_path  # default: already audio (wav/mp3/etc.)
+
+            _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mts", ".ts"}
+            if Path(audio_path).suffix.lower() in _VIDEO_EXTS:
+                cloud_path = self._extract_audio_for_cloud(audio_path)
+
+            def _local_path() -> str:
+                nonlocal effective_path
+                if effective_path is None:
+                    effective_path = self._ensure_wav(audio_path)
+                return effective_path
 
             # model_preference overrides the normal backend cascade.
             # Falls back to auto cascade if the preferred backend is unavailable.
             result = None
             if model_preference == "assemblyai":
                 if self._use_assemblyai:
-                    result = self._transcribe_assemblyai(effective_path)
+                    result = self._transcribe_assemblyai(cloud_path)
                 else:
                     logger.warning("model_preference=assemblyai requested but AssemblyAI not configured — using auto")
             elif model_preference == "deepgram":
                 if self._use_deepgram:
-                    result = self._transcribe_deepgram(effective_path)
+                    result = self._transcribe_deepgram(cloud_path)
                 else:
                     logger.warning("model_preference=deepgram requested but Deepgram not configured — using auto")
             elif model_preference == "whisper":
                 need_diarize = self._run_diarization or self._run_behavioural
                 if need_diarize and self._use_whisper_pyannote:
-                    # Combined /transcribe-diarize endpoint — best quality, one GPU call
-                    result = self._transcribe_whisper_pyannote(effective_path)
+                    result = self._transcribe_whisper_pyannote(_local_path())
                 elif self._use_external:
-                    # /transcribe only — diarize internally gated on need_diarize
-                    result = self._transcribe_external(effective_path)
+                    result = self._transcribe_external(_local_path())
                 else:
-                    result = self._transcribe_local(effective_path)
+                    result = self._transcribe_local(_local_path())
             elif model_preference == "parakeet":
                 if self._use_parakeet:
-                    result = self._transcribe_parakeet(effective_path)
+                    result = self._transcribe_parakeet(cloud_path)
                 else:
                     logger.warning("model_preference=parakeet requested but Parakeet not configured — using auto")
 
@@ -437,17 +450,17 @@ class Transcriber:
                 #   5. External Whisper + local diarize cascade
                 #   6. Local faster-whisper + local diarize (CPU, last resort)
                 if self._use_assemblyai:
-                    result = self._transcribe_assemblyai(effective_path)
+                    result = self._transcribe_assemblyai(cloud_path)
                 elif self._use_parakeet:
-                    result = self._transcribe_parakeet(effective_path)
+                    result = self._transcribe_parakeet(cloud_path)
                 elif self._use_deepgram:
-                    result = self._transcribe_deepgram(effective_path)
+                    result = self._transcribe_deepgram(cloud_path)
                 elif self._use_whisper_pyannote:
-                    result = self._transcribe_whisper_pyannote(effective_path)
+                    result = self._transcribe_whisper_pyannote(_local_path())
                 elif self._use_external:
-                    result = self._transcribe_external(effective_path)
+                    result = self._transcribe_external(_local_path())
                 else:
-                    result = self._transcribe_local(effective_path)
+                    result = self._transcribe_local(_local_path())
 
             # When diarization is disabled, collapse all speakers to Speaker_0
             if not self._run_diarization and result:
@@ -463,7 +476,7 @@ class Transcriber:
                 try:
                     self._compute_mfcc_embeddings(
                         result.get("segments", []),
-                        effective_path,
+                        _local_path(),
                     )
                 except Exception as _emb_err:
                     logger.warning("MFCC embedding fallback failed (non-fatal): %s", _emb_err)
@@ -480,6 +493,13 @@ class Transcriber:
                 except OSError:
                     pass
                 self._tmp_wav = None
+            # Cleanup temp cloud audio extract if we created one
+            if self._tmp_cloud_audio is not None:
+                try:
+                    os.unlink(self._tmp_cloud_audio)
+                except OSError:
+                    pass
+                self._tmp_cloud_audio = None
             # Clear per-request state to prevent leaking into next request
             self._num_speakers = None
             self._audio_data = None
@@ -539,6 +559,44 @@ class Transcriber:
             return tmp.name
 
         return audio_path
+
+    def _extract_audio_for_cloud(self, video_path: str) -> str:
+        """
+        Extract the audio stream from a video file into a small temp file for
+        cloud API upload (AssemblyAI, Deepgram, Parakeet).
+
+        Stereo channels and original sample rate are preserved — cloud backends
+        diarize better with multi-channel audio than a mono downmix.
+
+        Uses ffmpeg stream-copy (-c:a copy) to avoid re-encoding when possible.
+        Falls back to AAC 192k if the source codec is incompatible with m4a.
+        Result is typically 5–30 MB vs 200+ MB for the original video file.
+        """
+        import subprocess
+        tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
+        tmp.close()
+        self._tmp_cloud_audio = tmp.name
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "copy", tmp.name],
+                capture_output=True, timeout=120,
+            )
+            if result.returncode != 0:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", tmp.name],
+                    capture_output=True, timeout=120, check=True,
+                )
+            size_mb = Path(tmp.name).stat().st_size / 1024 / 1024
+            logger.info("Extracted audio for cloud upload: %.1f MB → %s", size_mb, tmp.name)
+            return tmp.name
+        except Exception as exc:
+            logger.warning("Audio extraction failed (%s) — sending original file to cloud backend", exc)
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+            self._tmp_cloud_audio = None
+            return video_path
 
     # ═══════════════════════════════════════════════════════════
     # PARAKEET BACKEND (fast transcription + separate diarize cascade)

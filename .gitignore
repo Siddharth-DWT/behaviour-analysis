@@ -68,6 +68,7 @@ redis_data/
 *.log
 server_logs.txt
 task_log.txt
+issues.txt
 
 # ── Claude Code ───────────────────────────────────────────────────────────────
 .claude/

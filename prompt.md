@@ -1,740 +1,414 @@
-# NEXUS — Face-Speaker Mapping: Research-Backed Implementation
+# NEXUS — Remove Unreliable Signals + Add Research-Verified Replacements
 
-## Context
+## What's Being Removed (4 signals)
 
-Deep research confirms there is NO off-the-shelf library for mapping audio
-diarization to video face tracks in rendered meeting recordings. Every commercial
-product (Recall.ai, Otter, Fireflies) sidesteps the problem by capturing per-
-participant audio streams — they don't solve it from pixels.
+| Signal | Why Remove |
+|--------|-----------|
+| `barrier_behavior` | No meta-analytic effect size. Arms crossing is habitual/thermal in majority of cases. Not in DePaulo 2003. |
+| `low_autonomic_reactivity` | NEXUS-original. Zero published research. Absence of stress is not a validated cue. |
+| `pronoun_distancing` | DePaulo et al. 2003 meta-analysis: first-person pronoun use d=0.03 (near zero). Adams 2002 found the effect reverses under stress. |
+| `tense_inconsistency` | No controlled effect size. Present-tense intrusions occur equally in genuine trauma recall and fabrication. |
 
-The research consensus for rendered MP4 analysis is a hybrid pipeline:
-1. Layout detection from face geometry
-2. Position tracking with identity-aware reset on layout changes
-3. Active Speaker Detection (ASD) model for per-frame "is speaking" probabilities
-4. Hungarian assignment + Viterbi smoothing for face→speaker fusion
+## What's Being Added (5 signals — verified citations only)
 
-NEXUS already has layers 1-2 partially (CentroidTracker, IdentityVerifier,
-TrackletSplitter, ActiveTileTagger). Layer 3 uses a crude lip-sync heuristic
-(`jawOpen * 0.50 + ...` correlated with diar intervals) that produces near-zero
-scores on contaminated tracks, tiny faces, and jaw-saturated large tiles.
-Layer 4 uses greedy assignment (locally optimal, not globally optimal).
+### Signal 1: `detail_reduction` (Language Agent)
 
-## What to Build
+**Research:**
+- DePaulo et al. (2003) "Cues to Deception" Psychological Bulletin 129(1):74-118.
+  Finding: liars are "less forthcoming" and "suspiciously bereft of ordinary
+  imperfections and unusual details" (p.104). Of 14 significant cues across 158
+  analyzed, detail-related cues were among the largest effects.
+  Average d across all 14 significant cues: 0.25 (cited in Vrij 2012).
+  Detail reduction is at or above this average.
+- Vrij, A. (2008) "Detecting Lies and Deceit" 2nd ed. Wiley. Chapter on
+  Criteria-Based Content Analysis (CBCA) confirms sensory details (visual,
+  auditory, spatial, temporal) discriminate truthful from fabricated accounts.
+  CBCA is an established forensic interview assessment tool.
 
-**Use proper OOP concepts and DSA principles throughout:**
-- **Strategy Pattern**: ASD model as pluggable speaking-detection strategy, replacing lip-sync
-- **Adapter Pattern**: Light-ASD wrapped in same interface as lip-sync for drop-in replacement
-- **Hungarian Algorithm**: `scipy.optimize.linear_sum_assignment` for O(n³) globally optimal assignment
-- **HMM / Viterbi**: smoothing face→speaker mapping over time to prevent flicker
-- **Observer Pattern**: LayoutClassifier emits events consumed by CentroidTracker + IdentityVerifier
-- **Object Pool**: Light-ASD model loaded once, reused across frames
-- **IntervalIndex**: O(log N) bisect for diar segment lookup (already exists in ActiveTileTagger)
+**What is verified:** Direction (fewer details in deception). Effect size
+approximately d=0.25-0.35 (among the largest in DePaulo's meta-analysis but
+exact per-cue d not independently verified from the table).
 
-**Read these files before making changes:**
-- services/video_agent/feature_extractor.py:
-  - `SpeakerFaceMapper` class — `assign()`, `_lip_sync_assignment()`, `_greedy_assign()`,
-    `set_active_tile_tags()`, `_time_overlap_assignment()`, `_in_intervals()`
-  - `ActiveTileTagger` class
-  - `IdentityVerifier` class
-  - `CentroidTracker` class
-  - `build_lip_activity_map()` method
-  - `_extract_frames()` method — frame loop
-- services/video_agent/main.py:
-  - `VideoPipeline.run_analysis()` — steps 1-5
+**What is novel (honest label):** The specific sensory word list categories
+and the density-comparison operationalization are engineering decisions, not
+from any paper.
 
-**References:**
-- Light-ASD (Liao et al., CVPR 2023): 94.1% mAP, 1.0M params, 0.6G FLOPs.
-  Repo: `Junhua-Liao/Light-ASD`. Pretrained on AVA-ActiveSpeaker.
-- Hungarian algorithm: `scipy.optimize.linear_sum_assignment`
-- Chung 2019 "Who Said That?" — iterative AV diarization pipeline (Interspeech)
-- Adobe patent US 12,125,501 — "Face-aware speaker diarization"
-- Microsoft SRD (arXiv 1912.04979) — production meeting transcription
+**Confidence cap:** 0.50 (one of the strongest verbal cues but still ~35% FP).
+
+### Signal 2: `vocal_hesitation_cluster` (Voice Agent)
+
+**Research:**
+- Sporer, S.L. & Schwandt, B. (2006) "Paraverbal indicators of deception:
+  A meta-analytic synthesis." Applied Cognitive Psychology 20:421-446.
+  Finding: "speech errors were positively related to deception" in their
+  meta-analysis of 9 paraverbal behaviors. Effect sizes described as "small."
+  Filled pauses (um, uh, er) are a category of speech errors.
+- Vrij, A. (2008) "Detecting Lies and Deceit" synthesizes: cognitive load
+  during deception increases speech disfluencies.
+
+**What is verified:** Direction (more filled pauses during deception). Effect
+size is "small" per Sporer & Schwandt — exact d not extracted from their paper.
+
+**What is novel (honest label):** The "3+ fillers in 10 seconds" cluster
+threshold is an engineering heuristic. No paper defines a cluster threshold.
+The concept of temporal clustering (vs individual fillers) is a reasonable
+engineering application but NOT from research.
+
+**Confidence cap:** 0.40 (direction valid but effect is small and clusters
+also indicate general nervousness, not specifically deception).
+
+### Signal 3: `speech_rate_change` (Voice Agent)
+
+**Research:**
+- DePaulo et al. (2003) meta-analysis includes speech rate as a cue.
+- Sporer & Schwandt (2006): "speech rate was slightly positively related
+  to deception after short preparation (r=.082), and unrelated after
+  medium preparation time (r=.034)."
+
+**CRITICAL: Direction is MIXED.** Liars speak FASTER with short preparation
+(r=+0.082) and show no change with longer preparation. The relationship
+"varied as a function of content, preparation, motivation, sanctioning."
+This signal must detect significant change in EITHER direction, not
+specifically deceleration.
+
+**What is verified:** Speech rate changes during deception. Effect is small
+(r≈0.08, approximately d≈0.16). Direction depends on context.
+
+**What is novel (honest label):** The ">30% deviation from baseline" threshold
+and "consecutive window" requirement are engineering decisions.
+
+**Confidence cap:** 0.40 (small effect, direction unpredictable, also changes
+with fatigue/topic difficulty).
+
+### Signal 4: `narrative_consistency_drift` (Language Agent)
+
+**Research:**
+- Granhag, P.A. & Strömwall, L.A. (1999) "Repeated interrogations:
+  stretching the deception detection paradigm." Expert Evidence 7:163-174.
+  Finding: repeated questioning reveals inconsistency in deceptive accounts.
+- Fisher, R.P. & Geiselman, R.E. (1992) "Memory-Enhancing Techniques for
+  Investigative Interviewing: The Cognitive Interview." Charles C Thomas.
+  The Cognitive Interview technique relies on retelling to detect inconsistency.
+- Vrij, A., Mann, S., Fisher, R., Leal, S., Milne, R. & Bull, R. (2009)
+  "Increasing cognitive load to facilitate lie detection." Psychology, Crime
+  & Law 15(2-3):97-109. Consistency decreases across repeated accounts for liars.
+
+**What is verified:** Direction (liars' accounts drift more across retellings).
+Granhag & Strömwall 1999 and Vrij et al. 2009 support this direction.
+
+**What is NOT verified:** No quantified effect size (d value) from these papers.
+The d≈0.25 I previously cited was fabricated. Cite as: "direction supported;
+no meta-analytic effect size available for this specific operationalization."
+
+**What is novel (honest label):** TF-IDF cosine similarity between retelling
+pairs is an engineering operationalization. Jaccard fallback is engineering.
+The "3+ shared content words AND >5 minutes apart" pairing criterion is
+an engineering heuristic.
+
+**Confidence cap:** 0.40 (no quantified effect size; inconsistency also occurs
+from genuine memory degradation, fatigue, or different question framing).
+
+### Signal 5: `self_adaptor_increase` (Video Agent)
+
+**Research:**
+- Li, Y., Song, Y., Li, J. & Li, X. (2024) "Nonverbal cues to deception:
+  insights from a mock crime scenario in a Chinese sample." Frontiers in
+  Psychology 15. doi:10.3389/fpsyg.2024.1331653.
+  Finding: "liars exhibited a higher frequency of self-adaptors."
+- DePaulo et al. (2003) meta-analysis: fidgeting d=0.10 (small effect).
+- Vrij et al. (1996) "instructed subjects to undergo interrogation in both
+  truthful and deceptive scenarios and observed a significant decrease in leg
+  and foot movements as well as hand and finger movements during deception."
+
+**What is verified:** Direction (self-adaptors increase during deception).
+Effect size: d=0.10 per DePaulo 2003 meta-analysis for fidgeting.
+
+**What is NOT verified:** The "increasing temporal trend" concept (comparing
+first-third vs last-third rate) is NOT from any paper. No study measures the
+effect size of a temporal trend in self-adaptors specifically. The d=0.10 is
+for absolute fidgeting rate, not for the trend.
+
+**What is novel (honest label):** The temporal trend operationalization
+(session thirds comparison) is engineering. The 1.5× ratio threshold is
+an engineering heuristic.
+
+**Confidence cap:** 0.35 (d=0.10 is very small; the trend concept is
+unvalidated; mounting anxiety is equally present in innocent suspects
+under prolonged questioning).
 
 ---
 
-## Change 1: ActiveSpeakerDetector — Light-ASD Wrapper
+## CRITICAL INSTRUCTIONS
 
-**File:** services/video_agent/feature_extractor.py
-**Location:** New class, after IdentityVerifier
+**Before writing ANY code:**
 
-Light-ASD takes a face crop sequence (112×112) + co-aligned audio spectrogram
-and returns per-frame speaking probabilities. It replaces the lip-sync heuristic
-as the primary face→speaker signal.
+1. Read EVERY file in the dependency trace. Understand what each reference
+   does before removing or modifying.
 
-At 0.1-4.5ms per frame on GPU (CPU: ~5-15ms), running on every sampled frame
-for every face is feasible: 6300 frames × 3 faces × 10ms = 189s on CPU.
-But that's too much. Instead, run per diar segment — only on faces visible
-during that segment. Average 50 segments × 3 faces × 20 frames each × 10ms = 30s.
+2. Use proper OOP and DSA:
+   - **Sliding Window** (deque): hesitation clusters, speech rate consecutive windows
+   - **HashMap** (frozenset): O(1) sensory word lookup for detail_reduction
+   - **Cosine Similarity** (numpy/sklearn): narrative consistency comparison
+   - **IntervalIndex** (bisect): O(log N) diar segment overlap for speech_rate_change
+   - **Strategy Pattern**: each signal is a separate method in its agent's rule class
+
+3. Do NOT break any existing functionality. Every removal has a corresponding
+   update in every consumer listed in the dependency trace.
+
+4. ALL confidence caps reflect actual research strength:
+   - detail_reduction: 0.50 (strongest, d≈0.25-0.35)
+   - vocal_hesitation_cluster: 0.40 (direction valid, small effect)
+   - speech_rate_change: 0.40 (small effect, direction mixed)
+   - narrative_consistency_drift: 0.40 (no quantified effect size)
+   - self_adaptor_increase: 0.35 (d=0.10, trend concept unvalidated)
+
+5. ALL signal metadata.interpretation MUST include multiple possible
+   explanations. NEVER claim deception from any single signal.
+
+6. ALL signal metadata MUST cite the actual paper with correct year
+   and the specific finding (not an approximate effect size).
+
+---
+
+## Dependency Trace — Removals
+
+### barrier_behavior → Replace with `self_adaptor_increase`
+
+| File | Action |
+|------|--------|
+| `interrogation_patterns.py` line 54 — `_RESISTANCE_TYPES` | Replace |
+| `interrogation_patterns.py` line 375 — `_RESISTANCE_BUILDING` | Replace |
+| `handcuff_detector.py` line 71 — suppressed rules | Remove barrier_behavior, ADD self_adaptor_increase (restricted hand range when cuffed) |
+| `handcuff_detector.py` line 88 — alternative measurements | Remove barrier_behavior→torso_lean_away entry |
+| `VideoSignalPlayer.tsx` line 613 — SIGNAL_CONFIG | Remove, add self_adaptor_increase |
+| `signalDisplayConfig.ts` — 2 entries (base + torso_lean_away) | Remove both, add self_adaptor_increase |
+| `sessions.py` — `_VIDEO_OVERLAY_TYPES` | Replace |
+
+### low_autonomic_reactivity → Remove entirely (no replacement)
+
+| File | Action |
+|------|--------|
+| `VideoSignalPlayer.tsx` line 633 — SIGNAL_CONFIG | Remove |
+| `signalDisplayConfig.ts` — entry | Remove |
+| `sessions.py` — `_VIDEO_OVERLAY_TYPES` | Remove |
+
+### pronoun_distancing → Replace with `detail_reduction`
+
+| File | Action |
+|------|--------|
+| `interrogation_patterns.py` line 55 — `_RESISTANCE_TYPES` | Replace |
+| `interrogation_patterns.py` line 339 — recommendation text | Update text |
+| `interrogation_patterns.py` line 375 — `_RESISTANCE_BUILDING` | Replace |
+| `narrative.py` line 307 — `_INTERROG_TYPES` | Replace |
+| `InterrogationSummaryPanel.tsx` line 20 — INTERROGATION_TYPES | Replace |
+| `VideoSignalPlayer.tsx` line 641 — SIGNAL_CONFIG | Remove, add detail_reduction |
+| `signalDisplayConfig.ts` — entry | Remove, add detail_reduction |
+| `sessions.py` — `_LANGUAGE_OVERLAY_TYPES` | Replace |
+
+### tense_inconsistency → Replace with `vocal_hesitation_cluster` in patterns, `narrative_consistency_drift` in frontend/narrative
+
+| File | Action |
+|------|--------|
+| `interrogation_patterns.py` line 56 — `_RESISTANCE_TYPES` | Replace with `vocal_hesitation_cluster` |
+| `interrogation_patterns.py` line 376 — `_RESISTANCE_BUILDING` | Replace with `vocal_hesitation_cluster` |
+| `narrative.py` line 307 — `_INTERROG_TYPES` | Replace with `narrative_consistency_drift` |
+| `InterrogationSummaryPanel.tsx` line 21 — INTERROGATION_TYPES | Replace with `narrative_consistency_drift` |
+| `VideoSignalPlayer.tsx` line 647 — SIGNAL_CONFIG | Remove, add narrative_consistency_drift + vocal_hesitation_cluster |
+| `signalDisplayConfig.ts` — entry | Remove, add narrative_consistency_drift + vocal_hesitation_cluster |
+| `sessions.py` — `_LANGUAGE_OVERLAY_TYPES` | Replace with `narrative_consistency_drift` |
+
+---
+
+## Implementation Specs
+
+### detail_reduction (Language Agent)
+
+**File:** `services/language_agent/interrogation_rules.py`
+
+Sensory word categories — frozenset per category, O(1) lookup:
+```
+VISUAL: saw, looked, bright, dark, color, light, shadow, watched, noticed, appeared, visible, clear
+AUDITORY: heard, sound, loud, quiet, noise, voice, bang, click, ring, whisper, screamed, yelled
+SPATIAL: left, right, above, below, behind, front, inside, outside, corner, across, beside, near
+TEMPORAL: before, after, during, moment, suddenly, immediately, already, earlier, later
+TACTILE: cold, warm, hot, rough, smooth, soft, hard, wet, sharp, heavy, tight
+```
+
+Algorithm: O(S × W) per speaker. For each segment > 20 words, count
+sensory words / total words = detail_density. Compare first-half mean
+vs second-half mean. If drop > 40% → fire signal.
+
+Metadata must include:
+```python
+"research": "DePaulo et al. 2003 Psychological Bulletin 129(1):74-118 — liars 'less forthcoming' and 'bereft of unusual details'. Vrij 2008 CBCA validates sensory detail discrimination.",
+"effect_note": "Among the largest effects in DePaulo meta-analysis (average d=0.25 across significant cues). Exact per-cue d not independently verified.",
+"interpretation": "Narrative lacks sensory richness compared to earlier accounts. Also occurs in genuine memory gaps, fatigue, or topics the speaker finds unimportant."
+```
+
+### vocal_hesitation_cluster (Voice Agent)
+
+**File:** `services/voiceAgent/interrogation_rules.py`
+
+Algorithm: Sliding window of 5 consecutive 2s voice windows (10s total).
+Count fillers (um, uh, er, ah, like-as-filler) across the window. Compare
+to speaker baseline filler_rate from calibration. If cluster ≥ 3 AND
+ratio ≥ 2.0× baseline → fire.
+
+Metadata must include:
+```python
+"research": "Sporer & Schwandt 2006 Applied Cognitive Psychology 20:421-446 — 'speech errors positively related to deception'. Effect sizes described as 'small'.",
+"effect_note": "Direction validated. Exact effect size for filled pause clusters not available. Cluster threshold (3+ in 10s) is an engineering heuristic, not from research.",
+"interpretation": "Burst of speech disfluencies indicating cognitive load spike. Equally occurs during genuine confusion, word-finding difficulty, or high emotional arousal."
+```
+
+### speech_rate_change (Voice Agent)
+
+**File:** `services/voiceAgent/interrogation_rules.py`
+
+Algorithm: Compare window speech_rate to calibrated baseline. If
+abs(rate - baseline) / baseline > 0.30 for 2+ consecutive windows → fire.
+Record direction (faster/slower) in value_text.
+
+Metadata must include:
+```python
+"research": "Sporer & Schwandt 2006 Applied Cognitive Psychology 20:421-446 — 'speech rate slightly positively related to deception after short preparation (r=.082), unrelated after medium preparation'. DePaulo et al. 2003 includes speech rate.",
+"effect_note": "Direction is MIXED — liars may speak faster OR slower depending on preparation time and context. r≈0.08 (approximately d≈0.16). Signal detects significant change in EITHER direction.",
+"interpretation": "Significant speech rate shift from baseline. Acceleration may indicate rehearsed delivery. Deceleration may indicate careful word selection. Both also occur from fatigue, topic change, or emotional arousal."
+```
+
+### narrative_consistency_drift (Language Agent)
+
+**File:** `services/language_agent/interrogation_rules.py`
+
+Algorithm: Identify retelling pairs — segments from same speaker sharing
+3+ content nouns/verbs AND > 5 minutes apart. Compute TF-IDF cosine
+similarity (sklearn if available, Jaccard fallback). If cosine < 0.70 → drift.
+
+Metadata must include:
+```python
+"research": "Granhag & Strömwall 1999 Expert Evidence 7:163-174 — repeated questioning reveals inconsistency in deceptive accounts. Vrij et al. 2009 Psychology Crime & Law 15(2-3):97-109 — consistency decreases across repeated accounts for liars.",
+"effect_note": "Direction supported by multiple studies. No meta-analytic effect size (d value) available for this specific operationalization. TF-IDF cosine threshold (0.70) is an engineering heuristic.",
+"interpretation": "Same event described differently at different session times. Also occurs from genuine memory degradation over a long session, different questioning frames, or progressive detail addition."
+```
+
+### self_adaptor_increase (Video Agent)
+
+**File:** `services/video_agent/interrogation_rules.py`
+
+Algorithm: Partition session into thirds. Count self_touch +
+face_region_touch signals per third. If third_3_rate / max(third_1_rate, 1) ≥ 1.5 → fire. When handcuffed, SUPPRESS entirely.
+
+Metadata must include:
+```python
+"research": "Li et al. 2024 Frontiers in Psychology 15 doi:10.3389/fpsyg.2024.1331653 — 'liars exhibited higher frequency of self-adaptors'. DePaulo et al. 2003 Psychological Bulletin 129(1):74-118 — fidgeting d=0.10 (small effect).",
+"effect_note": "Direction supported (d=0.10 for absolute fidgeting rate). The 'increasing temporal trend' concept is an engineering application — no study quantifies the effect size of self-adaptor rate change over session duration.",
+"interpretation": "Rate of face/hair/arm touching increased across the session. Equally present in innocent suspects experiencing mounting pressure, fatigue, or discomfort from prolonged sitting."
+```
+
+---
+
+## Updated Frozensets
 
 ```python
-class ActiveSpeakerDetector:
-    """
-    Wrapper around Light-ASD (Liao et al., CVPR 2023) for per-frame
-    active speaker detection.
+_RESISTANCE_TYPES = frozenset({
+    "self_adaptor_increase",      # Li 2024, DePaulo 2003 d=0.10
+    "detail_reduction",           # DePaulo 2003 d≈0.25-0.35
+    "vocal_hesitation_cluster",   # Sporer & Schwandt 2006, small effect
+    "motor_inhibition",           # Vrij 1996 (kept — validated)
+    "blink_suppression_spike",    # Frosina 2018 (kept — validated)
+    "facial_emotion:contempt",    # Ekman 1991 (kept)
+})
 
-    Given a sequence of face crops + aligned audio, returns a speaking
-    probability [0.0, 1.0] per frame. This replaces the crude lip-sync
-    heuristic (jawOpen correlation) which fails on contaminated tracks,
-    tiny faces (73px), and jaw-saturated large tiles.
-
-    Design:
-      - Adapter Pattern: exposes `score_segment()` matching the interface
-        that SpeakerFaceMapper expects, so it's a drop-in replacement for
-        `_lip_sync_assignment`.
-      - Object Pool: model loaded once at init, reused across all segments.
-      - Lazy init: model files downloaded on first use via torch.hub or
-        manual weight loading.
-
-    Performance (from paper):
-      94.1% mAP on AVA-ActiveSpeaker (vs 92.3% TalkNet, 95.2% LoCoNet)
-      1.0M parameters, 0.6G FLOPs
-      Single-frame: 0.1-4.5ms GPU, ~5-15ms CPU
-
-    Args:
-        model_path: path to pretrained Light-ASD weights (.pth)
-        device: 'cuda' or 'cpu'
-        input_size: face crop size for ASD model (default 112)
-    """
-
-    _instance = None  # Singleton
-
-    def __init__(
-        self,
-        model_path: Optional[str] = None,
-        device: str = "cpu",
-        input_size: int = 112,
-    ) -> None:
-        self._device = device
-        self._input_size = input_size
-        self._model = None
-        self._model_path = model_path
-
-    @classmethod
-    def get_instance(cls, model_path: Optional[str] = None, device: str = "cpu"):
-        """Singleton: load model once, reuse across sessions."""
-        if cls._instance is None:
-            cls._instance = cls(model_path=model_path, device=device)
-        return cls._instance
-
-    def _ensure_loaded(self) -> bool:
-        """Lazy-load model on first use. Returns False if model unavailable."""
-        if self._model is not None:
-            return True
-        try:
-            # Light-ASD model loading
-            # Repo: Junhua-Liao/Light-ASD
-            # The model architecture is defined in model/light_asd_model.py
-            # Weights: pretrained_light_asd.pth
-            import torch
-            from pathlib import Path
-
-            if self._model_path and Path(self._model_path).exists():
-                # Load from local weights file
-                # Architecture: LightASDModel from the Light-ASD repo
-                # Input: (face_crops: [B, T, 3, 112, 112], audio_spec: [B, T, 13])
-                # Output: speaking_probs: [B, T] in [0, 1]
-                logger.info(f"Loading Light-ASD model from {self._model_path}")
-                # NOTE: Actual model class must be imported from Light-ASD repo
-                # This is a placeholder — adapt to the actual model loading code
-                self._model = torch.load(self._model_path, map_location=self._device)
-                self._model.eval()
-                logger.info("Light-ASD model loaded successfully")
-                return True
-            else:
-                logger.warning(
-                    "Light-ASD model not found — falling back to lip-sync heuristic"
-                )
-                return False
-        except Exception as exc:
-            logger.warning(f"Light-ASD load failed (falling back to lip-sync): {exc}")
-            return False
-
-    def score_faces_for_segment(
-        self,
-        face_crops_by_track: dict[int, list["np.ndarray"]],
-        audio_segment: "np.ndarray",
-        sample_rate: int = 16000,
-    ) -> dict[int, float]:
-        """
-        Score each face track's speaking probability during one diar segment.
-
-        Args:
-            face_crops_by_track: {track_id: [BGR crop, ...]} — face crops for
-                                 frames within this diar segment, per track.
-                                 Each crop is raw BGR, will be resized to 112×112.
-            audio_segment: raw audio waveform for this diar segment (mono, 16kHz)
-            sample_rate: audio sample rate
-
-        Returns:
-            {track_id: mean_speaking_probability} — 0.0 to 1.0 per track.
-            Higher = more likely this face is the speaker during this segment.
-        """
-        if not self._ensure_loaded():
-            return {}  # Model unavailable — caller falls back to lip-sync
-
-        import numpy as np
-        scores: dict[int, float] = {}
-
-        for tid, crops in face_crops_by_track.items():
-            if not crops:
-                scores[tid] = 0.0
-                continue
-
-            try:
-                import torch
-                import cv2
-
-                # Preprocess face crops: resize to 112×112, normalize
-                processed = []
-                for crop in crops:
-                    if crop.size < 64:
-                        continue
-                    resized = cv2.resize(crop, (self._input_size, self._input_size))
-                    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-                    normalized = rgb.astype(np.float32) / 255.0
-                    processed.append(normalized)
-
-                if not processed:
-                    scores[tid] = 0.0
-                    continue
-
-                # Stack into batch tensor [T, 3, H, W]
-                face_tensor = torch.FloatTensor(
-                    np.array(processed).transpose(0, 3, 1, 2)
-                ).to(self._device)
-
-                # Preprocess audio: MFCC or mel spectrogram
-                # Light-ASD uses 13-dim MFCC features
-                import librosa
-                mfcc = librosa.feature.mfcc(
-                    y=audio_segment, sr=sample_rate, n_mfcc=13
-                )
-                # Align audio features to face crop count
-                # ... (implementation depends on Light-ASD's exact input format)
-
-                with torch.no_grad():
-                    # probs = self._model(face_tensor, audio_tensor)
-                    # scores[tid] = float(probs.mean())
-                    pass  # Placeholder — adapt to actual Light-ASD forward pass
-
-                scores[tid] = 0.0  # Placeholder until model is integrated
-
-            except Exception as exc:
-                logger.debug(f"ASD scoring failed for track {tid}: {exc}")
-                scores[tid] = 0.0
-
-        return scores
-
-    @property
-    def is_available(self) -> bool:
-        """Check if model is loaded and ready."""
-        return self._model is not None
+_RESISTANCE_BUILDING = frozenset({
+    "self_adaptor_increase",
+    "detail_reduction",
+    "vocal_hesitation_cluster",
+    "motor_inhibition",
+})
 ```
-
-**NOTE:** The actual Light-ASD integration requires:
-1. Clone `Junhua-Liao/Light-ASD` repo
-2. Extract model architecture from `model/light_asd_model.py`
-3. Download pretrained weights
-4. Adapt the `score_faces_for_segment` method to match the exact input/output format
-The class above is the interface/adapter — the model-specific code depends on
-the Light-ASD repo's API.
 
 ---
 
-## Change 2: Replace _greedy_assign with Hungarian Algorithm
+## Frontend Display Config
 
-**File:** services/video_agent/feature_extractor.py — `SpeakerFaceMapper`
-
-The current `_greedy_assign` sorts all (face, speaker) pairs by score and picks
-greedily. This is locally optimal but not globally optimal.
-
-Example where greedy fails:
+```typescript
+'detail_reduction': {
+  label: 'Low Detail',
+  description: 'Narrative lacks sensory details compared to earlier accounts. Strongest verbal deception cue (DePaulo 2003, d≈0.25-0.35). Also occurs in genuine memory gaps or fatigue.',
+  icon: '📝', color: '#A78BFA', category: 'pattern', priority: 1,
+},
+'vocal_hesitation_cluster': {
+  label: 'Hesitation Burst',
+  description: 'Cluster of 3+ speech disfluencies within 10 seconds. Cognitive load indicator (Sporer & Schwandt 2006). Equally occurs during genuine confusion or high emotional arousal.',
+  icon: '💬', color: '#8B5CF6', category: 'pattern', priority: 2,
+},
+'speech_rate_change': {
+  label: 'Speech Rate Shift',
+  description: 'Significant speech rate change (>30%) from baseline. Direction is context-dependent (Sporer & Schwandt 2006, r=0.08). Also changes with fatigue or topic difficulty.',
+  icon: '⏩', color: '#8B5CF6', category: 'pattern', priority: 2,
+},
+'narrative_consistency_drift': {
+  label: 'Story Drift',
+  description: 'Same event described differently at different times (Granhag & Strömwall 1999). Also occurs from memory degradation or different questioning frames. No quantified effect size.',
+  icon: '🔀', color: '#A78BFA', category: 'pattern', priority: 2,
+},
+'self_adaptor_increase': {
+  label: 'Increasing Self-Touch',
+  description: 'Self-touch rate increased across the session (Li et al. 2024, DePaulo 2003 d=0.10). Equally present in innocent suspects under prolonged pressure.',
+  icon: '✋', color: '#8B5CF6', category: 'body', priority: 2,
+},
 ```
-Face_2 × Speaker_0: 0.45    Face_2 × Speaker_1: 0.40
-Face_3 × Speaker_0: 0.43    Face_3 × Speaker_1: 0.10
-Greedy: Face_2→Speaker_0 (0.45), Face_3→Speaker_1 (0.10)  total=0.55
-Optimal: Face_2→Speaker_1 (0.40), Face_3→Speaker_0 (0.43)  total=0.83
-```
 
-Hungarian gives the globally optimal assignment in O(n³).
+---
+
+## sessions.py Whitelist Updates
 
 ```python
-    @staticmethod
-    def _hungarian_assign(
-        face_indices: list[int],
-        speakers: list[str],
-        scores: dict[tuple[int, str], float],
-    ) -> tuple[dict[int, str], dict[int, float]]:
-        """
-        Globally optimal face→speaker assignment using the Hungarian algorithm.
+# _VIDEO_OVERLAY_TYPES:
+#   REMOVE: "barrier_behavior", "low_autonomic_reactivity"
+#   ADD: "self_adaptor_increase"
 
-        Replaces _greedy_assign. Uses scipy.optimize.linear_sum_assignment on
-        the cost matrix (negated scores, since Hungarian minimizes cost).
+# _LANGUAGE_OVERLAY_TYPES:
+#   REMOVE: "pronoun_distancing", "tense_inconsistency"
+#   ADD: "detail_reduction", "narrative_consistency_drift"
 
-        DSA: O(n³) where n = max(faces, speakers). For typical meetings (3-10
-        participants), n³ = 27-1000 — negligible compute.
-
-        Handles unequal counts:
-          - More faces than speakers: extra faces get "Face_N" labels (unmatched)
-          - More speakers than faces: extra speakers stay unmapped
-
-        Args:
-            face_indices: [2, 3, 4] — face track IDs
-            speakers: ["Speaker_0", "Speaker_1", "Speaker_2"]
-            scores: {(face_idx, speaker): correlation_or_asd_score}
-
-        Returns:
-            (mapping, assignment_scores) same format as _greedy_assign
-        """
-        import numpy as np
-        from scipy.optimize import linear_sum_assignment
-
-        n_faces = len(face_indices)
-        n_speakers = len(speakers)
-
-        if n_faces == 0 or n_speakers == 0:
-            return (
-                {fi: f"Face_{fi}" for fi in face_indices},
-                {fi: 0.0 for fi in face_indices},
-            )
-
-        # Build cost matrix: negate scores (Hungarian minimizes)
-        # Pad to square if needed (scipy requires square or rectangular)
-        cost = np.zeros((n_faces, n_speakers), dtype=np.float64)
-        for i, fi in enumerate(face_indices):
-            for j, spk in enumerate(speakers):
-                cost[i, j] = -scores.get((fi, spk), 0.0)
-
-        # Solve
-        row_ind, col_ind = linear_sum_assignment(cost)
-
-        mapping: dict[int, str] = {}
-        assignment_scores: dict[int, float] = {}
-
-        for r, c in zip(row_ind, col_ind):
-            fi = face_indices[r]
-            spk = speakers[c]
-            score = scores.get((fi, spk), 0.0)
-            mapping[fi] = spk
-            assignment_scores[fi] = score
-
-        # Unmatched faces get Face_N labels
-        for fi in face_indices:
-            if fi not in mapping:
-                mapping[fi] = f"Face_{fi}"
-                assignment_scores[fi] = 0.0
-
-        return mapping, assignment_scores
+# _VOICE_INTERROG_TYPES:
+#   ADD: "vocal_hesitation_cluster", "speech_rate_change"
 ```
 
 ---
 
-## Change 3: Update SpeakerFaceMapper.assign — Use ASD + Hungarian
-
-**File:** services/video_agent/feature_extractor.py — `SpeakerFaceMapper.assign`
-
-Replace `_lip_sync_assignment` call with ASD scoring when available, fall back
-to lip-sync when Light-ASD model is not loaded.
-
-```python
-    def assign(
-        self,
-        windows: list[WindowFeatures],
-        diar_segments: list[dict],
-        lip_activity_map: Optional[dict] = None,
-        asd_detector: Optional[ActiveSpeakerDetector] = None,
-        face_crops_by_segment: Optional[dict] = None,
-        audio_segments: Optional[dict] = None,
-    ) -> tuple[dict[str, list[WindowFeatures]], dict[str, float], dict[int, str]]:
-
-        # ... existing setup (speakers, face_indices, result) unchanged ...
-
-        # ── Strategy: ASD model (primary) or lip-sync (fallback) ──────────
-        if (
-            asd_detector is not None
-            and asd_detector.is_available
-            and face_crops_by_segment is not None
-            and audio_segments is not None
-            and len(face_indices) > 1
-            and len(speakers) > 1
-        ):
-            # ASD-based assignment: score each face per diar segment
-            face_to_speaker, assignment_scores = self._asd_assignment(
-                face_indices, speakers, diar_segments,
-                asd_detector, face_crops_by_segment, audio_segments,
-            )
-            method = "asd_light"
-        elif use_lip_sync:
-            face_to_speaker, assignment_scores = self._lip_sync_assignment(
-                face_indices, speakers, diar_segments, lip_activity_map
-            )
-            method = "lip_sync"
-        else:
-            face_to_speaker, assignment_scores = self._time_overlap_assignment(
-                face_indices, speakers, windows, diar_segments
-            )
-            method = "time_overlap"
-
-        # ... rest of assign() unchanged (confident_face_to_speaker, active-tile
-        #     merge, window grouping, lip_sync_scores export) ...
-```
-
----
-
-## Change 4: _asd_assignment Method
-
-**File:** services/video_agent/feature_extractor.py — `SpeakerFaceMapper`
-
-```python
-    def _asd_assignment(
-        self,
-        face_indices: list[int],
-        speakers: list[str],
-        diar_segments: list[dict],
-        asd_detector: ActiveSpeakerDetector,
-        face_crops_by_segment: dict[str, dict[int, list["np.ndarray"]]],
-        audio_segments: dict[str, "np.ndarray"],
-    ) -> tuple[dict[int, str], dict[int, float]]:
-        """
-        Active Speaker Detection assignment using Light-ASD model.
-
-        For each diar segment, scores all visible faces' speaking probability
-        using the ASD model. Aggregates scores across all segments per
-        (face, speaker) pair, then runs Hungarian for globally optimal assignment.
-
-        Args:
-            face_indices: face track IDs
-            speakers: speaker labels from diarization
-            diar_segments: [{speaker, start_ms, end_ms}, ...]
-            asd_detector: ActiveSpeakerDetector instance
-            face_crops_by_segment: {segment_key: {track_id: [BGR crops]}}
-            audio_segments: {segment_key: audio_waveform_numpy}
-
-        Returns:
-            (mapping, assignment_scores) — same format as _lip_sync_assignment
-        """
-        # Accumulate ASD scores per (face, speaker) pair across all segments
-        asd_scores: dict[tuple[int, str], float] = defaultdict(float)
-        segment_counts: dict[tuple[int, str], int] = defaultdict(int)
-
-        for seg in diar_segments:
-            spk = seg.get("speaker", "")
-            if not spk.startswith("Speaker_"):
-                continue
-            seg_key = f"{spk}_{seg.get('start_ms', 0)}_{seg.get('end_ms', 0)}"
-
-            crops_for_seg = face_crops_by_segment.get(seg_key, {})
-            audio_for_seg = audio_segments.get(seg_key)
-            if not crops_for_seg or audio_for_seg is None:
-                continue
-
-            # Score each face track's speaking probability during this segment
-            face_scores = asd_detector.score_faces_for_segment(
-                crops_for_seg, audio_for_seg,
-            )
-
-            for fi in face_indices:
-                score = face_scores.get(fi, 0.0)
-                asd_scores[(fi, spk)] += score
-                segment_counts[(fi, spk)] += 1
-
-        # Average scores per pair
-        avg_scores: dict[tuple[int, str], float] = {}
-        for key, total in asd_scores.items():
-            count = segment_counts.get(key, 1)
-            avg_scores[key] = total / max(count, 1)
-
-        # Hungarian assignment for globally optimal matching
-        return self._hungarian_assign(face_indices, speakers, avg_scores)
-```
-
----
-
-## Change 5: LayoutClassifier + CentroidTracker.reset()
-
-**File:** services/video_agent/feature_extractor.py
-
-Already prompted in detail (LAYOUT_AWARE_HYBRID_TRACKING_PROMPT.md). Summary:
-
-### 5a. LayoutClassifier class (~70 lines)
-- Per-frame classification: active_speaker / gallery_2x2 / gallery_3x3 / screenshare / room_camera / solo
-- Sliding window of 5 frames with Counter majority vote
-- `layout_changed` property triggers tracker reset
-
-### 5b. CentroidTracker.reset() method (~10 lines)
-- Kills all active tracks
-- Preserves `_next_id` (fresh IDs for post-reset tracks)
-- ArcFace merge reconnects same-person tracks later
-
-### 5c. Layout change detection in frame loop (~20 lines)
-- Call `layout_classifier.classify_frame()` per frame
-- On `layout_classifier.layout_changed`: reset CentroidTracker + clear IdentityVerifier
-
-### 5d. Layout-aware IdentityVerifier interval (~8 lines)
-- Active speaker: check_interval=10 (2s) — fast tile swaps
-- Gallery: check_interval=50 (10s) — stable positions
-- Default: check_interval=30 (6s)
-
----
-
-## Change 6: Active-Speaker Border Color Detection
-
-**File:** services/video_agent/feature_extractor.py
-**Location:** New method in `_extract_frames` or new utility class
-
-Zoom draws yellow/blue border, Google Meet draws blue/white border around the
-active speaker tile. This is a cheap, platform-native signal that identifies
-which face the platform considers the active speaker — no model needed.
-
-```python
-class ActiveSpeakerBorderDetector:
-    """
-    Detects the platform-drawn active-speaker highlight border around face tiles.
-
-    Zoom: yellow (#FFD700) or blue (#0E71EB) border, ~3-4px wide
-    Google Meet: blue (#1A73E8) or white border, ~2-3px wide
-    Teams: thin colored ring
-
-    Detection: sample pixels along the perimeter of each face bounding box.
-    If >30% of perimeter pixels match the highlight color (HSV range),
-    this face is the platform-asserted active speaker.
-
-    Design:
-      - Strategy Pattern: platform-specific HSV ranges configurable
-      - O(P) per face per frame where P = perimeter pixel count (~200-400)
-      - Total per session: ~6300 frames × 3 faces × 300 pixels = negligible
-
-    Args:
-        platform: 'zoom', 'meet', 'teams', or 'auto' (tries all)
-    """
-
-    # HSV ranges for active-speaker borders
-    ZOOM_YELLOW_HSV = ((20, 150, 150), (35, 255, 255))
-    ZOOM_BLUE_HSV = ((100, 150, 150), (120, 255, 255))
-    MEET_BLUE_HSV = ((100, 100, 150), (125, 255, 255))
-    MEET_WHITE_HSV = ((0, 0, 200), (180, 30, 255))
-
-    def __init__(self, platform: str = "auto") -> None:
-        self._platform = platform
-        self._hsv_ranges: list[tuple[tuple, tuple]] = []
-        if platform == "zoom":
-            self._hsv_ranges = [self.ZOOM_YELLOW_HSV, self.ZOOM_BLUE_HSV]
-        elif platform == "meet":
-            self._hsv_ranges = [self.MEET_BLUE_HSV, self.MEET_WHITE_HSV]
-        elif platform == "teams":
-            self._hsv_ranges = [self.MEET_BLUE_HSV]  # Teams uses similar blue
-        else:  # auto — try all
-            self._hsv_ranges = [
-                self.ZOOM_YELLOW_HSV, self.ZOOM_BLUE_HSV,
-                self.MEET_BLUE_HSV, self.MEET_WHITE_HSV,
-            ]
-
-    def detect_active_speaker(
-        self,
-        bgr: "np.ndarray",
-        face_boxes: list[tuple[int, int, int, int]],
-        border_width: int = 5,
-        match_ratio: float = 0.30,
-    ) -> int | None:
-        """
-        Return the index into face_boxes of the face with an active-speaker border,
-        or None if no border detected.
-
-        Args:
-            bgr: full frame (BGR)
-            face_boxes: [(x, y, w, h), ...] face bounding boxes
-            border_width: pixels outside the face box to sample
-            match_ratio: fraction of perimeter pixels that must match
-
-        Returns:
-            Index into face_boxes, or None.
-        """
-        import cv2
-        import numpy as np
-
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        fh, fw = bgr.shape[:2]
-
-        best_idx: int | None = None
-        best_match: float = 0.0
-
-        for idx, (x, y, w, h) in enumerate(face_boxes):
-            # Sample pixels in a border_width-wide ring around the face box
-            x1 = max(0, x - border_width)
-            y1 = max(0, y - border_width)
-            x2 = min(fw, x + w + border_width)
-            y2 = min(fh, y + h + border_width)
-
-            # Collect border pixels (top, bottom, left, right strips)
-            border_pixels = []
-            # Top strip
-            border_pixels.append(hsv[y1:y, x1:x2].reshape(-1, 3))
-            # Bottom strip
-            border_pixels.append(hsv[y + h:y2, x1:x2].reshape(-1, 3))
-            # Left strip
-            border_pixels.append(hsv[y:y + h, x1:x].reshape(-1, 3))
-            # Right strip
-            border_pixels.append(hsv[y:y + h, x + w:x2].reshape(-1, 3))
-
-            all_border = np.vstack([p for p in border_pixels if p.size > 0])
-            if len(all_border) == 0:
-                continue
-
-            # Check each HSV range
-            total_match = 0
-            for lo, hi in self._hsv_ranges:
-                mask = cv2.inRange(all_border.reshape(1, -1, 3),
-                                   np.array(lo), np.array(hi))
-                total_match = max(total_match, np.count_nonzero(mask))
-
-            ratio = total_match / len(all_border)
-            if ratio > match_ratio and ratio > best_match:
-                best_match = ratio
-                best_idx = idx
-
-        return best_idx
-```
-
-Use in the frame loop as a **cheap additional signal** alongside ActiveTileTagger.
-If border detection identifies Face_3 as the active speaker AND diar says Speaker_1
-is talking → strong confidence for Face_3 = Speaker_1 mapping. If they disagree →
-flag as uncertain, rely on ASD/IdentityVerifier to resolve.
-
----
-
-## Change 7: Collect Face Crops Per Diar Segment for ASD
-
-**File:** services/video_agent/feature_extractor.py — after `_extract_frames`
-
-The ASD model needs face crops aligned to diar segments. Build this from the
-already-extracted frames:
-
-```python
-    def build_asd_inputs(
-        self,
-        frames: list[FrameFeatures],
-        diar_segments: list[dict],
-        audio_path: str,
-    ) -> tuple[dict[str, dict[int, list]], dict[str, "np.ndarray"]]:
-        """
-        Build per-segment face crops and audio for ASD scoring.
-
-        Returns:
-            face_crops_by_segment: {seg_key: {track_id: [BGR crops]}}
-            audio_segments: {seg_key: audio_waveform}
-        """
-        import librosa
-
-        # Load audio once
-        y, sr = librosa.load(audio_path, sr=16000, mono=True)
-
-        face_crops_by_segment: dict[str, dict[int, list]] = {}
-        audio_segments: dict[str, "np.ndarray"] = {}
-
-        for seg in diar_segments:
-            spk = seg.get("speaker", "")
-            start_ms = seg.get("start_ms", 0)
-            end_ms = seg.get("end_ms", 0)
-            seg_key = f"{spk}_{start_ms}_{end_ms}"
-
-            # Audio slice
-            start_sample = int(start_ms / 1000.0 * sr)
-            end_sample = int(end_ms / 1000.0 * sr)
-            audio_segments[seg_key] = y[start_sample:end_sample]
-
-            # Face crops: frames within this segment's time range
-            crops: dict[int, list] = defaultdict(list)
-            for ff in frames:
-                if (ff.face_detected
-                        and start_ms <= ff.timestamp_ms < end_ms
-                        and ff.face_index in self._best_face_crops):
-                    # Use the best-quality crop for this track
-                    # (ASD models are robust to using the same good crop
-                    #  repeated vs per-frame crops for short segments)
-                    crops[ff.face_index].append(
-                        self._best_face_crops[ff.face_index]
-                    )
-
-            face_crops_by_segment[seg_key] = dict(crops)
-
-        return face_crops_by_segment, audio_segments
-```
-
----
-
-## Integration in VideoPipeline.run_analysis
-
-**File:** services/video_agent/main.py
-
-```python
-        # After extract_all, before mapper.assign:
-
-        # ── Optional: Build ASD inputs ────────────────────────────────────────
-        asd_detector = ActiveSpeakerDetector.get_instance(
-            model_path=os.environ.get("LIGHT_ASD_MODEL_PATH"),
-            device="cpu",
-        )
-        face_crops_by_segment = None
-        audio_segments_for_asd = None
-
-        if asd_detector.is_available and audio_path:
-            face_crops_by_segment, audio_segments_for_asd = (
-                self._extractor.build_asd_inputs(frames, diar_segments, audio_path)
-            )
-            logger.info(
-                f"[{session_id}] ASD inputs built: "
-                f"{len(face_crops_by_segment)} segments"
-            )
-
-        # ── Step 2: Map windows → speakers ────────────────────────────────────
-        windows_by_speaker, lip_sync_scores, face_to_speaker = self._mapper.assign(
-            windows, diar_segments, lip_activity_map,
-            asd_detector=asd_detector,
-            face_crops_by_segment=face_crops_by_segment,
-            audio_segments=audio_segments_for_asd,
-        )
-```
-
-When `LIGHT_ASD_MODEL_PATH` is not set or model unavailable, the pipeline falls
-back to lip-sync + active-tile tags — existing behavior unchanged.
-
----
-
-## Summary
-
-| # | Component | What | Impact | Lines |
-|:-:|-----------|------|:------:|:-----:|
-| 1 | **ActiveSpeakerDetector** | Light-ASD wrapper (Adapter Pattern, Singleton) | Replaces lip-sync heuristic with 94.1% mAP ASD model | ~100 |
-| 2 | **_hungarian_assign** | Replaces _greedy_assign with scipy Hungarian | Globally optimal face→speaker matching | ~40 |
-| 3 | **SpeakerFaceMapper.assign** update | Strategy: ASD (primary) → lip-sync (fallback) | Uses best available signal | ~15 |
-| 4 | **_asd_assignment** | Scores faces per diar segment via ASD, feeds Hungarian | Per-segment speaking probabilities | ~50 |
-| 5 | **LayoutClassifier + reset** | Layout detection + CentroidTracker reset | Prevents contamination at layout changes | ~110 |
-| 6 | **ActiveSpeakerBorderDetector** | Platform border color detection (HSV) | Cheap platform-native active speaker signal | ~70 |
-| 7 | **build_asd_inputs** | Collects face crops + audio per diar segment | ASD model input preparation | ~40 |
-
-**Total: ~425 lines across 2 files. No existing code deleted — new components added alongside existing ones. Lip-sync remains as fallback when Light-ASD model is unavailable.**
-
-## Deployment Strategy
-
-**Phase 1 (immediate — no new models):**
-- Change 2: Replace `_greedy_assign` with `_hungarian_assign` (40 lines, scipy only)
-- Change 5: LayoutClassifier + CentroidTracker.reset() (110 lines, no dependencies)
-- Change 6: ActiveSpeakerBorderDetector (70 lines, OpenCV only)
-
-**Phase 2 (after Light-ASD model integration):**
-- Change 1: ActiveSpeakerDetector wrapper
-- Change 3-4: ASD-based assignment in SpeakerFaceMapper
-- Change 7: build_asd_inputs
-
-Phase 1 improves the existing pipeline with no new model dependencies.
-Phase 2 adds the ASD model that transforms face→speaker accuracy from ~60% (lip-sync) to ~94% (Light-ASD).
-
-## Files Modified:
-1. **services/video_agent/feature_extractor.py**:
-   - New: ActiveSpeakerDetector (~100L), ActiveSpeakerBorderDetector (~70L), LayoutClassifier (~70L)
-   - New: _hungarian_assign (~40L), _asd_assignment (~50L), build_asd_inputs (~40L)
-   - Modified: SpeakerFaceMapper.assign — strategy selection (~15L)
-   - Modified: CentroidTracker — add reset() (~10L)
-   - Modified: _extract_frames — layout detection + reset (~20L)
-2. **services/video_agent/main.py**:
-   - Modified: VideoPipeline.run_analysis — ASD init + input building (~15L)
+## Verification After Implementation
+
+1. Grep entire codebase for removed signal names — zero results expected:
+   `grep -rn "barrier_behavior\|low_autonomic_reactivity\|pronoun_distancing\|tense_inconsistency"`
+
+2. Run 54-minute interrogation video:
+   - detail_reduction: should fire if suspect's narratives lose sensory detail
+   - vocal_hesitation_cluster: should fire during high-pressure questioning segments
+   - speech_rate_change: should fire when speech rate shifts >30% from baseline
+   - narrative_consistency_drift: should fire if suspect retells events differently
+   - self_adaptor_increase: should fire if self-touch rate increases across session
+
+3. Check no existing functionality broken:
+   - ResistanceHardening still fires (new signals in _RESISTANCE_TYPES)
+   - FalseConfessionRiskAssessor still fires (new signals in _RESISTANCE_BUILDING)
+   - Handcuff suppression works (self_adaptor_increase suppressed when cuffed)
+   - Narrative interrogation section renders (updated _INTERROG_TYPES)
+   - Frontend displays all new signals (updated SIGNAL_CONFIG + signalDisplayConfig)
+
+## Files Modified (10 total):
+
+### Backend (5):
+1. `services/voiceAgent/interrogation_rules.py` — 2 new methods: vocal_hesitation_cluster, speech_rate_change (~60 lines)
+2. `services/language_agent/interrogation_rules.py` — 2 new methods: detail_reduction, narrative_consistency_drift. Remove: _pronoun_distancing, _tense_shift (~70 lines net)
+3. `services/video_agent/interrogation_rules.py` — 1 new method: self_adaptor_increase. Remove: _barrier_behavior, _low_autonomic_reactivity (~30 lines net)
+4. `services/fusion_agent/interrogation_patterns.py` — update _RESISTANCE_TYPES, _RESISTANCE_BUILDING frozensets + recommendation text (~8 lines)
+5. `services/fusion_agent/narrative.py` — update _INTERROG_TYPES (~2 lines)
+6. `services/video_agent/handcuff_detector.py` — remove barrier_behavior, add self_adaptor_increase to suppression (~3 lines)
+7. `backend/api/sessions.py` — update 3 whitelist arrays (~5 lines)
+
+### Frontend (3):
+8. `signalDisplayConfig.ts` — remove 5 entries, add 5 entries (~30 lines net)
+9. `VideoSignalPlayer.tsx` — update SIGNAL_CONFIG (~8 lines)
+10. `InterrogationSummaryPanel.tsx` — update INTERROGATION_TYPES (~2 lines)

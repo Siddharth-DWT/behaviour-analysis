@@ -791,4 +791,95 @@ const SIGNAL_MAP: Record<string, SignalDisplay> = {
     description: 'Vocal tone — warm, cold, aggressive, excited, nervous, or confident',
     icon: '🎭', color: '#6366F1', category: 'voice', priority: 1,
   },
+
+  // ── Interrogation: per-window behavioral signals ──────────────────────────────
+  // Category matches the modality (face/body/gaze). Purple (#8B5CF6) distinguishes
+  // interrogation-specific signals from standard behavioral signals.
+  'blink_suppression_spike': {
+    label: 'Blink Pattern',
+    description: 'Blink suppression followed by rapid blinking — cognitive load response during questioning. Common in both truthful and deceptive subjects under pressure.',
+    icon: '👁️', color: '#8B5CF6', category: 'face', priority: 1,
+  },
+  'motor_inhibition': {
+    label: 'Movement Control',
+    description: 'Unusually still body despite elevated stress — may indicate conscious movement suppression, freeze response, or simply focused attention.',
+    icon: '🧊', color: '#8B5CF6', category: 'body', priority: 1,
+  },
+  'freezing_response': {
+    label: 'Freeze Response',
+    description: 'Sudden body stillness after accusatory statement — threat-detection freeze. Equally common in truthful and deceptive subjects under accusation.',
+    icon: '❄️', color: '#8B5CF6', category: 'body', priority: 1,
+  },
+  'self_adaptor_increase': {
+    label: 'Increasing Self-Touch',
+    description: 'Self-touch rate increased across the session (Li et al. 2024, DePaulo 2003 d=0.10). Equally present in innocent suspects under prolonged pressure.',
+    icon: '✋', color: '#8B5CF6', category: 'body', priority: 2,
+  },
+  'erratic_gaze_pattern': {
+    label: 'Erratic Gaze',
+    description: 'Elevated gaze randomness during questioning — may indicate cognitive load, visual search, avoidance, or simply looking around the room.',
+    icon: '👀', color: '#8B5CF6', category: 'gaze', priority: 2,
+  },
+  // ── Interrogation: per-segment language signals ───────────────────────────────
+  // Category 'pattern' so they appear in the sidebar and timeline.
+  'detail_reduction': {
+    label: 'Low Detail',
+    description: 'Narrative lacks sensory details compared to earlier accounts. Strongest verbal deception cue (DePaulo 2003, d≈0.25-0.35). Also occurs in genuine memory gaps or fatigue.',
+    icon: '📝', color: '#A78BFA', category: 'pattern', priority: 1,
+  },
+  'narrative_consistency_drift': {
+    label: 'Story Drift',
+    description: 'Same event described differently at different times (Granhag & Strömwall 1999). Also occurs from memory degradation or different questioning frames. No quantified effect size.',
+    icon: '🔀', color: '#A78BFA', category: 'pattern', priority: 2,
+  },
+  'vocal_hesitation_cluster': {
+    label: 'Hesitation Burst',
+    description: 'Cluster of 3+ speech disfluencies within 10 seconds. Cognitive load indicator (Sporer & Schwandt 2006). Equally occurs during genuine confusion or high emotional arousal.',
+    icon: '💬', color: '#8B5CF6', category: 'pattern', priority: 2,
+  },
+  'speech_rate_change': {
+    label: 'Speech Rate Shift',
+    description: 'Significant speech rate change (>30%) from baseline. Direction is context-dependent (Sporer & Schwandt 2006, r=0.08). Also changes with fatigue or topic difficulty.',
+    icon: '⏩', color: '#8B5CF6', category: 'pattern', priority: 2,
+  },
+  'evidence_response_processing_delay': {
+    label: 'Delayed Response',
+    description: 'Extended pause (>2s) after evidence presented — processing time. Equally present in innocent suspects confronted with unexpected information.',
+    icon: '⏸️', color: '#EF4444', category: 'pattern', priority: 1,
+  },
+  'statement_contamination': {
+    label: 'Information Adopted',
+    description: 'Suspect using case-specific terms first introduced by interrogator — strongest false confession risk indicator (Garrett 2011: present in 97.5% of proven false confessions).',
+    icon: '⚠️', color: '#EF4444', category: 'pattern', priority: 1,
+  },
+
+  // ── Interrogation: per-phase compound signals ─────────────────────────────────
+  'capitulation_cascade': {
+    label: 'Capitulation Pattern',
+    description: 'Stress peak → freeze → weakening denial sequence — breakdown pattern. May indicate genuine breakdown, exhaustion, or pressure-induced compliance.',
+    icon: '📉', color: '#EF4444', category: 'pattern', priority: 1,
+  },
+  'resistance_hardening': {
+    label: 'Resistance Pattern',
+    description: 'Increasing defensive behaviors over time — adopted resistance strategy. May indicate deception or genuine innocent resistance to false accusations.',
+    icon: '📈', color: '#3B82F6', category: 'pattern', priority: 1,
+  },
+
+  // ── Interrogation: session-level signals ──────────────────────────────────────
+  // Priority 3 = hidden from sidebar; consumed by InterrogationSummaryPanel only.
+  'denial_weakening': {
+    label: 'Denial Weakening',
+    description: 'Denial strength decreased across session — from strong categorical denials to weak or acquiescent language.',
+    icon: '📊', color: '#F59E0B', category: 'pattern', priority: 3,
+  },
+  'false_confession_risk': {
+    label: 'False Confession Risk',
+    description: 'Multi-factor risk assessment — evaluates duration, contamination, capitulation, denial evolution, processing delays, and technique coerciveness.',
+    icon: '⚖️', color: '#EF4444', category: 'pattern', priority: 3,
+  },
+  'interrogator_technique': {
+    label: 'Interrogation Technique',
+    description: 'Classification of interrogator approach — PEACE (information-gathering), Reid (accusation-based), or Coercive (threats/promises).',
+    icon: '🎭', color: '#6B7280', category: 'pattern', priority: 3,
+  },
 };
