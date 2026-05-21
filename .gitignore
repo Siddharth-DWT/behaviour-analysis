@@ -57,3 +57,7 @@ services/language-agent/
 services/fusion-agent/
 services/api-gateway/
 pretrained_models/
+
+task_log.txt
+server_logs.txt
+issues.txt
