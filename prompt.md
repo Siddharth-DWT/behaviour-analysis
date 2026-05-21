@@ -609,6 +609,7 @@ flag as uncertain, rely on ASD/IdentityVerifier to resolve.
 The ASD model needs face crops aligned to diar segments. Build this from the
 already-extracted frames:
 
+Metadata must include:
 ```python
     def build_asd_inputs(
         self,

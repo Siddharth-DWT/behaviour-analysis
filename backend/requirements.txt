@@ -1,0 +1,58 @@
+# NEXUS Backend — merged requirements from all 6 services
+# Resolved to concrete versions where services disagree; newest wins.
+
+# ── Web framework ──────────────────────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# ── Database ───────────────────────────────────────────────────────────────────
+asyncpg==0.30.0
+psycopg2-binary==2.9.10
+
+# ── Redis ──────────────────────────────────────────────────────────────────────
+redis[hiredis]==5.2.1
+
+# ── HTTP client ────────────────────────────────────────────────────────────────
+httpx>=0.27.0
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
+pydantic==2.10.4
+python-dotenv==1.0.1
+numpy>=1.26.4
+
+# ── Authentication (api_gateway) ───────────────────────────────────────────────
+bcrypt>=4.0.0
+python-jose[cryptography]>=3.3.0
+
+# ── LLM APIs (language_agent + fusion_agent + api_gateway) ────────────────────
+anthropic==0.40.0
+openai>=1.0.0
+
+# ── Audio processing (voice_agent) ─────────────────────────────────────────────
+# torch must be installed separately in the Dockerfile (CPU or CUDA build).
+# See: https://pytorch.org/get-started/locally/
+librosa==0.10.2
+soundfile==0.13.1
+numba>=0.59.0
+av>=12.0.0
+scikit-learn>=1.3.0
+faster-whisper==1.1.0
+huggingface_hub>=0.20.0
+
+# ── NLP / Language (language_agent) ────────────────────────────────────────────
+# torch — installed separately in Dockerfile (see above)
+transformers==4.47.1
+onnxruntime>=1.17.0
+optimum[onnxruntime]>=1.17.0
+vaderSentiment>=3.3.2
+
+# ── Video / face (video_agent) ─────────────────────────────────────────────────
+# MediaPipe has a strict Python / numpy version requirement — ensure the
+# Dockerfile uses Python 3.11 and pins numpy>=1.24,<2.0.
+mediapipe>=0.10.14
+opencv-python-headless>=4.9.0
+insightface>=0.7.3
+
+# ── Neo4j knowledge graph (api_gateway) ───────────────────────────────────────
+neo4j>=5.20.0

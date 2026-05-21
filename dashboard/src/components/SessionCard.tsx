@@ -25,6 +25,9 @@ const MEETING_TYPE_LABELS: Record<string, string> = {
   client_meeting: "Client Meeting",
   internal: "Internal",
   interview: "Interview",
+  podcast: "Podcast",
+  debate: "Debate",
+  interrogation_video: "Interrogation Video",
   other: "Other",
 };
 

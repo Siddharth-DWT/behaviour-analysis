@@ -1,0 +1,578 @@
+# services/voiceAgent/main.py
+"""
+NEXUS Voice Agent (Agent 1)
+FastAPI service for acoustic & prosodic analysis.
+
+Implements 5 core rules from the Rule Engine:
+  - VOICE-CAL-01: Per-speaker baseline calibration
+  - VOICE-STRESS-01: Composite vocal stress score
+  - VOICE-FILLER-01: Filler word detection & classification
+  - VOICE-PITCH-01: Pitch elevation flag
+  - VOICE-RATE-01: Speech rate anomaly detection
+  - VOICE-TONE-03/04: Nervous + Confident tone classification
+
+Endpoints:
+  POST /analyse          → Process an audio file end-to-end
+  POST /analyse/stream   → Process audio chunk (for future real-time)
+  GET  /health           → Health check
+"""
+import asyncio
+import os
+import uuid
+import json
+import time
+import logging
+from typing import Optional
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+
+from shared.models.requests import VoiceAnalysisRequest as AnalysisRequest, VoiceAnalysisResponse as AnalysisResponse
+from shared.redis_layer import (
+    AgentStatusRecord,
+    EventRecord,
+    RedisEventStore,
+    RedisJobConsumer,
+    RedisKeys,
+    RedisLockManager,
+    RedisRepository,
+    SessionStateRecord,
+    SignalRecord,
+)
+
+try:
+    from shared.utils.audio_loader import load_audio as _load_audio
+except ImportError:
+    import librosa as _librosa
+    def _load_audio(path, sr=16000):
+        return _librosa.load(path, sr=sr, mono=True)
+
+from .feature_extractor import VoiceFeatureExtractor
+from .calibration import CalibrationModule
+from .rules import VoiceRuleEngine
+from .transcriber import Transcriber, USE_PYANNOTE
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("nexus.voice")
+
+app = FastAPI(
+    title="NEXUS Voice Agent",
+    description="Agent 1: Acoustic & prosodic analysis",
+    version="0.1.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Globals (initialised on startup) ──
+feature_extractor: Optional[VoiceFeatureExtractor] = None
+transcriber: Optional[Transcriber] = None
+rule_engine: Optional[VoiceRuleEngine] = None
+redis_repo = RedisRepository()
+event_store = RedisEventStore()
+lock_manager = RedisLockManager()
+
+
+async def _publish_voice_outputs(
+    session_id: str,
+    transcript: dict,
+    speaker_payload: list[dict],
+    signals: list[dict],
+    summary: dict,
+    speaker_embeddings: Optional[dict],
+) -> None:
+    await redis_repo.write_artifact(session_id, "transcript", {"segments": transcript.get("segments", [])})
+    await redis_repo.write_artifact(session_id, "speakers", {"speakers": speaker_payload})
+    await redis_repo.write_artifact(session_id, "diarization", {"segments": transcript.get("segments", [])})
+    await redis_repo.write_artifact(
+        session_id,
+        "summary:voice",
+        {
+            "summary": summary,
+            "duration_seconds": transcript.get("duration_seconds", 0),
+            "speaker_embeddings": speaker_embeddings or {},
+        },
+    )
+    if signals:
+        await redis_repo.publish_signals(
+            SignalRecord(
+                session_id=session_id,
+                agent="voice",
+                speaker_id=signal.get("speaker_id", "unknown"),
+                registry_id=signal.get("registry_id"),
+                signal_type=signal.get("signal_type", ""),
+                value=signal.get("value"),
+                value_text=signal.get("value_text", ""),
+                confidence=signal.get("confidence", 0.5),
+                window_start_ms=signal.get("window_start_ms", 0),
+                window_end_ms=signal.get("window_end_ms", 0),
+                metadata=signal.get("metadata") or {},
+            )
+            for signal in signals
+        )
+
+
+class VoiceJobConsumer(RedisJobConsumer):
+    """Consumes voice analysis jobs from nexus:jobs:voice and invokes analyse_audio()."""
+
+    def __init__(self) -> None:
+        super().__init__("voice", "voice-workers", "voice-1")
+
+    async def process_job(self, session_id: str, payload: dict) -> dict:
+        request = AnalysisRequest(**payload)
+        response = await analyse_audio(request)
+        return response.model_dump()
+
+
+@app.on_event("startup")
+async def startup():
+    global feature_extractor, transcriber, rule_engine
+    logger.info("Starting NEXUS Voice Agent...")
+
+    feature_extractor = VoiceFeatureExtractor()
+    transcriber = Transcriber()
+    rule_engine = VoiceRuleEngine()
+
+    asyncio.create_task(VoiceJobConsumer().run())
+
+    logger.info("Voice Agent ready.")
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "agent": "voice",
+        "version": "0.2.0",
+        "transcriber_backend": (
+            "assemblyai" if (transcriber and transcriber._use_assemblyai)
+            else "deepgram_nova3" if (transcriber and transcriber._use_deepgram_diarize)
+            else transcriber.backend if transcriber
+            else "not_loaded"
+        ),
+        "diarization_backend": (
+            "assemblyai" if (transcriber and transcriber._use_assemblyai)
+            else "deepgram_nova3" if (transcriber and transcriber._use_deepgram_diarize)
+            else "external_gpu" if (transcriber and transcriber._use_external_diarize)
+            else "local_pyannote" if USE_PYANNOTE
+            else "local_kmeans"
+        ) if transcriber else "not_loaded",
+        "last_diarization_used": getattr(transcriber, "_last_diarization_backend", "uninitialized") if transcriber else "not_loaded",
+        "models_loaded": {
+            "feature_extractor": feature_extractor is not None,
+            "transcriber": transcriber is not None,
+            "rule_engine": rule_engine is not None,
+        }
+    }
+
+
+
+@app.post("/transcribe")
+async def transcribe_only(request: AnalysisRequest):
+    """
+    Fast path: return transcript + diarisation without features/rules.
+    Respects full transcription_config and analysis_config.run_diarization.
+    Used by /quick-transcribe gateway endpoint and the parallel optimisation path.
+    """
+    file_path = Path(request.file_path)
+    if not file_path.exists():
+        raise HTTPException(404, f"Audio file not found: {file_path}")
+
+    session_id = request.session_id or str(uuid.uuid4())
+    start_time = time.time()
+
+    tc = request.transcription_config
+    ac = request.analysis_config
+
+    logger.info(
+        f"[{session_id}] Transcribe-only: {file_path.name} "
+        f"(model={getattr(tc, 'model_preference', None)}, "
+        f"diarize={getattr(ac, 'run_diarization', True)})"
+    )
+
+    transcript = transcriber.transcribe(
+        str(file_path),
+        num_speakers=request.num_speakers,
+        language=getattr(tc, "language", None) if tc else None,
+        model_preference=getattr(tc, "model_preference", None) if tc else None,
+        custom_prompt=getattr(tc, "custom_prompt", None) if tc else None,
+        key_terms=getattr(tc, "key_terms", None) if tc else None,
+        multichannel=getattr(tc, "multichannel", False) if tc else False,
+        keep_filler_words=getattr(tc, "keep_filler_words", False) if tc else False,
+        text_formatting=getattr(tc, "text_formatting", False) if tc else False,
+        auto_punctuation=getattr(tc, "auto_punctuation", True) if tc else True,
+        temperature=getattr(tc, "temperature", None) if tc else None,
+        run_diarization=getattr(ac, "run_diarization", True) if ac else True,
+        run_behavioural=getattr(ac, "run_behavioural", True) if ac else True,
+        translate_to=getattr(ac, "translate_to", None) if ac else None,
+        entity_detection=(not getattr(ac, "run_behavioural", True) and getattr(ac, "run_entity_extraction", True)) if ac else False,
+    )
+
+    elapsed = time.time() - start_time
+    speakers = list(set(seg["speaker"] for seg in transcript["segments"]))
+    logger.info(
+        f"[{session_id}] Transcribe-only complete: "
+        f"{transcript['duration_seconds']:.1f}s, {len(speakers)} speakers, "
+        f"{len(transcript['segments'])} segments in {elapsed:.1f}s"
+    )
+
+    return {
+        "session_id": session_id,
+        "duration_seconds": transcript["duration_seconds"],
+        "segments": transcript["segments"],
+        "speakers": speakers,
+        "backend": transcript.get("backend", "unknown"),
+        "model": transcript.get("model", "unknown"),
+    }
+
+
+@app.post("/analyse", response_model=AnalysisResponse)
+async def analyse_audio(request: AnalysisRequest):
+    """
+    Process a complete audio file through the Voice Agent pipeline.
+    
+    Pipeline:
+    1. Transcribe audio (Whisper) + speaker diarisation
+    2. Extract acoustic features per speaker per window
+    3. Build per-speaker baselines (calibration)
+    4. Run 5 core rules against features + baselines
+    5. Return all signals
+    """
+    file_path = Path(request.file_path)
+    if not file_path.exists():
+        raise HTTPException(404, f"Audio file not found: {file_path}")
+    
+    session_id = request.session_id or str(uuid.uuid4())
+    start_time = time.time()
+    lock_token = await lock_manager.acquire(session_id, "voice")
+    if not lock_token:
+        raise HTTPException(409, "Voice agent is already processing this session")
+    await redis_repo.set_session_state(session_id, SessionStateRecord(status="running", current_step="transcribing"))
+    await redis_repo.set_agent_status(session_id, "voice", AgentStatusRecord(status="running", summary_key="summary:voice"))
+    await event_store.append(
+        session_id,
+        EventRecord(session_id=session_id, agent="voice", event_type="agent_started", payload={"file_path": str(file_path)}),
+    )
+    
+    logger.info(f"[{session_id}] Analysing: {file_path.name}")
+
+    # ── Load audio once (reused by diarisation + feature extraction) ──
+    try:
+        from shared.utils.audio_loader import load_audio
+        audio_data = load_audio(str(file_path), sr=16000)
+    except ImportError:
+        import librosa as _lr
+        audio_data = _lr.load(str(file_path), sr=16000, mono=True)
+
+    # ── Create content-type profile ──
+    meeting_type = request.meeting_type or "sales_call"
+    _profile = None
+    try:
+        from shared.config.content_type_profile import ContentTypeProfile
+        _profile = ContentTypeProfile(meeting_type)
+    except ImportError:
+        pass
+
+    # ── Step 1: Transcribe + diarise ──
+    tc = request.transcription_config
+    ac = request.analysis_config
+    t_step = time.time()
+    logger.info(
+        f"[{session_id}] Step 1: Transcribing "
+        f"(num_speakers={request.num_speakers}, meeting_type={meeting_type}, "
+        f"model_pref={getattr(tc, 'model_preference', None)}, "
+        f"lang={getattr(tc, 'language', None)})"
+    )
+    transcript = transcriber.transcribe(
+        str(file_path),
+        num_speakers=request.num_speakers,
+        audio_data=audio_data,
+        meeting_type=meeting_type,
+        language=getattr(tc, "language", None) if tc else None,
+        model_preference=getattr(tc, "model_preference", None) if tc else None,
+        custom_prompt=getattr(tc, "custom_prompt", None) if tc else None,
+        key_terms=getattr(tc, "key_terms", None) if tc else None,
+        multichannel=getattr(tc, "multichannel", False) if tc else False,
+        keep_filler_words=getattr(tc, "keep_filler_words", False) if tc else False,
+        text_formatting=getattr(tc, "text_formatting", False) if tc else False,
+        auto_punctuation=getattr(tc, "auto_punctuation", True) if tc else True,
+        temperature=getattr(tc, "temperature", None) if tc else None,
+        run_diarization=getattr(ac, "run_diarization", True) if ac else True,
+        run_behavioural=getattr(ac, "run_behavioural", True) if ac else True,
+        translate_to=getattr(ac, "translate_to", None) if ac else None,
+        entity_detection=(not getattr(ac, "run_behavioural", True) and getattr(ac, "run_entity_extraction", True)) if ac else False,
+    )
+
+    duration_sec = transcript["duration_seconds"]
+    speakers = list(set(seg["speaker"] for seg in transcript["segments"]))
+    logger.info(
+        f"[{session_id}] Step 1 done: {duration_sec:.1f}s audio, {len(speakers)} speakers, "
+        f"{len(transcript['segments'])} segments in {time.time()-t_step:.1f}s"
+    )
+
+    # ── Early return: transcript-only mode (behavioural analysis disabled) ──
+    run_behavioural = getattr(ac, "run_behavioural", True) if ac else True
+
+    if not run_behavioural:
+        elapsed = time.time() - start_time
+        logger.info(f"[{session_id}] Transcript-only mode — skipping features/rules ({elapsed:.1f}s)")
+        word_counts: dict[str, int] = {}
+        transcript_speech_quick: dict[str, float] = {}
+        for seg in transcript["segments"]:
+            spk = seg["speaker"]
+            word_counts[spk] = word_counts.get(spk, 0) + len(seg.get("text", "").split())
+            transcript_speech_quick[spk] = transcript_speech_quick.get(spk, 0.0) + (seg["end_ms"] - seg["start_ms"]) / 1000.0
+        total_speech_sec_quick = sum(transcript_speech_quick.values()) or duration_sec
+        speaker_payload = [
+            {
+                "speaker_id": sid,
+                "baseline": None,
+                "signal_count": 0,
+                "talk_time_ms": int(transcript_speech_quick.get(sid, 0.0) * 1000),
+                "talk_time_pct": round(transcript_speech_quick.get(sid, 0.0) / total_speech_sec_quick * 100, 2),
+                "total_words": word_counts.get(sid, 0),
+                "calibration_confidence": 0.0,
+            }
+            for sid in speakers
+        ]
+        speaker_embeddings = getattr(transcriber, "_last_speaker_embeddings", None) or None
+        await _publish_voice_outputs(session_id, transcript, speaker_payload, [], {}, speaker_embeddings)
+        await redis_repo.set_agent_status(session_id, "voice", AgentStatusRecord(status="completed", summary_key="summary:voice"))
+        await event_store.append(
+            session_id,
+            EventRecord(session_id=session_id, agent="voice", event_type="agent_completed", payload={"signal_count": 0}),
+        )
+        await lock_manager.release(session_id, "voice", lock_token)
+        return AnalysisResponse(
+            session_id=session_id,
+            duration_seconds=duration_sec,
+            speakers=speaker_payload,
+            signals=[],
+            summary={},
+            transcript_segments=transcript["segments"],
+            speaker_embeddings=speaker_embeddings,
+        )
+
+    # ── Step 2: Extract acoustic features ──
+    t_step = time.time()
+    logger.info(f"[{session_id}] Step 2: Extracting acoustic features...")
+    try:
+        features_by_speaker = feature_extractor.extract_all(
+            str(file_path),
+            transcript["segments"],
+            audio_data=audio_data,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Audio file could not be decoded — it may be empty or corrupted. ({e})",
+        )
+
+    # ── Step 3: Build baselines ──
+    # Compute true speaking time per speaker from transcript (not feature windows)
+    # so calibration confidence isn't penalised by skipped short windows.
+    total_windows = sum(len(v) for v in features_by_speaker.values())
+    logger.info(
+        f"[{session_id}] Step 2 done: {len(features_by_speaker)} speakers, "
+        f"{total_windows} windows extracted in {time.time()-t_step:.1f}s"
+    )
+    transcript_speech = {}
+    for seg in transcript["segments"]:
+        spk = seg["speaker"]
+        transcript_speech[spk] = transcript_speech.get(spk, 0.0) + (seg["end_ms"] - seg["start_ms"]) / 1000.0
+
+    t_step = time.time()
+    logger.info(f"[{session_id}] Step 3: Calibrating baselines...")
+    calibration = CalibrationModule()
+    baselines = {}
+    for speaker_id, features_list in features_by_speaker.items():
+        baseline = calibration.build_baseline(
+            speaker_id, session_id, features_list,
+            transcript_speech_sec=transcript_speech.get(speaker_id, 0.0),
+        )
+        baselines[speaker_id] = baseline
+        logger.info(
+            f"[{session_id}] Baseline for {speaker_id}: "
+            f"F0={baseline.f0_mean:.1f}Hz, rate={baseline.speech_rate_wpm:.0f}wpm, "
+            f"confidence={baseline.calibration_confidence:.2f}"
+        )
+
+    logger.info(f"[{session_id}] Step 3 done: baselines built in {time.time()-t_step:.1f}s")
+
+    # ── Step 4: Run rules ──
+    t_step = time.time()
+    logger.info(f"[{session_id}] Step 4: Running rule engine...")
+    all_signals = []
+
+    for speaker_id, features_list in features_by_speaker.items():
+        baseline = baselines.get(speaker_id)
+        if not baseline:
+            continue
+
+        for features in features_list:
+            # All segments in this window (all speakers) for interruption detection
+            window_all_segments = [
+                s for s in transcript["segments"]
+                if s["end_ms"] > features["window_start_ms"]
+                and s["start_ms"] < features["window_end_ms"]
+            ]
+            signals = rule_engine.evaluate(
+                features=features,
+                baseline=baseline,
+                speaker_id=speaker_id,
+                transcript_segments=window_all_segments,
+                profile=_profile,
+            )
+            all_signals.extend(signals)
+
+    # ── Step 4b: Talk time signals (session-level) ──
+    talk_time_signals = VoiceRuleEngine._emit_talk_time_signals(
+        features_by_speaker, duration_sec
+    )
+    all_signals.extend(talk_time_signals)
+    if talk_time_signals:
+        logger.info(f"[{session_id}] Talk time: {len(talk_time_signals)} imbalance signals")
+
+    logger.info(f"[{session_id}] Step 4 done: {len(all_signals)} signals in {time.time()-t_step:.1f}s")
+
+    # ── Step 5: Build summary ──
+    elapsed = time.time() - start_time
+    logger.info(f"[{session_id}] Voice Agent complete: {len(all_signals)} signals in {elapsed:.1f}s")
+
+    summary = _build_summary(all_signals, baselines, transcript)
+
+    # Compute per-speaker word counts from transcript segments
+    word_counts = {}
+    for seg in transcript["segments"]:
+        spk = seg["speaker"]
+        words = len(seg.get("text", "").split())
+        word_counts[spk] = word_counts.get(spk, 0) + words
+
+    total_speech_sec = sum(transcript_speech.values()) or duration_sec
+
+    speaker_data = [
+        {
+            "speaker_id": sid,
+            "baseline": baselines[sid].to_dict() if sid in baselines else None,
+            "signal_count": len([s for s in all_signals if s.get("speaker_id") == sid]),
+            "talk_time_ms": int(transcript_speech.get(sid, 0.0) * 1000),
+            "talk_time_pct": round(transcript_speech.get(sid, 0.0) / total_speech_sec * 100, 2),
+            "total_words": word_counts.get(sid, 0),
+            "calibration_confidence": round(
+                baselines[sid].calibration_confidence if sid in baselines else 0.0, 4
+            ),
+        }
+        for sid in speakers
+    ]
+
+    signal_dicts = [s if isinstance(s, dict) else s.to_dict() for s in all_signals]
+    speaker_embeddings = getattr(transcriber, "_last_speaker_embeddings", None) or None
+    await _publish_voice_outputs(session_id, transcript, speaker_data, signal_dicts, summary, speaker_embeddings)
+    await redis_repo.set_agent_status(
+        session_id,
+        "voice",
+        AgentStatusRecord(status="completed", signal_count=len(signal_dicts), summary_key="summary:voice"),
+    )
+    await event_store.append(
+        session_id,
+        EventRecord(session_id=session_id, agent="voice", event_type="agent_completed", payload={"signal_count": len(signal_dicts)}),
+    )
+    await lock_manager.release(session_id, "voice", lock_token)
+    return AnalysisResponse(
+        session_id=session_id,
+        duration_seconds=duration_sec,
+        speakers=speaker_data,
+        signals=signal_dicts,
+        summary=summary,
+        transcript_segments=transcript["segments"],
+        speaker_embeddings=speaker_embeddings,
+    )
+
+
+@app.post("/analyse/upload")
+async def analyse_upload(file: UploadFile = File(...)):
+    """Upload an audio file and analyse it."""
+    # Save to temp location
+    upload_dir = Path("/app/data/recordings")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    
+    file_path = upload_dir / f"{uuid.uuid4()}_{file.filename}"
+    with open(file_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+    
+    return await analyse_audio(AnalysisRequest(file_path=str(file_path)))
+
+
+def _build_summary(signals: list, baselines: dict, transcript: dict) -> dict:
+    """Build a human-readable summary from all signals."""
+    summary = {
+        "total_signals": len(signals),
+        "per_speaker": {},
+        "key_moments": [],
+        "stress_peaks": [],
+        "filler_stats": {},
+    }
+    
+    for speaker_id, baseline in baselines.items():
+        speaker_signals = [s for s in signals if s.get("speaker_id") == speaker_id]
+        
+        stress_signals = [
+            s for s in speaker_signals 
+            if s.get("signal_type") == "vocal_stress_score"
+        ]
+        stress_values = [s["value"] for s in stress_signals if s.get("value") is not None]
+        
+        filler_signals = [
+            s for s in speaker_signals 
+            if s.get("signal_type") == "filler_detection"
+        ]
+        
+        pitch_flags = [
+            s for s in speaker_signals 
+            if s.get("signal_type") == "pitch_elevation_flag"
+        ]
+        
+        tone_signals = [
+            s for s in speaker_signals 
+            if s.get("signal_type") == "tone_classification"
+        ]
+        
+        summary["per_speaker"][speaker_id] = {
+            "baseline_f0_hz": round(baseline.f0_mean, 1),
+            "baseline_rate_wpm": round(baseline.speech_rate_wpm, 0),
+            "calibration_confidence": round(baseline.calibration_confidence, 2),
+            "avg_stress": round(sum(stress_values) / len(stress_values), 3) if stress_values else 0,
+            "max_stress": round(max(stress_values), 3) if stress_values else 0,
+            "total_fillers": len(filler_signals),
+            "pitch_elevation_events": len(pitch_flags),
+            "tone_distribution": _count_tones(tone_signals),
+        }
+        
+        # Find stress peaks (moments above 0.5)
+        for s in stress_signals:
+            if s.get("value", 0) > 0.5:
+                summary["stress_peaks"].append({
+                    "speaker": speaker_id,
+                    "time_ms": s.get("window_start_ms"),
+                    "stress_score": round(s["value"], 3),
+                    "confidence": round(s.get("confidence", 0), 3),
+                })
+    
+    # Sort stress peaks by score descending
+    summary["stress_peaks"].sort(key=lambda x: x["stress_score"], reverse=True)
+    summary["stress_peaks"] = summary["stress_peaks"][:10]  # Top 10
+    
+    return summary
+
+
+def _count_tones(tone_signals: list) -> dict:
+    counts = {}
+    for s in tone_signals:
+        tone = s.get("value_text", "unknown")
+        counts[tone] = counts.get(tone, 0) + 1
+    return counts

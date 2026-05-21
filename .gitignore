@@ -2,9 +2,6 @@
 .env
 *.env.local
 
-# ONNX model files (generated, don't commit)
-/models/
-
 # Python
 __pycache__/
 *.py[cod]
@@ -16,20 +13,9 @@ build/
 venv/
 .venv/
 
-# Data (don't commit recordings or reports)
-data/recordings/*
-data/reports/*
-!data/recordings/.gitkeep
-!data/reports/.gitkeep
-
 # Node
 node_modules/
 .next/
-
-# Docker volumes
-postgres_data/
-redis_data/
-data/overlays/
 
 # IDE
 .vscode/
@@ -38,20 +24,56 @@ data/overlays/
 *.swo
 .DS_Store
 
-# Models (downloaded at runtime)
+# ── Model files (downloaded/generated at runtime, never commit) ──────────────
+# Root-level legacy model dirs
+/models/
+pretrained_models/
+
+# Backend model dirs
+backend/models/mediapipe/
+backend/models/distilbert-onnx/
+backend/models/distilbert-onnx-int8/
+
+# Model file extensions
 *.pt
 *.bin
 *.onnx
+*.tflite
+*.task
 
-# Logs and PIDs
+# ── Data directories (runtime files, large binaries) ─────────────────────────
+# Root-level data (legacy layout)
+data/recordings/*
+data/reports/*
+data/overlays/
+!data/recordings/.gitkeep
+!data/reports/.gitkeep
+
+# Backend data (monolith layout)
+backend/data/recordings/*
+backend/data/overlays/
+backend/data/reports/*.json
+backend/data/reports/*.jsonl
+!backend/data/recordings/.gitkeep
+!backend/data/reports/.gitkeep
+!backend/data/labels/.gitkeep
+
+# ── Docker volumes ────────────────────────────────────────────────────────────
+postgres_data/
+redis_data/
+
+# ── Log files ─────────────────────────────────────────────────────────────────
 .logs/
 .pids/
+*.log
+server_logs.txt
+task_log.txt
+issues.txt
 
-# Claude Code
+# ── Claude Code ───────────────────────────────────────────────────────────────
 .claude/
-recordings/
 
-# Stale hyphenated service dirs (actual code is in voiceAgent/, api_gateway/, etc.)
+# ── Stale hyphenated service dirs (code lives in voiceAgent/, api_gateway/) ──
 services/voice-agent/
 services/language-agent/
 services/fusion-agent/
