@@ -299,11 +299,20 @@ class ConversationRuleEngine:
             per_speaker[s].get("questions_asked", 0) for s in speakers
         )
 
+        # Aggregate talk time for the dominance ratio denominator.
+        total_talk_time_ms = sum(
+            per_speaker[s].get("talk_time_ms", 0) for s in speakers
+        )
+
         for spk in speakers:
             data = per_speaker[spk]
 
             # Normalised talk time (0-1 scale, where 1/n = equal share)
-            talk_pct_norm = data.get("talk_time_pct", 0) / 100.0
+            # Guard against zero total_talk_time to prevent ZeroDivisionError.
+            if total_talk_time_ms > 0:
+                talk_pct_norm = data.get("talk_time_ms", 0) / total_talk_time_ms
+            else:
+                talk_pct_norm = data.get("talk_time_pct", 0) / 100.0
 
             # Interruption ratio: fraction of all interruptions made by this speaker
             int_count = data.get("interruption_count", 0)

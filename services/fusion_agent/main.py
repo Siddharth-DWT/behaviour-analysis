@@ -371,10 +371,11 @@ async def analyse_signals(request: AnalyseRequest):
     )
 
     for result in speaker_results:
-        all_fusion_signals.extend(result["signals"])
-        if result["state"] is not None:
-            all_unified_states.append(asdict(result["state"]))
-        all_alerts.extend(result["alerts"])
+        all_fusion_signals.extend(result.get("signals", []))
+        state = result.get("state")
+        if state is not None:
+            all_unified_states.append(asdict(state))
+        all_alerts.extend(result.get("alerts", []))
 
     logger.info(
         f"[{session_id}] Step 2 done: pairwise+compound fusion "

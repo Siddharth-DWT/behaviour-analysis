@@ -432,6 +432,9 @@ class LanguageRuleEngine:
         if not _check_llm_ready():
             return []
 
+        if not features_list:
+            return []
+
         categories = profile.get_intent_categories() if profile else None
         signals = []
 
@@ -456,9 +459,19 @@ class LanguageRuleEngine:
         Convert DistilBERT sentiment into a -1.0 to +1.0 signal.
         Always fires: neutral at confidence 0.40 (dashboard subtle indicator per spec).
         """
-        raw_label = f.get("sentiment_label", "NEUTRAL")
-        raw_score = f.get("sentiment_score", 0.5)
-        value = f.get("sentiment_value", 0.0)
+        sentiment_result = {
+            "label": f.get("sentiment_label", "NEUTRAL"),
+            "score": f.get("sentiment_score", 0.5),
+            "value": f.get("sentiment_value", 0.0),
+        }
+        if not sentiment_result or "label" not in sentiment_result:
+            return {
+                "value": 0.0, "label": "neutral", "confidence": 0.40,
+                "raw_label": "NEUTRAL", "raw_score": 0.0,
+            }
+        raw_label = sentiment_result["label"]
+        raw_score = sentiment_result["score"]
+        value = sentiment_result["value"]
 
         # Classify intensity (thresholds aligned with LLM ±0.35 neutral zone)
         abs_value = abs(value)
@@ -712,7 +725,8 @@ class LanguageRuleEngine:
         Detect persuasion techniques based on Cialdini's 6 principles.
         Uses regex patterns per category; emits on first match.
         """
-        text = f.get("text", "").strip()
+        text = f.get("text") or ""
+        text = text.strip()
         if not text:
             return None
 

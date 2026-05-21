@@ -25,9 +25,10 @@ import uuid
 import asyncio
 import logging
 import tempfile
+import threading
 import concurrent.futures
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,7 +49,8 @@ from shared.redis_layer import (
 
 try:
     from feature_extractor import (
-        VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures, FaceEmbeddingExtractor,
+        VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures,
+        FaceEmbeddingExtractor, MediaPipeModelManager,
     )
     from calibration import VideoCalibrationModule, FacialBaseline, BodyBaseline, GazeBaseline
     from facial_rules import FacialRuleEngine
@@ -56,7 +58,8 @@ try:
     from body_rules import BodyRuleEngine
 except ImportError:
     from services.video_agent.feature_extractor import (
-        VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures, FaceEmbeddingExtractor,
+        VideoFeatureExtractor, SpeakerFaceMapper, WindowFeatures,
+        FaceEmbeddingExtractor, MediaPipeModelManager,
     )
     from services.video_agent.calibration import (
         VideoCalibrationModule, FacialBaseline, BodyBaseline, GazeBaseline,
@@ -150,6 +153,12 @@ _extractor:   Optional[VideoFeatureExtractor]   = None
 _mapper:      Optional[SpeakerFaceMapper]       = None
 _calibrator:  Optional[VideoCalibrationModule]  = None
 
+# Lock protecting per-job state mutations on the shared _extractor singleton.
+# Only the setup/teardown sections that write to _extractor's mutable fields
+# are wrapped — the long-running extract_all() itself is NOT wrapped so that
+# jobs remain concurrent.
+_extractor_lock = threading.Lock()
+
 # ─── Async job state ──────────────────────────────────────────────────────────
 # job_id → {status, result, error, created_at}
 # Status lifecycle: "queued" → "running" → "done" | "failed"
@@ -182,6 +191,83 @@ def _get_calibrator() -> VideoCalibrationModule:
     if _calibrator is None:
         _calibrator = VideoCalibrationModule()
     return _calibrator
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ModelPrewarmer
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ModelPrewarmer:
+    """
+    Eliminates the 30-90s model-loading tax paid on the first video job.
+
+    All work runs in background threads (run_in_executor) so the event loop
+    is never blocked during or after startup.
+
+    Loading strategy — two ordered phases:
+      Phase 1: MediaPipe .task file downloads in parallel (IO-bound, ~10-100 MB
+               each; skipped when files are already cached on disk).
+      Phase 2: All heavy singletons in parallel (CPU-bound init):
+               - FaceEmbeddingExtractor  (InsightFace ArcFace buffalo_l, ~20-30s)
+               - VideoFeatureExtractor   (lightweight, but kicks the lazy check)
+               - SpeakerFaceMapper       (lightweight)
+               - VideoCalibrationModule  (lightweight)
+
+    Failures in any individual warm-up step are non-fatal: logged as warnings
+    so a missing optional model never prevents the agent from starting.
+    """
+
+    # Getter names on MediaPipeModelManager — called to ensure .task files exist.
+    _MEDIAPIPE_GETTERS: tuple[str, ...] = (
+        "get_face_landmarker_path",
+        "get_pose_landmarker_path",
+        "get_hand_landmarker_path",
+        "get_face_detector_path",
+        "get_gesture_recognizer_path",
+    )
+
+    # (display_name, loader_fn) — each loader_fn is called once in a thread.
+    _SINGLETONS: tuple[tuple[str, Callable[[], Any]], ...] = (
+        ("FaceEmbeddingExtractor (InsightFace ArcFace)", FaceEmbeddingExtractor.get_instance),
+        ("VideoFeatureExtractor",                        _get_extractor),
+        ("SpeakerFaceMapper",                            _get_mapper),
+        ("VideoCalibrationModule",                       _get_calibrator),
+    )
+
+    async def warm_up(self) -> None:
+        loop = asyncio.get_running_loop()
+        logger.info("Model pre-warming started (background)...")
+
+        # Phase 1 — MediaPipe model file downloads (parallel IO)
+        dl_tasks = [
+            loop.run_in_executor(None, self._download_mediapipe_model, getter)
+            for getter in self._MEDIAPIPE_GETTERS
+        ]
+        await asyncio.gather(*dl_tasks, return_exceptions=True)
+
+        # Phase 2 — singleton initialisation (parallel CPU)
+        init_tasks = [
+            loop.run_in_executor(None, loader)
+            for _, loader in self._SINGLETONS
+        ]
+        results = await asyncio.gather(*init_tasks, return_exceptions=True)
+
+        for (name, _), result in zip(self._SINGLETONS, results):
+            if isinstance(result, Exception):
+                logger.warning(f"Pre-warm failed [{name}]: {result}")
+            else:
+                logger.info(f"Pre-warmed: {name}")
+
+        logger.info("Model pre-warming complete.")
+
+    def _download_mediapipe_model(self, getter_name: str) -> None:
+        model_dir = os.getenv("MEDIAPIPE_MODEL_DIR", "models/mediapipe")
+        mgr = MediaPipeModelManager(model_dir)
+        try:
+            path = getattr(mgr, getter_name)()
+            logger.info(f"MediaPipe model ready: {Path(path).name}")
+        except Exception as exc:
+            logger.warning(f"MediaPipe model download failed [{getter_name}]: {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -305,13 +391,15 @@ class VideoPipeline:
 
         # ── Step 1: Frame extraction (no overlay — fast path) ─────────────────
         logger.info(f"[{session_id}] Extracting video features from {Path(video_path).name}")
-        self._extractor._diar_segments = diar_segments  # active-speaker fallback in InteractionDetector
+        with _extractor_lock:
+            self._extractor._diar_segments = diar_segments  # active-speaker fallback in InteractionDetector
         try:
             windows, lip_activity_map = self._extractor.extract_all(
                 video_path, overlay_output_path=None, meeting_type=meeting_type
             )
         finally:
-            self._extractor._diar_segments = []  # prevent leaking into next request
+            with _extractor_lock:
+                self._extractor._diar_segments = []  # prevent leaking into next request
         logger.info(f"[{session_id}] {len(windows)} windows extracted")
 
         if not windows:
@@ -400,19 +488,9 @@ class VideoPipeline:
                 source = "none"
 
             for track_id, (embedding, thumbnail) in emb_results.items():
-                # Prefer a named Speaker_N label over Face_N when both exist
-                # (can happen if residual non-canonical windows survived).
-                speaker_label = next(
-                    (wf.speaker_id for wf in windows
-                     if wf.face_index == track_id
-                     and wf.speaker_id
-                     and not wf.speaker_id.startswith("Face_")),
-                    next(
-                        (wf.speaker_id for wf in windows
-                         if wf.face_index == track_id and wf.speaker_id),
-                        f"Face_{track_id}",
-                    ),
-                )
+                # Always key by Face_N so _build_session_face_locks can look up
+                # by the same label it constructs from face_to_speaker.
+                speaker_label = f"Face_{track_id}"
                 face_embeddings_data[speaker_label] = {
                     "embedding":     embedding,
                     "thumbnail_b64": base64.b64encode(thumbnail).decode(),
@@ -471,7 +549,8 @@ class VideoPipeline:
                 f"[{session_id}] Burning landmarks + {len(all_signals)} signal labels onto video "
                 f"→ {output_path}"
             )
-            self._extractor._diar_segments = diar_segments or []
+            with _extractor_lock:
+                self._extractor._diar_segments = diar_segments or []
             self._extractor.burn_landmarks_and_labels(
                 video_path, all_signals, output_path=output_path,
                 display_names=display_names or {},
@@ -611,13 +690,22 @@ async def _run_video_job(
     display_names: dict = {}
     if _dn_raw is not None:
         _dn_bytes: bytes = _dn_raw if isinstance(_dn_raw, (bytes, bytearray)) else str(_dn_raw).encode()
-        _dn_data = json.loads(_dn_bytes)
-        display_names = _dn_data.get("payload", {}).get("names", {})
+        try:
+            _dn_data = json.loads(_dn_bytes)
+            display_names = _dn_data.get("payload", {}).get("names", {})
+        except json.JSONDecodeError as _dn_err:
+            logger.warning(
+                f"[{session_id}] Failed to parse display_names from Redis (skipping): {_dn_err}"
+            )
     if display_names:
         logger.info(f"[{session_id}] Video job {job_id} burn: {len(display_names)} display names received")
 
     # ── Phase 2: Burn signal labels onto original video (cosmetic) ────────────
     _video_jobs[job_id]["status"] = "annotating"
+    if "result" not in _video_jobs.get(job_id, {}):
+        logger.warning(f"[{session_id}] Job {job_id} missing 'result' before Phase 2 burn; skipping overlay")
+        await _lock_manager.release(session_id, "video", lock_token)
+        return
     try:
         annotated_path = await loop.run_in_executor(
             _thread_pool,
@@ -692,10 +780,9 @@ class VideoJobConsumer(RedisJobConsumer):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Video Agent starting — singletons initialised on first request.")
-    # Model files download lazily on first extract_all() call.
-    # Pre-warming here would block startup; lazy is preferred.
+    logger.info("Video Agent starting...")
     asyncio.create_task(VideoJobConsumer().run())
+    asyncio.create_task(ModelPrewarmer().warm_up())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -778,8 +865,14 @@ async def analyse(
         "created_at": time.time(),
     }
 
+    async def _job_with_cleanup():
+        try:
+            await _run_video_job(job_id, video_path, session_id, raw_segs, meeting_type)
+        finally:
+            Path(video_path).unlink(missing_ok=True)
+
     asyncio.create_task(
-        _run_video_job(job_id, video_path, session_id, raw_segs, meeting_type),
+        _job_with_cleanup(),
         name=f"video-job-{job_id[:8]}",
     )
 

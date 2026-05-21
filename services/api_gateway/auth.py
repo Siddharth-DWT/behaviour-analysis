@@ -5,6 +5,7 @@ Password hashing (bcrypt), JWT tokens, and FastAPI auth dependencies.
 """
 import os
 import re
+import time
 import uuid as _uuid
 import secrets
 import logging
@@ -102,6 +103,12 @@ def verify_access_token(token: str) -> dict:
         raise HTTPException(401, "Token has expired")
     except JWTError:
         raise HTTPException(401, "Invalid token")
+
+    # Explicit expiry check as a defence-in-depth measure: python-jose catches
+    # ExpiredSignatureError above, but this guards against clock skew edge cases
+    # or tokens that were decoded without exp validation by a misconfigured call.
+    if payload.get("exp", 0) < time.time():
+        raise HTTPException(401, "Token has expired")
 
     if payload.get("type") != "access":
         raise HTTPException(401, "Invalid token type")

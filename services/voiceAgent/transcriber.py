@@ -399,6 +399,12 @@ class Transcriber:
             # Convert to 16kHz mono WAV upfront so all backends get clean audio.
             effective_path = self._ensure_wav(audio_path)
 
+            # For WAV inputs _ensure_wav() returns the path without loading.
+            # Populate the cache now so every downstream method hits it on first
+            # access instead of each independently re-reading from disk.
+            if self._audio_data is None:
+                self._load_audio_cached(effective_path)
+
             # model_preference overrides the normal backend cascade.
             # Falls back to auto cascade if the preferred backend is unavailable.
             result = None
@@ -492,6 +498,28 @@ class Transcriber:
             self._run_behavioural = True
             self._translate_to = None
 
+    def _load_audio_cached(self, path: str) -> tuple[np.ndarray, int]:
+        """
+        Load 16kHz mono audio from *path* exactly once per transcribe() call.
+
+        Caches the result in self._audio_data on first call. All subsequent
+        calls — regardless of which path is passed — return the cached array.
+        This is safe because every path seen within a single transcribe() call
+        refers to the same recording (original file or its 16kHz mono WAV copy).
+
+        DSA: O(1) cache lookup via None-check; load cost paid at most once.
+        """
+        if self._audio_data is not None:
+            return self._audio_data
+        try:
+            from shared.utils.audio_loader import load_audio
+            y, sr = load_audio(path, sr=16000)
+        except ImportError:
+            import librosa
+            y, sr = librosa.load(path, sr=16000, mono=True)
+        self._audio_data = (y, sr)
+        return self._audio_data
+
     def _ensure_wav(self, audio_path: str) -> str:
         """
         Convert input file to 16kHz mono WAV if it's not already WAV.
@@ -524,14 +552,10 @@ class Transcriber:
             logger.info(f"Converted pre-loaded audio to 16kHz WAV: {tmp.name}")
             return tmp.name
 
-        # Non-WAV file on disk (mp4, mp3, m4a, webm, ogg, flac) — load and convert
+        # Non-WAV file on disk (mp4, mp3, m4a, webm, ogg, flac) — load and convert.
+        # _load_audio_cached() caches (y, sr) so downstream methods reuse it.
         if not audio_path.lower().endswith(".wav"):
-            try:
-                from shared.utils.audio_loader import load_audio
-                y, sr = load_audio(audio_path, sr=16000)
-            except ImportError:
-                import librosa
-                y, sr = librosa.load(audio_path, sr=16000, mono=True)
+            y, sr = self._load_audio_cached(audio_path)
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             sf.write(tmp.name, y, sr)
             self._tmp_wav = tmp.name

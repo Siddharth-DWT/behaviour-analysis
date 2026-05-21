@@ -17,6 +17,7 @@ Architecture reference: docs/ARCHITECTURE.md — Fusion Temporal Alignment
   Long:      1-15min (Temporal sequences)
 """
 import json
+import math
 import time
 import logging
 
@@ -244,7 +245,11 @@ def compute_unified_state(
         weighted_sum = 0.0
         weight_total = 0.0
         for i, s in enumerate(sorted_sent):
-            value = _to_float(s.get("value", 0))
+            raw_value = _to_float(s.get("value", 0))
+            # Skip NaN/Inf values to prevent propagation into the weighted average.
+            if not math.isfinite(raw_value):
+                continue
+            value = raw_value
             conf = max(_to_float(s.get("confidence", 0.5)), 0.1)
             recency = 1.0 + (i / max(len(sorted_sent) - 1, 1)) * 0.9
             w = recency * conf

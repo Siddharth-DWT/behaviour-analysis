@@ -31,6 +31,20 @@ print('buffalo_l pre-download complete')"
 
 COPY . .
 
+# Pre-download MediaPipe .task model files so the first analysis job
+# does not stall on a runtime download.  Files land in /app/models/mediapipe/
+# and are baked into the image layer alongside the source code.
+RUN python3 -c "\
+import os; os.makedirs('models/mediapipe', exist_ok=True); \
+from feature_extractor import MediaPipeModelManager; \
+mgr = MediaPipeModelManager('models/mediapipe'); \
+mgr.get_face_landmarker_path(); \
+mgr.get_pose_landmarker_path(); \
+mgr.get_hand_landmarker_path(); \
+mgr.get_gesture_recognizer_path(); \
+mgr.get_face_detector_path(); \
+print('MediaPipe models pre-download complete')"
+
 EXPOSE 8004
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8004"]

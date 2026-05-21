@@ -142,6 +142,7 @@ Return ONLY the JSON object."""
             user_prompt=user_prompt,
             max_tokens=2000,
             temperature=0.1,
+            timeout=60,
         )
 
         # Parse JSON from LLM response
@@ -278,6 +279,22 @@ Return ONLY the JSON object."""
 
         # ── Fix topics ──
         topics = result.get("topics", [])
+        if not topics:
+            # No topics returned by LLM — auto-segment immediately
+            n = max(3, min(5, len(segments) // 6))
+            chunk = len(segments) // n if n > 0 else len(segments)
+            names = ["Introduction", "Discussion", "Main Topic", "Development", "Closing"]
+            topics = []
+            for i in range(n):
+                s_idx = i * chunk
+                e_idx = min((i + 1) * chunk, len(segments)) - 1 if i < n - 1 else len(segments) - 1
+                topics.append({
+                    "name": names[i] if i < len(names) else f"Phase {i+1}",
+                    "start_ms": segments[s_idx].get("start_ms", 0),
+                    "end_ms": segments[e_idx].get("end_ms", duration_ms),
+                })
+            result["topics"] = topics
+            return result
         # If LLM returned 0-1 topics or all start at 0 → auto-segment
         all_at_zero = all(t.get("start_ms", 0) == 0 for t in topics)
         if len(topics) <= 1 or all_at_zero:
@@ -317,6 +334,16 @@ Return ONLY the JSON object."""
                 person["first_mention_ms"] = _match_timestamp(
                     person["name"], seg_texts
                 )
+
+        # Guard: drop people/companies entries with no usable name or type
+        result["people"] = [
+            p for p in result.get("people", [])
+            if p.get("name", "").strip()
+        ]
+        result["companies"] = [
+            c for c in result.get("companies", [])
+            if c.get("name", "").strip()
+        ]
 
         return result
 

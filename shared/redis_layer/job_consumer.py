@@ -20,6 +20,11 @@ from .repository import RedisRepository
 
 logger = logging.getLogger(__name__)
 
+# Redis error string for an already-existing consumer group.
+# Stored as a constant so it is easy to update if the Redis/Valkey
+# error message ever changes, and to avoid raw string matching in logic.
+_BUSYGROUP_ERR = "BUSYGROUP"
+
 
 class RedisJobConsumer(ABC):
     """
@@ -77,7 +82,7 @@ class RedisJobConsumer(ABC):
             )
             logger.info("[%s] Consumer group '%s' created", self._agent, self._group)
         except Exception as exc:
-            if "BUSYGROUP" not in str(exc):
+            if _BUSYGROUP_ERR not in str(exc):
                 logger.warning("[%s] xgroup_create: %s", self._agent, exc)
 
     async def _handle(self, msg_id: str, fields: dict) -> None:
@@ -98,8 +103,13 @@ class RedisJobConsumer(ABC):
             )
             try:
                 await self._repo.write_result(session_id, self._agent, {"error": str(exc)})
-            except Exception:
-                pass
+            except Exception as write_exc:
+                # Log but do not re-raise — ACK must still proceed so the
+                # message is not redelivered indefinitely.
+                logger.error(
+                    "[%s] write_result failed for job %s (session=%s): %s",
+                    self._agent, msg_id, session_id, write_exc,
+                )
         finally:
             await self._ack(msg_id)
 
