@@ -1,0 +1,379 @@
+Correct final architecture
+
+You need a separate layer:
+
+Speaker_N = audio/voice identity
+Face_N    = visual/face-track identity
+SpeakerFaceLink = temporary session-level relation
+Registry identity = only after confidence-gated fusion
+
+Do not treat face_to_speaker as truth. Treat it as evidence.
+
+Recommended object:
+
+{
+  "speaker_id": "Speaker_2",
+  "face_id": "Face_4",
+  "status": "confirmed",
+  "confidence": 0.82,
+  "av_offset_ms": 420,
+  "evidence": {
+    "lip_sync_score": 0.31,
+    "score_margin": 0.14,
+    "segment_votes": 7,
+    "matched_speech_ms": 18000,
+    "face_visible_ratio": 0.76
+  }
+}
+
+Gateway should only use this link for registry fusion when status = confirmed.
+
+6. Correct algorithm design
+
+Use this pipeline:
+
+1. Build per-face lip-motion timeline
+2. Estimate audio-video offset
+3. Shift diarization timestamps
+4. Score every Face_N × Speaker_N pair
+5. Add segment-level votes
+6. Add margin/confidence checks
+7. Use Hungarian/bipartite assignment
+8. Export only confirmed links
+9. Gateway uses only confirmed links for registry fusion
+Step A — replace absolute lip score with lip-motion score
+
+Current score is absolute. Add delta:
+
+lip_motion = abs(curr_lip_score - prev_lip_score)
+
+Better:
+
+lip_raw = (
+    jaw_open * 0.45
+    + mouth_lower_down * 0.25
+    + mouth_funnel * 0.15
+    + mouth_pucker * 0.10
+    + (1.0 - mouth_close) * 0.05
+)
+
+lip_motion = abs(lip_raw - prev_lip_raw_for_same_face)
+
+Then normalize per face:
+
+median = np.median(values)
+mad = np.median(np.abs(values - median)) + 1e-6
+norm_lip = (value - median) / mad
+
+This prevents big/close faces from always winning.
+
+Step B — estimate AV offset first
+
+Before mapping:
+
+global_audio_activity(t) = 1 if anyone is speaking
+global_lip_activity(t) = max normalized lip motion across faces
+
+Try offsets:
+
+-1500ms to +1500ms, step 100ms
+
+Pick the offset with highest correlation:
+
+best_offset = argmax(
+    mean(global_lip_activity during shifted audio speech)
+    - mean(global_lip_activity during shifted silence)
+)
+
+Then shift all diarization segments by best_offset.
+
+This is very important because even a 500ms audio/video drift can map the speaking face incorrectly.
+
+Step C — segment-level voting
+
+For every diarized segment:
+
+Speaker_2: 12000ms → 14600ms
+
+Check all faces during that exact segment. The winner is the face with highest lip motion.
+
+Accept the vote only if:
+
+segment duration >= 500ms
+face visible ratio >= 0.50
+winner score >= threshold
+winner - second_best >= margin
+not heavy overlap speech
+
+Then:
+
+votes[speaker][face] += segment_duration_ms * confidence
+
+This is stronger than one global average.
+
+Step D — pairwise score
+
+For every (Speaker_N, Face_N):
+
+final_score =
+  0.45 * lip_sync_contrast
++ 0.35 * segment_vote_score
++ 0.10 * silence_penalty_inverse
++ 0.10 * temporal_consistency
+
+Reject if:
+
+final_score < 0.30
+score_margin < 0.10
+matched_speech_ms < 3000
+segment_votes < 2
+face_visible_ratio < 0.40
+
+Current 0.02 should not be used for identity.
+
+Step E — Hungarian assignment instead of greedy
+
+Current greedy assignment can pick the best local pair and block the correct global pair. Replace it with max-weight bipartite matching.
+
+For a small number of meeting participants, brute force is also okay:
+
+from itertools import permutations
+
+def best_assignment(speakers, faces, score_matrix):
+    best = None
+    best_score = -1e9
+
+    for face_perm in permutations(faces, min(len(speakers), len(faces))):
+        total = 0
+        pairs = []
+        for speaker, face in zip(speakers, face_perm):
+            total += score_matrix.get((speaker, face), -999)
+            pairs.append((speaker, face))
+
+        if total > best_score:
+            best_score = total
+            best = pairs
+
+    return best or []
+
+For production, use scipy.optimize.linear_sum_assignment if available.
+
+7. Gateway fixes you should apply
+Fix 1 — return and use link confidence
+
+Gateway currently discards lip_sync_scores and only keeps face_to_speaker. Change _run_video() to return scores too:
+
+lip_sync_scores = result.get("lip_sync_scores", {})
+return sigs, face_embs, f2s, lip_sync_scores, vid_job_id
+
+Then unpack:
+
+vid_signals, face_embeddings_from_video, face_to_speaker, lip_sync_scores, video_job_id = ...
+Fix 2 — only remap strong links
+
+Replace current remap:
+
+speaker_keyed_face_embs[speaker_label] = face_embeddings_from_video[face_label]
+
+with:
+
+STRONG_LIP_SYNC_SCORE = 0.10
+
+speaker_keyed_face_embs = {}
+
+for face_idx_int, speaker_label in face_to_speaker.items():
+    face_label = f"Face_{face_idx_int}"
+    score = lip_sync_scores.get(speaker_label, 0.0)
+
+    if score < STRONG_LIP_SYNC_SCORE:
+        logger.warning(
+            f"[{session_id}] Skipping weak face-speaker link "
+            f"{face_label} → {speaker_label}, score={score}"
+        )
+        continue
+
+    if face_label in face_embeddings_from_video:
+        speaker_keyed_face_embs[speaker_label] = {
+            **face_embeddings_from_video[face_label],
+            "source_face_label": face_label,
+            "lip_sync_score": score,
+            "link_confidence": score,
+        }
+Fix 3 — do not pass all face embeddings into speaker matcher
+
+This line is risky:
+
+face_embeddings=speaker_keyed_face_embs or face_embeddings_from_video
+
+Change to:
+
+face_embeddings=speaker_keyed_face_embs
+
+For audio+video sessions, match_or_create_speakers() should only receive face embeddings that are confirmed for a Speaker_N.
+
+Fix 4 — exclude linked faces from non-speaking registration
+
+Current non-speaking registration can include faces already linked by lip-sync. Fix it:
+
+linked_face_labels = {
+    f"Face_{face_idx_int}"
+    for face_idx_int in face_to_speaker.keys()
+}
+
+non_speaking = {
+    label: data
+    for label, data in face_embeddings_from_video.items()
+    if label.startswith("Face_")
+    and label not in speaker_identity_map
+    and label not in linked_face_labels
+}
+
+Better order:
+
+1. Match Speaker_N using voice + only confirmed linked face
+2. Add Face_N alias for confirmed links
+3. Register remaining unlinked faces as face-only
+
+Do not register linked speaking faces as face-only first.
+
+Fix 5 — do not allow face-only override when voice disagrees
+
+Inside match_or_create_speakers():
+
+if voice_match and face_match and voice_match.registry_id != face_match.registry_id:
+    # conflict
+    # speaker is audio identity, so do not let face override
+    choose voice_match for Speaker_N
+    mark face link as conflict
+    do not merge registries automatically
+
+Rules should be:
+
+Voice strong + face strong + same registry → face_voice_fused
+Voice strong + face weak/missing → voice_embedding
+Voice strong + face strong but different registry → voice_embedding + conflict log
+Voice weak + face strong + strong lip-sync link → face_embedding_allowed
+Voice weak + face strong + weak lip-sync link → do not merge, create pending link
+
+For a speaking Speaker_N, face evidence should never override strong voice evidence.
+
+8. What should happen for your bad session
+
+For bc6aee7c-b2cc-459f-9909-68812a1ca99c, the correct behavior should have been:
+
+Speaker_0 → voice identity first
+Face_10 → visual identity
+SpeakerFaceLink(Speaker_0, Face_10) only if strong lip-sync evidence
+
+Speaker_2 → voice identity first
+Face_4 → visual identity
+SpeakerFaceLink(Speaker_2, Face_4) only if strong lip-sync evidence
+
+If Speaker_2 voice did not agree with Face_4 registry, the system should have produced:
+
+Speaker_2 = voice match / new voice identity
+Face_4 = face-only identity
+link_status = conflict or low_confidence
+
+Final algorithm
+
+Use two stages:
+
+Stage 1: collect evidence
+
+For every speaker segment:
+
+for segment in diar_segments:
+    speaker = segment["speaker"]
+    start = segment["start_ms"]
+    end = segment["end_ms"]
+
+    for face in faces:
+        score = mean_lip_activity(face, start, end)
+        visible = face_visible_ratio(face, start, end)
+
+    winner_face = face_with_highest_score
+    second_face = second_highest_score
+
+    if winner_score - second_score >= margin:
+        votes[speaker][winner_face] += segment_duration * winner_score
+Stage 2: lock mapping
+
+After all segments:
+
+for speaker in speakers:
+    best_face = highest_vote_face
+    second_face = second_highest_vote_face
+
+    if best_score >= threshold and best_score - second_score >= margin:
+        lock[speaker] = best_face
+
+Then enforce one-to-one mapping:
+
+Speaker_0 can map only to Face_10
+Face_10 can map only to Speaker_0
+
+If two speakers fight for the same face, choose the speaker with stronger evidence and mark the other as unlinked.
+
+Why “mean time” alone is not enough
+
+Mean timestamp overlap is helpful, but alone it can fail because:
+
+audio/video offset may exist
+two people may overlap while speaking
+listener may move lips/smile silently
+face may disappear for a few windows
+diarization speaker labels may have short wrong segments
+ArcFace may duplicate one person into multiple Face_N tracks
+
+So use mean lip activity inside transcript timestamp windows, but also add:
+
+margin check
+minimum duration
+minimum votes
+one-to-one locking
+gateway safety check
+The best practical design
+
+Use this rule:
+
+Once Speaker_N ↔ Face_N is confirmed, lock it for the full session.
+But before confirmation, keep it as pending.
+
+Example output:
+
+{
+  "speaker_face_links": {
+    "Speaker_0": {
+      "face_id": "Face_10",
+      "status": "locked",
+      "confidence": 0.84,
+      "matched_speech_ms": 24000,
+      "segment_votes": 9,
+      "score_margin": 0.21
+    },
+    "Speaker_2": {
+      "face_id": null,
+      "status": "unlinked",
+      "reason": "low_margin"
+    }
+  }
+}
+My recommendation
+
+Yes, implement your idea as:
+
+Segment-level lip-sync voting + session-level one-to-one lock
+
+Do not implement it as:
+
+single global mean score → immediate permanent registry merge
+
+Also, even after locking, gateway should still treat it as session lock, not permanent identity truth. The registry merge should happen only if voice and face do not conflict. Your current gateway identity path is risky because it remaps Face_N to Speaker_N and then links Face_N to Speaker_N registry entries using face_to_speaker.
+
+So final answer:
+
+Yes, your idea is good.
+Use it as a session-level lock.
+But add confidence threshold, margin, vote count, duration, and one-to-one enforcement.
+Then gateway should trust only locked mappings, not weak face_to_speaker links.
