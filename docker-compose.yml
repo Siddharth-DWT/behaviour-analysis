@@ -44,7 +44,7 @@ services:
     ports:
       - "${POSTGRES_PORT:-5436}:5432"
     volumes:
-      - ba_postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
       - ./infrastructure/postgres/init:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U nexus -d nexus"]
@@ -195,7 +195,7 @@ services:
 # --------------------------------------------------------------------------
 
 volumes:
-  ba_postgres_data:
+  postgres_data:
     driver: local
   ba_redis_data:
     driver: local
