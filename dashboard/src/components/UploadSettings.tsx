@@ -70,6 +70,7 @@ const CONTENT_TYPE_OPTIONS = [
   { value: "internal", label: "Internal Meeting" },
   { value: "interview", label: "Interview" },
   { value: "podcast", label: "Podcast" },
+  { value: "interrogation_video", label: "Interrogation Video" },
 ];
 
 const LANGUAGE_OPTIONS = [

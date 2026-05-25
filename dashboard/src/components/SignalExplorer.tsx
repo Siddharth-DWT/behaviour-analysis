@@ -3,6 +3,7 @@ import {
   Mic,
   MessageSquareText,
   Combine,
+  Eye,
   ChevronDown,
   ChevronRight,
   Activity,
@@ -17,7 +18,7 @@ import type { Signal } from "../api/client";
 interface SignalTypeMeta {
   label: string;
   description: string;
-  category: "voice" | "language" | "fusion";
+  category: "voice" | "language" | "fusion" | "video";
   interpret: (s: Signal) => { label: string; severity: "high" | "med" | "low" | "neutral" | "info" } | null;
 }
 
@@ -184,6 +185,274 @@ const SIGNAL_TYPE_META: Record<string, SignalTypeMeta> = {
     category: "fusion",
     interpret: (s) => ({ label: "Persistent incongruence pattern", severity: "high" }),
   },
+
+  // ── Phase 2E fusion (audio × video) ──────────────────────────────────────
+  tone_face_masking: {
+    label: "Voice-Face Masking",
+    description: "Voice tone and facial emotion strongly contradict each other",
+    category: "fusion",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt.includes("strong")) return { label: "Strong masking detected", severity: "high" };
+      if (txt.includes("moderate")) return { label: "Moderate masking", severity: "med" };
+      return { label: "Mild voice-face mismatch", severity: "neutral" };
+    },
+  },
+  stress_suppression: {
+    label: "Stress Suppression",
+    description: "Stress visible in one channel (voice or face) but suppressed in the other",
+    category: "fusion",
+    interpret: (s) => ({ label: "Stress suppression detected", severity: "high" }),
+  },
+  cognitive_load: {
+    label: "Cognitive Overload",
+    description: "Filler words and gaze breaks co-occurring — high cognitive demand",
+    category: "fusion",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt.includes("high")) return { label: "High cognitive load", severity: "high" };
+      if (txt.includes("moderate")) return { label: "Moderate cognitive load", severity: "med" };
+      return { label: "Mild cognitive load", severity: "neutral" };
+    },
+  },
+  nonverbal_disagreement: {
+    label: "Nonverbal Disagreement",
+    description: "Head shake co-occurs with objection language — explicit disagreement",
+    category: "fusion",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt.includes("explicit")) return { label: "Explicit disagreement", severity: "high" };
+      return { label: "Polite but resistant", severity: "med" };
+    },
+  },
+  physical_engagement: {
+    label: "Physical Engagement",
+    description: "Forward lean and strong visual attention — fully engaged",
+    category: "fusion",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt === "disengagement" || txt.includes("disengage")) return { label: "Physical disengagement", severity: "high" };
+      if (txt.includes("elsewhere")) return { label: "Body present, mind elsewhere", severity: "med" };
+      return { label: "High physical engagement", severity: "low" };
+    },
+  },
+  false_confidence: {
+    label: "False Confidence",
+    description: "Gaze breaks align with hedging language — low genuine confidence",
+    category: "fusion",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt.includes("low_confidence")) return { label: "Low genuine confidence", severity: "high" };
+      if (txt.includes("mild")) return { label: "Mild uncertainty", severity: "med" };
+      return { label: "Hedged statement", severity: "neutral" };
+    },
+  },
+  smile_sentiment_incongruence: {
+    label: "Smile Masks Sentiment",
+    description: "Social smile co-occurring with negative sentiment — masking displeasure",
+    category: "fusion",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt.includes("sarcasm")) return { label: "Possible sarcasm", severity: "med" };
+      return { label: "Smile masking negative sentiment", severity: "high" };
+    },
+  },
+  processing_load: {
+    label: "Processing Load",
+    description: "Long response latency with facial stress — overwhelmed",
+    category: "fusion",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt.includes("high")) return { label: "High processing load", severity: "high" };
+      if (txt.includes("elevated")) return { label: "Elevated processing load", severity: "med" };
+      return { label: "Mild processing delay", severity: "neutral" };
+    },
+  },
+  dominance_anxiety: {
+    label: "Dominance Anxiety",
+    description: "Dominant language but gaze avoidance — anxiety under dominant facade",
+    category: "fusion",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt === "dominance_anxiety") return { label: "Dominance anxiety", severity: "high" };
+      return { label: "Dominance with uncertainty", severity: "med" };
+    },
+  },
+  interrupt_intent: {
+    label: "Interrupt Intent",
+    description: "Forward lean during interruption — assertive or defensive intent",
+    category: "fusion",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt.includes("competitive")) return { label: "Competitive interrupt", severity: "med" };
+      return { label: "Reactive interrupt", severity: "neutral" };
+    },
+  },
+  rapport_confirmation: {
+    label: "Rapport Confirmed",
+    description: "Empathy language and head nods strongly aligned — genuine rapport",
+    category: "fusion",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt.includes("strong")) return { label: "Strong rapport", severity: "low" };
+      if (txt.includes("building")) return { label: "Building rapport", severity: "low" };
+      return { label: "Rapport indicator", severity: "low" };
+    },
+  },
+  head_body_incongruence: {
+    label: "Head-Body Incongruence",
+    description: "Head and body signals contradict each other",
+    category: "fusion",
+    interpret: (s) => ({ label: "Head-body mismatch", severity: "med" }),
+  },
+  voice_face_alignment: {
+    label: "Voice-Face Alignment",
+    description: "Alignment (or mismatch) between vocal tone and facial expression",
+    category: "fusion",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt === "congruent") return null;
+      return { label: `Misaligned: ${txt.replace(/_/g, " ")}`, severity: "med" };
+    },
+  },
+
+  // ── Video signals ─────────────────────────────────────────────────────────
+  facial_emotion: {
+    label: "Facial Emotion",
+    description: "Dominant facial emotion detected via DeepFace/FACS analysis",
+    category: "video",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (!txt || txt === "neutral") return null;
+      const severity: Record<string, "high" | "med" | "low" | "neutral"> = {
+        angry: "high", fearful: "high", contempt: "high",
+        disgusted: "med", sad: "med",
+        surprised: "neutral",
+        happy: "low",
+      };
+      return { label: txt.charAt(0).toUpperCase() + txt.slice(1), severity: severity[txt] ?? "neutral" };
+    },
+  },
+  facial_engagement: {
+    label: "Facial Engagement",
+    description: "Engagement level inferred from facial expression activity",
+    category: "video",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt === "high_engagement") return { label: "High engagement", severity: "low" };
+      if (txt === "low_engagement") return { label: "Low engagement", severity: "med" };
+      if (txt === "disengaged") return { label: "Disengaged", severity: "high" };
+      return null;
+    },
+  },
+  facial_stress: {
+    label: "Facial Stress",
+    description: "Visible stress indicators in facial muscle activity (AU4, AU7, AU23)",
+    category: "video",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt === "high_facial_stress") return { label: "High facial stress", severity: "high" };
+      if (txt === "moderate") return { label: "Moderate facial stress", severity: "med" };
+      return null;
+    },
+  },
+  smile_type: {
+    label: "Smile Type",
+    description: "Duchenne (genuine) vs. social vs. forced smile classification",
+    category: "video",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt === "duchenne") return { label: "Genuine (Duchenne) smile", severity: "low" };
+      if (txt === "forced") return { label: "Forced smile", severity: "med" };
+      if (txt === "social") return { label: "Social smile", severity: "neutral" };
+      return null;
+    },
+  },
+  body_lean: {
+    label: "Body Lean",
+    description: "Direction of body lean — forward lean signals engagement, back lean signals withdrawal",
+    category: "video",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt === "forward_lean") return { label: "Forward lean — engaged", severity: "low" };
+      if (txt === "back_lean") return { label: "Back lean — withdrawing", severity: "med" };
+      return null;
+    },
+  },
+  posture: {
+    label: "Posture",
+    description: "Body posture classification — upright, slumped, open, or closed",
+    category: "video",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (!txt || txt === "upright") return null;
+      if (txt.includes("slump") || txt.includes("closed")) return { label: txt.replace(/_/g, " "), severity: "med" };
+      return { label: txt.replace(/_/g, " "), severity: "neutral" };
+    },
+  },
+  head_nod: {
+    label: "Head Nod",
+    description: "Head nodding — agreement or active listening",
+    category: "video",
+    interpret: (s) => ({ label: "Head nod", severity: "low" }),
+  },
+  head_shake: {
+    label: "Head Shake",
+    description: "Head shaking — disagreement or uncertainty",
+    category: "video",
+    interpret: (s) => ({ label: "Head shake", severity: "med" }),
+  },
+  body_fidgeting: {
+    label: "Body Fidgeting",
+    description: "Excessive body movement or restlessness — discomfort or stress indicator",
+    category: "video",
+    interpret: (s) => {
+      if (s.value == null) return null;
+      if (s.value > 0.6) return { label: `High fidget (${(s.value * 100).toFixed(0)}%)`, severity: "high" };
+      if (s.value > 0.3) return { label: `Moderate fidget (${(s.value * 100).toFixed(0)}%)`, severity: "med" };
+      return null;
+    },
+  },
+  screen_contact: {
+    label: "Screen Contact",
+    description: "Gaze direction relative to camera — eye contact and attention measure",
+    category: "video",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt === "low_screen_contact") return { label: `Low eye contact (${s.value != null ? Math.round(s.value * 100) : "?"}%)`, severity: "med" };
+      if (txt === "sustained_high") return { label: "Sustained eye contact", severity: "low" };
+      return null;
+    },
+  },
+  attention_level: {
+    label: "Attention Level",
+    description: "Overall attentiveness based on gaze pattern and direction analysis",
+    category: "video",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt.includes("high")) return { label: "High attention", severity: "low" };
+      if (txt.includes("reduced")) return { label: "Reduced attention", severity: "med" };
+      if (txt.includes("low")) return { label: "Low attention", severity: "high" };
+      return null;
+    },
+  },
+  sustained_distraction: {
+    label: "Sustained Distraction",
+    description: "Extended gaze away from screen — attention lost to off-screen stimulus",
+    category: "video",
+    interpret: (s) => ({ label: "Sustained distraction", severity: "high" }),
+  },
+  gaze_synchrony: {
+    label: "Gaze Synchrony",
+    description: "Coordination of gaze patterns between participants — rapport indicator",
+    category: "video",
+    interpret: (s) => {
+      const txt = (s.value_text || "").toLowerCase();
+      if (txt.includes("high") || txt.includes("strong")) return { label: "High gaze synchrony", severity: "low" };
+      if (txt.includes("low") || txt.includes("none")) return { label: "Low gaze synchrony", severity: "med" };
+      return { label: "Moderate gaze synchrony", severity: "neutral" };
+    },
+  },
 };
 
 // ── Helpers ──
@@ -207,9 +476,10 @@ const AGENT_CONFIG = {
   voice: { label: "Voice", icon: Mic, color: "var(--agent-voice)", bgClass: "bg-accent-blue-10" },
   language: { label: "Language", icon: MessageSquareText, color: "var(--agent-language)", bgClass: "bg-accent-purple-10" },
   fusion: { label: "Fusion", icon: Combine, color: "var(--agent-fusion)", bgClass: "bg-alert-10" },
+  video: { label: "Video", icon: Eye, color: "var(--agent-gaze, #EC4899)", bgClass: "bg-pink-10" },
 };
 
-type AgentFilter = "all" | "voice" | "language" | "fusion";
+type AgentFilter = "all" | "voice" | "language" | "fusion" | "video";
 type SeverityFilter = "all" | "high" | "med" | "low";
 
 interface SignalGroup {
@@ -264,10 +534,10 @@ export default function SignalExplorer({ signals, signalsByAgent, totalCount, sp
       result.push({ signalType, meta, signals: sigs, noteworthyCount: noteworthy, highCount: high, medCount: med, lowCount: low });
     }
 
-    // Sort: fusion first, then by noteworthy count desc
+    // Sort: fusion first, then language, voice, video; then by noteworthy count desc
     result.sort((a, b) => {
-      const catOrder = { fusion: 0, language: 1, voice: 2 };
-      const catDiff = (catOrder[a.meta.category] ?? 3) - (catOrder[b.meta.category] ?? 3);
+      const catOrder = { fusion: 0, language: 1, voice: 2, video: 3 };
+      const catDiff = (catOrder[a.meta.category] ?? 4) - (catOrder[b.meta.category] ?? 4);
       if (catDiff !== 0) return catDiff;
       return b.highCount - a.highCount || b.noteworthyCount - a.noteworthyCount;
     });
