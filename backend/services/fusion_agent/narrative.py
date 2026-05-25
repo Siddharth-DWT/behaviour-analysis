@@ -525,16 +525,16 @@ def _build_context(
         if vid:
             lines.append(
                 f"  FACE: emotion={vid.get('dominant_emotion', '?')}, "
-                f"stress={vid.get('avg_facial_stress', 0):.2f}, "
-                f"engagement={vid.get('avg_facial_engagement', 0):.2f}"
+                f"stress={(vid.get('avg_facial_stress') or 0):.2f}, "
+                f"engagement={(vid.get('avg_facial_engagement') or 0):.2f}"
             )
             lines.append(
-                f"  GAZE: on_screen={vid.get('avg_gaze_on_screen_pct', 0):.0%}, "
+                f"  GAZE: on_screen={(vid.get('avg_gaze_on_screen_pct') or 0):.0%}, "
                 f"breaks={vid.get('gaze_breaks', 0)}, "
                 f"blink_anomalies={vid.get('blink_anomalies', 0)}"
             )
             lines.append(
-                f"  BODY: movement={vid.get('avg_body_movement', 0):.2f}, "
+                f"  BODY: movement={(vid.get('avg_body_movement') or 0):.2f}, "
                 f"self_touch={vid.get('hand_near_face_events', 0)}, "
                 f"nods={vid.get('head_nods', 0)}, "
                 f"shakes={vid.get('head_shakes', 0)}"
@@ -549,7 +549,7 @@ def _build_context(
         # Pre-compute cross-modal incongruence flag
         if vs and vid:
             voice_stress = vs.get("avg_stress", 0)
-            face_stress = vid.get("avg_facial_stress", 0)
+            face_stress = vid.get("avg_facial_stress") or 0
             delta = abs(voice_stress - face_stress)
             if delta > 0.25:
                 higher = "voice" if voice_stress > face_stress else "face"
