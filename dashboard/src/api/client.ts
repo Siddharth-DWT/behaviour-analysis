@@ -152,13 +152,73 @@ export interface Report {
   report_type: string;
   content: {
     executive_summary?: string;
+    key_facts?: Array<{
+      type?: string;
+      speaker?: string;
+      text?: string;
+      timestamp?: string;
+      status?: string;
+    }>;
     key_moments?: Array<{
       time_description?: string;
       description?: string;
       significance?: string;
+      signals_involved?: string[];
     }>;
-    cross_modal_insights?: string[];
-    recommendations?: string[];
+    cross_modal_insights?: Array<string | {
+      insight?: string;
+      modalities?: string[];
+      type?: string;
+      significance?: string;
+    }>;
+    recommendations?: Array<string | {
+      priority?: string;
+      action?: string;
+      rationale?: string;
+    }>;
+    speaker_analyses?: Record<string, {
+      role?: string;
+      behavioral_profile?: string;
+      voice_patterns?: string;
+      body_language?: string;
+      key_moments?: string[];
+    }>;
+    risk_assessment?: {
+      risk_level?: string;
+      risk_score?: number;
+      false_confession_risk?: string;
+      contributing_factors?: Array<{
+        factor: string;
+        present: boolean;
+        detail?: string;
+      }>;
+      ethical_note?: string;
+    };
+    contamination_timeline?: Array<{
+      term?: string;
+      timestamps?: string[];
+      context?: string;
+    }>;
+    technique_analysis?: {
+      techniques?: Array<{
+        name?: string;
+        classification?: string;
+        count?: number;
+        timestamps?: string[];
+        effectiveness?: string;
+      }>;
+    };
+    deal_assessment?: {
+      close_probability?: number;
+      stage_reached?: string;
+      buying_signals?: string[];
+      unresolved_objections?: string[];
+    };
+    objection_handling?: Array<{
+      objection?: string;
+      handling_quality?: string;
+      resolved?: boolean;
+    }>;
     raw_response?: string;
     entities?: {
       people?: Array<{ name: string; role: string; first_mention_ms: number }>;

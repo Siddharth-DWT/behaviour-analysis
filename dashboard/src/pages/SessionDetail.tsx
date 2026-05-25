@@ -1385,7 +1385,8 @@ export default function SessionDetail() {
       {/* ═══ REPORT TAB ═══ */}
       {activeTab === "report" && (
         <div className="space-y-6">
-          {/* Executive Summary */}
+
+          {/* 1 — Executive Summary */}
           {content?.executive_summary ? (
             <section className="rounded-lg border border-accent-purple-30 bg-nexus-surface p-5">
               <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-nexus-accent-purple">
@@ -1408,15 +1409,159 @@ export default function SessionDetail() {
             </section>
           ) : null}
 
-          {/* Key Moments */}
-          {content?.key_moments && content.key_moments.length > 0 && (
+          {/* 2 — Key Facts & Commitments (all types) */}
+          {content?.key_facts && (content.key_facts as any[]).length > 0 && (
+            <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
+              <h2 className="mb-4 flex items-center gap-2 text-sm font-semibold text-nexus-text-primary">
+                <span>📋</span>
+                Key Facts &amp; Commitments
+              </h2>
+              <div className="space-y-2">
+                {(content.key_facts as any[]).map((fact: any, i: number) => (
+                  <div
+                    key={i}
+                    className="flex items-start gap-2 rounded border-l-2 bg-nexus-surface-hover p-2 text-xs"
+                    style={{
+                      borderLeftColor:
+                        fact.type === "commitment" ? "var(--accent-blue)"
+                        : fact.type === "objection" ? "var(--stress-high)"
+                        : fact.type === "admission" ? "var(--stress-med)"
+                        : "var(--text-muted)",
+                    }}
+                  >
+                    <span className="mt-0.5 shrink-0">
+                      {fact.type === "commitment" ? "✅"
+                        : fact.type === "objection" ? "❌"
+                        : fact.type === "admission" ? "⚠️"
+                        : "📌"}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <span className="text-nexus-text-primary">{fact.text}</span>
+                      <span className="ml-2 text-nexus-text-muted">
+                        {fact.speaker && `— ${fact.speaker} `}
+                        {fact.timestamp && `at ${fact.timestamp}`}
+                        {fact.status && ` (${fact.status})`}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* 3 — Risk Assessment (interrogation_video only) */}
+          {session.meeting_type === "interrogation_video" && content?.risk_assessment && (
+            <section className="rounded-lg border border-amber-500/30 bg-nexus-surface p-5">
+              <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-amber-400">
+                <span>⚖️</span>
+                False Confession Risk Assessment
+              </h2>
+              {/* Risk gauge */}
+              <div className="mb-3">
+                <div className="flex items-center justify-between mb-1 text-xs">
+                  <span className="font-semibold capitalize" style={{
+                    color: (content.risk_assessment as any).risk_score < 0.3 ? "#10B981"
+                      : (content.risk_assessment as any).risk_score < 0.55 ? "#F59E0B"
+                      : (content.risk_assessment as any).risk_score < 0.8 ? "#F97316"
+                      : "#EF4444",
+                  }}>
+                    {(content.risk_assessment as any).false_confession_risk}
+                  </span>
+                  <span className="text-nexus-text-muted font-mono">
+                    {((content.risk_assessment as any).risk_score * 100).toFixed(0)}%
+                  </span>
+                </div>
+                <div className="h-2 w-full overflow-hidden rounded-full bg-gray-700">
+                  <div
+                    className="h-full rounded-full"
+                    style={{
+                      width: `${Math.min((content.risk_assessment as any).risk_score * 100, 100)}%`,
+                      backgroundColor: (content.risk_assessment as any).risk_score < 0.3 ? "#10B981"
+                        : (content.risk_assessment as any).risk_score < 0.55 ? "#F59E0B"
+                        : (content.risk_assessment as any).risk_score < 0.8 ? "#F97316"
+                        : "#EF4444",
+                    }}
+                  />
+                </div>
+              </div>
+              {/* Contributing factors */}
+              {(content.risk_assessment as any).contributing_factors?.length > 0 && (
+                <div className="flex flex-wrap gap-1 mb-3">
+                  {(content.risk_assessment as any).contributing_factors.map((f: any, i: number) => (
+                    <span
+                      key={i}
+                      className={`rounded px-1.5 py-0.5 text-[10px] ${
+                        f.present
+                          ? "bg-red-900/40 text-red-300"
+                          : "bg-gray-800 text-gray-500"
+                      }`}
+                    >
+                      {f.present ? "✓" : "✗"} {f.factor.replace(/_/g, " ")}
+                      {f.detail && <span className="ml-1 opacity-70">— {f.detail}</span>}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {/* Ethical note */}
+              {(content.risk_assessment as any).ethical_note && (
+                <p className="text-[10px] text-nexus-text-muted italic border-t border-nexus-border pt-2 mt-2">
+                  {(content.risk_assessment as any).ethical_note}
+                </p>
+              )}
+            </section>
+          )}
+
+          {/* 4 — Speaker Analyses (all types) */}
+          {content?.speaker_analyses && Object.keys(content.speaker_analyses as any).length > 0 && (
+            <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
+              <h2 className="mb-4 text-sm font-semibold text-nexus-text-primary">
+                👤 Speaker Analysis
+              </h2>
+              <div className="space-y-4">
+                {Object.entries(content.speaker_analyses as Record<string, any>).map(([spk, analysis]) => (
+                  <div key={spk} className="border-l-2 border-accent-purple-40 pl-3">
+                    <div className="text-xs font-semibold text-nexus-accent-purple mb-1">
+                      {analysis.role ? `${spk} (${analysis.role})` : spk}
+                    </div>
+                    {analysis.behavioral_profile && (
+                      <p className="text-sm text-nexus-text-primary mb-1">
+                        {analysis.behavioral_profile}
+                      </p>
+                    )}
+                    {analysis.voice_patterns && (
+                      <p className="text-xs text-nexus-text-secondary mb-0.5">
+                        🎙️ {analysis.voice_patterns}
+                      </p>
+                    )}
+                    {analysis.body_language && (
+                      <p className="text-xs text-nexus-text-secondary mb-0.5">
+                        🧍 {analysis.body_language}
+                      </p>
+                    )}
+                    {analysis.key_moments?.length > 0 && (
+                      <div className="mt-1 space-y-0.5">
+                        {analysis.key_moments.map((km: string, ki: number) => (
+                          <p key={ki} className="text-[10px] text-nexus-text-muted font-mono">
+                            • {km}
+                          </p>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* 5 — Key Moments */}
+          {content?.key_moments && (content.key_moments as any[]).length > 0 && (
             <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
               <h2 className="mb-4 flex items-center gap-2 text-sm font-semibold text-nexus-text-primary">
                 <Target className="h-4 w-4 text-nexus-accent-blue" />
                 Key Moments
               </h2>
               <div className="space-y-4">
-                {content.key_moments.map((moment, i) => (
+                {(content.key_moments as any[]).map((moment: any, i: number) => (
                   <div key={i} className="border-l-2 border-accent-blue-40 pl-3">
                     <div className="flex items-center gap-2 text-xs">
                       <span className="flex h-5 w-5 items-center justify-center rounded-full bg-accent-blue-15 font-mono text-[10px] font-bold text-nexus-accent-blue">
@@ -1430,7 +1575,18 @@ export default function SessionDetail() {
                     </div>
                     <p className="mt-1 text-sm text-nexus-text-primary">{moment.description}</p>
                     {moment.significance && (
-                      <p className="mt-0.5 text-xs text-nexus-text-secondary italic">{moment.significance}</p>
+                      <p className="mt-0.5 text-xs text-nexus-text-secondary italic">
+                        {moment.significance}
+                      </p>
+                    )}
+                    {moment.signals_involved?.length > 0 && (
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {moment.signals_involved.map((sig: string, si: number) => (
+                          <span key={si} className="rounded-full bg-accent-blue-15 px-1.5 py-0.5 text-[9px] text-nexus-accent-blue">
+                            {sig.replace(/_/g, " ")}
+                          </span>
+                        ))}
+                      </div>
                     )}
                   </div>
                 ))}
@@ -1438,20 +1594,39 @@ export default function SessionDetail() {
             </section>
           )}
 
-          {/* Cross-Modal Insights */}
+          {/* 6 — Cross-Modal Insights */}
           <section className="rounded-lg border-l-[3px] border-nexus-accent-purple bg-nexus-surface p-5">
             <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-nexus-accent-purple">
               <Lightbulb className="h-4 w-4" />
               Cross-Modal Insights
             </h2>
-            {content?.cross_modal_insights && content.cross_modal_insights.length > 0 ? (
-              <ul className="space-y-2">
-                {content.cross_modal_insights.map((insight, i) => (
-                  <li key={i} className="flex items-start gap-2 text-sm text-nexus-text-primary">
-                    <span className="mt-1 text-nexus-accent-purple font-bold">→</span>
-                    {insight}
-                  </li>
-                ))}
+            {content?.cross_modal_insights && (content.cross_modal_insights as any[]).length > 0 ? (
+              <ul className="space-y-3">
+                {(content.cross_modal_insights as any[]).map((insight: any, i: number) => {
+                  const text = typeof insight === "string" ? insight : insight.insight;
+                  const modalities: string[] = typeof insight === "object" ? (insight.modalities ?? []) : [];
+                  const significance: string = typeof insight === "object" ? (insight.significance ?? "") : "";
+                  return (
+                    <li key={i} className="flex items-start gap-2 text-sm text-nexus-text-primary">
+                      <span className="mt-1 font-bold text-nexus-accent-purple shrink-0">⚡</span>
+                      <div>
+                        <span>{text}</span>
+                        {significance && (
+                          <p className="mt-0.5 text-xs text-nexus-text-muted italic">{significance}</p>
+                        )}
+                        {modalities.length > 0 && (
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            {modalities.map((m: string) => (
+                              <span key={m} className="rounded-full bg-accent-purple-15 px-2 py-0.5 text-[10px] text-nexus-accent-purple">
+                                {m}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </li>
+                  );
+                })}
               </ul>
             ) : (
               <p className="text-sm text-nexus-text-muted italic">
@@ -1460,19 +1635,168 @@ export default function SessionDetail() {
             )}
           </section>
 
-          {/* Coaching Recommendations */}
-          {content?.recommendations && content.recommendations.length > 0 && (
+          {/* 7 — Contamination Timeline (interrogation_video only) */}
+          {session.meeting_type === "interrogation_video" &&
+            content?.contamination_timeline &&
+            (content.contamination_timeline as any[]).length > 0 && (
+            <section className="rounded-lg border border-red-900/40 bg-nexus-surface p-5">
+              <h2 className="mb-3 text-sm font-semibold text-red-400">
+                ⚠️ Contamination Timeline
+              </h2>
+              <div className="space-y-2">
+                {(content.contamination_timeline as any[]).map((item: any, i: number) => (
+                  <div key={i} className="rounded bg-nexus-surface-hover p-2 text-xs">
+                    <span className="font-mono text-red-300">"{item.term}"</span>
+                    <span className="ml-2 text-nexus-text-muted">
+                      Interrogator at {item.interrogator_first} → Suspect adopted at {item.suspect_adopted}
+                    </span>
+                    {item.context && (
+                      <p className="mt-0.5 text-nexus-text-muted italic">{item.context}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* 8 — Technique Analysis (interrogation_video only) */}
+          {session.meeting_type === "interrogation_video" && content?.technique_analysis && (
+            <section className="rounded-lg border border-amber-900/30 bg-nexus-surface p-5">
+              <h2 className="mb-3 text-sm font-semibold text-amber-400">
+                🎭 Technique Analysis
+              </h2>
+              <div className="flex items-center gap-3 mb-2">
+                <span className="rounded px-2 py-0.5 text-[11px] font-semibold uppercase"
+                  style={{
+                    backgroundColor: (content.technique_analysis as any).primary === "peace" ? "#10B98122"
+                      : (content.technique_analysis as any).primary === "reid" ? "#F59E0B22"
+                      : (content.technique_analysis as any).primary === "coercive" ? "#EF444422"
+                      : "#6B728022",
+                    color: (content.technique_analysis as any).primary === "peace" ? "#10B981"
+                      : (content.technique_analysis as any).primary === "reid" ? "#F59E0B"
+                      : (content.technique_analysis as any).primary === "coercive" ? "#EF4444"
+                      : "#6B7280",
+                  }}>
+                  {(content.technique_analysis as any).primary}
+                </span>
+                {(content.technique_analysis as any).peace_markers > 0 && (
+                  <span className="text-[10px] text-emerald-400">PEACE ×{(content.technique_analysis as any).peace_markers}</span>
+                )}
+                {(content.technique_analysis as any).reid_markers > 0 && (
+                  <span className="text-[10px] text-amber-400">Reid ×{(content.technique_analysis as any).reid_markers}</span>
+                )}
+                {(content.technique_analysis as any).coercive_markers > 0 && (
+                  <span className="text-[10px] text-red-400">Coercive ×{(content.technique_analysis as any).coercive_markers}</span>
+                )}
+              </div>
+              {(content.technique_analysis as any).assessment && (
+                <p className="text-xs text-nexus-text-secondary">{(content.technique_analysis as any).assessment}</p>
+              )}
+            </section>
+          )}
+
+          {/* 9 — Deal Assessment (sales_call only) */}
+          {session.meeting_type === "sales_call" && content?.deal_assessment && (
+            <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
+              <h2 className="mb-3 text-sm font-semibold text-nexus-text-primary">
+                📈 Deal Assessment
+              </h2>
+              <div className="grid grid-cols-2 gap-3 text-xs">
+                <div>
+                  <span className="text-nexus-text-muted">Close Probability</span>
+                  <div className="mt-1 font-semibold" style={{
+                    color: (content.deal_assessment as any).close_probability === "high" ? "#10B981"
+                      : (content.deal_assessment as any).close_probability === "medium" ? "#F59E0B"
+                      : "#EF4444",
+                  }}>
+                    {(content.deal_assessment as any).close_probability?.toUpperCase()}
+                  </div>
+                </div>
+                <div>
+                  <span className="text-nexus-text-muted">Stage Reached</span>
+                  <div className="mt-1 text-nexus-text-primary font-medium">
+                    {(content.deal_assessment as any).stage_reached}
+                  </div>
+                </div>
+                <div>
+                  <span className="text-nexus-text-muted">Buying Signals</span>
+                  <div className="mt-1 text-emerald-400 font-semibold">
+                    {(content.deal_assessment as any).buying_signals ?? 0}
+                  </div>
+                </div>
+                <div>
+                  <span className="text-nexus-text-muted">Unresolved Objections</span>
+                  <div className="mt-1 font-semibold" style={{
+                    color: (content.deal_assessment as any).unresolved_objections > 0 ? "#EF4444" : "#10B981",
+                  }}>
+                    {(content.deal_assessment as any).unresolved_objections ?? 0}
+                  </div>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {/* 10 — Objection Handling (sales_call + client_meeting) */}
+          {["sales_call", "client_meeting"].includes(session.meeting_type) &&
+            content?.objection_handling &&
+            (content.objection_handling as any[]).length > 0 && (
+            <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
+              <h2 className="mb-3 text-sm font-semibold text-nexus-text-primary">
+                🛡️ Objection Handling
+              </h2>
+              <div className="space-y-2">
+                {(content.objection_handling as any[]).map((obj: any, i: number) => (
+                  <div key={i} className="rounded border-l-2 bg-nexus-surface-hover p-2 text-xs"
+                    style={{ borderLeftColor: obj.resolved ? "var(--stress-low)" : "var(--stress-high)" }}>
+                    <div className="flex items-center gap-2 mb-1">
+                      <span>{obj.resolved ? "✅" : "❌"}</span>
+                      <span className="font-medium text-nexus-text-primary">{obj.objection}</span>
+                      {obj.timestamp && (
+                        <span className="ml-auto font-mono text-nexus-text-muted">{obj.timestamp}</span>
+                      )}
+                    </div>
+                    {obj.handling_quality && (
+                      <p className="text-nexus-text-secondary mb-0.5">Quality: {obj.handling_quality}</p>
+                    )}
+                    {obj.prospect_reaction && (
+                      <p className="text-nexus-text-muted italic">{obj.prospect_reaction}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* 11 — Recommendations */}
+          {content?.recommendations && (content.recommendations as any[]).length > 0 && (
             <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
               <h2 className="mb-3 text-sm font-semibold text-nexus-text-primary">
                 Coaching Recommendations
               </h2>
-              <ul className="space-y-2">
-                {content.recommendations.map((rec, i) => (
-                  <li key={i} className="flex items-start gap-2 text-sm text-nexus-text-primary">
-                    <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-nexus-stress-low" />
-                    {rec}
-                  </li>
-                ))}
+              <ul className="space-y-3">
+                {(content.recommendations as any[]).map((rec: any, i: number) => {
+                  const text = typeof rec === "string" ? rec : rec.action;
+                  const priority: string = typeof rec === "object" ? (rec.priority ?? "") : "";
+                  const rationale: string = typeof rec === "object" ? (rec.rationale ?? "") : "";
+                  return (
+                    <li key={i} className="flex items-start gap-2 text-sm text-nexus-text-primary">
+                      <span
+                        className="mt-1.5 h-2 w-2 shrink-0 rounded-full"
+                        style={{
+                          backgroundColor: priority === "high" ? "#EF4444"
+                            : priority === "medium" ? "#F59E0B"
+                            : "#22C55E",
+                        }}
+                      />
+                      <div>
+                        <span>{text}</span>
+                        {rationale && (
+                          <p className="mt-0.5 text-xs text-nexus-text-muted italic">{rationale}</p>
+                        )}
+                      </div>
+                    </li>
+                  );
+                })}
               </ul>
             </section>
           )}

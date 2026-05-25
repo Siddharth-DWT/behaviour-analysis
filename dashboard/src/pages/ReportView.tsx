@@ -211,7 +211,7 @@ export default function ReportView() {
                       className="flex items-start gap-2 text-sm text-nexus-text-primary"
                     >
                       <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-nexus-accent-purple" />
-                      {insight}
+                      {typeof insight === "string" ? insight : insight.insight ?? ""}
                     </li>
                   ))}
                 </ul>
@@ -231,7 +231,7 @@ export default function ReportView() {
                     className="flex items-start gap-2 text-sm text-nexus-text-primary"
                   >
                     <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-nexus-stress-low" />
-                    {rec}
+                    {typeof rec === "string" ? rec : rec.action ?? ""}
                   </li>
                 ))}
               </ul>

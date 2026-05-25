@@ -495,6 +495,71 @@ def _build_context(
                     f"({r['time_to_resolve_ms']//1000}s to resolve)"
                 )
 
+    # ── Synthesized per-speaker cross-modal profile ──────────────────────────
+    lines.append("\n=== CROSS-MODAL SPEAKER PROFILES ===")
+    lines.append("(Pre-computed synthesis — use these for speaker_analyses in your output)")
+
+    for speaker_id in speakers:
+        display = _display(speaker_id, name_map)
+        lines.append(f"\n[{display}]")
+
+        vs = voice_summary.get("per_speaker", {}).get(speaker_id, {})
+        if vs:
+            lines.append(
+                f"  VOICE: stress_avg={vs.get('avg_stress', 0):.2f}, "
+                f"stress_max={vs.get('max_stress', 0):.2f}, "
+                f"fillers={vs.get('total_fillers', 0)}, "
+                f"pitch_events={vs.get('pitch_elevation_events', 0)}"
+            )
+
+        ls = language_summary.get("per_speaker", {}).get(speaker_id, {})
+        if ls:
+            lines.append(
+                f"  LANGUAGE: sentiment_avg={ls.get('avg_sentiment', 0):.2f}, "
+                f"power={ls.get('avg_power_score', 0.5):.2f}, "
+                f"buying_signals={ls.get('buying_signal_count', 0)}, "
+                f"objections={ls.get('objection_count', 0)}"
+            )
+
+        vid = (video_summary or {}).get("per_speaker", {}).get(speaker_id, {})
+        if vid:
+            lines.append(
+                f"  FACE: emotion={vid.get('dominant_emotion', '?')}, "
+                f"stress={vid.get('avg_facial_stress', 0):.2f}, "
+                f"engagement={vid.get('avg_facial_engagement', 0):.2f}"
+            )
+            lines.append(
+                f"  GAZE: on_screen={vid.get('avg_gaze_on_screen_pct', 0):.0%}, "
+                f"breaks={vid.get('gaze_breaks', 0)}, "
+                f"blink_anomalies={vid.get('blink_anomalies', 0)}"
+            )
+            lines.append(
+                f"  BODY: movement={vid.get('avg_body_movement', 0):.2f}, "
+                f"self_touch={vid.get('hand_near_face_events', 0)}, "
+                f"nods={vid.get('head_nods', 0)}, "
+                f"shakes={vid.get('head_shakes', 0)}"
+            )
+
+        cs = conversation_summary or {}
+        dom_pct = cs.get("dominance", {}).get("per_speaker", {}).get(speaker_id, 0)
+        interrupts = cs.get("interruptions", {}).get("per_speaker", {}).get(speaker_id, 0)
+        if dom_pct:
+            lines.append(f"  CONVERSATION: talk_time={dom_pct:.1f}%, interruptions={interrupts}")
+
+        # Pre-compute cross-modal incongruence flag
+        if vs and vid:
+            voice_stress = vs.get("avg_stress", 0)
+            face_stress = vid.get("avg_facial_stress", 0)
+            delta = abs(voice_stress - face_stress)
+            if delta > 0.25:
+                higher = "voice" if voice_stress > face_stress else "face"
+                lower = "face" if higher == "voice" else "voice"
+                lines.append(
+                    f"  ⚡ INCONGRUENCE: {higher} stress "
+                    f"({max(voice_stress, face_stress):.2f}) vs {lower} "
+                    f"({min(voice_stress, face_stress):.2f}) — delta {delta:.2f}"
+                )
+
     return "\n".join(lines)
 
 
@@ -507,6 +572,16 @@ def _build_prompt(context: str, meeting_type: str) -> tuple[str, str]:
             "stress points during pricing/negotiation, decision readiness indicators, "
             "close probability assessment, and whether the prospect showed genuine "
             "or manufactured interest. Identify the seller and buyer roles. "
+            "KEY FACTS: List commitments and objections FIRST with speaker, timestamp, and status. "
+            "SPEAKER ANALYSIS: Profile the seller's persuasion effectiveness and the prospect's genuine "
+            "interest level — distinguish spoken interest from behavioral engagement. "
+            "CROSS-MODAL INSIGHTS: Focus on prospect incongruence — verbal agreement with disengaged body "
+            "language, nodding with avoidant gaze, positive words with stressed voice. These reveal unspoken objections. "
+            "OUTPUT STRUCTURE: Include 'deal_assessment' with close_probability (high/medium/low), "
+            "stage_reached, buying_signals count, unresolved_objections count, "
+            "prospect_engagement_trend (increasing/stable/declining). "
+            "Include 'objection_handling' array (each with 'objection', 'timestamp', "
+            "'handling_quality', 'resolved' boolean, 'prospect_reaction'). "
             "If video data is present: note forward lean (engagement), gaze breaks (distraction), "
             "facial stress peaks, head nods (agreement) or shakes (disagreement), "
             "and any incongruence between spoken words and body language."
@@ -585,10 +660,24 @@ def _build_prompt(context: str, meeting_type: str) -> tuple[str, str]:
             "capitulation cascade patterns (multi-signal compliance); "
             "behavioural indicators (freezing response, blink suppression, motor inhibition, "
             "evidence-response processing delays). "
+            "SPEAKER ANALYSIS: Profile the suspect's behavioral trajectory across the session — "
+            "how did their stress, denial strength, body language, and speech patterns evolve? "
+            "Profile the interrogator's technique shifts and their effect on the suspect. "
+            "CROSS-MODAL INSIGHTS: Focus on moments where voice/face/body signals diverge — "
+            "stress peaks without verbal acknowledgment, calm speech during facial distress, "
+            "body freezing after specific questions. "
+            "OUTPUT STRUCTURE: Include 'risk_assessment' with false_confession_risk level (low/low_moderate/"
+            "moderate/elevated/high), risk_score (0.0-1.0), contributing_factors array (each with 'factor', "
+            "'present' boolean, 'detail' string) for: contamination, session_duration, coercive_technique, "
+            "denial_weakening, processing_delays, capitulation_pattern. Include 'ethical_note' string. "
+            "Include 'contamination_timeline' array (each with 'term', 'interrogator_first', "
+            "'suspect_adopted', 'context'). Include 'technique_analysis' with 'primary', 'peace_markers', "
+            "'reid_markers', 'coercive_markers', 'assessment'. "
             "CRITICAL ETHICAL CONSTRAINTS: Never claim guilt or deception. All findings are "
             "probabilistic indicators only, never binary determinations. "
             "Distinguish between genuine recall difficulty and stress-induced compliance. "
             "Frame every risk indicator with its alternative innocent explanation. "
+            "Use 'incongruence', 'stress indicator', 'risk factor' — never 'deception' or 'lying'. "
             "If coercive technique detected, flag elevated false confession risk regardless of other signals. "
             "Research basis: Kassin et al. (2010, 2012), Garrett (2011), Vrij (2005, 2008)."
         ),
@@ -596,6 +685,7 @@ def _build_prompt(context: str, meeting_type: str) -> tuple[str, str]:
         "client_meeting": (
             "Focus on: rapport trajectory, client satisfaction indicators, "
             "risk flags, unspoken concerns detected through cross-modal analysis. "
+            "KEY FACTS: List commitments and action items FIRST with speaker, timestamp, and status. "
             "If video data is present: note any body language incongruence with stated satisfaction."
         ),
         "internal": (
@@ -634,25 +724,84 @@ def _build_prompt(context: str, meeting_type: str) -> tuple[str, str]:
         "wherever a name is available from the SPEAKER NAME MAP. Only use Speaker_X when no name is known."
     )
 
+    # ── Content-type isolation instructions ──────────────────────────────────
+    if meeting_type == "interrogation_video":
+        extra_fields = (
+            "REQUIRED for this interrogation session: include 'risk_assessment', "
+            "'contamination_timeline', and 'technique_analysis' fields as described in FOCUS. "
+            "Do NOT include 'deal_assessment' or 'objection_handling'."
+        )
+    elif meeting_type in ("sales_call", "client_meeting"):
+        extra_fields = (
+            "REQUIRED for this sales/client session: include 'deal_assessment' and "
+            "'objection_handling' fields as described in FOCUS. "
+            "Do NOT include 'risk_assessment', 'contamination_timeline', or 'technique_analysis'."
+        )
+    else:
+        extra_fields = (
+            "Do NOT include 'risk_assessment', 'contamination_timeline', 'technique_analysis', "
+            "'deal_assessment', or 'objection_handling'. These are type-specific fields not "
+            "applicable to this session type."
+        )
+
     user_prompt = f"""Analyse the following multi-modal signal data from a recorded meeting and produce a structured report.
 
 FOCUS: {focus}
 
 {context}
 
-Respond with a JSON object containing EXACTLY these fields:
+Respond with a JSON object containing these fields:
 {{
-  "executive_summary": "2-3 sentence overview of the session's key dynamics",
+  "executive_summary": "3-5 sentence overview emphasising the most important finding",
+
+  "key_facts": [
+    {{
+      "type": "commitment | objection | decision | admission | disclosure",
+      "speaker": "speaker name or label",
+      "text": "exact quote or paraphrase",
+      "timestamp": "MM:SS",
+      "status": "confirmed | unresolved | retracted"
+    }}
+  ],
+
+  "speaker_analyses": {{
+    "Speaker_0": {{
+      "role": "role if known",
+      "behavioral_profile": "2-3 sentence narrative synthesising voice + language + video",
+      "voice_patterns": "one sentence on vocal stress, pace, fillers",
+      "body_language": "one sentence on posture, gestures, gaze (omit if no video data)",
+      "key_moments": ["timestamp — description of notable moment"]
+    }}
+  }},
+
   "key_moments": [
-    {{"time_description": "timestamp or time range", "description": "what happened", "significance": "why it matters"}}
+    {{
+      "time_description": "timestamp or range",
+      "description": "what happened",
+      "significance": "why it matters",
+      "signals_involved": ["signal_type_1", "signal_type_2"]
+    }}
   ],
+
   "cross_modal_insights": [
-    "Each insight describes a pattern that only cross-modal analysis reveals. Include body/face/gaze vs voice/language incongruence (e.g. calm face but stressed voice, nodding while saying no, forward lean but avoidant gaze). At least one insight must reference video signals if VIDEO ANALYSIS data is present."
+    {{
+      "insight": "full description of the cross-modal pattern",
+      "modalities": ["voice", "face"],
+      "type": "incongruence | synchrony | escalation | suppression",
+      "significance": "what this reveals about the speaker's state"
+    }}
   ],
+
   "recommendations": [
-    "Actionable recommendations based on the analysis"
+    {{
+      "priority": "high | medium | low",
+      "action": "specific actionable recommendation",
+      "rationale": "brief reason based on the evidence"
+    }}
   ]
 }}
+
+{extra_fields}
 
 Return ONLY the JSON object, no other text."""
 
@@ -670,18 +819,35 @@ def _parse_narrative_response(raw_text: str, speakers: list[str]) -> dict:
     try:
         parsed = json.loads(text)
         return {
+            # Base fields (all content types)
             "executive_summary": parsed.get("executive_summary", ""),
+            "key_facts": parsed.get("key_facts", []),
+            "speaker_analyses": parsed.get("speaker_analyses", {}),
             "key_moments": parsed.get("key_moments", []),
             "cross_modal_insights": parsed.get("cross_modal_insights", []),
             "recommendations": parsed.get("recommendations", []),
+            # Interrogation-specific (None when absent — frontend guards on contentType)
+            "risk_assessment": parsed.get("risk_assessment"),
+            "contamination_timeline": parsed.get("contamination_timeline"),
+            "technique_analysis": parsed.get("technique_analysis"),
+            # Sales-specific
+            "deal_assessment": parsed.get("deal_assessment"),
+            "objection_handling": parsed.get("objection_handling"),
         }
     except json.JSONDecodeError:
         logger.warning("Failed to parse LLM narrative as JSON, returning raw text")
         return {
             "executive_summary": text[:500],
+            "key_facts": [],
+            "speaker_analyses": {},
             "key_moments": [],
             "cross_modal_insights": [],
             "recommendations": [],
+            "risk_assessment": None,
+            "contamination_timeline": None,
+            "technique_analysis": None,
+            "deal_assessment": None,
+            "objection_handling": None,
         }
 
 
@@ -794,13 +960,101 @@ def _fallback_narrative(
                 "Detected potentially manufactured urgency: fast pace with stress indicators"
             )
 
+    # ── Build key_facts from entities ────────────────────────────────────────
+    key_facts: list[dict] = []
+    for obj in entities.get("objections", []):
+        ts_s = obj.get("timestamp_ms", 0) // 1000
+        m, s = divmod(ts_s, 60)
+        key_facts.append({
+            "type": "objection",
+            "speaker": obj.get("speaker", ""),
+            "text": obj.get("text", ""),
+            "timestamp": f"{m}:{s:02d}",
+            "status": "confirmed" if obj.get("resolved") else "unresolved",
+        })
+    for com in entities.get("commitments", []):
+        ts_s = com.get("timestamp_ms", 0) // 1000
+        m, s = divmod(ts_s, 60)
+        key_facts.append({
+            "type": "commitment",
+            "speaker": com.get("speaker", ""),
+            "text": com.get("text", ""),
+            "timestamp": f"{m}:{s:02d}",
+            "status": "confirmed",
+        })
+
+    # ── Build speaker_analyses from per-speaker summaries ────────────────────
+    speaker_analyses: dict[str, dict] = {}
+    for speaker_id in speakers:
+        vs = voice_summary.get("per_speaker", {}).get(speaker_id, {})
+        ls = language_summary.get("per_speaker", {}).get(speaker_id, {})
+        profile_parts = []
+        if vs.get("max_stress", 0) > 0.60:
+            profile_parts.append(
+                f"Vocal stress peaked at {vs['max_stress']:.2f} during the session"
+            )
+        if ls.get("buying_signal_count", 0) > 0:
+            profile_parts.append(
+                f"showed {ls['buying_signal_count']} buying signal(s)"
+            )
+        if ls.get("avg_power_score", 0.5) < 0.35:
+            profile_parts.append("used hedging/powerless language")
+        speaker_analyses[speaker_id] = {
+            "role": "",
+            "behavioral_profile": ". ".join(profile_parts) if profile_parts
+                else "No notable behavioral patterns detected.",
+            "voice_patterns": (
+                f"Avg stress {vs.get('avg_stress', 0):.2f}, "
+                f"{vs.get('total_fillers', 0)} fillers, "
+                f"{vs.get('pitch_elevation_events', 0)} pitch elevation events."
+            ) if vs else "",
+            "body_language": "",
+            "key_moments": [],
+        }
+
+    # ── Build risk_assessment from false_confession_risk signal ──────────────
+    risk_assessment = None
+    risk_sig = next(
+        (s for s in fusion_signals if s.get("signal_type") == "false_confession_risk"), None
+    )
+    if risk_sig:
+        meta = risk_sig.get("metadata") or {}
+        rf = meta.get("risk_factors", {})
+        contributing_factors = [
+            {"factor": "contamination",       "present": bool(rf.get("contamination", {}).get("signal_count", 0) > 0),       "detail": f"{rf.get('contamination', {}).get('signal_count', 0)} contamination event(s)"},
+            {"factor": "session_duration",    "present": bool((rf.get("duration_risk", {}).get("contribution", 0)) > 0),       "detail": f"{meta.get('duration_minutes', 0):.0f} min session"},
+            {"factor": "coercive_technique",  "present": bool(rf.get("coercive_technique", {}).get("signal_count", 0) > 0),   "detail": "coercive markers detected" if rf.get("coercive_technique", {}).get("signal_count", 0) > 0 else "no coercive markers"},
+            {"factor": "denial_weakening",    "present": bool(rf.get("denial_evolution", {}).get("weakening_count", 0) > 0), "detail": f"{rf.get('denial_evolution', {}).get('weakening_count', 0)} weakening event(s)"},
+            {"factor": "processing_delays",   "present": bool(rf.get("processing_delays", {}).get("signal_count", 0) > 0),   "detail": f"{rf.get('processing_delays', {}).get('signal_count', 0)} delay event(s)"},
+            {"factor": "capitulation_pattern","present": bool(rf.get("capitulation_cascade", {}).get("signal_count", 0) > 0),"detail": f"{rf.get('capitulation_cascade', {}).get('signal_count', 0)} cascade event(s)"},
+        ]
+        risk_assessment = {
+            "false_confession_risk": risk_sig.get("value_text", "unknown").replace("_", " "),
+            "risk_score": round(risk_sig.get("value", 0), 3),
+            "contributing_factors": contributing_factors,
+            "ethical_note": (
+                "Risk score indicates probability of coerced compliance, NOT guilt or deception. "
+                "All factors have alternative innocent explanations."
+            ),
+        }
+
     return {
         "executive_summary": (
             f"Session with {len(speakers)} speaker(s). "
             + (insights[0] + ". " if insights else "No notable patterns detected. ")
             + f"{len(fusion_signals)} cross-modal fusion signal(s) generated."
         ),
+        "key_facts": key_facts,
+        "speaker_analyses": speaker_analyses,
         "key_moments": [],
-        "cross_modal_insights": cross_modal if cross_modal else ["No cross-modal patterns detected in this window"],
+        "cross_modal_insights": cross_modal if cross_modal else [
+            {"insight": "No cross-modal patterns detected in this window",
+             "modalities": [], "type": "none", "significance": ""}
+        ],
         "recommendations": [],
+        "risk_assessment": risk_assessment,
+        "contamination_timeline": None,
+        "technique_analysis": None,
+        "deal_assessment": None,
+        "objection_handling": None,
     }
