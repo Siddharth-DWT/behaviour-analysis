@@ -866,14 +866,43 @@ Return ONLY the JSON object, no other text."""
 
 def _parse_narrative_response(raw_text: str, speakers: list[str]) -> dict:
     """Parse the LLM response into structured report."""
-    # Strip markdown wrapping if present
-    text = raw_text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        text = text.rsplit("```", 1)[0].strip()
+
+    def _extract_json(text: str) -> dict:
+        """Try multiple strategies to extract a JSON object from text."""
+        text = text.strip()
+
+        # Strategy 1: direct parse
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 2: strip markdown code fences anywhere in text
+        if "```" in text:
+            start = text.find("```")
+            end = text.rfind("```")
+            if start != end:
+                inner = text[start:end + 3]
+                inner = inner.split("\n", 1)[1] if "\n" in inner else inner[3:]
+                inner = inner.rsplit("```", 1)[0].strip()
+                try:
+                    return json.loads(inner)
+                except json.JSONDecodeError:
+                    pass
+
+        # Strategy 3: find outermost { ... } — handles preamble or trailing text
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+
+        raise json.JSONDecodeError("No valid JSON found", text, 0)
 
     try:
-        parsed = json.loads(text)
+        parsed = _extract_json(raw_text)
         return {
             # Meeting notes fields (all content types)
             "general_summary": parsed.get("general_summary", []),
@@ -900,7 +929,7 @@ def _parse_narrative_response(raw_text: str, speakers: list[str]) -> dict:
             "general_summary": [],
             "notes": [],
             "action_items": [],
-            "executive_summary": text[:500],
+            "executive_summary": raw_text.strip()[:500],
             "key_facts": [],
             "speaker_analyses": {},
             "key_moments": [],
