@@ -722,6 +722,12 @@ function resolveDisplayLabel(
   return spkId;
 }
 
+function formatMs(ms: number): string {
+  const totalS = Math.floor(ms / 1000);
+  const m = Math.floor(totalS / 60);
+  return `${m}:${String(totalS % 60).padStart(2, "0")}`;
+}
+
 // ── Sub-components ────────────────────────────────────────────────────────────
 
 interface SpeakerGroupHeaderProps {
@@ -730,6 +736,7 @@ interface SpeakerGroupHeaderProps {
   roster: Record<string, SpeakerInfo>;
   highlighted: boolean;
   onToggle: () => void;
+  onDetail: () => void;
 }
 
 function SpeakerGroupHeader({
@@ -738,6 +745,7 @@ function SpeakerGroupHeader({
   roster,
   highlighted,
   onToggle,
+  onDetail,
 }: SpeakerGroupHeaderProps) {
   const [imgFailed, setImgFailed] = useState(false);
   const token = getAccessToken();
@@ -788,7 +796,16 @@ function SpeakerGroupHeader({
           </span>
         )}
       </div>
-      {highlighted && <span className="ml-auto shrink-0 text-[8px] text-yellow-400">●</span>}
+      <div className="ml-auto flex shrink-0 items-center gap-1">
+        <button
+          onClick={(e) => { e.stopPropagation(); onDetail(); }}
+          className="rounded px-1 py-0.5 text-[9px] text-gray-500 transition-colors hover:bg-blue-500/20 hover:text-blue-400"
+          title="View all signals for this face"
+        >
+          ≡
+        </button>
+        {highlighted && <span className="text-[8px] text-yellow-400">●</span>}
+      </div>
     </button>
   );
 }
@@ -827,6 +844,156 @@ function FaceHighlight({ speaker, signals }: FaceHighlightProps) {
   );
 }
 
+// ── FaceDetailPanel ───────────────────────────────────────────────────────────
+
+interface FaceDetailPanelProps {
+  speakerId: string;
+  allSignals: VideoSignal[];
+  toCanonical: Record<string, string>;
+  roster: Record<string, SpeakerInfo>;
+  onClose: () => void;
+  onSeek: (ms: number) => void;
+}
+
+function FaceDetailPanel({
+  speakerId,
+  allSignals,
+  toCanonical,
+  roster,
+  onClose,
+  onSeek,
+}: FaceDetailPanelProps) {
+  const token = getAccessToken();
+
+  // Include signals from fragment tracks that were merged into this canonical ID.
+  const fragmentIds = new Set(
+    Object.entries(toCanonical)
+      .filter(([, canon]) => canon === speakerId)
+      .map(([frag]) => frag)
+  );
+
+  const faceSignals = allSignals.filter((s) => {
+    const sid = s.speaker_id ?? "";
+    if (sid !== speakerId && !fragmentIds.has(sid)) return false;
+    if (s.signal_type === "presence_detected") return false;
+    if (SIGNAL_CONFIG[s.signal_type]?.hidden) return false;
+    return true;
+  });
+
+  // Group by signal_type, sort groups by occurrence count descending.
+  const grouped: Record<string, VideoSignal[]> = {};
+  for (const s of faceSignals) {
+    if (!SIGNAL_CONFIG[s.signal_type]) continue;
+    (grouped[s.signal_type] ??= []).push(s);
+  }
+  const sortedTypes = Object.keys(grouped).sort(
+    (a, b) => grouped[b].length - grouped[a].length
+  );
+
+  const info = roster[speakerId];
+  const [imgFailed, setImgFailed] = useState(false);
+  const thumbPath = !imgFailed && info?.thumbnail_url
+    ? `/api${info.thumbnail_url}${token ? `?token=${encodeURIComponent(token)}` : ""}`
+    : null;
+  const displayLabel = resolveDisplayLabel(info, speakerId);
+  const initials = displayLabel.slice(0, 2).toUpperCase();
+
+  // Category summary counts
+  const catCounts: Record<string, number> = {};
+  for (const s of faceSignals) {
+    const cat = SIGNAL_CONFIG[s.signal_type]?.category ?? "other";
+    catCounts[cat] = (catCounts[cat] ?? 0) + 1;
+  }
+
+  return (
+    <div className="absolute inset-0 z-20 flex flex-col overflow-hidden rounded-lg bg-black/96 backdrop-blur-sm">
+      {/* Header */}
+      <div className="flex items-center gap-3 border-b border-white/10 p-3">
+        {thumbPath ? (
+          <img
+            src={thumbPath}
+            alt={displayLabel}
+            className="h-10 w-10 flex-shrink-0 rounded-full border border-gray-600 object-cover"
+            onError={() => setImgFailed(true)}
+          />
+        ) : (
+          <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-gray-700">
+            <span className="text-xs font-bold text-gray-400">{initials}</span>
+          </div>
+        )}
+        <div className="min-w-0 flex-1">
+          <span className="block text-sm font-semibold text-white">{displayLabel}</span>
+          <span className="text-[10px] text-gray-400">
+            {faceSignals.length} signals · {sortedTypes.length} types
+            {Object.keys(catCounts).length > 0 && (
+              <> · {Object.entries(catCounts)
+                .sort((a, b) => b[1] - a[1])
+                .map(([cat, n]) => `${n} ${cat}`)
+                .join(", ")}
+              </>
+            )}
+          </span>
+        </div>
+        <button
+          onClick={onClose}
+          className="ml-2 shrink-0 rounded p-1 text-gray-400 transition-colors hover:bg-white/10 hover:text-white"
+          title="Close"
+        >
+          ✕
+        </button>
+      </div>
+
+      {/* Signal groups — scrollable */}
+      <div className="flex-1 overflow-y-auto p-3 space-y-4">
+        {sortedTypes.length === 0 ? (
+          <p className="text-xs text-gray-500">No displayable signals recorded for this face.</p>
+        ) : (
+          sortedTypes.map((type) => {
+            const sigs = grouped[type].sort((a, b) => a.start_ms - b.start_ms);
+            const display = getSignalDisplay(type, sigs[0]?.value_text ?? "");
+            const cfg = SIGNAL_CONFIG[type];
+            const color = cfg ? resolveColor(cfg, sigs[0]) : "#6B7280";
+            const avgConf = sigs.reduce((acc, s) => acc + s.confidence, 0) / sigs.length;
+
+            return (
+              <div key={type}>
+                {/* Signal type row */}
+                <div className="mb-1.5 flex items-center gap-2">
+                  <span className="font-mono text-sm" style={{ color }}>{display.icon}</span>
+                  <span className="text-xs font-medium text-gray-200">{display.label}</span>
+                  <span
+                    className="rounded-full px-1.5 py-0.5 text-[9px] font-medium"
+                    style={{ backgroundColor: `${color}22`, color }}
+                  >
+                    {sigs.length}×
+                  </span>
+                  <span className="ml-auto text-[9px] text-gray-500">
+                    avg {Math.round(avgConf * 100)}%
+                  </span>
+                </div>
+                {/* Timestamp pills — click to seek */}
+                <div className="flex flex-wrap gap-1">
+                  {sigs.map((s, i) => (
+                    <button
+                      key={i}
+                      onClick={() => { onSeek(s.start_ms); onClose(); }}
+                      className="rounded px-1.5 py-0.5 font-mono text-[10px] transition-colors hover:bg-white/10"
+                      style={{ color: `${color}bb`, border: `1px solid ${color}33` }}
+                      title={`Confidence ${Math.round(s.confidence * 100)}% · click to jump`}
+                    >
+                      {formatMs(s.start_ms)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Component ──────────────────────────────────────────────────────────────────
 
 interface Props {
@@ -855,6 +1022,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   const [showExpanded, setShowExpanded] = useState(false);
   const [speakerRoster, setSpeakerRoster] = useState<Record<string, SpeakerInfo>>({});
   const [highlightedSpeaker, setHighlightedSpeaker] = useState<string | null>(null);
+  const [detailSpeaker, setDetailSpeaker] = useState<string | null>(null);
 
   // Fetch speaker roster once on mount to resolve display names and thumbnails.
   useEffect(() => {
@@ -914,7 +1082,9 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
         if (ms < start || ms > end) return false;
         const cfg = SIGNAL_CONFIG[s.signal_type];
         if (!cfg) return false;
-        if (!enabledCategories.has(cfg.category)) return false;
+        // presence_detected is structural (face-tracking keep-alive) — exempt from
+        // category toggles so turning off "Face" signals doesn't erase face entries.
+        if (s.signal_type !== "presence_detected" && !enabledCategories.has(cfg.category)) return false;
         if (selectedSpeaker !== "all") {
           const resolvedId = canon[s.speaker_id ?? ""] ?? s.speaker_id ?? "";
           if (resolvedId !== selectedSpeaker && s.speaker_id !== selectedSpeaker) return false;
@@ -1132,7 +1302,17 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   return (
     <div className="w-full space-y-3">
       {/* Video Playback — badges panel left, video right */}
-      <div className="flex overflow-hidden rounded-lg bg-black" style={{ minHeight: 580 }}>
+      <div className="relative flex overflow-hidden rounded-lg bg-black" style={{ minHeight: 580 }}>
+        {detailSpeaker && (
+          <FaceDetailPanel
+            speakerId={detailSpeaker}
+            allSignals={signals}
+            toCanonical={toCanonical}
+            roster={speakerRoster}
+            onClose={() => setDetailSpeaker(null)}
+            onSeek={seekTo}
+          />
+        )}
 
         {/* Left panel: signal badges in the black area */}
         <div className="flex w-48 flex-shrink-0 flex-col justify-start gap-1 overflow-y-auto p-3">
@@ -1153,11 +1333,12 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                 const visibleSigs = showExpanded ? prioritySigs : prioritySigs.slice(0, 3);
                 const hasPresence = activeSignals.some((s: VideoSignal) => s.signal_type === "presence_detected" && (toCanonical[s.speaker_id ?? ""] ?? s.speaker_id) === speakerId);
                 if (visibleSigs.length === 0 && !hasPresence) return null;
-                // Hide any face/speaker with no thumbnail from the video sidebar.
-                // No thumbnail = ArcFace failed to extract an embedding (too few frames,
-                // too small, static graphic, or photo on screen). These are unreliable
-                // detections and should not appear in the panel regardless of label type.
-                if (!speakerRoster[rawId]?.thumbnail_url) return null;
+                // Thumbnail gate: hide faces that have NO thumbnail AND NO behavioral signals.
+                // A face with real signals (body, gaze, head) is shown even without a thumbnail
+                // (ArcFace can fail on small/profile faces while rule engines still fire).
+                // Also skip the gate until the roster has loaded to avoid a flash where all
+                // faces are hidden during the initial roster fetch.
+                if (rosterLoaded && !speakerRoster[rawId]?.thumbnail_url && visibleSigs.length === 0 && !hasPresence) return null;
                 return (
                   <div key={speakerId} className="flex flex-col gap-1">
                     <SpeakerGroupHeader
@@ -1170,7 +1351,11 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                           rawId && prev !== rawId ? rawId : null
                         )
                       }
+                      onDetail={() => setDetailSpeaker(speakerId)}
                     />
+                    {visibleSigs.length === 0 && hasPresence && (
+                      <span className="px-2 text-[9px] text-white/25 italic">in frame</span>
+                    )}
                     {visibleSigs.map((s: VideoSignal, i: number) => {
                       const display = getSignalDisplay(s.signal_type, s.value_text ?? "");
                       const color = display.color;

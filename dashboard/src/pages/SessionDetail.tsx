@@ -1506,6 +1506,97 @@ export default function SessionDetail() {
             </section>
           )}
 
+          {/* 3a — Statement Contradictions (all types) */}
+          {content?.contradiction_analysis && (content.contradiction_analysis as any[]).length > 0 && (
+            <section className="rounded-lg border border-amber-500/20 bg-nexus-surface p-5">
+              <h2 className="mb-4 flex items-center gap-2 text-sm font-semibold text-amber-400">
+                <Zap className="h-4 w-4" />
+                Statement Contradictions
+              </h2>
+              <div className="space-y-4">
+                {(content.contradiction_analysis as any[]).map((c: any, i: number) => (
+                  <div key={i} className="rounded border border-nexus-border p-3">
+                    <div className="mb-2 text-xs font-medium text-nexus-text-muted">
+                      {c.speaker} —{" "}
+                      <span className="capitalize text-amber-400/80">
+                        {(c.contradiction_type || "").replace(/_/g, " ")}
+                      </span>
+                    </div>
+                    <div className="mb-2 grid grid-cols-2 gap-3">
+                      <div className="rounded bg-nexus-surface-hover p-2">
+                        <div className="text-[10px] text-nexus-text-muted">{c.statement_a?.timestamp}</div>
+                        <p className="mt-0.5 text-sm text-nexus-text-primary">
+                          &ldquo;{c.statement_a?.text}&rdquo;
+                        </p>
+                        <div className="mt-1 text-[10px]">
+                          stress:{" "}
+                          <span className={c.statement_a?.voice_stress > 0.5 ? "text-red-400" : "text-green-400"}>
+                            {c.statement_a?.voice_stress?.toFixed(2)}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="rounded bg-nexus-surface-hover p-2">
+                        <div className="text-[10px] text-nexus-text-muted">{c.statement_b?.timestamp}</div>
+                        <p className="mt-0.5 text-sm text-nexus-text-primary">
+                          &ldquo;{c.statement_b?.text}&rdquo;
+                        </p>
+                        <div className="mt-1 text-[10px]">
+                          stress:{" "}
+                          <span className={c.statement_b?.voice_stress > 0.5 ? "text-red-400" : "text-green-400"}>
+                            {c.statement_b?.voice_stress?.toFixed(2)}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                    {c.voice_delta && (
+                      <p className="text-xs italic text-nexus-accent-purple">{c.voice_delta}</p>
+                    )}
+                    {c.significance && (
+                      <p className="mt-1 text-xs text-nexus-text-secondary">{c.significance}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* 3b — Voice Anomalies with Transcript Context (all types) */}
+          {content?.voice_text_correlations && (content.voice_text_correlations as any[]).length > 0 && (
+            <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
+              <h2 className="mb-4 flex items-center gap-2 text-sm font-semibold text-nexus-accent-purple">
+                <MessageSquare className="h-4 w-4" />
+                Voice Anomalies — What Was Being Said
+              </h2>
+              <div className="space-y-3">
+                {(content.voice_text_correlations as any[]).map((v: any, i: number) => (
+                  <div
+                    key={i}
+                    className="flex items-start gap-3 rounded border-l-2 border-nexus-accent-purple bg-nexus-surface-hover p-2"
+                  >
+                    <div className="shrink-0 text-center">
+                      <div className="font-mono text-xs text-nexus-text-muted">{v.timestamp}</div>
+                      <div className="text-[10px] text-red-400">{v.anomaly_value}</div>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="mb-0.5 text-xs font-medium text-nexus-text-muted">
+                        {v.speaker} —{" "}
+                        <span className="capitalize">
+                          {(v.anomaly_type || "").replace(/_/g, " ")}
+                        </span>
+                      </div>
+                      <p className="text-sm text-nexus-text-primary">
+                        &ldquo;{v.transcript_text}&rdquo;
+                      </p>
+                      {v.context && (
+                        <p className="mt-1 text-xs italic text-nexus-text-secondary">{v.context}</p>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
           {/* 3 — Risk Assessment (interrogation_video only) */}
           {session.meeting_type === "interrogation_video" && content?.risk_assessment && (
             <section className="rounded-lg border border-amber-500/30 bg-nexus-surface p-5">

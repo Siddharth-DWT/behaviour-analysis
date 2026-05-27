@@ -237,6 +237,23 @@ export interface Report {
       handling_quality?: string;
       resolved?: boolean;
     }>;
+    contradiction_analysis?: Array<{
+      speaker?: string;
+      statement_a?: { text?: string; timestamp?: string; voice_stress?: number };
+      statement_b?: { text?: string; timestamp?: string; voice_stress?: number };
+      contradiction_type?: string;
+      voice_delta?: string;
+      significance?: string;
+    }>;
+    voice_text_correlations?: Array<{
+      timestamp?: string;
+      speaker?: string;
+      anomaly_type?: string;
+      anomaly_value?: string;
+      transcript_text?: string;
+      additional_signals?: string;
+      context?: string;
+    }>;
     raw_response?: string;
     entities?: {
       people?: Array<{ name: string; role: string; first_mention_ms: number }>;

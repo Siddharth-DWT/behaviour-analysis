@@ -274,6 +274,7 @@ async def acomplete(
     max_tokens: int = 1000,
     temperature: float = 0.3,
     model: Optional[str] = None,
+    json_response: bool = False,
 ) -> str:
     """
     Async LLM call routed purely by model name.
@@ -283,16 +284,20 @@ async def acomplete(
       "gpt-*" / "o1*" / "o3*" / None → OpenAI API
       "glm-*" / "llama*" / "mistral*" / "qwen*" → Ollama
       Anything else → OpenAI API (safe default)
+
+    json_response: when True, enables provider-native JSON mode (OpenAI
+    response_format=json_object, Ollama format=json) to guarantee the
+    model returns valid JSON instead of prose.
     """
     if model is None:
         model = os.getenv("DEFAULT_LLM_MODEL", "gpt-4o")
 
     if model.startswith("gpt-") or model.startswith("o1") or model.startswith("o3"):
-        return await _acomplete_openai(system_prompt, user_prompt, max_tokens, temperature, model=model)
+        return await _acomplete_openai(system_prompt, user_prompt, max_tokens, temperature, model=model, json_response=json_response)
     elif any(model.startswith(p) for p in ("glm-", "llama", "mistral", "qwen")):
-        return await _acomplete_ollama(system_prompt, user_prompt, max_tokens, temperature, model=model)
+        return await _acomplete_ollama(system_prompt, user_prompt, max_tokens, temperature, model=model, json_response=json_response)
     else:
-        return await _acomplete_openai(system_prompt, user_prompt, max_tokens, temperature, model=model)
+        return await _acomplete_openai(system_prompt, user_prompt, max_tokens, temperature, model=model, json_response=json_response)
 
 
 async def _acomplete_anthropic(
@@ -335,6 +340,7 @@ async def _acomplete_openai(
     max_tokens: int,
     temperature: float,
     model: Optional[str] = None,
+    json_response: bool = False,
 ) -> str:
     """Async call to OpenAI API."""
     api_key = os.getenv("OPENAI_API_KEY", "")
@@ -350,7 +356,7 @@ async def _acomplete_openai(
         _uses_completion_tokens = any(resolved_model.startswith(p) for p in ("o1", "o3", "gpt-5"))
 
         if _uses_completion_tokens:
-            # o1 / o3 / gpt-5: temperature parameter is not supported (only default=1 allowed)
+            # o1 / o3 / gpt-5: temperature not supported; response_format not supported
             response = await client.chat.completions.create(
                 model=resolved_model,
                 max_completion_tokens=max_tokens,
@@ -360,6 +366,9 @@ async def _acomplete_openai(
                 ],
             )
         else:
+            kwargs = {}
+            if json_response:
+                kwargs["response_format"] = {"type": "json_object"}
             response = await client.chat.completions.create(
                 model=resolved_model,
                 max_tokens=max_tokens,
@@ -368,6 +377,7 @@ async def _acomplete_openai(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
+                **kwargs,
             )
 
         return response.choices[0].message.content.strip()
@@ -386,6 +396,7 @@ async def _acomplete_ollama(
     max_tokens: int,
     temperature: float,
     model: Optional[str] = None,
+    json_response: bool = False,
 ) -> str:
     """Async call to Ollama /api/chat endpoint."""
     if not OLLAMA_URL:
@@ -394,18 +405,22 @@ async def _acomplete_ollama(
     import httpx
     resolved_model = model or _get_model()
 
+    body: dict = {
+        "model": resolved_model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "options": _ollama_options(resolved_model, max_tokens, temperature),
+    }
+    if json_response:
+        body["format"] = "json"
+
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": resolved_model,
-                "stream": False,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "options": _ollama_options(resolved_model, max_tokens, temperature),
-            },
+            json=body,
             headers=_ollama_headers(),
         )
     resp.raise_for_status()
