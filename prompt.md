@@ -1,383 +1,486 @@
-# NEXUS — Add Meeting Notes, Topic-Grouped Details, and Action Items to Narrative Report
+# NEXUS — Cross-Modal Contradiction Analysis in Narrative Report
 
-## What Fireflies Produces (the target pattern)
+## Problem
 
+The narrative LLM receives voice stress peaks ("432s — stress=0.78") but NOT
+what was being said at that timestamp. It receives language summaries but NOT
+the voice signals at the moments of contradictory statements. Two rich data
+streams exist side by side but are never cross-referenced at the statement level.
+
+## What to Build
+
+Two cross-referencing analyses that work for ALL content types:
+
+### Analysis 1: Text Contradictions + Voice Evidence
+
+Find moments where the same speaker said contradictory things at different
+timestamps. For each contradiction pair, show the voice/video signals at
+BOTH timestamps. This reveals whether the speaker was stressed during the
+revision (possible deception/discomfort) or calm (likely a genuine update).
+
+```json
+"contradiction_analysis": [
+  {
+    "speaker": "Speaker_0",
+    "statement_a": {
+      "text": "I was home all night",
+      "timestamp": "2:30",
+      "voice_stress": 0.22,
+      "facial_stress": 0.18,
+      "speech_rate_vs_baseline": "+5%"
+    },
+    "statement_b": {
+      "text": "I might have gone out around 10",
+      "timestamp": "18:45",
+      "voice_stress": 0.71,
+      "facial_stress": 0.65,
+      "speech_rate_vs_baseline": "-35%"
+    },
+    "contradiction_type": "factual_reversal",
+    "voice_delta": "Voice stress increased 3.2× between statements. Speech rate dropped 35%. Pitch elevated at revision.",
+    "significance": "The speaker revised their account of nighttime whereabouts with elevated stress markers at the revision point, suggesting the revision was a significant cognitive event."
+  }
+]
 ```
-GENERAL SUMMARY
-• 5-7 bullet points — one per key theme/decision/outcome
-• No paragraphs — scannable bullets only
 
-NOTES (grouped by topic)
-  Topic Heading 1
-  Brief description of this topic area.
-    • Speaker-attributed detail with timestamp (01:54)
-      • Supporting sub-detail
-      • Supporting sub-detail
-    • Another speaker-attributed detail (08:56)
-      • Sub-detail
-  
-  Topic Heading 2
-  Brief description.
-    • Detail (14:22)
-      • Sub-detail
+### Analysis 2: Voice Anomalies + Transcript Context
 
-ACTION ITEMS (grouped by person)
-  Person Name
-    • Task description (timestamp)
-    • Task description (timestamp)
-  
-  Another Person
-    • Task description (timestamp)
+For each voice anomaly (stress peak, pitch spike, speech rate change, hesitation
+cluster), show exactly what was being said at that moment. This gives the user
+immediate context — they see the signal AND the words together.
+
+```json
+"voice_text_correlations": [
+  {
+    "timestamp": "8:30",
+    "speaker": "Speaker_0",
+    "anomaly_type": "stress_peak",
+    "anomaly_value": "stress=0.78 (baseline=0.25)",
+    "transcript_text": "The pricing is... um... competitive for what you're getting",
+    "additional_signals": {
+      "speech_rate": "-35% from baseline",
+      "fillers": "1 (um)",
+      "facial_stress": 0.72
+    },
+    "context": "Stress peak occurred during pricing discussion — speaker showed multi-channel stress (voice + face + speech rate) while discussing price competitiveness"
+  }
+]
 ```
-
-**Three layers: Summary (what happened) → Notes (what was discussed, by topic) → Action Items (what to do next, by person).**
-
-This structure works for ALL meeting types — not just sales calls. It works for:
-- Sales: topics = pricing, demo, objections. Actions = send proposal, schedule follow-up.
-- Interviews: topics = intro, technical questions, cultural fit. Actions = send feedback, schedule next round.
-- Internal meetings: topics = status updates, blockers, decisions. Actions = assigned tasks.
-- Client meetings: topics = project review, concerns, next steps. Actions = deliverables.
-- Interrogation: topics = background questions, evidence presentation, denial phase. Actions = review contamination, check procedure compliance.
 
 ## CRITICAL INSTRUCTIONS
 
 **Before writing ANY code:**
 
 1. Read `services/fusion_agent/narrative.py` — COMPLETELY:
-   - `_build_context()` — check what's in `entities["topics"]`, `entities["commitments"]`,
-     `entities["objections"]`, `entities["people"]`, transcript segments
-   - `_build_prompt()` — the JSON schema the LLM is asked to produce
-   - `_parse_narrative_response()` — what fields it extracts
-   - `_fallback_narrative()` — the non-LLM path
+   - `_build_context()` — what it currently receives and builds
+   - `generate_session_narrative()` — what parameters are passed
+   - `_build_prompt()` — the JSON schema
+   - `_fallback_narrative()` — how it uses transcript_segments
 
-2. Read `services/language_agent/entity_extractor.py`:
-   - The `topics` array output — each topic has `name`, `start_ms`, `end_ms`, optional `summary`
-   - The `commitments` array — each has `speaker`, `text`, `start_ms`/`timestamp_ms`
-   - The `objections` array — each has `speaker`, `text`, `start_ms`, `resolved`
+2. Read `services/fusion_agent/fusion_service.py`:
+   - What data is available when narrative is called
+   - `voice_summary` structure — stress_peaks with timestamps
+   - `fusion_signals` — all cross-modal signals with timestamps
 
-3. Read whatever frontend component renders the report (SessionDetail.tsx or equivalent)
-   to understand how the new fields will be displayed.
+3. Think about the problem:
+   - The LLM needs BOTH transcript text AND voice signals at the same timestamps
+   - Full transcript can be 50K+ tokens — can't dump it all into context
+   - Need to be SELECTIVE: only include segments at anomaly timestamps + contradiction candidates
+   - The fallback path needs to work without an LLM
 
 4. Use proper OOP and DSA:
-   - **HashMap**: group transcript segments by topic interval using bisect for O(log T) per segment
-   - **Template Method**: topic-grouped notes follow same structure regardless of content type
-   - The LLM already receives the full transcript in context — it just needs to be told
-     to organize its output by topic
-
-5. Content-type isolation: The general_summary, notes, and action_items sections
-   appear for ALL content types. They are NOT type-specific. The content within
-   them naturally adapts because the LLM's type_instructions guide the focus.
+   - **bisect**: O(log N) lookup of transcript segment at a given timestamp
+   - **HashMap**: group segments by speaker for contradiction detection
+   - **TF-IDF cosine** or **Jaccard**: find same-topic segment pairs from same speaker
+   - **Negation detection**: regex for "not", "never", "didn't", "no" flips between pairs
 
 ---
 
-## Change 1: Add Three New Fields to JSON Schema
+## Change 1: Add Transcript Segments to _build_context()
+
+**File:** `services/fusion_agent/narrative.py` — `_build_context()`
+
+Currently `_build_context()` does NOT receive `transcript_segments`. Add it
+as a parameter and build two new context sections:
+
+### 1a. Add `transcript_segments` parameter
+
+```python
+def _build_context(
+    session_id, duration_seconds, speakers,
+    voice_summary, language_summary, fusion_signals,
+    unified_states,
+    entities=None, graph_analytics=None,
+    conversation_summary=None, video_summary=None,
+    transcript_segments=None,            # ← ADD
+) -> str:
+```
+
+Update the call site in `generate_session_narrative()` to pass transcript_segments.
+
+### 1b. Voice Anomaly + Transcript Cross-Reference Section
+
+For each stress peak, pitch elevation, and speech rate anomaly in voice_summary,
+find the transcript segment at that timestamp and include the text.
+
+```python
+    # ── Voice Anomalies with Transcript Context ────────────────────────
+    segs = transcript_segments or []
+    if segs and peaks:
+        lines.append("\n=== VOICE ANOMALIES WITH TRANSCRIPT CONTEXT ===")
+        lines.append("(What was being said at each voice anomaly moment)")
+
+        # Build sorted timestamp index for O(log N) segment lookup
+        import bisect
+        seg_starts = [s.get("start_ms", 0) for s in segs]
+
+        for p in peaks[:10]:  # top 10 stress peaks
+            time_ms = p.get("time_ms", 0)
+            speaker = p.get("speaker", "?")
+            stress = p.get("stress_score", 0)
+
+            # Find transcript segment at this timestamp
+            idx = bisect.bisect_right(seg_starts, time_ms) - 1
+            if 0 <= idx < len(segs):
+                seg = segs[idx]
+                seg_end = seg.get("end_ms", seg.get("start_ms", 0) + 2000)
+                # Only use if segment is within ±3 seconds of the anomaly
+                if abs(seg.get("start_ms", 0) - time_ms) < 5000:
+                    text = seg.get("text", "").strip()
+                    if text:
+                        time_s = time_ms / 1000
+                        m, s = divmod(int(time_s), 60)
+                        lines.append(
+                            f"\n  {m}:{s:02d} — {_display(speaker, name_map)}: "
+                            f"stress={stress:.3f}"
+                        )
+                        lines.append(f"    Said: \"{text[:200]}\"")
+```
+
+### 1c. Statement Pairs for Contradiction Detection
+
+For each speaker, find transcript segments that share topic words but express
+different claims. Include both segments in the context so the LLM can assess.
+
+```python
+    # ── Potential Contradictions (same speaker, different claims) ────────
+    if segs and len(segs) > 10:
+        lines.append("\n=== POTENTIAL STATEMENT CONTRADICTIONS ===")
+        lines.append("(Same speaker, similar topic, different content — for LLM to evaluate)")
+
+        from collections import defaultdict
+        import re
+
+        # Group segments by speaker
+        by_speaker: dict[str, list[dict]] = defaultdict(list)
+        for seg in segs:
+            spk = seg.get("speaker", "")
+            text = seg.get("text", "").strip()
+            if spk and len(text) > 30:
+                by_speaker[spk].append(seg)
+
+        # Content word extraction (reuse _extract_content_words pattern)
+        def _content_words(text: str) -> set[str]:
+            return {w.lower() for w in re.findall(r"\b[a-zA-Z]{5,}\b", text.lower())}
+            # Note: use the validated stopword list if available
+
+        for spk, spk_segs in by_speaker.items():
+            if len(spk_segs) < 5:
+                continue
+
+            pairs_found = 0
+            for i, seg_a in enumerate(spk_segs):
+                if pairs_found >= 3:  # max 3 contradiction candidates per speaker
+                    break
+                words_a = _content_words(seg_a["text"])
+                if len(words_a) < 3:
+                    continue
+
+                for seg_b in spk_segs[i+5:]:  # at least 5 segments apart (~10s)
+                    words_b = _content_words(seg_b["text"])
+                    shared = words_a & words_b
+                    if len(shared) < 2:
+                        continue
+
+                    # Check for negation flip
+                    neg_a = bool(re.search(r"\b(not|never|didn't|don't|wasn't|weren't|no|none)\b",
+                                           seg_a["text"], re.I))
+                    neg_b = bool(re.search(r"\b(not|never|didn't|don't|wasn't|weren't|no|none)\b",
+                                           seg_b["text"], re.I))
+
+                    if neg_a != neg_b or len(shared) >= 4:
+                        time_a = seg_a.get("start_ms", 0) // 1000
+                        time_b = seg_b.get("start_ms", 0) // 1000
+                        ma, sa = divmod(time_a, 60)
+                        mb, sb = divmod(time_b, 60)
+
+                        # Lookup voice stress at both timestamps
+                        stress_a = _stress_at(time_a * 1000, voice_summary)
+                        stress_b = _stress_at(time_b * 1000, voice_summary)
+
+                        lines.append(
+                            f"\n  {_display(spk, name_map)} — potential contradiction:"
+                        )
+                        lines.append(
+                            f"    A ({ma}:{sa:02d}): \"{seg_a['text'][:150]}\" "
+                            f"[stress={stress_a:.2f}]"
+                        )
+                        lines.append(
+                            f"    B ({mb}:{sb:02d}): \"{seg_b['text'][:150]}\" "
+                            f"[stress={stress_b:.2f}]"
+                        )
+                        lines.append(f"    Shared topic words: {', '.join(sorted(shared)[:5])}")
+                        if neg_a != neg_b:
+                            lines.append(f"    ⚡ Negation flip detected")
+
+                        pairs_found += 1
+                        break  # next seg_a
+```
+
+Helper function to lookup stress at a timestamp:
+
+```python
+def _stress_at(timestamp_ms: int, voice_summary: dict) -> float:
+    """Find the closest stress peak within ±5 seconds of a timestamp."""
+    peaks = voice_summary.get("stress_peaks", [])
+    closest = 0.0
+    closest_dist = float("inf")
+    for p in peaks:
+        dist = abs(p.get("time_ms", 0) - timestamp_ms)
+        if dist < 5000 and dist < closest_dist:
+            closest = p.get("stress_score", 0)
+            closest_dist = dist
+    # If no stress peak nearby, check per-speaker average
+    if closest == 0.0:
+        for spk_data in voice_summary.get("per_speaker", {}).values():
+            closest = spk_data.get("avg_stress", 0)
+            break
+    return closest
+```
+
+---
+
+## Change 2: Add to JSON Schema
 
 **File:** `services/fusion_agent/narrative.py` — `_build_prompt()`
 
-Add to the JSON schema between `executive_summary` and `key_facts`:
-
-```json
-  "general_summary": [
-    "Key theme or outcome as a single bullet point",
-    "Another key theme — one per major topic discussed",
-    "Decision or agreement reached",
-    "Timeline or deadline established",
-    "Technical/operational update if relevant"
-  ],
-
-  "notes": [
-    {
-      "topic": "Topic or Phase Name",
-      "summary": "One sentence describing what was discussed in this topic area",
-      "details": [
-        {
-          "speaker": "Person Name or Speaker_0",
-          "text": "What they said or contributed — paraphrased or key quote",
-          "timestamp": "MM:SS",
-          "sub_details": [
-            "Supporting point or context",
-            "Another supporting detail"
-          ]
-        }
-      ]
-    }
-  ],
-
-  "action_items": [
-    {
-      "assignee": "Person Name or Speaker_0",
-      "task": "Specific task or commitment",
-      "deadline": "By Friday afternoon" or null,
-      "timestamp": "MM:SS",
-      "context": "Brief reason or origin of this action"
-    }
-  ],
-```
-
-**Add to the system prompt instruction:**
-
-```
-"STRUCTURE REQUIREMENTS:
-1. general_summary: 5-7 bullet points covering the key themes, decisions, and outcomes.
-   Each bullet is one standalone sentence. No paragraphs. Scannable.
-2. notes: Group discussion details by TOPIC or PHASE. Use the conversation phases/topics
-   from the context data. Under each topic, list speaker-attributed details with timestamps.
-   Each detail can have sub_details for supporting points. This is the detailed record of
-   what was discussed — the most comprehensive section.
-3. action_items: List every commitment, task, or follow-up mentioned. Group by assignee
-   (the person responsible). Include deadline if mentioned, timestamp of when it was agreed,
-   and brief context. Extract from both explicit commitments ('I will send the report')
-   and implicit ones ('We should schedule a follow-up' — assign to whoever said it).
-"
-```
-
-**The notes section should map to the `topics` array from entity extraction.** Add this to the context:
+Add two new fields to the JSON schema:
 
 ```python
-# In _build_context(), after the ENTITIES section:
-if topics:
-    lines.append("\nCONVERSATION PHASES (use these as 'topic' headings in the 'notes' output):")
-    for t in topics:
-        s_m, s_s = divmod(t.get("start_ms", 0) // 1000, 60)
-        e_m, e_s = divmod(t.get("end_ms", 0) // 1000, 60)
-        lines.append(f"  {t.get('name', 'Unknown')} ({s_m}:{s_s:02d}–{e_m}:{e_s:02d})")
-        if t.get("summary"):
-            lines.append(f"    {t['summary']}")
+    '"contradiction_analysis": ['
+    '  {'
+    '    "speaker": "Speaker name",'
+    '    "statement_a": {"text": "What they said first", "timestamp": "MM:SS", "voice_stress": 0.22},'
+    '    "statement_b": {"text": "What they said later that contradicts", "timestamp": "MM:SS", "voice_stress": 0.71},'
+    '    "contradiction_type": "factual_reversal | number_change | negation_flip | narrative_shift",'
+    '    "voice_delta": "How voice/face signals changed between the two statements",'
+    '    "significance": "Why this matters — what does the combination of text change + voice change tell us"'
+    '  }'
+    '],'
+    '"voice_text_correlations": ['
+    '  {'
+    '    "timestamp": "MM:SS",'
+    '    "speaker": "Speaker name",'
+    '    "anomaly_type": "stress_peak | pitch_elevation | speech_rate_drop | hesitation_cluster",'
+    '    "anomaly_value": "stress=0.78 (baseline=0.25)",'
+    '    "transcript_text": "What was being said at this moment",'
+    '    "additional_signals": "Other voice/face/body signals active at this timestamp",'
+    '    "context": "Why this moment matters — what topic was being discussed"'
+    '  }'
+    '],'
+```
+
+Add to the structure requirements instruction:
+
+```python
+    "CONTRADICTION ANALYSIS: Review the POTENTIAL STATEMENT CONTRADICTIONS in the context. "
+    "For each genuine contradiction (not just topic revisiting), include both statements, "
+    "their timestamps, the voice stress at each moment, and what the voice delta tells us. "
+    "Contradiction types: factual_reversal (opposite claims), number_change (different figures), "
+    "negation_flip (denied then admitted or vice versa), narrative_shift (story changed). "
+    "VOICE-TEXT CORRELATIONS: For each voice anomaly in the context that has transcript text, "
+    "include the anomaly details + what was being said. Focus on the top 5 most significant "
+    "moments where voice and text together tell a richer story than either alone. "
+    "IMPORTANT: Not every statement revision is a contradiction. People update estimates, "
+    "add details, and refine positions naturally. Only flag genuinely contradictory statements "
+    "where the later version is incompatible with the earlier one. "
 ```
 
 ---
 
-## Change 2: Update _parse_narrative_response()
+## Change 3: _parse_narrative_response
+
+Add the two new fields:
 
 ```python
-return {
-    # ... existing fields ...
-    "general_summary": parsed.get("general_summary", []),
-    "notes": parsed.get("notes", []),
-    "action_items": parsed.get("action_items", []),
-    # ... rest of existing fields ...
-}
-```
-
-And in the JSON fallback block:
-```python
-"general_summary": [],
-"notes": [],
-"action_items": [],
+    "contradiction_analysis": parsed.get("contradiction_analysis", []),
+    "voice_text_correlations": parsed.get("voice_text_correlations", []),
 ```
 
 ---
 
-## Change 3: Update _fallback_narrative()
+## Change 4: _fallback_narrative (non-LLM path)
 
-Build `general_summary` from existing insights:
-```python
-general_summary = []
-# From entities
-if entities.get("commitments"):
-    general_summary.append(
-        f"{len(entities['commitments'])} commitment(s) made during the session."
-    )
-if entities.get("objections"):
-    resolved = sum(1 for o in entities["objections"] if o.get("resolved"))
-    total = len(entities["objections"])
-    general_summary.append(
-        f"{total} objection(s) raised, {resolved} resolved."
-    )
-# From voice summary
-for spk, data in voice_summary.get("per_speaker", {}).items():
-    if data.get("max_stress", 0) > 0.60:
-        general_summary.append(
-            f"{spk} showed elevated stress during the session."
-        )
-# From language summary
-for spk, data in language_summary.get("per_speaker", {}).items():
-    if data.get("buying_signal_count", 0) > 2:
-        general_summary.append(
-            f"{spk} showed {data['buying_signal_count']} buying signals."
-        )
-if not general_summary:
-    general_summary.append(f"Session with {len(speakers)} speaker(s) completed.")
-```
+Build contradiction_analysis from the pre-computed contradiction candidates:
 
-Build `notes` from topics + transcript segments:
 ```python
-notes = []
-for topic in entities.get("topics", []):
-    # Find transcript segments that fall within this topic's time range
-    topic_start = topic.get("start_ms", 0)
-    topic_end = topic.get("end_ms", 0)
-    topic_details = []
-    for seg in transcript_segments:  # need to pass these to _fallback
-        if seg.get("start_ms", 0) >= topic_start and seg.get("end_ms", 0) <= topic_end:
-            if len(seg.get("text", "")) > 30:  # skip very short segments
-                ts_s = seg["start_ms"] // 1000
-                m, s = divmod(ts_s, 60)
-                topic_details.append({
-                    "speaker": seg.get("speaker", ""),
-                    "text": seg["text"][:200],  # truncate for notes
-                    "timestamp": f"{m}:{s:02d}",
-                    "sub_details": [],
-                })
-    if topic_details:
-        notes.append({
-            "topic": topic.get("name", "Discussion"),
-            "summary": topic.get("summary", ""),
-            "details": topic_details[:10],  # cap at 10 per topic
-        })
-```
+    # ── Contradiction analysis (from transcript) ─────────────────────────
+    contradiction_analysis = []
+    segs = transcript_segments or []
+    if len(segs) > 10:
+        by_speaker = defaultdict(list)
+        for seg in segs:
+            spk = seg.get("speaker", "")
+            text = seg.get("text", "").strip()
+            if spk and len(text) > 30:
+                by_speaker[spk].append(seg)
 
-Build `action_items` from commitments:
-```python
-action_items = []
-for com in entities.get("commitments", []):
-    ts_s = com.get("timestamp_ms", com.get("start_ms", 0)) // 1000
-    m, s = divmod(ts_s, 60)
-    action_items.append({
-        "assignee": com.get("speaker", "Unknown"),
-        "task": com.get("text", ""),
-        "deadline": None,
-        "timestamp": f"{m}:{s:02d}",
-        "context": "",
-    })
-# Also extract implicit action items from objections marked unresolved
-for obj in entities.get("objections", []):
-    if not obj.get("resolved"):
-        ts_s = obj.get("timestamp_ms", obj.get("start_ms", 0)) // 1000
-        m, s = divmod(ts_s, 60)
-        action_items.append({
-            "assignee": "",  # unassigned — needs follow-up
-            "task": f"Follow up on unresolved objection: {obj.get('text', '')}",
-            "deadline": None,
-            "timestamp": f"{m}:{s:02d}",
-            "context": f"Raised by {obj.get('speaker', 'unknown')}",
-        })
+        for spk, spk_segs in by_speaker.items():
+            for i, seg_a in enumerate(spk_segs):
+                words_a = _content_words(seg_a["text"])
+                if len(words_a) < 3:
+                    continue
+                for seg_b in spk_segs[i+5:]:
+                    words_b = _content_words(seg_b["text"])
+                    shared = words_a & words_b
+                    if len(shared) < 2:
+                        continue
+                    neg_a = bool(re.search(r"\b(not|never|didn't|don't|no)\b", seg_a["text"], re.I))
+                    neg_b = bool(re.search(r"\b(not|never|didn't|don't|no)\b", seg_b["text"], re.I))
+                    if neg_a != neg_b:
+                        time_a = seg_a.get("start_ms", 0)
+                        time_b = seg_b.get("start_ms", 0)
+                        stress_a = _stress_at(time_a, voice_summary)
+                        stress_b = _stress_at(time_b, voice_summary)
+                        ma, sa = divmod(time_a // 1000, 60)
+                        mb, sb = divmod(time_b // 1000, 60)
+                        contradiction_analysis.append({
+                            "speaker": spk,
+                            "statement_a": {
+                                "text": seg_a["text"][:200],
+                                "timestamp": f"{ma}:{sa:02d}",
+                                "voice_stress": round(stress_a, 3),
+                            },
+                            "statement_b": {
+                                "text": seg_b["text"][:200],
+                                "timestamp": f"{mb}:{sb:02d}",
+                                "voice_stress": round(stress_b, 3),
+                            },
+                            "contradiction_type": "negation_flip",
+                            "voice_delta": (
+                                f"Stress {'increased' if stress_b > stress_a else 'decreased'} "
+                                f"from {stress_a:.2f} to {stress_b:.2f} between statements"
+                            ),
+                            "significance": (
+                                "Speaker's position reversed between these statements. "
+                                "Cross-reference voice stress change for context."
+                            ),
+                        })
+                        break
+                if len(contradiction_analysis) >= 5:
+                    break
+
+    # ── Voice-text correlations ──────────────────────────────────────────
+    voice_text_correlations = []
+    peaks = voice_summary.get("stress_peaks", [])
+    seg_starts = [s.get("start_ms", 0) for s in segs]
+    for p in peaks[:5]:
+        time_ms = p.get("time_ms", 0)
+        idx = bisect.bisect_right(seg_starts, time_ms) - 1
+        if 0 <= idx < len(segs):
+            seg = segs[idx]
+            if abs(seg.get("start_ms", 0) - time_ms) < 5000:
+                text = seg.get("text", "").strip()
+                if text:
+                    m, s_val = divmod(time_ms // 1000, 60)
+                    voice_text_correlations.append({
+                        "timestamp": f"{m}:{s_val:02d}",
+                        "speaker": p.get("speaker", ""),
+                        "anomaly_type": "stress_peak",
+                        "anomaly_value": f"stress={p.get('stress_score', 0):.3f}",
+                        "transcript_text": text[:200],
+                        "additional_signals": "",
+                        "context": f"Voice stress peaked during this statement",
+                    })
 ```
 
 ---
 
-## Change 4: Frontend Report Tab
+## Change 5: Frontend — Report Tab
 
-**File:** SessionDetail.tsx (or equivalent report rendering component)
-
-Add three new sections. They render for ALL content types (not type-gated):
-
-### General Summary (before executive_summary or replacing it)
+### Contradiction Analysis Section
 
 ```tsx
-{content?.general_summary && content.general_summary.length > 0 && (
-  <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
-    <h2 className="mb-3 text-sm font-semibold text-nexus-text-primary">
-      📋 Summary
-    </h2>
-    <ul className="space-y-1.5">
-      {content.general_summary.map((point, i) => (
-        <li key={i} className="flex items-start gap-2 text-sm text-nexus-text-primary">
-          <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-accent-blue" />
-          {point}
-        </li>
-      ))}
-    </ul>
-  </section>
-)}
-```
-
-### Notes (after key_facts, before speaker_analyses)
-
-```tsx
-{content?.notes && content.notes.length > 0 && (
-  <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
-    <h2 className="mb-4 text-sm font-semibold text-nexus-text-primary">
-      📝 Notes
-    </h2>
-    <div className="space-y-5">
-      {content.notes.map((topic, i) => (
-        <div key={i}>
-          <h3 className="text-sm font-semibold text-nexus-accent-purple mb-1">
-            {topic.topic}
-          </h3>
-          {topic.summary && (
-            <p className="text-xs text-nexus-text-muted mb-2 italic">{topic.summary}</p>
-          )}
-          <ul className="space-y-2 ml-2 border-l-2 border-nexus-border pl-3">
-            {topic.details.map((detail, j) => (
-              <li key={j} className="text-sm text-nexus-text-primary">
-                <div className="flex items-start gap-2">
-                  <span className="mt-0.5 text-nexus-accent-purple">→</span>
-                  <div>
-                    <span className="font-medium">{detail.speaker}</span>
-                    {detail.timestamp && (
-                      <span className="ml-1.5 text-[10px] text-nexus-text-muted">
-                        ({detail.timestamp})
-                      </span>
-                    )}
-                    <span className="ml-1">{detail.text}</span>
-                    {detail.sub_details?.length > 0 && (
-                      <ul className="mt-1 ml-3 space-y-0.5">
-                        {detail.sub_details.map((sub, k) => (
-                          <li key={k} className="text-xs text-nexus-text-secondary flex items-start gap-1.5">
-                            <span className="mt-1 h-1 w-1 shrink-0 rounded-full bg-nexus-text-muted" />
-                            {sub}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                </div>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ))}
-    </div>
-  </section>
-)}
-```
-
-### Action Items (after recommendations, or as the final section)
-
-```tsx
-{content?.action_items && content.action_items.length > 0 && (
-  <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
-    <h2 className="mb-4 text-sm font-semibold text-nexus-text-primary">
-      ✅ Action Items
+{content?.contradiction_analysis && content.contradiction_analysis.length > 0 && (
+  <section className="rounded-lg border border-amber-500/20 bg-nexus-surface p-5">
+    <h2 className="mb-4 flex items-center gap-2 text-sm font-semibold text-amber-400">
+      ⚡ Statement Contradictions
     </h2>
     <div className="space-y-4">
-      {/* Group by assignee */}
-      {Object.entries(
-        content.action_items.reduce((groups, item) => {
-          const key = item.assignee || "Unassigned";
-          (groups[key] = groups[key] || []).push(item);
-          return groups;
-        }, {})
-      ).map(([assignee, items]) => (
-        <div key={assignee}>
-          <h3 className="text-xs font-semibold text-nexus-text-primary mb-1.5 uppercase tracking-wide">
-            {assignee}
-          </h3>
-          <ul className="space-y-1.5 ml-2">
-            {items.map((item, i) => (
-              <li key={i} className="flex items-start gap-2 text-sm text-nexus-text-primary">
-                <span className="mt-0.5">•</span>
-                <div>
-                  {item.task}
-                  {item.deadline && (
-                    <span className="ml-1.5 text-xs text-amber-400 font-medium">
-                      — {item.deadline}
-                    </span>
-                  )}
-                  {item.timestamp && (
-                    <span className="ml-1.5 text-[10px] text-nexus-text-muted">
-                      ({item.timestamp})
-                    </span>
-                  )}
-                  {item.context && (
-                    <p className="text-xs text-nexus-text-muted mt-0.5">{item.context}</p>
-                  )}
-                </div>
-              </li>
-            ))}
-          </ul>
+      {content.contradiction_analysis.map((c, i) => (
+        <div key={i} className="rounded border border-nexus-border p-3">
+          <div className="text-xs font-medium text-nexus-text-muted mb-2">
+            {c.speaker} — {c.contradiction_type.replace("_", " ")}
+          </div>
+          <div className="grid grid-cols-2 gap-3 mb-2">
+            <div className="rounded bg-nexus-surface-hover p-2">
+              <div className="text-[10px] text-nexus-text-muted">{c.statement_a.timestamp}</div>
+              <div className="text-sm">&ldquo;{c.statement_a.text}&rdquo;</div>
+              <div className="mt-1 text-[10px]">
+                voice stress: <span className={c.statement_a.voice_stress > 0.5 ? "text-red-400" : "text-green-400"}>
+                  {c.statement_a.voice_stress?.toFixed(2)}
+                </span>
+              </div>
+            </div>
+            <div className="rounded bg-nexus-surface-hover p-2">
+              <div className="text-[10px] text-nexus-text-muted">{c.statement_b.timestamp}</div>
+              <div className="text-sm">&ldquo;{c.statement_b.text}&rdquo;</div>
+              <div className="mt-1 text-[10px]">
+                voice stress: <span className={c.statement_b.voice_stress > 0.5 ? "text-red-400" : "text-green-400"}>
+                  {c.statement_b.voice_stress?.toFixed(2)}
+                </span>
+              </div>
+            </div>
+          </div>
+          {c.voice_delta && (
+            <div className="text-xs text-nexus-accent-purple italic">{c.voice_delta}</div>
+          )}
+          {c.significance && (
+            <div className="mt-1 text-xs text-nexus-text-secondary">{c.significance}</div>
+          )}
+        </div>
+      ))}
+    </div>
+  </section>
+)}
+```
+
+### Voice-Text Correlations Section
+
+```tsx
+{content?.voice_text_correlations && content.voice_text_correlations.length > 0 && (
+  <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
+    <h2 className="mb-4 flex items-center gap-2 text-sm font-semibold text-nexus-accent-purple">
+      🎙️ Voice Anomalies — What Was Being Said
+    </h2>
+    <div className="space-y-3">
+      {content.voice_text_correlations.map((v, i) => (
+        <div key={i} className="flex items-start gap-3 rounded border-l-2 border-nexus-accent-purple p-2 bg-nexus-surface-hover">
+          <div className="shrink-0 text-center">
+            <div className="text-xs font-mono text-nexus-text-muted">{v.timestamp}</div>
+            <div className="text-[10px] text-red-400">{v.anomaly_value}</div>
+          </div>
+          <div className="flex-1">
+            <div className="text-xs font-medium text-nexus-text-muted mb-0.5">
+              {v.speaker} — {v.anomaly_type.replace("_", " ")}
+            </div>
+            <div className="text-sm text-nexus-text-primary">
+              &ldquo;{v.transcript_text}&rdquo;
+            </div>
+            {v.context && (
+              <div className="mt-1 text-xs text-nexus-text-secondary italic">{v.context}</div>
+            )}
+          </div>
         </div>
       ))}
     </div>
@@ -387,34 +490,39 @@ Add three new sections. They render for ALL content types (not type-gated):
 
 ---
 
-## Complete Report Section Order
+## Updated Report Section Order
 
 ```
-1. General Summary (NEW — bullet points, scannable)
-2. Executive Summary (existing — 3-5 sentence paragraph for context)
-3. Key Facts & Commitments (existing — timestamped facts)
-4. Notes (NEW — topic-grouped discussion details)
-5. Risk Assessment (interrogation only)
-6. Speaker Analyses (existing — per-person behavioral profiles)
-7. Key Moments (existing — timestamped events)
-8. Cross-Modal Insights (existing — incongruence alerts)
-9. Recommendations (existing — prioritized actions)
-10. Action Items (NEW — assigned tasks with deadlines)
+1. General Summary
+2. Executive Summary
+3. Key Facts & Commitments
+4. Notes (topic-grouped)
+5. Statement Contradictions (NEW)
+6. Voice Anomalies — What Was Being Said (NEW)
+7. Risk Assessment (interrogation only)
+8. Speaker Analyses
+9. Key Moments
+10. Cross-Modal Insights
+11. Recommendations
+12. Action Items
 ```
 
-**General Summary goes FIRST** because users scan for "what happened" before reading details.
-**Action Items goes LAST** because users check tasks after understanding context.
-**Notes goes MIDDLE** because it's the detailed record — only read when drilling in.
+Contradictions and voice-text correlations go AFTER notes (the detailed record)
+and BEFORE speaker analyses (the synthesis). They bridge raw data and interpretation.
 
 ---
 
-## Backward Compatibility
+## Content-Type Applicability
 
-- Old reports without `general_summary`, `notes`, `action_items` → fields are `[]` → sections don't render
-- Frontend checks `content?.notes && content.notes.length > 0` before rendering
-- LLM may produce empty arrays if the meeting is too short for topic grouping — that's fine
-- `_fallback_narrative` produces these fields from entity data when LLM is unavailable
-- No existing fields are removed or renamed
+Both sections work for ALL content types:
+
+| Content Type | Contradiction Example | Voice-Text Example |
+|-------------|----------------------|-------------------|
+| Sales | "We can deliver in 4 weeks" → "Timeline is 6-8 weeks" | Stress peak during pricing discussion |
+| Interview | "I have 5 years of Java experience" → "I mostly did Python" | Hesitation cluster during technical question |
+| Interrogation | "I was home" → "I might have gone out" | Stress spike after evidence disclosure |
+| Client meeting | "Budget is approved" → "We need to get approval" | Speech rate drop during commitment discussion |
+| Internal | "Project is on track" → "We're behind on the deliverable" | Pitch elevation during status update |
 
 ---
 
@@ -422,13 +530,11 @@ Add three new sections. They render for ALL content types (not type-gated):
 
 ### Backend (1):
 1. **services/fusion_agent/narrative.py**:
-   - `_build_prompt()` — add 3 new fields to JSON schema + structure instructions (~30 lines)
-   - `_build_context()` — add topic phase listing for LLM (~10 lines)
-   - `_parse_narrative_response()` — parse 3 new fields (~5 lines)
-   - `_fallback_narrative()` — build general_summary, notes, action_items from entities (~60 lines)
+   - `_build_context()` — add transcript_segments parameter, voice anomaly + transcript section (~40 lines), contradiction candidate section (~50 lines), `_stress_at()` helper (~12 lines)
+   - `generate_session_narrative()` — pass transcript_segments to _build_context (~1 line)
+   - `_build_prompt()` — add 2 new fields to JSON schema + structure instructions (~20 lines)
+   - `_parse_narrative_response()` — parse 2 new fields (~2 lines)
+   - `_fallback_narrative()` — build contradiction_analysis + voice_text_correlations (~60 lines)
 
 ### Frontend (1):
-2. **SessionDetail.tsx** (or equivalent):
-   - General Summary section (~15 lines)
-   - Notes section with topic grouping (~35 lines)
-   - Action Items section with assignee grouping (~30 lines)
+2. **SessionDetail.tsx** — Statement Contradictions section (~30 lines) + Voice-Text Correlations section (~25 lines)
