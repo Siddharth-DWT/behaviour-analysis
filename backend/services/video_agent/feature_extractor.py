@@ -40,7 +40,7 @@ logger = logging.getLogger("nexus.video.features")
 # ─── Processing constants ──────────────────────────────────────────────────
 TARGET_FPS: int = 5
 WINDOW_MS: int = 2000
-MIN_LIP_SYNC_LINK_SCORE: float = 0.02
+MIN_LIP_SYNC_LINK_SCORE: float = 0.10
 ACTIVE_TILE_MIN_AREA:   float = 0.08   # face_box_area above this → dominant/active-speaker tile
 
 # Blink detection (Soukupova & Cech 2016)
@@ -4160,6 +4160,8 @@ class VideoFeatureExtractor:
                             track_face_heights=track_face_heights,
                             track_centroids=track_centroids,
                             pose_quality=track_pose_quality,
+                            track_first_ms=_track_first_ms,
+                            track_last_ms=_track_last_ms,
                         )
                         if _cut_timestamps:
                             canonical = self._cross_shot_merge(
@@ -4764,8 +4766,13 @@ class VideoFeatureExtractor:
                 best_dist = d
                 best_zone = zone_name
 
-        touch_threshold = max(face_w * 0.45, face_h * 0.35, 0.04)
+        touch_threshold = max(face_w * 0.30, face_h * 0.25, 0.03)
         if best_dist > touch_threshold:
+            return ""
+        # Nose sits at the face centre — it is the default nearest zone for any hand
+        # gesture passing across mid-face. Require the fingertip to be within a tighter
+        # radius (20% face_w) to distinguish an actual nose touch from a passing gesture.
+        if best_zone == "nose" and best_dist > max(face_w * 0.20, face_h * 0.15, 0.025):
             return ""
 
         # Merge left/right variants
@@ -5254,6 +5261,8 @@ class VideoFeatureExtractor:
         track_face_heights: dict[int, float] | None = None,
         track_centroids: dict[int, tuple[float, float]] | None = None,
         pose_quality: dict[int, float] | None = None,
+        track_first_ms: dict[int, float] | None = None,
+        track_last_ms: dict[int, float] | None = None,
     ) -> dict[int, int]:
         """
         Merge CentroidTracker track_ids that belong to the same physical person.
@@ -5373,6 +5382,23 @@ class VideoFeatureExtractor:
                 )
 
             for canon_tid, sim in scores.items():
+                # Temporal overlap handling:
+                # Hard reject was replaced with a raised threshold because a hard
+                # reject cannot distinguish jitter (same person, head turn, ~400ms
+                # overlap) from genuine co-presence (different people, tile switch).
+                # Instead: any overlap → demand 0.75 ArcFace similarity.
+                #   Same person jitter:   sim ~0.80-0.95 → passes 0.75 → merges ✓
+                #   Different person:     sim ~0.40-0.60 → blocked by 0.75    ✓
+                # Non-overlapping tracks use _effective_thresh normally.
+                if track_first_ms and track_last_ms:
+                    a_first = track_first_ms.get(tid, 0)
+                    a_last  = track_last_ms.get(tid, float("inf"))
+                    b_first = track_first_ms.get(canon_tid, 0)
+                    b_last  = track_last_ms.get(canon_tid, float("inf"))
+                    if a_first < b_last and b_first < a_last:
+                        if sim < 0.75:
+                            continue  # overlapping + low sim → different people
+                        # overlapping + high sim (≥0.75) → jitter, same person
                 eff = _effective_thresh(tid, canon_tid, sim)
                 if sim > eff and sim > best_sim:
                     best_sim = sim
@@ -5799,6 +5825,14 @@ class IntervalSet:
             if seg.get("speaker") == speaker
         ])
 
+    @classmethod
+    def from_all_segments(cls, segments: list[dict]) -> "IntervalSet":
+        """Build from all diarization segments regardless of speaker."""
+        return cls([
+            (seg.get("start_ms", 0), seg.get("end_ms", 0))
+            for seg in segments
+        ])
+
 
 # SpeakerFaceMapper  — assigns windows to speakers
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5895,9 +5929,24 @@ class SpeakerFaceMapper:
         use_lip_sync = not use_asd and lip_activity_map is not None and multi_face and multi_speaker
 
         if use_asd:
+            # Faces missing from asd_scores (tiny face_area < 0.001, no crops buffered)
+            # fall back to lip-sync per-face rather than leaving them unscored.
+            asd_missing = [fi for fi in face_indices if fi not in (asd_scores or {})]
             face_to_speaker, assignment_scores = self._asd_assignment(
                 face_indices, speakers, diar_segments, asd_scores  # type: ignore[arg-type]
             )
+            if asd_missing and lip_activity_map and multi_speaker:
+                lip_ft, lip_scores = self._lip_sync_assignment(
+                    asd_missing, speakers, diar_segments, lip_activity_map
+                )
+                for fi in asd_missing:
+                    if fi not in face_to_speaker or not face_to_speaker[fi].startswith("Speaker_"):
+                        face_to_speaker[fi]    = lip_ft.get(fi, f"Face_{fi}")
+                        assignment_scores[fi]  = lip_scores.get(fi, 0.0)
+                logger.debug(
+                    "ASD partial fallback: lip-sync used for %d face(s) missing crops: %s",
+                    len(asd_missing), asd_missing,
+                )
             method = "asd"
             confident_face_to_speaker: dict[int, str] = {
                 fi: spk
@@ -6077,6 +6126,11 @@ class SpeakerFaceMapper:
             spk: IntervalSet.from_segments(diar_segments, spk)
             for spk in speakers
         }
+        # Silence baseline uses only frames where NO speaker is active.
+        # Skipping frames where other speakers are talking removes baseline
+        # contamination from listener reactions (smiling, nodding) during
+        # multi-face grid meetings.
+        anyone_speaking_iset = IntervalSet.from_all_segments(diar_segments)
 
         scores: dict[tuple[int, str], float] = {}
 
@@ -6096,18 +6150,20 @@ class SpeakerFaceMapper:
                     if iset.contains(ts_ms):
                         speaking_sum += lip_score
                         speaking_n   += 1
-                    else:
+                    elif not anyone_speaking_iset.contains(ts_ms):
+                        # True silence — no speaker active; clean baseline
                         silence_sum += lip_score
                         silence_n   += 1
+                    # else: another speaker is active — skip to avoid contamination
 
                 avg_speaking = speaking_sum / max(speaking_n, 1)
                 avg_silence  = silence_sum  / max(silence_n,  1)
                 scores[(face_idx, speaker)] = avg_speaking - avg_silence
 
                 logger.debug(
-                    "lip_sync score  face=%d × %s: %.4f  (spk_avg=%.4f  sil_avg=%.4f)",
+                    "lip_sync score  face=%d × %s: %.4f  (spk_avg=%.4f n=%d  sil_avg=%.4f n=%d)",
                     face_idx, speaker,
-                    avg_speaking - avg_silence, avg_speaking, avg_silence,
+                    avg_speaking - avg_silence, avg_speaking, speaking_n, avg_silence, silence_n,
                 )
 
         return self._hungarian_assign(face_indices, speakers, scores)

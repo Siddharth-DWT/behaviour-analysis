@@ -830,7 +830,7 @@ export default function UploadPage() {
     }
 
     // ── Full path: create session + background pipeline ──
-    const CHUNKED_THRESHOLD = 50 * 1024 * 1024; // 50 MB
+    const CHUNKED_THRESHOLD = 10 * 1024 * 1024; // 10 MB — show progress for all meaningful files
     try {
       let sid: string;
       if (file.size > CHUNKED_THRESHOLD) {

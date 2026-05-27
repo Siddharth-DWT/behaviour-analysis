@@ -118,6 +118,7 @@ class FusionAnalyseRequest(BaseModel):
     voice_summary: Optional[dict] = None
     language_summary: Optional[dict] = None
     video_summary: Optional[dict] = None
+    transcript_segments: Optional[list[dict]] = None
 
 
 class FusionSessionAnalyseRequest(BaseModel):

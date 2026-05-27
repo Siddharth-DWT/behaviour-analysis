@@ -51,6 +51,7 @@ async def generate_session_narrative(
     graph_analytics: Optional[dict] = None,
     conversation_summary: Optional[dict] = None,
     video_summary: Optional[dict] = None,
+    transcript_segments: Optional[list[dict]] = None,
 ) -> Optional[dict]:
     """
     Generate a structured narrative report for the session using the LLM.
@@ -84,7 +85,10 @@ async def generate_session_narrative(
     llm_complete = _get_llm_complete()
     if llm_complete is None:
         return _fallback_narrative(
-            speakers, voice_summary, language_summary, fusion_signals, entities
+            speakers, voice_summary, language_summary, fusion_signals, entities,
+            transcript_segments=transcript_segments,
+            video_summary=video_summary,
+            conversation_summary=conversation_summary,
         )
 
     # ── Build the structured context for the LLM ──
@@ -113,7 +117,10 @@ async def generate_session_narrative(
     except Exception as e:
         logger.warning(f"LLM narrative generation failed: {e}")
         return _fallback_narrative(
-            speakers, voice_summary, language_summary, fusion_signals, entities
+            speakers, voice_summary, language_summary, fusion_signals, entities,
+            transcript_segments=transcript_segments,
+            video_summary=video_summary,
+            conversation_summary=conversation_summary,
         )
 
 
@@ -415,11 +422,13 @@ def _build_context(
 
         topics = entities.get("topics", [])
         if topics:
-            lines.append("CONVERSATION PHASES:")
+            lines.append("CONVERSATION PHASES (use these as 'topic' headings in the 'notes' output):")
             for t in topics:
-                s = t.get("start_ms", 0) // 1000
-                e = t.get("end_ms", 0) // 1000
-                lines.append(f"  {s}s-{e}s: {t.get('name', '?')}")
+                s_m, s_s = divmod(t.get("start_ms", 0) // 1000, 60)
+                e_m, e_s = divmod(t.get("end_ms", 0) // 1000, 60)
+                lines.append(f"  {t.get('name', 'Unknown')} ({s_m}:{s_s:02d}–{e_m}:{e_s:02d})")
+                if t.get("summary"):
+                    lines.append(f"    {t['summary']}")
 
         objections = entities.get("objections", [])
         if objections:
@@ -721,7 +730,18 @@ def _build_prompt(context: str, meeting_type: str) -> tuple[str, str]:
         "the executive summary, key moments, and cross-modal insights. Do not ignore body language "
         "or facial expression data even if voice/language data is richer. "
         "IMPORTANT: Always use real names (e.g. 'John', 'Sarah') instead of Speaker_X labels "
-        "wherever a name is available from the SPEAKER NAME MAP. Only use Speaker_X when no name is known."
+        "wherever a name is available from the SPEAKER NAME MAP. Only use Speaker_X when no name is known. "
+        "STRUCTURE REQUIREMENTS: "
+        "1. general_summary: 5-7 bullet points covering the key themes, decisions, and outcomes. "
+        "Each bullet is one standalone sentence. No paragraphs. Scannable. "
+        "2. notes: Group discussion details by TOPIC or PHASE. Use the CONVERSATION PHASES from the "
+        "context data as topic headings. Under each topic, list speaker-attributed details with timestamps. "
+        "Each detail can have sub_details for supporting points. This is the detailed record of what was "
+        "discussed — the most comprehensive section. "
+        "3. action_items: List every commitment, task, or follow-up mentioned. Group by assignee "
+        "(the person responsible). Include deadline if mentioned, timestamp of when it was agreed, "
+        "and brief context. Extract from both explicit commitments ('I will send the report') and "
+        "implicit ones ('We should schedule a follow-up' — assign to whoever said it)."
     )
 
     # ── Content-type isolation instructions ──────────────────────────────────
@@ -752,7 +772,43 @@ FOCUS: {focus}
 
 Respond with a JSON object containing these fields:
 {{
-  "executive_summary": "3-5 sentence overview emphasising the most important finding",
+  "general_summary": [
+    "Key theme or outcome as a single bullet point",
+    "Another key theme — one per major topic discussed",
+    "Decision or agreement reached",
+    "Timeline or deadline established",
+    "Technical or operational update if relevant"
+  ],
+
+  "notes": [
+    {{
+      "topic": "Topic or Phase Name",
+      "summary": "One sentence describing what was discussed in this topic area",
+      "details": [
+        {{
+          "speaker": "Person Name or Speaker_0",
+          "text": "What they said or contributed — paraphrased or key quote",
+          "timestamp": "MM:SS",
+          "sub_details": [
+            "Supporting point or context",
+            "Another supporting detail"
+          ]
+        }}
+      ]
+    }}
+  ],
+
+  "action_items": [
+    {{
+      "assignee": "Person Name or Speaker_0",
+      "task": "Specific task or commitment",
+      "deadline": "By Friday afternoon",
+      "timestamp": "MM:SS",
+      "context": "Brief reason or origin of this action"
+    }}
+  ],
+
+  "executive_summary": "Comprehensive 8-10 sentence narrative paragraph written as a professional behavioural analyst report. Cover ALL of the following in flowing prose (not bullet points): (1) the session purpose and overall outcome, (2) the most significant behavioural pattern per speaker — stress, hesitation, confidence, or engagement, (3) language dynamics — sentiment arc, persuasion attempts, objections, commitments, (4) cross-modal incongruences or alignments that reveal hidden state — especially where voice, face, body, or gaze DISAGREE, (5) emotional dynamics and rapport between participants, (6) any risks, concerns, or unresolved tensions. Be specific — name speakers, cite signal types, quote timestamps. Do not repeat bullet-point facts from general_summary; synthesise them into analytical prose.",
 
   "key_facts": [
     {{
@@ -819,6 +875,10 @@ def _parse_narrative_response(raw_text: str, speakers: list[str]) -> dict:
     try:
         parsed = json.loads(text)
         return {
+            # Meeting notes fields (all content types)
+            "general_summary": parsed.get("general_summary", []),
+            "notes": parsed.get("notes", []),
+            "action_items": parsed.get("action_items", []),
             # Base fields (all content types)
             "executive_summary": parsed.get("executive_summary", ""),
             "key_facts": parsed.get("key_facts", []),
@@ -837,6 +897,9 @@ def _parse_narrative_response(raw_text: str, speakers: list[str]) -> dict:
     except json.JSONDecodeError:
         logger.warning("Failed to parse LLM narrative as JSON, returning raw text")
         return {
+            "general_summary": [],
+            "notes": [],
+            "action_items": [],
             "executive_summary": text[:500],
             "key_facts": [],
             "speaker_analyses": {},
@@ -857,6 +920,9 @@ def _fallback_narrative(
     language_summary: dict,
     fusion_signals: list[dict],
     entities: Optional[dict] = None,
+    transcript_segments: Optional[list[dict]] = None,
+    video_summary: Optional[dict] = None,
+    conversation_summary: Optional[dict] = None,
 ) -> dict:
     """
     Generate a basic narrative without LLM API.
@@ -1012,6 +1078,92 @@ def _fallback_narrative(
             "key_moments": [],
         }
 
+    # ── Build general_summary ─────────────────────────────────────────────────
+    general_summary: list[str] = []
+    if entities.get("commitments"):
+        general_summary.append(
+            f"{len(entities['commitments'])} commitment(s) made during the session."
+        )
+    if entities.get("objections"):
+        resolved = sum(1 for o in entities["objections"] if o.get("resolved"))
+        total = len(entities["objections"])
+        general_summary.append(
+            f"{total} objection(s) raised, {resolved} resolved."
+        )
+    for spk, data in voice_summary.get("per_speaker", {}).items():
+        if data.get("max_stress", 0) > 0.60:
+            general_summary.append(
+                f"{spk} showed elevated stress during the session."
+            )
+    for spk, data in language_summary.get("per_speaker", {}).items():
+        if data.get("buying_signal_count", 0) > 2:
+            general_summary.append(
+                f"{spk} showed {data['buying_signal_count']} buying signals."
+            )
+    for spk, data in (video_summary or {}).get("per_speaker", {}).items():
+        emotion = data.get("dominant_emotion")
+        if emotion and emotion not in ("neutral", ""):
+            conf = data.get("dominant_emotion_confidence", 0)
+            if conf >= 0.50:
+                general_summary.append(
+                    f"{spk} displayed predominantly {emotion} facial affect (confidence {conf:.0%})."
+                )
+    conv_rapport = (conversation_summary or {}).get("rapport_score")
+    if conv_rapport is not None:
+        label = "strong" if conv_rapport >= 0.65 else "moderate" if conv_rapport >= 0.40 else "low"
+        general_summary.append(f"Overall conversational rapport was {label} ({conv_rapport:.2f}).")
+    if not general_summary:
+        general_summary.append(f"Session with {len(speakers)} speaker(s) completed.")
+
+    # ── Build notes from topics + transcript segments ─────────────────────────
+    notes: list[dict] = []
+    segs = transcript_segments or []
+    for topic in entities.get("topics", []):
+        topic_start = topic.get("start_ms", 0)
+        topic_end = topic.get("end_ms", 0)
+        topic_details = []
+        for seg in segs:
+            if seg.get("start_ms", 0) >= topic_start and seg.get("end_ms", 0) <= topic_end:
+                if len(seg.get("text", "")) > 30:
+                    ts_s = seg["start_ms"] // 1000
+                    m, s = divmod(ts_s, 60)
+                    topic_details.append({
+                        "speaker": seg.get("speaker", ""),
+                        "text": seg["text"][:200],
+                        "timestamp": f"{m}:{s:02d}",
+                        "sub_details": [],
+                    })
+        if topic_details:
+            notes.append({
+                "topic": topic.get("name", "Discussion"),
+                "summary": topic.get("summary", ""),
+                "details": topic_details[:10],
+            })
+
+    # ── Build action_items from commitments and unresolved objections ─────────
+    action_items: list[dict] = []
+    for com in entities.get("commitments", []):
+        ts_s = com.get("timestamp_ms", com.get("start_ms", 0)) // 1000
+        m, s = divmod(ts_s, 60)
+        action_items.append({
+            "assignee": com.get("speaker", "Unknown"),
+            "task": com.get("text", ""),
+            "deadline": None,
+            "timestamp": f"{m}:{s:02d}",
+            "context": "",
+        })
+    for obj in entities.get("objections", []):
+        if not obj.get("resolved"):
+            ts_s = obj.get("timestamp_ms", obj.get("start_ms", 0)) // 1000
+            m, s = divmod(ts_s, 60)
+            action_items.append({
+                "assignee": "",
+                "task": f"Follow up on unresolved objection: {obj.get('text', '')}",
+                "deadline": None,
+                "timestamp": f"{m}:{s:02d}",
+                "context": f"Raised by {obj.get('speaker', 'unknown')}",
+            })
+
     # ── Build risk_assessment from false_confession_risk signal ──────────────
     risk_assessment = None
     risk_sig = next(
@@ -1038,12 +1190,97 @@ def _fallback_narrative(
             ),
         }
 
+    # ── Build executive_summary as a flowing analyst paragraph ──────────────
+    _exec: list[str] = []
+
+    # Opening: participant count + tone
+    _sentiments = [d.get("avg_sentiment", 0) for d in language_summary.get("per_speaker", {}).values()]
+    _avg_sent = sum(_sentiments) / len(_sentiments) if _sentiments else 0
+    _tone = "generally positive" if _avg_sent > 0.2 else "mixed" if _avg_sent > -0.1 else "predominantly negative"
+    _exec.append(f"This session involved {len(speakers)} participant(s) and carried a {_tone} overall tone.")
+
+    # Vocal stress
+    _stressed = [spk for spk, d in voice_summary.get("per_speaker", {}).items() if d.get("max_stress", 0) > 0.60]
+    _high_filler = [spk for spk, d in voice_summary.get("per_speaker", {}).items() if d.get("total_fillers", 0) > 5]
+    if _stressed:
+        _exec.append(
+            f"Elevated vocal stress was detected in {', '.join(_stressed)}, "
+            "suggesting cognitive load or emotional pressure at key moments."
+        )
+    if _high_filler:
+        _exec.append(
+            f"{', '.join(_high_filler)} exhibited high filler-word usage, "
+            "indicating real-time reasoning or uncertainty during portions of the discussion."
+        )
+
+    # Language engagement signals
+    _buyers = [
+        (spk, d["buying_signal_count"])
+        for spk, d in language_summary.get("per_speaker", {}).items()
+        if d.get("buying_signal_count", 0) > 0
+    ]
+    if _buyers:
+        _exec.append(
+            f"Positive engagement signals were detected from "
+            f"{', '.join(f'{s} ({c} signal(s))' for s, c in _buyers)}."
+        )
+
+    # Commitments and objections
+    _n_commits = len((entities or {}).get("commitments", []))
+    _n_objs = len((entities or {}).get("objections", []))
+    _resolved = sum(1 for o in (entities or {}).get("objections", []) if o.get("resolved"))
+    if _n_commits or _n_objs:
+        _exec.append(
+            f"{_n_commits} commitment(s) and {_n_objs} objection(s) "
+            f"({_resolved} resolved) were recorded across the session."
+        )
+
+    # Video / facial affect
+    _emotions = [
+        (spk, d.get("dominant_emotion"))
+        for spk, d in (video_summary or {}).get("per_speaker", {}).items()
+        if d.get("dominant_emotion") and d.get("dominant_emotion") not in ("neutral", "")
+        and d.get("dominant_emotion_confidence", 0) >= 0.50
+    ]
+    if _emotions:
+        _exec.append(
+            f"Facial expression analysis identified "
+            f"{', '.join(f'{s} ({e})' for s, e in _emotions)} as dominant emotional states."
+        )
+
+    # Rapport
+    _rapport = (conversation_summary or {}).get("rapport_score")
+    if _rapport is not None:
+        _rlabel = "strong" if _rapport >= 0.65 else "moderate" if _rapport >= 0.40 else "low"
+        _exec.append(
+            f"Conversational dynamics showed {_rlabel} rapport between participants "
+            f"(score: {_rapport:.2f})."
+        )
+
+    # Cross-modal fusion
+    _n_fusion = len(fusion_signals)
+    if _n_fusion > 0 and cross_modal:
+        _exec.append(
+            f"{_n_fusion} cross-modal fusion event(s) were flagged; "
+            f"most notably, {cross_modal[0].lower()}."
+        )
+        if len(cross_modal) > 1:
+            _exec.append(cross_modal[1].rstrip(".") + ".")
+    elif _n_fusion > 0:
+        _exec.append(
+            f"{_n_fusion} cross-modal signal(s) were detected spanning voice, language, "
+            "and visual modalities."
+        )
+    elif not _exec:
+        _exec.append("No notable cross-modal patterns were detected in this session.")
+
+    executive_summary = " ".join(_exec)
+
     return {
-        "executive_summary": (
-            f"Session with {len(speakers)} speaker(s). "
-            + (insights[0] + ". " if insights else "No notable patterns detected. ")
-            + f"{len(fusion_signals)} cross-modal fusion signal(s) generated."
-        ),
+        "general_summary": general_summary,
+        "notes": notes,
+        "action_items": action_items,
+        "executive_summary": executive_summary,
         "key_facts": key_facts,
         "speaker_analyses": speaker_analyses,
         "key_moments": [],

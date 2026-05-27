@@ -1,426 +1,332 @@
-# NEXUS — Enhanced Narrative Report Generation + Report Panel
+# NEXUS — Add Meeting Notes, Topic-Grouped Details, and Action Items to Narrative Report
 
-## Current State (verified from code)
+## What Fireflies Produces (the target pattern)
 
-**narrative.py** (806L) generates reports via Claude/OpenAI API. The LLM receives
-400+ lines of rich per-agent data but outputs only 4 generic fields:
+```
+GENERAL SUMMARY
+• 5-7 bullet points — one per key theme/decision/outcome
+• No paragraphs — scannable bullets only
 
-```json
-{
-  "executive_summary": "2-3 sentences",
-  "key_moments": [{time_description, description, significance}],
-  "cross_modal_insights": ["insight1"],
-  "recommendations": ["rec1"]
-}
+NOTES (grouped by topic)
+  Topic Heading 1
+  Brief description of this topic area.
+    • Speaker-attributed detail with timestamp (01:54)
+      • Supporting sub-detail
+      • Supporting sub-detail
+    • Another speaker-attributed detail (08:56)
+      • Sub-detail
+  
+  Topic Heading 2
+  Brief description.
+    • Detail (14:22)
+      • Sub-detail
+
+ACTION ITEMS (grouped by person)
+  Person Name
+    • Task description (timestamp)
+    • Task description (timestamp)
+  
+  Another Person
+    • Task description (timestamp)
 ```
 
-Same structure for ALL content types. No per-speaker analysis, no key facts
-section, no interrogation-specific sections. The `speaker_analyses` field from
-the function docstring was never added to the JSON schema.
+**Three layers: Summary (what happened) → Notes (what was discussed, by topic) → Action Items (what to do next, by person).**
 
-**SessionDetail.tsx** has a Report tab (line 1386) that renders these 4 sections
-with styled cards. It fetches from `["report", id]` query with `has_report === true`.
-
-**InsightPanel.tsx** shows entities (objections, commitments) and conversation
-dynamics but has NO access to the narrative report.
-
-**InterrogationSummaryPanel.tsx** shows risk gauge + denial trajectory on the
-Video tab but has NO connection to the Report tab.
-
-## What Top Meeting Analyzers Do (Otter, Gong, Fireflies, Chorus)
-
-All of them structure reports with:
-1. Key facts / action items / commitments FIRST (assigned to people)
-2. Per-speaker behavioral profile
-3. Topic/phase timeline with timestamps
-4. Content-type-specific sections
-5. Actionable recommendations
-
-NEXUS has 6-modality cross-modal analysis that NONE of them have. The report
-should showcase this unique capability — especially incongruence detection
-(calm voice + stressed face, nodding during denial, forward lean + avoidant gaze).
+This structure works for ALL meeting types — not just sales calls. It works for:
+- Sales: topics = pricing, demo, objections. Actions = send proposal, schedule follow-up.
+- Interviews: topics = intro, technical questions, cultural fit. Actions = send feedback, schedule next round.
+- Internal meetings: topics = status updates, blockers, decisions. Actions = assigned tasks.
+- Client meetings: topics = project review, concerns, next steps. Actions = deliverables.
+- Interrogation: topics = background questions, evidence presentation, denial phase. Actions = review contamination, check procedure compliance.
 
 ## CRITICAL INSTRUCTIONS
 
 **Before writing ANY code:**
 
-1. Read `services/fusion_agent/narrative.py` COMPLETELY:
-   - `_build_context()` — what data is available (voice, language, video,
-     conversation, entities, graph analytics, interrogation signals)
-   - `_build_prompt()` — current system prompt + per-content-type instructions
-   - `_parse_narrative_response()` — JSON parsing
-   - `_fallback_narrative()` — non-LLM fallback with interrogation handling
-   - The function docstring shows `speaker_analyses` was intended but never implemented
+1. Read `services/fusion_agent/narrative.py` — COMPLETELY:
+   - `_build_context()` — check what's in `entities["topics"]`, `entities["commitments"]`,
+     `entities["objections"]`, `entities["people"]`, transcript segments
+   - `_build_prompt()` — the JSON schema the LLM is asked to produce
+   - `_parse_narrative_response()` — what fields it extracts
+   - `_fallback_narrative()` — the non-LLM path
 
-2. Read `frontend/.../SessionDetail.tsx` lines 1386-1490:
-   - How the Report tab renders executive_summary, key_moments, cross_modal_insights, recommendations
-   - The `report?.narrative` fallback
-   - The `content?.` property access pattern
+2. Read `services/language_agent/entity_extractor.py`:
+   - The `topics` array output — each topic has `name`, `start_ms`, `end_ms`, optional `summary`
+   - The `commitments` array — each has `speaker`, `text`, `start_ms`/`timestamp_ms`
+   - The `objections` array — each has `speaker`, `text`, `start_ms`, `resolved`
 
-3. Read `frontend/.../InsightPanel.tsx`:
-   - SalesPanel, MeetingPanel, InterviewPanel, ConversationDynamicsPanel
-   - How entities (objections, commitments) are rendered
-   - Content-type routing pattern
+3. Read whatever frontend component renders the report (SessionDetail.tsx or equivalent)
+   to understand how the new fields will be displayed.
 
-4. Read `frontend/.../InterrogationSummaryPanel.tsx`:
-   - RiskGauge, DenialTrajectory, TechniqueBadge, ContaminationList
-   - How interrogation-specific data is extracted from signals
+4. Use proper OOP and DSA:
+   - **HashMap**: group transcript segments by topic interval using bisect for O(log T) per segment
+   - **Template Method**: topic-grouped notes follow same structure regardless of content type
+   - The LLM already receives the full transcript in context — it just needs to be told
+     to organize its output by topic
 
-5. Read `frontend/.../contentTypes.ts`:
-   - Content type definitions with roles, entityFields, speakerStats
-
-6. Think about the problem and solution:
-   - The report structure should be content-type-aware at BOTH LLM prompt
-     level AND frontend rendering level
-   - Per-speaker analysis must synthesize voice + language + video data into
-     a behavioral narrative, not just repeat numbers
-   - Cross-modal insights must describe WHAT disagrees and WHY it matters
-   - Key facts (commitments, objections, admissions) go FIRST because that's
-     what users look for immediately
-   - Interrogation reports need risk assessment, contamination timeline, and
-     ethical framing that other content types don't
-
-7. Use proper OOP and DSA:
-   - **Strategy Pattern**: content-type-specific prompt builders
-   - **Builder Pattern**: report structure assembly
-   - **Template Method**: common report skeleton with type-specific sections
-   - **HashMap**: O(1) signal lookup by type for per-speaker aggregation
+5. Content-type isolation: The general_summary, notes, and action_items sections
+   appear for ALL content types. They are NOT type-specific. The content within
+   them naturally adapts because the LLM's type_instructions guide the focus.
 
 ---
 
-## Change 1: Enhanced LLM Output Schema
+## Change 1: Add Three New Fields to JSON Schema
 
 **File:** `services/fusion_agent/narrative.py` — `_build_prompt()`
 
-Replace the current 4-field JSON schema with a content-type-aware structure:
-
-### Base Schema (ALL content types)
+Add to the JSON schema between `executive_summary` and `key_facts`:
 
 ```json
-{
-  "executive_summary": "3-5 sentence overview emphasizing the most important finding",
+  "general_summary": [
+    "Key theme or outcome as a single bullet point",
+    "Another key theme — one per major topic discussed",
+    "Decision or agreement reached",
+    "Timeline or deadline established",
+    "Technical/operational update if relevant"
+  ],
 
-  "key_facts": [
+  "notes": [
     {
-      "type": "commitment | objection | decision | admission | disclosure",
-      "speaker": "John",
-      "text": "I'll send the proposal by Friday",
-      "timestamp": "12:30",
-      "status": "confirmed | unresolved | retracted"
+      "topic": "Topic or Phase Name",
+      "summary": "One sentence describing what was discussed in this topic area",
+      "details": [
+        {
+          "speaker": "Person Name or Speaker_0",
+          "text": "What they said or contributed — paraphrased or key quote",
+          "timestamp": "MM:SS",
+          "sub_details": [
+            "Supporting point or context",
+            "Another supporting detail"
+          ]
+        }
+      ]
     }
   ],
 
-  "speaker_analyses": {
-    "Speaker_0": {
-      "role": "Seller",
-      "behavioral_profile": "Confident delivery with controlled pacing. Stress elevated during pricing discussion (8:30-9:15) — facial stress peaked at 0.72 while voice remained steady, suggesting rehearsed composure. Forward lean increased during closing, indicating genuine investment in outcome.",
-      "voice_patterns": "Steady baseline with 2 pitch elevation events during value propositions. Speech rate dropped 25% during objection handling — deliberate, not stressed.",
-      "body_language": "Open posture maintained throughout. 3 self-touch events during competitor discussion — possible discomfort with the topic.",
-      "key_moments": ["8:30 — stress peak during pricing", "15:00 — strongest engagement during demo"]
-    }
-  },
-
-  "key_moments": [
+  "action_items": [
     {
-      "timestamp": "8:30",
-      "description": "Pricing discussion opened — prospect's facial engagement dropped while verbal response remained positive",
-      "significance": "Classic incongruence — spoken interest may mask concern about budget",
-      "signals_involved": ["facial_engagement_drop", "positive_sentiment", "gaze_break"]
+      "assignee": "Person Name or Speaker_0",
+      "task": "Specific task or commitment",
+      "deadline": "By Friday afternoon" or null,
+      "timestamp": "MM:SS",
+      "context": "Brief reason or origin of this action"
     }
   ],
+```
 
-  "cross_modal_insights": [
-    {
-      "insight": "At 8:30, John's voice remained calm (stress 0.22) while facial stress spiked to 0.72 — a 3× delta indicating emotional suppression during pricing discussion",
-      "modalities": ["voice", "face"],
-      "type": "incongruence",
-      "significance": "Cross-modal mismatch suggests rehearsed composure rather than genuine confidence on pricing"
-    }
-  ],
+**Add to the system prompt instruction:**
 
-  "recommendations": [
-    {
-      "priority": "high | medium | low",
-      "action": "Follow up on the unresolved pricing objection within 48 hours",
-      "rationale": "Sarah's facial engagement dropped 40% during pricing but she didn't voice the concern — unspoken objection likely still active"
-    }
-  ]
+```
+"STRUCTURE REQUIREMENTS:
+1. general_summary: 5-7 bullet points covering the key themes, decisions, and outcomes.
+   Each bullet is one standalone sentence. No paragraphs. Scannable.
+2. notes: Group discussion details by TOPIC or PHASE. Use the conversation phases/topics
+   from the context data. Under each topic, list speaker-attributed details with timestamps.
+   Each detail can have sub_details for supporting points. This is the detailed record of
+   what was discussed — the most comprehensive section.
+3. action_items: List every commitment, task, or follow-up mentioned. Group by assignee
+   (the person responsible). Include deadline if mentioned, timestamp of when it was agreed,
+   and brief context. Extract from both explicit commitments ('I will send the report')
+   and implicit ones ('We should schedule a follow-up' — assign to whoever said it).
+"
+```
+
+**The notes section should map to the `topics` array from entity extraction.** Add this to the context:
+
+```python
+# In _build_context(), after the ENTITIES section:
+if topics:
+    lines.append("\nCONVERSATION PHASES (use these as 'topic' headings in the 'notes' output):")
+    for t in topics:
+        s_m, s_s = divmod(t.get("start_ms", 0) // 1000, 60)
+        e_m, e_s = divmod(t.get("end_ms", 0) // 1000, 60)
+        lines.append(f"  {t.get('name', 'Unknown')} ({s_m}:{s_s:02d}–{e_m}:{e_s:02d})")
+        if t.get("summary"):
+            lines.append(f"    {t['summary']}")
+```
+
+---
+
+## Change 2: Update _parse_narrative_response()
+
+```python
+return {
+    # ... existing fields ...
+    "general_summary": parsed.get("general_summary", []),
+    "notes": parsed.get("notes", []),
+    "action_items": parsed.get("action_items", []),
+    # ... rest of existing fields ...
 }
 ```
 
-### Interrogation-Specific Extensions
-
-For `interrogation_video` content type, ADD these sections to the schema:
-
-```json
-{
-  "risk_assessment": {
-    "false_confession_risk": "low | low_moderate | moderate | elevated | high",
-    "risk_score": 0.45,
-    "contributing_factors": [
-      {"factor": "contamination", "present": true, "detail": "4 case-specific terms adopted"},
-      {"factor": "session_duration", "present": false, "detail": "54 min — below 3-hour risk threshold"},
-      {"factor": "coercive_technique", "present": false, "detail": "Mixed PEACE/Reid — no coercion detected"},
-      {"factor": "denial_weakening", "present": true, "detail": "Categorical → weak over 54 minutes"},
-      {"factor": "processing_delays", "present": true, "detail": "2584ms delay after GPS evidence"},
-      {"factor": "capitulation_pattern", "present": true, "detail": "2 cascade events between 7:21-19:25"}
-    ],
-    "ethical_note": "Risk score indicates probability of coerced compliance, NOT guilt or deception. All factors have alternative innocent explanations."
-  },
-
-  "contamination_timeline": [
-    {
-      "term": "GPS data",
-      "interrogator_first": "18:45",
-      "suspect_adopted": "19:30",
-      "context": "Officer mentioned GPS tracking; suspect referenced GPS 45 seconds later"
-    }
-  ],
-
-  "technique_analysis": {
-    "primary": "mixed",
-    "peace_markers": 6,
-    "reid_markers": 9,
-    "coercive_markers": 0,
-    "assessment": "Primarily PEACE framework with Reid accusatory elements. No coercive tactics detected. Reid elements may increase false confession risk in vulnerable suspects."
-  }
-}
-```
-
-### Sales-Specific Extensions
-
-```json
-{
-  "deal_assessment": {
-    "close_probability": "high | medium | low",
-    "stage_reached": "Closing",
-    "buying_signals": 4,
-    "unresolved_objections": 1,
-    "prospect_engagement_trend": "increasing | stable | declining"
-  },
-
-  "objection_handling": [
-    {
-      "objection": "Pricing too high",
-      "timestamp": "12:30",
-      "handling_quality": "partial — addressed ROI but not compared to competitor pricing",
-      "resolved": false,
-      "prospect_reaction": "Verbal acceptance but facial engagement dropped 30%"
-    }
-  ]
-}
-```
-
----
-
-## Change 2: Content-Type-Specific Prompt Instructions
-
-**File:** `services/fusion_agent/narrative.py` — `_build_prompt()`
-
-Update the `type_instructions` dict to request content-type-specific fields:
-
-### Interrogation Prompt Addition
-
+And in the JSON fallback block:
 ```python
-"interrogation_video": (
-    "... existing focus text ... "
-    "OUTPUT STRUCTURE: Include 'risk_assessment' with false_confession_risk level, "
-    "score, and 6 contributing factors (contamination, session_duration, coercive_technique, "
-    "denial_weakening, processing_delays, capitulation_pattern). Each factor has 'present' "
-    "(boolean) and 'detail' (string). Include 'contamination_timeline' listing each "
-    "case-specific term with interrogator_first and suspect_adopted timestamps. Include "
-    "'technique_analysis' with primary technique, marker counts, and assessment. "
-    "SPEAKER ANALYSIS: Profile the suspect's behavioral trajectory across the session — "
-    "how did their stress, denial strength, body language, and speech patterns change? "
-    "Profile the interrogator's technique shifts. "
-    "CROSS-MODAL INSIGHTS: Focus on moments where voice/face/body signals diverge — "
-    "stress peaks without verbal acknowledgment, calm speech during facial distress, "
-    "body freezing after specific questions. "
-    "ETHICAL FRAMING: Every finding must include an alternative innocent explanation. "
-    "Never use the word 'deception'. Use 'incongruence', 'stress indicator', 'risk factor'. "
-),
+"general_summary": [],
+"notes": [],
+"action_items": [],
 ```
 
-### Sales Prompt Addition
+---
 
+## Change 3: Update _fallback_narrative()
+
+Build `general_summary` from existing insights:
 ```python
-"sales_call": (
-    "... existing focus text ... "
-    "OUTPUT STRUCTURE: Include 'deal_assessment' with close_probability, stage_reached, "
-    "buying_signal count, unresolved_objection count, and prospect_engagement_trend. "
-    "Include 'objection_handling' listing each objection with handling_quality assessment "
-    "and prospect's true reaction (verbal vs body language). "
-    "SPEAKER ANALYSIS: Profile the seller's persuasion effectiveness and the prospect's "
-    "genuine interest level (distinguish spoken interest from behavioral engagement). "
-    "CROSS-MODAL INSIGHTS: Focus on prospect incongruence — verbal agreement with "
-    "disengaged body language, nodding with avoidant gaze, positive words with stressed voice. "
-    "These reveal unspoken objections. "
-    "KEY FACTS: List commitments and objections FIRST with speaker, timestamp, and status. "
-),
+general_summary = []
+# From entities
+if entities.get("commitments"):
+    general_summary.append(
+        f"{len(entities['commitments'])} commitment(s) made during the session."
+    )
+if entities.get("objections"):
+    resolved = sum(1 for o in entities["objections"] if o.get("resolved"))
+    total = len(entities["objections"])
+    general_summary.append(
+        f"{total} objection(s) raised, {resolved} resolved."
+    )
+# From voice summary
+for spk, data in voice_summary.get("per_speaker", {}).items():
+    if data.get("max_stress", 0) > 0.60:
+        general_summary.append(
+            f"{spk} showed elevated stress during the session."
+        )
+# From language summary
+for spk, data in language_summary.get("per_speaker", {}).items():
+    if data.get("buying_signal_count", 0) > 2:
+        general_summary.append(
+            f"{spk} showed {data['buying_signal_count']} buying signals."
+        )
+if not general_summary:
+    general_summary.append(f"Session with {len(speakers)} speaker(s) completed.")
 ```
 
-### Interview, Meeting, Podcast — Similar Additions
-
-Each content type gets a specific `OUTPUT STRUCTURE` instruction telling the LLM
-which extra sections to produce and what to focus on in speaker analyses.
-
----
-
-## Change 3: Per-Speaker Aggregation in _build_context()
-
-**File:** `services/fusion_agent/narrative.py` — `_build_context()`
-
-After the existing per-agent sections, add a SYNTHESIZED per-speaker block
-that combines all modalities. This gives the LLM a pre-computed cross-modal
-view instead of asking it to cross-reference 4 separate sections:
-
+Build `notes` from topics + transcript segments:
 ```python
-    # ── Synthesized per-speaker cross-modal profile ──────────────────────────
-    lines.append("\n=== CROSS-MODAL SPEAKER PROFILES ===")
-    lines.append("(Pre-computed synthesis — use these for speaker_analyses)")
-
-    for speaker_id in speakers:
-        display = _display(speaker_id, name_map)
-        lines.append(f"\n[{display}]")
-
-        # Voice
-        vs = voice_summary.get("per_speaker", {}).get(speaker_id, {})
-        if vs:
-            lines.append(f"  VOICE: stress_avg={vs.get('avg_stress', 0):.2f}, "
-                         f"stress_max={vs.get('max_stress', 0):.2f}, "
-                         f"fillers={vs.get('total_fillers', 0)}, "
-                         f"pitch_events={vs.get('pitch_elevation_events', 0)}")
-
-        # Language
-        ls = language_summary.get("per_speaker", {}).get(speaker_id, {})
-        if ls:
-            lines.append(f"  LANGUAGE: sentiment_avg={ls.get('avg_sentiment', 0):.2f}, "
-                         f"power={ls.get('avg_power_score', 0.5):.2f}, "
-                         f"buying_signals={ls.get('buying_signal_count', 0)}, "
-                         f"objections={ls.get('objection_count', 0)}")
-
-        # Video
-        vid = (video_summary or {}).get("per_speaker", {}).get(speaker_id, {})
-        if vid:
-            lines.append(f"  FACE: emotion={vid.get('dominant_emotion', '?')}, "
-                         f"stress={vid.get('avg_facial_stress', 0):.2f}, "
-                         f"engagement={vid.get('avg_facial_engagement', 0):.2f}")
-            lines.append(f"  GAZE: on_screen={vid.get('avg_gaze_on_screen_pct', 0):.0%}, "
-                         f"breaks={vid.get('gaze_breaks', 0)}, "
-                         f"blink_anomalies={vid.get('blink_anomalies', 0)}")
-            lines.append(f"  BODY: movement={vid.get('avg_body_movement', 0):.2f}, "
-                         f"self_touch={vid.get('hand_near_face_events', 0)}, "
-                         f"nods={vid.get('head_nods', 0)}, "
-                         f"shakes={vid.get('head_shakes', 0)}")
-
-        # Conversation
-        cs = (conversation_summary or {})
-        dom = cs.get("dominance", {}).get("per_speaker", {}).get(speaker_id, 0)
-        if dom:
-            lines.append(f"  CONVERSATION: talk_time={dom:.1f}%, "
-                         f"interruptions={cs.get('interruptions', {}).get('per_speaker', {}).get(speaker_id, 0)}")
-
-        # Cross-modal flags
-        if vs and vid:
-            voice_stress = vs.get("avg_stress", 0)
-            face_stress = vid.get("avg_facial_stress", 0)
-            delta = abs(voice_stress - face_stress)
-            if delta > 0.25:
-                higher = "voice" if voice_stress > face_stress else "face"
-                lines.append(f"  ⚡ INCONGRUENCE: {higher} stress ({max(voice_stress, face_stress):.2f}) "
-                             f"vs {'face' if higher == 'voice' else 'voice'} "
-                             f"({min(voice_stress, face_stress):.2f}) — "
-                             f"delta {delta:.2f}")
+notes = []
+for topic in entities.get("topics", []):
+    # Find transcript segments that fall within this topic's time range
+    topic_start = topic.get("start_ms", 0)
+    topic_end = topic.get("end_ms", 0)
+    topic_details = []
+    for seg in transcript_segments:  # need to pass these to _fallback
+        if seg.get("start_ms", 0) >= topic_start and seg.get("end_ms", 0) <= topic_end:
+            if len(seg.get("text", "")) > 30:  # skip very short segments
+                ts_s = seg["start_ms"] // 1000
+                m, s = divmod(ts_s, 60)
+                topic_details.append({
+                    "speaker": seg.get("speaker", ""),
+                    "text": seg["text"][:200],  # truncate for notes
+                    "timestamp": f"{m}:{s:02d}",
+                    "sub_details": [],
+                })
+    if topic_details:
+        notes.append({
+            "topic": topic.get("name", "Discussion"),
+            "summary": topic.get("summary", ""),
+            "details": topic_details[:10],  # cap at 10 per topic
+        })
 ```
 
----
-
-## Change 4: Enhanced _parse_narrative_response()
-
-**File:** `services/fusion_agent/narrative.py`
-
-Parse the new fields while maintaining backward compatibility:
-
+Build `action_items` from commitments:
 ```python
-def _parse_narrative_response(raw_text: str, speakers: list[str]) -> dict:
-    # ... existing JSON parsing ...
-
-    return {
-        "executive_summary": parsed.get("executive_summary", ""),
-        "key_facts": parsed.get("key_facts", []),
-        "speaker_analyses": parsed.get("speaker_analyses", {}),
-        "key_moments": parsed.get("key_moments", []),
-        "cross_modal_insights": parsed.get("cross_modal_insights", []),
-        "recommendations": parsed.get("recommendations", []),
-        # Content-type-specific sections (may be absent)
-        "risk_assessment": parsed.get("risk_assessment"),
-        "contamination_timeline": parsed.get("contamination_timeline"),
-        "technique_analysis": parsed.get("technique_analysis"),
-        "deal_assessment": parsed.get("deal_assessment"),
-        "objection_handling": parsed.get("objection_handling"),
-    }
+action_items = []
+for com in entities.get("commitments", []):
+    ts_s = com.get("timestamp_ms", com.get("start_ms", 0)) // 1000
+    m, s = divmod(ts_s, 60)
+    action_items.append({
+        "assignee": com.get("speaker", "Unknown"),
+        "task": com.get("text", ""),
+        "deadline": None,
+        "timestamp": f"{m}:{s:02d}",
+        "context": "",
+    })
+# Also extract implicit action items from objections marked unresolved
+for obj in entities.get("objections", []):
+    if not obj.get("resolved"):
+        ts_s = obj.get("timestamp_ms", obj.get("start_ms", 0)) // 1000
+        m, s = divmod(ts_s, 60)
+        action_items.append({
+            "assignee": "",  # unassigned — needs follow-up
+            "task": f"Follow up on unresolved objection: {obj.get('text', '')}",
+            "deadline": None,
+            "timestamp": f"{m}:{s:02d}",
+            "context": f"Raised by {obj.get('speaker', 'unknown')}",
+        })
 ```
 
 ---
 
-## Change 5: Enhanced _fallback_narrative()
+## Change 4: Frontend Report Tab
 
-**File:** `services/fusion_agent/narrative.py`
+**File:** SessionDetail.tsx (or equivalent report rendering component)
 
-The fallback already handles interrogation signals. Enhance it to produce
-the new structure fields:
+Add three new sections. They render for ALL content types (not type-gated):
 
-- Build `key_facts` from entities.commitments + entities.objections
-- Build `speaker_analyses` from per-speaker summaries (voice + language + video)
-- Build `risk_assessment` from false_confession_risk signal metadata
-- Keep existing cross_modal_insights switch/case (already comprehensive)
-
----
-
-## Change 6: Enhanced Report Tab in SessionDetail.tsx
-
-**File:** `frontend/.../SessionDetail.tsx` — Report tab section (line 1386)
-
-### New Section Order
-
-```
-1. Executive Summary (existing — keep)
-2. Key Facts & Commitments (NEW — from key_facts array)
-3. Risk Assessment (NEW — interrogation only, from risk_assessment)
-4. Speaker Analyses (NEW — from speaker_analyses object)
-5. Key Moments (existing — enhance with signals_involved)
-6. Cross-Modal Insights (existing — enhance with modalities + type)
-7. Recommendations (existing — enhance with priority)
-```
-
-### Key Facts Section
+### General Summary (before executive_summary or replacing it)
 
 ```tsx
-{content?.key_facts && content.key_facts.length > 0 && (
+{content?.general_summary && content.general_summary.length > 0 && (
   <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
-    <h2 className="mb-4 flex items-center gap-2 text-sm font-semibold text-nexus-text-primary">
-      📋 Key Facts & Commitments
+    <h2 className="mb-3 text-sm font-semibold text-nexus-text-primary">
+      📋 Summary
     </h2>
-    <div className="space-y-2">
-      {content.key_facts.map((fact, i) => (
-        <div key={i} className="flex items-start gap-2 rounded border-l-2 bg-nexus-surface-hover p-2 text-xs"
-          style={{
-            borderLeftColor: fact.type === "commitment" ? "var(--accent-blue)"
-              : fact.type === "objection" ? "var(--stress-high)"
-              : fact.type === "admission" ? "var(--stress-med)"
-              : "var(--text-muted)"
-          }}>
-          <span className="shrink-0 mt-0.5">
-            {fact.type === "commitment" ? "✅" : fact.type === "objection" ? "❌"
-             : fact.type === "admission" ? "⚠️" : "📌"}
-          </span>
-          <div className="flex-1">
-            <span className="text-nexus-text-primary">{fact.text}</span>
-            <span className="ml-2 text-nexus-text-muted">
-              — {fact.speaker} at {fact.timestamp}
-              {fact.status && ` (${fact.status})`}
-            </span>
-          </div>
+    <ul className="space-y-1.5">
+      {content.general_summary.map((point, i) => (
+        <li key={i} className="flex items-start gap-2 text-sm text-nexus-text-primary">
+          <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-accent-blue" />
+          {point}
+        </li>
+      ))}
+    </ul>
+  </section>
+)}
+```
+
+### Notes (after key_facts, before speaker_analyses)
+
+```tsx
+{content?.notes && content.notes.length > 0 && (
+  <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
+    <h2 className="mb-4 text-sm font-semibold text-nexus-text-primary">
+      📝 Notes
+    </h2>
+    <div className="space-y-5">
+      {content.notes.map((topic, i) => (
+        <div key={i}>
+          <h3 className="text-sm font-semibold text-nexus-accent-purple mb-1">
+            {topic.topic}
+          </h3>
+          {topic.summary && (
+            <p className="text-xs text-nexus-text-muted mb-2 italic">{topic.summary}</p>
+          )}
+          <ul className="space-y-2 ml-2 border-l-2 border-nexus-border pl-3">
+            {topic.details.map((detail, j) => (
+              <li key={j} className="text-sm text-nexus-text-primary">
+                <div className="flex items-start gap-2">
+                  <span className="mt-0.5 text-nexus-accent-purple">→</span>
+                  <div>
+                    <span className="font-medium">{detail.speaker}</span>
+                    {detail.timestamp && (
+                      <span className="ml-1.5 text-[10px] text-nexus-text-muted">
+                        ({detail.timestamp})
+                      </span>
+                    )}
+                    <span className="ml-1">{detail.text}</span>
+                    {detail.sub_details?.length > 0 && (
+                      <ul className="mt-1 ml-3 space-y-0.5">
+                        {detail.sub_details.map((sub, k) => (
+                          <li key={k} className="text-xs text-nexus-text-secondary flex items-start gap-1.5">
+                            <span className="mt-1 h-1 w-1 shrink-0 rounded-full bg-nexus-text-muted" />
+                            {sub}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
         </div>
       ))}
     </div>
@@ -428,186 +334,87 @@ the new structure fields:
 )}
 ```
 
-### Risk Assessment Section (interrogation only)
+### Action Items (after recommendations, or as the final section)
 
 ```tsx
-{content?.risk_assessment && (
-  <section className="rounded-lg border border-amber-500/30 bg-nexus-surface p-5">
-    <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-amber-400">
-      ⚖️ False Confession Risk Assessment
-    </h2>
-    {/* Risk gauge bar */}
-    {/* Contributing factors with ✓/✗ badges */}
-    {/* Ethical note in italic muted text */}
-  </section>
-)}
-```
-
-### Speaker Analyses Section
-
-```tsx
-{content?.speaker_analyses && Object.keys(content.speaker_analyses).length > 0 && (
+{content?.action_items && content.action_items.length > 0 && (
   <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
     <h2 className="mb-4 text-sm font-semibold text-nexus-text-primary">
-      👤 Speaker Analysis
+      ✅ Action Items
     </h2>
-    {Object.entries(content.speaker_analyses).map(([spk, analysis]) => (
-      <div key={spk} className="mb-4 border-l-2 border-accent-purple-40 pl-3">
-        <div className="text-xs font-semibold text-nexus-accent-purple mb-1">
-          {analysis.role ? `${spk} (${analysis.role})` : spk}
+    <div className="space-y-4">
+      {/* Group by assignee */}
+      {Object.entries(
+        content.action_items.reduce((groups, item) => {
+          const key = item.assignee || "Unassigned";
+          (groups[key] = groups[key] || []).push(item);
+          return groups;
+        }, {})
+      ).map(([assignee, items]) => (
+        <div key={assignee}>
+          <h3 className="text-xs font-semibold text-nexus-text-primary mb-1.5 uppercase tracking-wide">
+            {assignee}
+          </h3>
+          <ul className="space-y-1.5 ml-2">
+            {items.map((item, i) => (
+              <li key={i} className="flex items-start gap-2 text-sm text-nexus-text-primary">
+                <span className="mt-0.5">•</span>
+                <div>
+                  {item.task}
+                  {item.deadline && (
+                    <span className="ml-1.5 text-xs text-amber-400 font-medium">
+                      — {item.deadline}
+                    </span>
+                  )}
+                  {item.timestamp && (
+                    <span className="ml-1.5 text-[10px] text-nexus-text-muted">
+                      ({item.timestamp})
+                    </span>
+                  )}
+                  {item.context && (
+                    <p className="text-xs text-nexus-text-muted mt-0.5">{item.context}</p>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
         </div>
-        <p className="text-sm text-nexus-text-primary mb-1">{analysis.behavioral_profile}</p>
-        {analysis.voice_patterns && (
-          <p className="text-xs text-nexus-text-secondary">🎙️ {analysis.voice_patterns}</p>
-        )}
-        {analysis.body_language && (
-          <p className="text-xs text-nexus-text-secondary">🧍 {analysis.body_language}</p>
-        )}
-      </div>
-    ))}
+      ))}
+    </div>
   </section>
 )}
 ```
 
-### Enhanced Cross-Modal Insights
+---
 
-```tsx
-{/* Update existing cross-modal section to handle object format */}
-{content.cross_modal_insights.map((insight, i) => {
-  const text = typeof insight === "string" ? insight : insight.insight;
-  const modalities = typeof insight === "object" ? insight.modalities : null;
-  return (
-    <li key={i} className="flex items-start gap-2 text-sm text-nexus-text-primary">
-      <span className="mt-1 text-nexus-accent-purple font-bold">⚡</span>
-      <div>
-        {text}
-        {modalities && (
-          <div className="mt-1 flex gap-1">
-            {modalities.map((m) => (
-              <span key={m} className="rounded-full bg-accent-purple-15 px-2 py-0.5 text-[10px] text-nexus-accent-purple">
-                {m}
-              </span>
-            ))}
-          </div>
-        )}
-      </div>
-    </li>
-  );
-})}
+## Complete Report Section Order
+
+```
+1. General Summary (NEW — bullet points, scannable)
+2. Executive Summary (existing — 3-5 sentence paragraph for context)
+3. Key Facts & Commitments (existing — timestamped facts)
+4. Notes (NEW — topic-grouped discussion details)
+5. Risk Assessment (interrogation only)
+6. Speaker Analyses (existing — per-person behavioral profiles)
+7. Key Moments (existing — timestamped events)
+8. Cross-Modal Insights (existing — incongruence alerts)
+9. Recommendations (existing — prioritized actions)
+10. Action Items (NEW — assigned tasks with deadlines)
 ```
 
-### Enhanced Recommendations with Priority
-
-```tsx
-{content.recommendations.map((rec, i) => {
-  const text = typeof rec === "string" ? rec : rec.action;
-  const priority = typeof rec === "object" ? rec.priority : null;
-  const rationale = typeof rec === "object" ? rec.rationale : null;
-  return (
-    <li key={i} className="flex items-start gap-2 text-sm text-nexus-text-primary">
-      <span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${
-        priority === "high" ? "bg-red-400" :
-        priority === "medium" ? "bg-amber-400" : "bg-nexus-stress-low"
-      }`} />
-      <div>
-        {text}
-        {rationale && <p className="mt-0.5 text-xs text-nexus-text-muted italic">{rationale}</p>}
-      </div>
-    </li>
-  );
-})}
-```
+**General Summary goes FIRST** because users scan for "what happened" before reading details.
+**Action Items goes LAST** because users check tasks after understanding context.
+**Notes goes MIDDLE** because it's the detailed record — only read when drilling in.
 
 ---
 
-## Change 7: Content-Type Isolation — STRICT
+## Backward Compatibility
 
-**Content-type-specific sections MUST only appear for their own content type.
-They must NOT leak into other types.**
-
-| Section | Shows ONLY for | Never shows for |
-|---------|---------------|-----------------|
-| `risk_assessment` | `interrogation_video` | sales_call, interview, meeting, podcast, etc |
-| `contamination_timeline` | `interrogation_video` | everything else |
-| `technique_analysis` | `interrogation_video` | everything else |
-| `deal_assessment` | `sales_call` | interrogation_video, interview, meeting, etc |
-| `objection_handling` | `sales_call`, `client_meeting` | interrogation_video, podcast, lecture, etc |
-| Deal Progression bar | `sales_call` | everything else |
-| Candidate Assessment | `interview` | everything else |
-| Participation Balance | `internal`, `meeting` | sales_call, interrogation_video |
-
-**Backend enforcement:** The `_build_prompt()` type_instructions for each
-content type requests ONLY the fields relevant to that type. The LLM prompt
-must explicitly say "Do NOT include risk_assessment for non-interrogation
-sessions" and "Do NOT include deal_assessment for non-sales sessions."
-
-```python
-# In the user_prompt, after the JSON schema:
-if meeting_type == "interrogation_video":
-    extra = (
-        "Include 'risk_assessment', 'contamination_timeline', and 'technique_analysis' fields. "
-        "Do NOT include 'deal_assessment' or 'objection_handling'."
-    )
-elif meeting_type == "sales_call":
-    extra = (
-        "Include 'deal_assessment' and 'objection_handling' fields. "
-        "Do NOT include 'risk_assessment', 'contamination_timeline', or 'technique_analysis'."
-    )
-else:
-    extra = (
-        "Do NOT include 'risk_assessment', 'contamination_timeline', 'technique_analysis', "
-        "'deal_assessment', or 'objection_handling'. These are type-specific fields."
-    )
-```
-
-**Frontend enforcement:** Every content-type-specific section checks BOTH
-data availability AND content type before rendering:
-
-```tsx
-{/* WRONG — shows for any session that happens to have the data: */}
-{content?.risk_assessment && (
-  <RiskAssessmentSection ... />
-)}
-
-{/* CORRECT — shows ONLY for interrogation AND only when data exists: */}
-{contentType === "interrogation_video" && content?.risk_assessment && (
-  <RiskAssessmentSection ... />
-)}
-
-{/* CORRECT — shows ONLY for sales: */}
-{contentType === "sales_call" && content?.deal_assessment && (
-  <DealAssessmentSection ... />
-)}
-```
-
-**The `contentType` prop must be passed to the Report tab.** Currently
-`SessionDetail.tsx` has `detail.meeting_type` or `session.meeting_type`
-available — pass it into the report rendering block.
-
-**Shared sections** that appear for ALL content types:
-- Executive Summary ✅
-- Key Facts & Commitments ✅ (commitments in sales, admissions in interrogation, decisions in meetings)
-- Speaker Analyses ✅
-- Key Moments ✅
-- Cross-Modal Insights ✅
-- Recommendations ✅
-
-These shared sections use the SAME structure but the LLM populates them
-differently based on content type (the type_instructions handle this).
-
----
-
-## Change 8: Backward Compatibility
-
-ALL changes must be backward compatible:
-
-- Old reports (4-field JSON) still render correctly — the new sections
-  check `content?.key_facts && content.key_facts.length > 0` before rendering
-- New fields default to empty arrays/objects in `_parse_narrative_response`
-- Frontend handles BOTH string format (`"insight text"`) and object format
-  (`{insight, modalities, type}`) for cross_modal_insights and recommendations
-- `_fallback_narrative` produces the new structure fields when data is available
-  but gracefully returns empty when not
+- Old reports without `general_summary`, `notes`, `action_items` → fields are `[]` → sections don't render
+- Frontend checks `content?.notes && content.notes.length > 0` before rendering
+- LLM may produce empty arrays if the meeting is too short for topic grouping — that's fine
+- `_fallback_narrative` produces these fields from entity data when LLM is unavailable
+- No existing fields are removed or renamed
 
 ---
 
@@ -615,17 +422,13 @@ ALL changes must be backward compatible:
 
 ### Backend (1):
 1. **services/fusion_agent/narrative.py**:
-   - `_build_prompt()` — content-type-specific JSON schema + output structure instructions (~50 lines)
-   - `_build_context()` — cross-modal speaker profiles section (~40 lines)
-   - `_parse_narrative_response()` — parse new fields (~10 lines)
-   - `_fallback_narrative()` — produce new structure fields (~30 lines)
+   - `_build_prompt()` — add 3 new fields to JSON schema + structure instructions (~30 lines)
+   - `_build_context()` — add topic phase listing for LLM (~10 lines)
+   - `_parse_narrative_response()` — parse 3 new fields (~5 lines)
+   - `_fallback_narrative()` — build general_summary, notes, action_items from entities (~60 lines)
 
 ### Frontend (1):
-2. **SessionDetail.tsx** — Report tab:
-   - Key Facts section (NEW, ~25 lines)
-   - Risk Assessment section (NEW, interrogation only, ~20 lines)
-   - Speaker Analyses section (NEW, ~20 lines)
-   - Enhanced cross-modal insights with modality badges (~10 lines changed)
-   - Enhanced recommendations with priority dots (~10 lines changed)
-   - Contamination timeline section (NEW, interrogation only, ~15 lines)
-   - Technique analysis section (NEW, interrogation only, ~10 lines)
+2. **SessionDetail.tsx** (or equivalent):
+   - General Summary section (~15 lines)
+   - Notes section with topic grouping (~35 lines)
+   - Action Items section with assignee grouping (~30 lines)

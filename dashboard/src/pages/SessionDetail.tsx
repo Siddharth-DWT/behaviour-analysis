@@ -41,6 +41,14 @@ import VideoSignalPlayer from "../components/VideoSignalPlayer";
 
 // ── Helpers ──
 
+const VIDEO_EXTENSIONS = new Set(["mp4", "webm", "mov", "avi", "mkv", "m4v"]);
+
+function isVideoFile(url: string | null | undefined): boolean {
+  if (!url) return false;
+  const ext = url.split("?")[0].split(".").pop()?.toLowerCase() ?? "";
+  return VIDEO_EXTENSIONS.has(ext);
+}
+
 function formatDuration(ms: number | null): string {
   if (!ms) return "--";
   const totalSec = Math.round(ms / 1000);
@@ -595,7 +603,7 @@ export default function SessionDetail() {
   const { data: videoSignalData } = useQuery({
     queryKey: ["video-signals", id],
     queryFn: () => getVideoSignals(id!),
-    enabled: !!id && !!detail?.session?.media_url,
+    enabled: !!id && isVideoFile(detail?.session?.media_url),
     // Poll every 30 s until Face/Body/Gaze signals arrive, then stop
     refetchInterval: (query) => {
       const d = query.state.data as { signals?: { agent: string }[] } | undefined;
@@ -1189,8 +1197,8 @@ export default function SessionDetail() {
         )}
       </section>
 
-      {/* 5b. VIDEO PLAYER with signal overlay */}
-      {session.media_url && videoSignalData && (
+      {/* 5b. VIDEO PLAYER with signal overlay — audio-only sessions skip this */}
+      {isVideoFile(session.media_url) && videoSignalData && (
         <div className="rounded-lg border border-nexus-border bg-nexus-surface p-4">
           <h2 className="mb-3 text-sm font-medium text-nexus-text-secondary">
             Video Playback
@@ -1443,6 +1451,55 @@ export default function SessionDetail() {
                         {fact.status && ` (${fact.status})`}
                       </span>
                     </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* Notes (topic-grouped discussion details) */}
+          {content?.notes && (content.notes as any[]).length > 0 && (
+            <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
+              <h2 className="mb-4 text-sm font-semibold text-nexus-text-primary">
+                Notes
+              </h2>
+              <div className="space-y-5">
+                {(content.notes as any[]).map((topic: any, i: number) => (
+                  <div key={i}>
+                    <h3 className="text-sm font-semibold text-nexus-accent-purple mb-1">
+                      {topic.topic}
+                    </h3>
+                    {topic.summary && (
+                      <p className="text-xs text-nexus-text-muted mb-2 italic">{topic.summary}</p>
+                    )}
+                    <ul className="space-y-2 ml-2 border-l-2 border-nexus-border pl-3">
+                      {(topic.details || []).map((detail: any, j: number) => (
+                        <li key={j} className="text-sm text-nexus-text-primary">
+                          <div className="flex items-start gap-2">
+                            <span className="mt-0.5 text-nexus-accent-purple">→</span>
+                            <div>
+                              <span className="font-medium">{detail.speaker}</span>
+                              {detail.timestamp && (
+                                <span className="ml-1.5 text-[10px] text-nexus-text-muted">
+                                  ({detail.timestamp})
+                                </span>
+                              )}
+                              <span className="ml-1">{detail.text}</span>
+                              {detail.sub_details?.length > 0 && (
+                                <ul className="mt-1 ml-3 space-y-0.5">
+                                  {detail.sub_details.map((sub: string, k: number) => (
+                                    <li key={k} className="text-xs text-nexus-text-secondary flex items-start gap-1.5">
+                                      <span className="mt-1 h-1 w-1 shrink-0 rounded-full bg-nexus-text-muted" />
+                                      {sub}
+                                    </li>
+                                  ))}
+                                </ul>
+                              )}
+                            </div>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
                   </div>
                 ))}
               </div>
@@ -1798,6 +1855,53 @@ export default function SessionDetail() {
                   );
                 })}
               </ul>
+            </section>
+          )}
+
+          {/* Action Items (grouped by assignee) */}
+          {content?.action_items && (content.action_items as any[]).length > 0 && (
+            <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
+              <h2 className="mb-4 text-sm font-semibold text-nexus-text-primary">
+                Action Items
+              </h2>
+              <div className="space-y-4">
+                {Object.entries(
+                  (content.action_items as any[]).reduce((groups: Record<string, any[]>, item: any) => {
+                    const key = item.assignee || "Unassigned";
+                    (groups[key] = groups[key] || []).push(item);
+                    return groups;
+                  }, {})
+                ).map(([assignee, items]) => (
+                  <div key={assignee}>
+                    <h3 className="text-xs font-semibold text-nexus-text-primary mb-1.5 uppercase tracking-wide">
+                      {assignee}
+                    </h3>
+                    <ul className="space-y-1.5 ml-2">
+                      {(items as any[]).map((item: any, i: number) => (
+                        <li key={i} className="flex items-start gap-2 text-sm text-nexus-text-primary">
+                          <span className="mt-0.5">•</span>
+                          <div>
+                            {item.task}
+                            {item.deadline && (
+                              <span className="ml-1.5 text-xs text-amber-400 font-medium">
+                                — {item.deadline}
+                              </span>
+                            )}
+                            {item.timestamp && (
+                              <span className="ml-1.5 text-[10px] text-nexus-text-muted">
+                                ({item.timestamp})
+                              </span>
+                            )}
+                            {item.context && (
+                              <p className="text-xs text-nexus-text-muted mt-0.5">{item.context}</p>
+                            )}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+              </div>
             </section>
           )}
 

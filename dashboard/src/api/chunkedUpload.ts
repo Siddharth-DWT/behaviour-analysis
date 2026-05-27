@@ -2,7 +2,7 @@ import { getAccessToken } from "./client";
 
 const API_BASE = "/api";
 const CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB
-const MAX_PARALLEL = 3;              // 3 simultaneous chunk uploads
+const MAX_PARALLEL = 5;              // 5 simultaneous chunk uploads
 const MAX_RETRIES  = 3;              // retries per chunk before giving up
 
 export interface ChunkProgress {
@@ -111,27 +111,34 @@ export async function uploadFileChunked(
   const { upload_id, total_chunks } = init;
   let chunksUploaded = 0;
 
-  // ── 2. Upload chunks in parallel batches ─────────────────────────────────────
-  const indices = Array.from({ length: total_chunks }, (_, i) => i);
+  // ── 2. Upload chunks — sliding window keeps MAX_PARALLEL in-flight at all times ──
+  // Sequential batches (old approach) stall: the next batch only starts after the
+  // slowest chunk in the current batch finishes. A sliding window starts the next
+  // chunk as soon as any slot frees up, keeping throughput constant.
+  const inFlight = new Set<Promise<void>>();
 
-  for (let i = 0; i < indices.length; i += MAX_PARALLEL) {
-    const batch = indices.slice(i, i + MAX_PARALLEL);
-    await Promise.all(
-      batch.map(async (idx) => {
-        const start = idx * CHUNK_SIZE;
-        const end   = Math.min(start + CHUNK_SIZE, file.size);
-        await uploadOneChunk(upload_id, idx, file.slice(start, end));
-        chunksUploaded++;
-        report({
-          phase:          "uploading",
-          chunksUploaded,
-          totalChunks:    total_chunks,
-          bytesUploaded:  Math.min(chunksUploaded * CHUNK_SIZE, file.size),
-          progressPct:    Math.round((chunksUploaded / total_chunks) * 100),
-        });
-      }),
-    );
+  for (let idx = 0; idx < total_chunks; idx++) {
+    const start = idx * CHUNK_SIZE;
+    const end   = Math.min(start + CHUNK_SIZE, file.size);
+    let p!: Promise<void>;
+    p = (async () => {
+      await uploadOneChunk(upload_id, idx, file.slice(start, end));
+      chunksUploaded++;
+      inFlight.delete(p);
+      report({
+        phase:          "uploading",
+        chunksUploaded,
+        totalChunks:    total_chunks,
+        bytesUploaded:  Math.min(chunksUploaded * CHUNK_SIZE, file.size),
+        progressPct:    Math.round((chunksUploaded / total_chunks) * 100),
+      });
+    })();
+    inFlight.add(p);
+    if (inFlight.size >= MAX_PARALLEL) {
+      await Promise.race(inFlight);
+    }
   }
+  await Promise.all(inFlight);
 
   // ── 3. Complete ───────────────────────────────────────────────────────────────
   report({ phase: "assembling", progressPct: 100, chunksUploaded: total_chunks, totalChunks: total_chunks });

@@ -20,7 +20,6 @@ const SIGNAL_CONFIG: Record<string, SignalConfigEntry> = {
     label: () => "",
     color: "transparent",
     category: "face",
-    hidden: true,
   },
   facial_stress: {
     icon: "●",
@@ -1054,9 +1053,11 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
       if (!rawId) continue;
       const cfg = SIGNAL_CONFIG[s.signal_type];
       if (cfg?.category === "voice") continue;
+      // Fusion signals are session-spanning and start at first window of the face track —
+      // they appear before the person joins and must not seed the group or drive panel visibility.
+      if (s.agent === "fusion") continue;
       // Session-spanning hidden signals (denial_weakening, false_confession_risk, etc.)
-      // feed InterrogationSummaryPanel but must not keep face entries alive in the
-      // sidebar after the person's face is gone from frame.
+      // feed InterrogationSummaryPanel but must not keep face entries alive in the sidebar.
       if (cfg?.hidden) continue;
 
       const canonId = toCanonical[rawId] ?? rawId;
@@ -1142,6 +1143,8 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
               {Object.entries(visibleByFace).map(([speakerId, { label, rawId, signals: sigs }]) => {
                 const prioritySigs = sigs
                   .filter((s: VideoSignal) => {
+                    if (s.agent === "fusion") return false;
+                    if (s.signal_type === "presence_detected") return false;
                     if (SIGNAL_CONFIG[s.signal_type]?.hidden) return false;
                     const display = getSignalDisplay(s.signal_type, s.value_text ?? "");
                     return display.priority <= (showExpanded ? 2 : 1);
@@ -1150,12 +1153,11 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                 const visibleSigs = showExpanded ? prioritySigs : prioritySigs.slice(0, 3);
                 const hasPresence = activeSignals.some((s: VideoSignal) => s.signal_type === "presence_detected" && (toCanonical[s.speaker_id ?? ""] ?? s.speaker_id) === speakerId);
                 if (visibleSigs.length === 0 && !hasPresence) return null;
-                // Hide any speaker with no face thumbnail from the video sidebar.
-                // Face_N without thumbnail = unconfirmed detection (ArcFace failure, photo).
-                // Speaker_N without thumbnail = voice-only speaker, no face matched — their
-                // signals belong in the voice/language panels, not the video player sidebar.
-                // Face_N without thumbnail can still show (face detected but not lip-synced).
-                if (rawId.startsWith("Speaker_") && !speakerRoster[rawId]?.thumbnail_url) return null;
+                // Hide any face/speaker with no thumbnail from the video sidebar.
+                // No thumbnail = ArcFace failed to extract an embedding (too few frames,
+                // too small, static graphic, or photo on screen). These are unreliable
+                // detections and should not appear in the panel regardless of label type.
+                if (!speakerRoster[rawId]?.thumbnail_url) return null;
                 return (
                   <div key={speakerId} className="flex flex-col gap-1">
                     <SpeakerGroupHeader

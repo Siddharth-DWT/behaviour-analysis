@@ -5,6 +5,7 @@ Ported from services/api_gateway/main.py lines ~984–1202.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -120,8 +121,11 @@ async def upload_chunk(
             )
 
     chunk_path = CHUNK_UPLOAD_DIR / upload_id / f"chunk_{chunk_number:06d}"
-    with open(chunk_path, "wb") as f:
-        f.write(data)
+    # Run blocking disk write in a thread so the event loop stays free for
+    # other concurrent chunk uploads arriving at the same time.
+    await asyncio.get_running_loop().run_in_executor(
+        None, chunk_path.write_bytes, data
+    )
 
     session["received_chunks"].add(chunk_number)
     received = len(session["received_chunks"])

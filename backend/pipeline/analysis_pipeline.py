@@ -570,6 +570,7 @@ class AnalysisPipeline:
                         voice_summary=enriched_voice_summary,
                         language_summary=language_summary,
                         video_summary=video_summary_for_fusion,
+                        transcript_segments=transcript_segments or [],
                     )
                 )
                 fusion_result = fusion_resp.model_dump() if hasattr(fusion_resp, "model_dump") else dict(fusion_resp)

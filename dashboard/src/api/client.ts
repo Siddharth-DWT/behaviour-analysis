@@ -151,6 +151,24 @@ export interface Report {
   session_id: string;
   report_type: string;
   content: {
+    general_summary?: string[];
+    notes?: Array<{
+      topic?: string;
+      summary?: string;
+      details?: Array<{
+        speaker?: string;
+        text?: string;
+        timestamp?: string;
+        sub_details?: string[];
+      }>;
+    }>;
+    action_items?: Array<{
+      assignee?: string;
+      task?: string;
+      deadline?: string | null;
+      timestamp?: string;
+      context?: string;
+    }>;
     executive_summary?: string;
     key_facts?: Array<{
       type?: string;

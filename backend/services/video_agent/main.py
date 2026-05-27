@@ -476,9 +476,40 @@ class VideoPipeline:
 
         _is_interrogation = meeting_type == "interrogation_video"
 
+        # Meeting types where video-call tile position is a reliable identity marker.
+        # Position re-indexing is ONLY safe when the probe explicitly confirms a
+        # simultaneous multi-face grid layout. In active_speaker / unknown probes,
+        # different people share the same full-screen tile at different times →
+        # collapsing by tile position merges them into one Face_N and mixes all signals.
+        # meeting_type="grid" is kept as a user-level hint but still requires the probe
+        # to confirm a non-room, non-active_speaker layout before re-indexing fires.
+        _PROBE_GRID_TYPES = {"grid"}
+        _use_position_index = (
+            _profile.meeting_type in _PROBE_GRID_TYPES
+            or (meeting_type == "grid" and _profile.meeting_type not in {"room", "active_speaker", "unknown"})
+        )
+
+        # ── Position-based face re-indexing ───────────────────────────────────
+        # All faces are visible simultaneously in grid/video-call layouts, making
+        # lip-sync correlation unreliable (silence baseline contaminated by listener
+        # reactions). Tile position is stable identity — quantise median (cx, cy)
+        # per track_id to a cell and collapse fragmented tracks at the same tile.
+        _old_to_new_idx: dict[int, int] = {}
+        _track_window_counts: dict[int, int] = {}
+        if _use_position_index:
+            windows, _old_to_new_idx, _track_window_counts = VideoPipeline._reindex_by_position(windows, cell_size=0.20)
+            logger.info(
+                "[%s] Position re-indexing (meeting_type=%r, probe=%r): "
+                "%d track_id(s) → %d tile cluster(s)",
+                session_id, meeting_type, _profile.meeting_type,
+                len(_old_to_new_idx),
+                len(set(_old_to_new_idx.values())),
+            )
+
         # ── Inject active-tile tags into mapper ───────────────────────────────
-        # Skipped for interrogation videos — no speaker-face mapping is performed.
-        if not _is_interrogation:
+        # Skipped for interrogation and position-indexed sessions — neither uses
+        # speaker-face linking (identity comes from pose label or tile position).
+        if not _is_interrogation and not _use_position_index:
             self._mapper.set_active_tile_tags(active_tile_tags)
             if active_tile_tags:
                 logger.info(
@@ -492,11 +523,11 @@ class VideoPipeline:
                 )
 
         # ── Step 1b: Light-ASD active speaker scoring (optional) ─────────────
-        # Skipped for interrogation videos — no speaker-face mapping is performed.
-        # For other sessions: replaces MediaPipe jawOpen lip-sync correlation with
-        # a learned AV model (94.1% precision on AVA-ActiveSpeaker).
+        # Skipped for interrogation and position-indexed sessions — neither performs
+        # speaker-face linking. For other sessions: replaces MediaPipe jawOpen
+        # lip-sync correlation with a learned AV model (94.1% precision on AVA-ActiveSpeaker).
         asd_scores: dict | None = None
-        if not _is_interrogation:
+        if not _is_interrogation and not _use_position_index:
             _asd = LightASDClassifier.get_instance(
                 model_dir=os.path.join(os.path.dirname(__file__), "..", "..", "models")
             )
@@ -537,19 +568,19 @@ class VideoPipeline:
                         pass
 
         # ── Step 2: Map windows → speakers ────────────────────────────────────
-        # Interrogation videos skip all speaker-face linking — single-camera
-        # ceiling/oblique angle makes lip-sync unreliable (suspect looks down,
-        # interrogator often off-camera). Face_N tracks carry behavioral signals
-        # on their own timeline without being merged to Speaker_N labels.
+        # Interrogation: single-camera angle makes lip-sync unreliable.
+        # Position-indexed sessions: tile position already defines identity —
+        # silence baseline is contaminated by listener reactions in multi-face layouts.
+        # Both skip speaker-face linking; Face_N labels carry signals directly.
         windows_by_speaker, lip_sync_scores, face_to_speaker = self._mapper.assign(
             windows, diar_segments, lip_activity_map,
             asd_scores=asd_scores,
-            skip_speaker_link=_is_interrogation,
+            skip_speaker_link=_is_interrogation or _use_position_index,
         )
         # ── Step 2b: Remove static faces (photos/graphics on screen) ─────────
         # Skipped for room profiles — no screen share possible in physical rooms.
         # For all other profiles (grid, active_speaker, unknown) static graphics
-        # can appear as screenshare sidebar content.
+        # (avatars, shared slides, presentation thumbnails) can appear as faces.
         static_tracks: set[str] = set()
         if getattr(self._extractor, "_profile_static_filter", True):
             static_tracks = {
@@ -748,6 +779,13 @@ class VideoPipeline:
         except Exception as exc:
             logger.warning(f"[{session_id}] Face embedding extraction failed (non-fatal): {exc}")
 
+        # ── Step 5b: Re-key embeddings after position-based re-indexing ─────────
+        if _old_to_new_idx and face_embeddings_data:
+            face_embeddings_data = VideoPipeline._rekey_embeddings(
+                face_embeddings_data, _old_to_new_idx, _track_window_counts
+            )
+            logger.info("[%s] Position re-index: embeddings re-keyed → %d entries", session_id, len(face_embeddings_data))
+
         elapsed = time.time() - start
 
         logger.info(
@@ -768,6 +806,78 @@ class VideoPipeline:
             lip_sync_scores=lip_sync_scores,
             face_to_speaker={str(k): v for k, v in face_to_speaker.items()},
         ), video_path
+
+    @staticmethod
+    def _reindex_by_position(
+        windows: list,
+        cell_size: float = 0.20,
+    ) -> tuple[list, dict, dict]:
+        """
+        Collapse fragmented CentroidTracker IDs at the same grid tile into one Face_N.
+
+        Computes median (cx, cy) per track_id, quantizes to a (col, row) cell using
+        round() — avoids boundary jitter that int() causes at tile edges.
+        Multiple track_ids at the same cell → same Face_N index.
+
+        Returns (updated_windows, old_track_id → new_face_index mapping,
+                 old_track_id → window_count mapping).
+        Window counts are passed to _rekey_embeddings so it can choose the thumbnail
+        from the dominant (most-windowed) track rather than any arbitrary track.
+        """
+        from collections import defaultdict
+        pos_by_track: dict[int, list[tuple[float, float]]] = defaultdict(list)
+        for wf in windows:
+            if wf.face_centre_x > 0 or wf.face_centre_y > 0:
+                pos_by_track[wf.face_index].append((wf.face_centre_x, wf.face_centre_y))
+
+        track_window_counts: dict[int, int] = {tid: len(pts) for tid, pts in pos_by_track.items()}
+
+        cell_to_idx: dict[tuple[int, int], int] = {}
+        old_to_new: dict[int, int] = {}
+        next_idx = 0
+        for track_id in sorted(pos_by_track.keys()):
+            pts = pos_by_track[track_id]
+            med_cx = sorted(p[0] for p in pts)[len(pts) // 2]
+            med_cy = sorted(p[1] for p in pts)[len(pts) // 2]
+            cell = (round(med_cx / cell_size), round(med_cy / cell_size))
+            if cell not in cell_to_idx:
+                cell_to_idx[cell] = next_idx
+                next_idx += 1
+            old_to_new[track_id] = cell_to_idx[cell]
+
+        for wf in windows:
+            if wf.face_index in old_to_new:
+                wf.face_index = old_to_new[wf.face_index]
+        return windows, old_to_new, track_window_counts
+
+    @staticmethod
+    def _rekey_embeddings(
+        embeddings: dict,
+        old_to_new: dict,
+        track_window_counts: dict | None = None,
+    ) -> dict:
+        """Re-key face_embeddings_data after position-based re-indexing.
+
+        When multiple track_ids collapse to the same tile cell, keeps the embedding
+        from the track with the MOST windows (dominant occupant of that tile position).
+        This prevents a brief initial track (e.g. 2s before a scene cut showing a
+        different person) from overwriting the thumbnail of the person who occupied
+        the tile for the rest of the session.
+        """
+        result: dict = {}
+        result_window_counts: dict[str, int] = {}
+        for old_label, data in sorted(embeddings.items()):
+            track_id = data.get("track_id")
+            if track_id is not None and track_id in old_to_new:
+                new_label = f"Face_{old_to_new[track_id]}"
+                this_count = (track_window_counts or {}).get(track_id, 0)
+                if new_label not in result or this_count > result_window_counts.get(new_label, 0):
+                    result[new_label] = {**data, "track_id": old_to_new[track_id]}
+                    result_window_counts[new_label] = this_count
+            else:
+                if old_label not in result:
+                    result[old_label] = data
+        return result
 
     def burn_overlay(
         self,
