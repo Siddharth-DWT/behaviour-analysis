@@ -1,4 +1,4 @@
-# NEXUS — Fix Face-to-Speaker Mapping Pipeline
+# NEXUS — Fix Face-to-Speaker Mapping Pipeline + LR-ASD Model Upgrade
 
 ## Root Cause (verified from code)
 
@@ -16,19 +16,25 @@ Small face: 0.05 - 0.02 = 0.03 → REJECTED → no link → signals dropped
 
 The large face ALWAYS wins regardless of who is actually speaking.
 
-## Files to Modify (3 files, 5 changes)
+Additionally, the ASD model is Light-ASD (CVPR 2023, 94.1% mAP). The same
+authors released LR-ASD (IJCV 2025, 94.5% mAP) — a drop-in replacement with
+better cross-domain robustness and +0.4% accuracy. Same input format, same
+output format, same singleton pattern.
+
+## Files to Modify (3 files, 6 changes)
 
 ```
 services/video_agent/feature_extractor.py
-  - build_lip_activity_map()     — line ~3486
-  - _lip_sync_assignment()       — line ~6056
-  - MIN_LIP_SYNC_LINK_SCORE      — line 43
+  - LightASDClassifier → upgrade to LR-ASD model support    — Change 6
+  - build_lip_activity_map()                                  — Change 1
+  - _lip_sync_assignment()                                    — Change 2
+  - MIN_LIP_SYNC_LINK_SCORE                                   — Change 3
 
 services/video_agent/main.py
-  - calibration_confidence write  — in _build_summaries or run_analysis
+  - calibration_confidence write                              — Change 5
 
 backend/pipeline/analysis_pipeline.py
-  - _SESSION_FACE_LOCK_MIN_SCORE  — line 52
+  - _SESSION_FACE_LOCK_MIN_SCORE                              — Change 4
 ```
 
 ## CRITICAL INSTRUCTIONS
@@ -36,40 +42,40 @@ backend/pipeline/analysis_pipeline.py
 **Before writing ANY code:**
 
 1. Read `services/video_agent/feature_extractor.py` — COMPLETELY:
-   - `build_lip_activity_map()` — current implementation builds
-     `{face_index: [(timestamp_ms, lip_score), ...]}` where `lip_score`
-     is a weighted composite of jaw_open (0.50), mouth_lower_down (0.20),
-     mouth_funnel (0.15), mouth_pucker (0.10), mouth_close_inv (0.05).
-     These are all ABSOLUTE blendshape values (0.0-1.0 range).
-   - `_lip_sync_assignment()` — current implementation computes per-(face, speaker)
-     correlation = mean(lip during speech) - mean(lip during silence).
-     Uses `_hungarian_assign` for globally-optimal pairing.
-   - `MIN_LIP_SYNC_LINK_SCORE` = 0.10 — minimum correlation to accept a link.
+   - `LightASDClassifier` class — singleton, loads ONNX or TorchScript from
+     `models/light_asd/light_asd.onnx` or `.pt`. Input: 96×96 grayscale crops
+     + 16kHz mono audio (40-dim log-mel filterbank, 4 audio frames per video
+     frame). Output: per-frame speaking probabilities → Viterbi 2-state HMM
+     smoothing → binary 0.0/1.0 labels. Singleton via `get_instance()`.
+   - `build_lip_activity_map()` — builds `{face_idx: [(ts_ms, lip_score)]}` from
+     absolute blendshape composite: jaw_open (0.50) + mouth_lower_down (0.20) +
+     mouth_funnel (0.15) + mouth_pucker (0.10) + mouth_close_inv (0.05).
+   - `_lip_sync_assignment()` — per-(face,speaker) correlation = mean(lip during speech)
+     - mean(lip during silence). Uses `_hungarian_assign` for global optimum.
+   - `MIN_LIP_SYNC_LINK_SCORE` = 0.10.
    - `SpeakerFaceMapper.assign()` — priority: ASD > lip_sync > time_overlap.
-     ASD path works correctly (binary labels, scale-independent).
-     time_overlap path works correctly (single-speaker sessions).
-     ONLY the lip_sync path has the absolute-score bias.
 
 2. Read `services/video_agent/main.py`:
-   - `VideoPipeline.run_analysis()` — where lip_activity_map is built and
-     passed to mapper.assign()
-   - `_build_summaries()` — where speaker summaries (including calibration_confidence)
-     are built per speaker. Check if Face_N entries get calibration_confidence.
+   - Where `LightASDClassifier.get_instance()` is called
+   - Where `_asd.score(_face_crops, _tmp_audio.name, fps=_fps)` runs
+   - The face crop buffering in `_extract_frames()` — 96×96 grayscale crops
+     keyed by `(timestamp_ms, cx_int, cy_int)`
 
 3. Read `backend/pipeline/analysis_pipeline.py`:
-   - `_build_session_face_locks()` — reads lip_sync_scores, rejects entries
-     below _SESSION_FACE_LOCK_MIN_SCORE (0.06).
-   - `_SESSION_FACE_LOCK_MIN_SCORE` default value and env var.
+   - `_build_session_face_locks()` — lip_sync_scores threshold
+   - `_SESSION_FACE_LOCK_MIN_SCORE` = 0.06
 
 4. Use proper OOP and DSA:
-   - **Delta computation**: O(T) per face where T = timestamps
-   - **MAD normalization**: O(T) median + O(T) median of abs deviations
+   - **Delta computation**: O(T) per face
+   - **MAD normalization**: O(T) median + O(T) MAD
    - **bisect**: O(log S) for diar segment lookup per timestamp
-   - **Hungarian assignment**: unchanged — already optimal
+   - **Singleton pattern**: LR-ASD follows same `get_instance()` pattern
+   - **Hungarian assignment**: unchanged
 
-5. Do NOT change the ASD path or time_overlap path. ONLY change the lip_sync path.
-   ASD works correctly. time_overlap works correctly. The fix is isolated to
-   `build_lip_activity_map()` and `_lip_sync_assignment()`.
+5. Do NOT change the ASD path routing logic or time_overlap path.
+   The ASD path works correctly — Change 6 only upgrades the MODEL, not the
+   calling code. The `SpeakerFaceMapper.assign()` priority (ASD > lip_sync >
+   time_overlap) stays the same. The `score()` method signature stays the same.
 
 ---
 
@@ -89,28 +95,22 @@ lip_score = (
     + mouth_pucker     * 0.10
     + (1.0 - mouth_close) * 0.05
 )
-# Returns: {face_idx: [(ts_ms, lip_score), ...]}
 ```
 
 ### New:
 ```python
 def build_lip_activity_map(self, frames) -> dict[int, list[tuple[int, float]]]:
     """
-    Build per-face lip activity timeseries using frame-to-frame DELTA
-    instead of absolute blendshape values.
-
-    Delta measures jaw MOTION — a small face moving its jaw produces the
-    same normalized delta as a large face moving its jaw. This eliminates
-    the systematic bias toward larger faces in _lip_sync_assignment.
+    Build per-face lip activity using frame-to-frame DELTA + MAD normalization.
+    Delta measures jaw MOTION — scale-independent across face sizes.
 
     Steps:
-      1. Compute raw composite per frame (same weights as before)
-      2. Compute |delta| between consecutive frames per face → O(T)
-      3. MAD-normalize per face so all faces are on the same scale → O(T)
+      1. Compute raw composite per frame (same weights)
+      2. |delta| between consecutive frames per face → O(T)
+      3. MAD-normalize per face → O(T)
 
     DSA: O(F × T) where F = faces, T = frames per face.
     """
-    # Step 1: raw composites per face (existing code, unchanged)
     raw_by_face: dict[int, list[tuple[int, float]]] = defaultdict(list)
     for frame in frames:
         fi = frame.face_index
@@ -123,30 +123,24 @@ def build_lip_activity_map(self, frames) -> dict[int, list[tuple[int, float]]]:
         )
         raw_by_face[fi].append((frame.timestamp_ms, composite))
 
-    # Step 2 + 3: delta + MAD normalize per face
     result: dict[int, list[tuple[int, float]]] = {}
     for fi, raw_series in raw_by_face.items():
         if len(raw_series) < 3:
             result[fi] = [(ts, 0.0) for ts, _ in raw_series]
             continue
 
-        # Sort by timestamp (should already be sorted, but guarantee)
         raw_series.sort(key=lambda x: x[0])
 
-        # Compute absolute deltas between consecutive frames
         deltas = []
         for i in range(1, len(raw_series)):
             delta = abs(raw_series[i][1] - raw_series[i - 1][1])
             deltas.append((raw_series[i][0], delta))
 
-        # MAD normalization: median absolute deviation
         delta_values = [d for _, d in deltas]
         median_delta = sorted(delta_values)[len(delta_values) // 2]
         abs_devs = [abs(d - median_delta) for d in delta_values]
         mad = sorted(abs_devs)[len(abs_devs) // 2]
 
-        # Normalize: (delta - median) / (MAD * 1.4826 + epsilon)
-        # 1.4826 makes MAD consistent with std for normal distributions
         scale = mad * 1.4826 + 1e-6
         normalized = []
         for ts, delta in deltas:
@@ -158,22 +152,13 @@ def build_lip_activity_map(self, frames) -> dict[int, list[tuple[int, float]]]:
     return result
 ```
 
-**Why MAD instead of std?** MAD is robust to outliers. A single large jaw movement
-(yawn, cough) inflates std but barely affects MAD. This prevents one-off events
-from distorting the normalization.
-
 ---
 
 ## Change 2: _lip_sync_assignment() — Segment-Level Voting
 
 **File:** `services/video_agent/feature_extractor.py` — `_lip_sync_assignment()`
 
-The current correlation (mean during speech - mean during silence) works on
-the ENTIRE session. Replace with segment-level voting: for each diar segment,
-compute the correlation, then vote. This is more robust because one speaker's
-long monologue doesn't dominate the score.
-
-### Replace the correlation computation inside _lip_sync_assignment:
+Replace session-wide correlation with per-diar-segment voting with quality gates.
 
 ```python
 def _lip_sync_assignment(
@@ -184,96 +169,62 @@ def _lip_sync_assignment(
     lip_activity_map: dict[int, list[tuple[int, float]]],
 ) -> tuple[dict[int, str], dict[int, float]]:
     """
-    Assign faces to speakers using delta-normalized lip activity.
-
-    Segment-level voting:
-      For each (face, speaker) pair, for each diar segment of that speaker:
-        1. Compute mean lip_delta during segment (speech)
-        2. Compute mean lip_delta during ±2s around segment (silence)
-        3. score_segment = speech_mean - silence_mean
-      Aggregate: weighted mean by segment duration (longer = more reliable)
-
-    Quality gates per segment:
-      - Duration ≥ 500ms (very short segments are noise)
-      - Face visible ratio ≥ 0.50 (face must be detected in ≥50% of segment frames)
-
-    DSA: O(F × S × T/S) ≈ O(F × T) where F=faces, S=segments, T=total timestamps.
-    bisect for O(log T) per segment boundary lookup.
+    Segment-level voting with quality gates:
+      - Duration ≥ 500ms
+      - Face visible ratio ≥ 0.50
+    Weighted mean by segment duration.
+    DSA: bisect O(log T) per segment boundary.
     """
+    import bisect
     scores: dict[tuple[int, str], float] = {}
 
     for fi in face_indices:
         series = lip_activity_map.get(fi, [])
         if not series:
             continue
-
         timestamps = [t for t, _ in series]
         values = [v for _, v in series]
 
         for spk in speakers:
-            spk_segs = [
-                seg for seg in diar_segments
-                if seg.get("speaker") == spk
-            ]
+            spk_segs = [s for s in diar_segments if s.get("speaker") == spk]
             if not spk_segs:
                 continue
 
-            seg_scores = []
-            seg_weights = []
-
+            seg_scores, seg_weights = [], []
             for seg in spk_segs:
                 seg_start = seg.get("start_ms", 0)
                 seg_end = seg.get("end_ms", 0)
                 seg_dur = seg_end - seg_start
-
-                # Quality gate: segment duration
                 if seg_dur < 500:
                     continue
 
-                # Find lip values during this segment — bisect O(log T)
                 i_start = bisect.bisect_left(timestamps, seg_start)
                 i_end = bisect.bisect_right(timestamps, seg_end)
                 speech_vals = values[i_start:i_end]
 
-                # Quality gate: face visible ratio
                 if len(speech_vals) < max(1, (i_end - i_start) * 0.50):
                     continue
-
                 if not speech_vals:
                     continue
 
                 speech_mean = sum(speech_vals) / len(speech_vals)
 
-                # Silence: 2 seconds before and after the segment
                 sil_start = max(0, seg_start - 2000)
                 sil_end = min(timestamps[-1] if timestamps else seg_end, seg_end + 2000)
-                i_sil_start = bisect.bisect_left(timestamps, sil_start)
-                i_sil_end = bisect.bisect_right(timestamps, sil_end)
-                silence_vals = (
-                    values[i_sil_start:i_start]
-                    + values[i_end:i_sil_end]
-                )
+                i_sil_s = bisect.bisect_left(timestamps, sil_start)
+                i_sil_e = bisect.bisect_right(timestamps, sil_end)
+                silence_vals = values[i_sil_s:i_start] + values[i_end:i_sil_e]
+                silence_mean = sum(silence_vals) / len(silence_vals) if silence_vals else 0.0
 
-                silence_mean = (
-                    sum(silence_vals) / len(silence_vals)
-                    if silence_vals else 0.0
-                )
-
-                seg_score = speech_mean - silence_mean
-                seg_scores.append(seg_score)
+                seg_scores.append(speech_mean - silence_mean)
                 seg_weights.append(seg_dur)
 
-            # Weighted mean by segment duration
             if seg_scores and sum(seg_weights) > 0:
-                total_weight = sum(seg_weights)
-                weighted_score = sum(
-                    s * w for s, w in zip(seg_scores, seg_weights)
-                ) / total_weight
-                scores[(fi, spk)] = max(0.0, weighted_score)
+                total_w = sum(seg_weights)
+                scores[(fi, spk)] = max(0.0, sum(s * w for s, w in zip(seg_scores, seg_weights)) / total_w)
             else:
                 scores[(fi, spk)] = 0.0
 
-    # Delegate to Hungarian assignment (unchanged)
     return self._hungarian_assign(face_indices, speakers, scores)
 ```
 
@@ -284,21 +235,11 @@ def _lip_sync_assignment(
 **File:** `services/video_agent/feature_extractor.py` — line 43
 
 ```python
-# BEFORE:
-MIN_LIP_SYNC_LINK_SCORE: float = 0.10
-
-# AFTER:
 MIN_LIP_SYNC_LINK_SCORE: float = 0.20
 ```
 
-**Why 0.30:** With MAD-normalized delta scores, genuine speaker-face correlations
-produce scores in the 0.40-0.80 range. Random noise correlations produce < 0.15.
-0.20 is the midpoint — conservative enough to avoid false rejects, strict enough
-to block noise.
-
-The ASD path and active-tile sentinel (1.0) are both well above 0.20.
-The time_overlap sentinel (1.0) is also above 0.20.
-Only genuine lip-sync correlations need to clear this threshold.
+With MAD-normalized delta scores: genuine matches 0.40-0.80, noise < 0.15.
+0.20 gives a 0.05 margin on both sides (noise ceiling 0.15, genuine floor 0.25).
 
 ---
 
@@ -307,20 +248,8 @@ Only genuine lip-sync correlations need to clear this threshold.
 **File:** `backend/pipeline/analysis_pipeline.py` — line 52
 
 ```python
-# BEFORE:
-_SESSION_FACE_LOCK_MIN_SCORE = float(os.getenv("SESSION_FACE_LOCK_MIN_SCORE", "0.06"))
-
-# AFTER:
 _SESSION_FACE_LOCK_MIN_SCORE = float(os.getenv("SESSION_FACE_LOCK_MIN_SCORE", "0.10"))
 ```
-
-**Why 0.10:** The gateway threshold is the final gate before registry linking.
-At 0.06, random noise from the old absolute-score system could pass.
-With the new delta-based scores, genuine links produce ≥ 0.30 (from the
-video agent's threshold). 0.10 is a safety floor — anything that passed the
-video agent's 0.30 will easily clear 0.10 at the gateway.
-
-The active-tile sentinel (1.0) and time_overlap sentinel (1.0) are unaffected.
 
 ---
 
@@ -328,65 +257,208 @@ The active-tile sentinel (1.0) and time_overlap sentinel (1.0) are unaffected.
 
 **File:** `services/video_agent/main.py` — `_build_summaries()`
 
-The current code builds `SpeakerVideoSummary` per speaker in `windows_by_speaker`.
-Since windows are keyed by `Face_N` (not `Speaker_N`), the summaries already
-use `Face_N` keys. Check that `calibration_confidence` is populated.
+Verify `calibration_confidence` is populated for Face_N entries. If missing, add:
 
 ```python
-# In _build_summaries, verify this field exists:
-for spk, wins in windows_by_speaker.items():
-    baseline = baselines.get(spk)
-    if baseline:
-        facial_bl, body_bl, gaze_bl = baseline
-        summaries[spk] = SpeakerVideoSummary(
-            ...,
-            calibration_confidence=facial_bl.confidence,  # ← must be here
-        )
+summaries[spk] = SpeakerVideoSummary(
+    ...,
+    calibration_confidence=facial_bl.confidence,
+)
 ```
 
-If `calibration_confidence` is missing from the summary, add it.
+The gateway (`analysis_pipeline.py`) must then write this value to the speakers
+table for Face_N rows (currently only written for Speaker_N by voice agent).
 
-The gateway then needs to write this value to the speakers table for Face_N rows.
-Check `analysis_pipeline.py` — the voice agent writes `calibration_confidence`
-for Speaker_N during `_publish_voice_outputs`. The video agent's value needs
-to be written similarly during Step 4 (registry matching).
+---
+
+## Change 6: Upgrade Light-ASD → LR-ASD Model
+
+**Paper:** Liao et al. "LR-ASD: Lightweight and Robust Network for Active Speaker Detection"
+IJCV 2025. Same authors as Light-ASD (CVPR 2023).
+
+**Repo:** `github.com/Junhua-Liao/LR-ASD`
+**Weights:** `weight/finetuning_TalkSet.model` (PyTorch checkpoint)
+
+**Why upgrade:**
+- 94.45% mAP on AVA (+0.4% over Light-ASD 94.1%)
+- Better cross-dataset robustness (SOTA on Talkies, Columbia, RealVAD)
+- Same input format: 96×96 grayscale face crops + 16kHz mono audio
+- Same output format: per-frame speaking probabilities → binary labels
+- Same singleton pattern, same `score()` method signature
+- 1.3M params (+0.3M over Light-ASD 1.0M — negligible)
+
+### What to change in LightASDClassifier:
+
+**6a. Update model file paths:**
 
 ```python
-# In analysis_pipeline.py, after receiving video_response:
-# For each Face_N in video_response.speaker_summaries:
-#   UPDATE speakers SET calibration_confidence = summary.calibration_confidence
-#   WHERE session_id = $1 AND speaker_label = face_label
+# BEFORE:
+onnx_path = Path(model_dir) / "light_asd" / "light_asd.onnx"
+pt_path   = Path(model_dir) / "light_asd" / "light_asd.pt"
+
+# AFTER — support both old and new paths (backward compatible):
+# Priority: LR-ASD (new) > Light-ASD (legacy)
+lr_asd_onnx  = Path(model_dir) / "lr_asd" / "lr_asd.onnx"
+lr_asd_pt    = Path(model_dir) / "lr_asd" / "lr_asd.pt"
+light_onnx   = Path(model_dir) / "light_asd" / "light_asd.onnx"
+light_pt     = Path(model_dir) / "light_asd" / "light_asd.pt"
+
+# Try LR-ASD first, fall back to Light-ASD
+for onnx_path, label in [(lr_asd_onnx, "LR-ASD"), (light_onnx, "Light-ASD")]:
+    if onnx_path.exists():
+        try:
+            import onnxruntime as ort
+            self._sess = ort.InferenceSession(
+                str(onnx_path), providers=["CPUExecutionProvider"]
+            )
+            self._available = True
+            self._model_name = label
+            logger.info("%s: ONNX model loaded — %s", label, onnx_path)
+            break
+        except Exception as exc:
+            logger.warning("%s: ONNX load failed: %s", label, exc)
+
+if not self._available:
+    for pt_path, label in [(lr_asd_pt, "LR-ASD"), (light_pt, "Light-ASD")]:
+        if pt_path.exists():
+            try:
+                import torch
+                self._torch_model = torch.jit.load(str(pt_path), map_location="cpu")
+                self._torch_model.eval()
+                self._available = True
+                self._model_name = label
+                logger.info("%s: TorchScript model loaded — %s", label, pt_path)
+                break
+            except Exception as exc:
+                logger.warning("%s: PyTorch load failed: %s", label, exc)
 ```
+
+**6b. Update class docstring:**
+
+```python
+class LightASDClassifier:
+    """
+    Active Speaker Detection via LR-ASD (Liao et al., IJCV 2025) or
+    Light-ASD (Liao et al., CVPR 2023) fallback.
+
+    LR-ASD: 94.45% mAP on AVA-ActiveSpeaker, SOTA cross-domain robustness.
+    Light-ASD: 94.1% mAP (legacy, used when LR-ASD model not available).
+
+    Model loading (priority order):
+      1. LR-ASD ONNX   — <model_dir>/lr_asd/lr_asd.onnx
+      2. Light-ASD ONNX — <model_dir>/light_asd/light_asd.onnx (legacy fallback)
+      3. LR-ASD PT      — <model_dir>/lr_asd/lr_asd.pt
+      4. Light-ASD PT   — <model_dir>/light_asd/light_asd.pt (legacy fallback)
+      5. Disabled        — falls back to lip-sync correlation
+
+    Same input/output as Light-ASD — drop-in replacement.
+    Source: https://github.com/Junhua-Liao/LR-ASD
+    """
+```
+
+**6c. Add `_model_name` property for logging:**
+
+```python
+def __init__(self, model_dir: str = "models") -> None:
+    self._sess = None
+    self._torch_model = None
+    self._available: bool = False
+    self._librosa_ok: bool = False
+    self._sr: int = 16000
+    self._model_name: str = "none"   # ← ADD
+    # ... rest of init
+```
+
+**6d. Update log messages in main.py:**
+
+```python
+# BEFORE:
+logger.info("[%s] Light-ASD: scored %d tracks", session_id, len(asd_scores))
+
+# AFTER:
+logger.info(
+    "[%s] %s: scored %d tracks",
+    session_id, _asd._model_name, len(asd_scores),
+)
+```
+
+**6e. Update the comment in main.py:**
+
+```python
+# BEFORE:
+# For other sessions: replaces MediaPipe jawOpen
+# lip-sync correlation with a learned AV model (94.1% precision on AVA-ActiveSpeaker).
+
+# AFTER:
+# For other sessions: replaces MediaPipe jawOpen lip-sync correlation
+# with LR-ASD (94.45% mAP, IJCV 2025) or Light-ASD (94.1%, CVPR 2023) fallback.
+```
+
+### How to obtain the LR-ASD model:
+
+```bash
+# Option A: Clone and export to ONNX
+git clone https://github.com/Junhua-Liao/LR-ASD.git
+cd LR-ASD
+# Download pretrained weights (auto-downloaded on first run, or manual):
+# weight/finetuning_TalkSet.model
+# Export to ONNX:
+python export_onnx.py --model weight/finetuning_TalkSet.model --output lr_asd.onnx
+# Place at: models/lr_asd/lr_asd.onnx
+
+# Option B: Use TorchScript directly
+python -c "
+import torch
+model = torch.load('weight/finetuning_TalkSet.model', map_location='cpu')
+# Trace with dummy inputs matching score() input shapes
+# ... (see LR-ASD repo for exact architecture)
+torch.jit.save(traced, 'models/lr_asd/lr_asd.pt')
+"
+```
+
+Note: The LR-ASD repo may need a custom `export_onnx.py` script — check the
+repo for export instructions. The model architecture is the same backbone as
+Light-ASD with improved temporal modeling, so the ONNX export process is
+identical. Input shapes: audio `[B, 1, N_MELS, T_audio]`, visual `[B, T_video, 1, 96, 96]`.
 
 ---
 
 ## What NOT to Change
 
-- ASD path (`_asd_assignment`) — works correctly, binary labels are scale-independent
-- time_overlap path (`_time_overlap_assignment`) — works correctly for single-speaker
-- Active-tile sentinel logic — already sets `lip_sync_scores[spk] = 1.0`
-- `_hungarian_assign` — already globally optimal
-- `SpeakerFaceMapper.assign()` routing logic — method priority ASD > lip_sync > time_overlap is correct
-- `skip_speaker_link` for interrogation — correct by design
+- `SpeakerFaceMapper.assign()` routing (ASD > lip_sync > time_overlap) — unchanged
+- `_hungarian_assign()` — unchanged
+- `_asd_assignment()` — unchanged (the ASD scoring logic is correct, only model upgraded)
+- `score()` method signature — unchanged (same input: face_crops + audio, same output: binary labels)
+- `_viterbi_smooth()` — unchanged
+- `CROP_SIZE` = 96, `N_MELS` = 40, `AUDIO_FRAMES_PER_VIDEO` = 4 — unchanged
+- Active-tile sentinel logic — unchanged
+- `skip_speaker_link` for interrogation — unchanged
+- Face crop buffering in `_extract_frames()` — unchanged (same 96×96 grayscale)
 
 ## Expected Results
 
 | Scenario | Before | After |
 |----------|:------:|:-----:|
-| 2-person meeting, no ASD | Large face gets Speaker_0, small face DROPPED | Both faces mapped correctly |
-| 3-person meeting, sidebar faces | Only active-tile face linked | All faces linked via delta correlation |
-| Single speaker | Works (time_overlap) | Works (unchanged) |
-| ASD available | Works | Works (unchanged) |
-| Interrogation | Skip (by design) | Skip (unchanged) |
-| Noise correlation | Passes at 0.06 gateway | Blocked at 0.30 video + 0.10 gateway |
+| 2-person meeting, no ASD | Large face gets Speaker, small face DROPPED | Both linked (delta correlation) |
+| 3-person meeting, sidebar faces | Only active-tile face linked | All linked via delta |
+| ASD available (Light-ASD) | 94.1% mAP | 94.45% mAP (LR-ASD) |
+| ASD cross-domain (Zoom/Teams) | Degrades on non-AVA content | Better robustness (TalkSet training) |
+| No model file at all | Disabled → lip-sync | Disabled → lip-sync (unchanged) |
+| Only Light-ASD model present | Works | Works (legacy fallback) |
+| LR-ASD + Light-ASD both present | N/A | LR-ASD used (higher priority) |
 
 ## Files Modified:
 1. **services/video_agent/feature_extractor.py**:
-   - `MIN_LIP_SYNC_LINK_SCORE`: 0.10 → 0.30 (~1 line)
+   - `LightASDClassifier.__init__()`: LR-ASD path priority + legacy fallback (~20 lines changed)
+   - `LightASDClassifier` docstring: updated (~5 lines)
+   - `_model_name` property added (~2 lines)
+   - `MIN_LIP_SYNC_LINK_SCORE`: 0.10 → 0.20 (~1 line)
    - `build_lip_activity_map()`: delta + MAD normalization (~30 lines changed)
-   - `_lip_sync_assignment()`: segment-level voting with quality gates (~50 lines changed)
+   - `_lip_sync_assignment()`: segment-level voting (~50 lines changed)
 2. **services/video_agent/main.py**:
+   - Log message uses `_asd._model_name` (~2 lines)
+   - Comment updated (~2 lines)
    - Verify `calibration_confidence` in `_build_summaries` (~2 lines)
 3. **backend/pipeline/analysis_pipeline.py**:
    - `_SESSION_FACE_LOCK_MIN_SCORE`: 0.06 → 0.10 (~1 line)
-   - Write video calibration_confidence to speakers table for Face_N (~5 lines)
+   - Write video calibration_confidence for Face_N (~5 lines)
