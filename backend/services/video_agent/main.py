@@ -522,10 +522,10 @@ class VideoPipeline:
                     f"mapper will use lip-sync only (may produce weak linkage)"
                 )
 
-        # ── Step 1b: Light-ASD active speaker scoring (optional) ─────────────
+        # ── Step 1b: ASD active speaker scoring (optional) ───────────────────
         # Skipped for interrogation and position-indexed sessions — neither performs
-        # speaker-face linking. For other sessions: replaces MediaPipe jawOpen
-        # lip-sync correlation with a learned AV model (94.1% precision on AVA-ActiveSpeaker).
+        # speaker-face linking. For other sessions: replaces MediaPipe jawOpen lip-sync
+        # correlation with LR-ASD (94.45% mAP, IJCV 2025) or Light-ASD (94.1%, CVPR 2023) fallback.
         asd_scores: dict | None = None
         if not _is_interrogation and not _use_position_index:
             _asd = LightASDClassifier.get_instance(
@@ -549,17 +549,17 @@ class VideoPipeline:
                     if _face_crops:
                         asd_scores = _asd.score(_face_crops, _tmp_audio.name, fps=_fps)
                         logger.info(
-                            "[%s] Light-ASD: scored %d tracks", session_id, len(asd_scores)
+                            "[%s] %s: scored %d tracks", session_id, _asd._model_name, len(asd_scores)
                         )
                     else:
                         logger.warning(
-                            "[%s] Light-ASD: no face crops buffered — "
-                            "falling back to lip-sync", session_id
+                            "[%s] %s: no face crops buffered — "
+                            "falling back to lip-sync", session_id, _asd._model_name
                         )
                 except Exception as exc:
                     logger.warning(
-                        "[%s] Light-ASD audio extraction failed (non-fatal): %s",
-                        session_id, exc,
+                        "[%s] %s audio extraction failed (non-fatal): %s",
+                        session_id, _asd._model_name, exc,
                     )
                 finally:
                     try:

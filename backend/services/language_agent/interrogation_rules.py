@@ -60,7 +60,13 @@ _INTERROGATION_DOMAIN_STOPWORDS: frozenset[str] = frozenset({
     "yeah", "okay", "alright", "gonna", "wanna", "gotta",
     "stuff", "kinda", "sorta", "nah", "nope", "yep",
 })
-_ALL_STOPWORDS: frozenset[str] = _VALIDATED_STOPWORDS | _INTERROGATION_DOMAIN_STOPWORDS
+# Filter to pure alphabetic tokens only — spaCy includes contraction suffixes
+# like "'ll" and "'ve" which sklearn's tokenizer splits into "ll"/"ve", causing
+# an inconsistency warning (sklearn tokenizes stop words to validate them).
+_ALL_STOPWORDS: frozenset[str] = frozenset(
+    w for w in (_VALIDATED_STOPWORDS | _INTERROGATION_DOMAIN_STOPWORDS)
+    if w.isalpha()
+)
 
 # ── Sensory vocabulary for detail_reduction (Vrij 2017) ──────────────────────
 # Words that encode episodic/perceptual grounding in a recalled scene.

@@ -129,18 +129,46 @@ async def generate_session_narrative(
         )
 
 
+_COMMON_WORDS = {
+    "about", "after", "again", "already", "also", "always", "another", "before",
+    "being", "between", "during", "every", "first", "going", "great", "guessing",
+    "having", "known", "maybe", "might", "never", "other", "really", "right",
+    "since", "still", "their", "there", "these", "thing", "think", "those",
+    "through", "under", "until", "using", "where", "which", "while", "would",
+}
+
+def _is_valid_person_name(name: str) -> bool:
+    """Return True only for strings that look like actual person names."""
+    if not name or len(name) < 3:
+        return False
+    # Pure numbers ("20", "100") or names starting with digit
+    if name[0].isdigit() or name.isdigit():
+        return False
+    # Must start with an uppercase letter (proper noun)
+    if not name[0].isupper():
+        return False
+    # Must contain at least one alphabetic character
+    if not any(c.isalpha() for c in name):
+        return False
+    # Reject common English words mistaken for names
+    if name.lower() in _COMMON_WORDS:
+        return False
+    return True
+
+
 def _build_speaker_name_map(entities: dict) -> dict[str, str]:
     """
     Build a mapping from speaker label → display name using extracted people entities.
     e.g. {"Speaker_0": "John (Seller)", "Speaker_1": "Sarah (Prospect)"}
     Falls back to the label itself when no name is known.
+    Filters out false NER extractions (verbs, numbers, common words).
     """
     name_map: dict[str, str] = {}
     for p in entities.get("people", []):
         label = p.get("speaker_label", "")
         name = p.get("name", "")
         role = p.get("role", "")
-        if label and name:
+        if label and name and _is_valid_person_name(name):
             display = f"{name} ({role.capitalize()})" if role else name
             name_map[label] = display
     return name_map
@@ -152,13 +180,25 @@ def _display(speaker_id: str, name_map: dict[str, str]) -> str:
 
 
 _NEG_PATTERN = re.compile(
-    r"\b(not|never|didn't|don't|wasn't|weren't|no|none|nobody)\b"
-    r"(?!\s+(just|only|merely|necessarily|yet))",
+    r"\b(not|never|didn't|don't|wasn't|weren't|no(?!t)|none|nobody)\b"
+    r"(?!\s+(?:just|only|merely|necessarily|yet|even))",
     re.IGNORECASE,
 )
 
 _CLAIM_PATTERN = re.compile(
-    r"(I |we |it is|it's|that's|there |they )",
+    r"\bI\s+(didn't|don't|wasn't|weren't|never|did|was|am|have|had|know|knew|saw|went|said|told|think|thought)\b",
+    re.IGNORECASE,
+)
+
+_IMPORTANCE_PATTERNS = re.compile(
+    r"(\?"
+    r"|\b(will|can|should|need to|have to|going to|let's|agreed|decided)\b"
+    r"|\b\d{1,2}[:.]\d{2}\b"
+    r"|\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
+    r"|\b\d+\s*(percent|%|dollars?|hours?|minutes?|days?|weeks?)\b"
+    r"|\b(problem|issue|concern|blocker|risk|deadline)\b"
+    r"|\b(okay|agree|sounds good|let's do|confirmed)\b"
+    r")",
     re.IGNORECASE,
 )
 
@@ -248,84 +288,32 @@ def _build_context(
                 f"stress={p.get('stress_score', 0):.3f}"
             )
 
-    # ── Voice Anomalies with Transcript Context ───────────────────────────────
+    # ── Full transcript (raw) ─────────────────────────────────────────────────
+    # Give the LLM the complete transcript so it can find contradictions and
+    # correlate voice anomalies itself — no algorithmic pre-filtering.
     segs = transcript_segments or []
-    if segs and peaks:
-        lines.append("\n=== VOICE ANOMALIES WITH TRANSCRIPT CONTEXT ===")
-        lines.append("(What was being said at each voice stress peak)")
-        seg_starts = [s.get("start_ms", 0) for s in segs]
-        for p in peaks[:10]:
-            time_ms = p.get("time_ms", 0)
-            speaker = p.get("speaker", "?")
-            stress = p.get("stress_score", 0)
-            idx = bisect.bisect_right(seg_starts, time_ms) - 1
-            if 0 <= idx < len(segs):
-                seg = segs[idx]
-                if abs(seg.get("start_ms", 0) - time_ms) < 5000:
-                    text = seg.get("text", "").strip()
-                    if text:
-                        m, s = divmod(int(time_ms / 1000), 60)
-                        lines.append(
-                            f"\n  {m}:{s:02d} — {_display(speaker, name_map)}: "
-                            f"stress={stress:.3f}"
-                        )
-                        lines.append(f'    Said: "{text[:200]}"')
-
-    # ── Potential Statement Contradictions ────────────────────────────────────
-    if segs and len(segs) > 10:
-        lines.append("\n=== POTENTIAL STATEMENT CONTRADICTIONS ===")
-        lines.append("(Same speaker, similar topic, different content — for LLM to evaluate)")
-        by_speaker: dict[str, list[dict]] = defaultdict(list)
-        for seg in segs:
-            spk = seg.get("speaker", "")
+    if segs:
+        lines.append("\n=== FULL TRANSCRIPT ===")
+        for seg in segs[:400]:          # cap at 400 segments (~12k tokens worst-case)
+            m, s = divmod(seg.get("start_ms", 0) // 1000, 60)
+            spk = _display(seg.get("speaker", "?"), name_map)
             text = seg.get("text", "").strip()
-            if spk and len(text) > 30:
-                by_speaker[spk].append(seg)
+            if text:
+                lines.append(f"  [{m}:{s:02d}] {spk}: {text[:150]}")
 
-        for spk, spk_segs in by_speaker.items():
-            if len(spk_segs) < 5:
-                continue
-            pairs_found = 0
-            for i, seg_a in enumerate(spk_segs):
-                if pairs_found >= 3:
-                    break
-                words_a = _content_words(seg_a["text"])
-                if len(words_a) < 3:
-                    continue
-                for seg_b in spk_segs[i + 5:]:
-                    if not _CLAIM_PATTERN.search(seg_a["text"]) or not _CLAIM_PATTERN.search(seg_b["text"]):
-                        continue
-                    words_b = _content_words(seg_b["text"])
-                    shared = words_a & words_b
-                    if len(shared) < 4:
-                        continue
-                    neg_a = bool(_NEG_PATTERN.search(seg_a["text"]))
-                    neg_b = bool(_NEG_PATTERN.search(seg_b["text"]))
-                    if neg_a != neg_b or len(shared) >= 6:
-                        time_a = seg_a.get("start_ms", 0)
-                        time_b = seg_b.get("start_ms", 0)
-                        ma, sa = divmod(time_a // 1000, 60)
-                        mb, sb = divmod(time_b // 1000, 60)
-                        stress_a = _stress_at(time_a, voice_summary, speaker=spk)
-                        stress_b = _stress_at(time_b, voice_summary, speaker=spk)
-                        sa_str = f"{stress_a:.2f}" if stress_a is not None else "N/A"
-                        sb_str = f"{stress_b:.2f}" if stress_b is not None else "N/A"
-                        lines.append(
-                            f"\n  {_display(spk, name_map)} — potential contradiction:"
-                        )
-                        lines.append(
-                            f'    A ({ma}:{sa:02d}): "{seg_a["text"][:150]}" '
-                            f"[stress={sa_str}]"
-                        )
-                        lines.append(
-                            f'    B ({mb}:{sb:02d}): "{seg_b["text"][:150]}" '
-                            f"[stress={sb_str}]"
-                        )
-                        lines.append(f"    Shared topic words: {', '.join(sorted(shared)[:5])}")
-                        if neg_a != neg_b:
-                            lines.append("    ⚡ Negation flip detected")
-                        pairs_found += 1
-                        break
+    # ── Voice stress peaks (raw) ──────────────────────────────────────────────
+    if peaks:
+        lines.append("\n=== VOICE STRESS PEAKS ===")
+        lines.append("(speaker — timestamp — stress score — baseline avg)")
+        for p in peaks[:15]:
+            spk_id = p.get("speaker", "?")
+            stress = p.get("stress_score", 0.0)
+            baseline = voice_summary.get("per_speaker", {}).get(spk_id, {}).get("avg_stress", 0.0)
+            m, s = divmod(p.get("time_ms", 0) // 1000, 60)
+            lines.append(
+                f"  {m}:{s:02d} — {_display(spk_id, name_map)}: "
+                f"stress={stress:.3f}  baseline={baseline:.3f}"
+            )
 
     # Video analysis per speaker
     if video_summary and video_summary.get("per_speaker"):
@@ -858,11 +846,13 @@ def _build_prompt(context: str, meeting_type: str) -> tuple[str, str]:
         "STRUCTURE REQUIREMENTS: "
         "1. general_summary: 5-7 bullet points covering the key themes, decisions, and outcomes. "
         "Each bullet is one standalone sentence. No paragraphs. Scannable. "
-        "2. notes: Group KEY discussion points by TOPIC or PHASE. Use the CONVERSATION PHASES from the "
-        "context data as topic headings. Under each topic include ONLY the 2-4 most significant "
-        "contributions — decisions made, problems raised, agreements reached, or key questions asked. "
-        "Do NOT transcribe every utterance. Omit pleasantries, filler, repetition, and off-topic remarks. "
-        "Each detail entry should represent a distinct insight, decision, or turning point. "
+        "2. notes: Group discussion by TOPIC or PHASE. Use the CONVERSATION PHASES from the context data "
+        "as topic headings. Under each topic, include ONLY 2-4 entries that represent DECISIONS, "
+        "COMMITMENTS, PROBLEMS RAISED, or KEY QUESTIONS. Exclude: greetings, pleasantries, filler "
+        "('got it', 'okay', 'yeah'), repetition, casual chat, and off-topic remarks. "
+        "If a topic had no decisions or key points, omit the topic entirely. "
+        "Each entry should be a PARAPHRASED key point, not a verbatim transcript quote. "
+        "A 20-minute meeting should produce 8-15 total note entries, not 30+. "
         "3. action_items: List every commitment, task, or follow-up mentioned. Group by assignee "
         "(the person responsible). Include deadline if mentioned, timestamp of when it was agreed, "
         "and brief context. Extract from both explicit commitments ('I will send the report') and "
@@ -1005,7 +995,7 @@ Respond with a JSON object containing these fields:
   ]
 }}
 
-CONTRADICTION ANALYSIS: Review the POTENTIAL STATEMENT CONTRADICTIONS section above. For each genuine contradiction (not just a topic revisit or elaboration), produce one entry. Contradiction types: factual_reversal (opposite claims), number_change (different figures), negation_flip (denied then admitted or vice versa), narrative_shift (story changed). The voice_delta must describe how stress/pitch/pace changed between statement A and B. IMPORTANT: Only flag genuinely contradictory statements — people update estimates, add details, and refine positions naturally. A revision is only contradictory when the later version is INCOMPATIBLE with the earlier one. Omit this field (empty array) if no genuine contradictions are found.
+CONTRADICTION ANALYSIS: Review the POTENTIAL STATEMENT CONTRADICTIONS section above. A genuine contradiction requires ALL of these to be true: (1) SAME speaker making both statements, (2) both statements are first-person claims ("I know", "I didn't", "I was") about the SAME specific fact, (3) the later claim is DIRECTLY INCOMPATIBLE with the earlier one — not an elaboration, update, or narrative progression. Contradiction types: factual_reversal (opposite first-person claims), number_change (different figures stated by same speaker), negation_flip (same speaker denied then admitted the same fact). Do NOT flag: case background narrated by an interrogator, information updates, emotional reactions to new information, or one speaker describing what another person did. The voice_delta must describe how stress/pitch/pace changed between statement A and B. Return an empty array if no genuine first-person contradictions are found.
 VOICE-TEXT CORRELATIONS: For each voice anomaly in the VOICE ANOMALIES WITH TRANSCRIPT CONTEXT section, produce one entry with the anomaly details and what was being said. Focus on the top 5 most significant moments where voice and text together tell a richer story than either alone. Omit this field (empty array) if no relevant transcript text was found near the anomaly timestamps.
 
 {extra_fields}
@@ -1301,23 +1291,43 @@ def _fallback_narrative(
         general_summary.append(f"Session with {len(speakers)} speaker(s) completed.")
 
     # ── Build notes from topics + transcript segments ─────────────────────────
-    # Fallback path: pick the longest segment per topic (most substantive speaker turn)
-    # rather than dumping every utterance. Cap at 3 details per topic.
+    # Score each segment by importance (decisions, commitments, problems, questions)
+    # rather than by length — verbose chit-chat fails this filter, short decisions pass.
     notes: list[dict] = []
     segs = transcript_segments or []
     for topic in entities.get("topics", []):
         topic_start = topic.get("start_ms", 0)
         topic_end = topic.get("end_ms", 0)
-        candidates = [
+        topic_segs = [
             seg for seg in segs
             if seg.get("start_ms", 0) >= topic_start
             and seg.get("end_ms", 0) <= topic_end
-            and len(seg.get("text", "")) > 80
+            and len(seg.get("text", "")) > 30
         ]
-        # Keep the 3 longest utterances per topic as representative key points
-        candidates.sort(key=lambda x: len(x.get("text", "")), reverse=True)
+        scored = []
+        for seg in topic_segs:
+            text = seg.get("text", "")
+            importance = 0
+            if _IMPORTANCE_PATTERNS.search(text):
+                importance += 3
+            for com in entities.get("commitments", []):
+                if abs(com.get("timestamp_ms", 0) - seg.get("start_ms", 0)) < 3000:
+                    importance += 5
+            for obj in entities.get("objections", []):
+                if abs(obj.get("timestamp_ms", 0) - seg.get("start_ms", 0)) < 3000:
+                    importance += 4
+            spk = seg.get("speaker", "")
+            spk_avg = voice_summary.get("per_speaker", {}).get(spk, {}).get("avg_stress", 0.25)
+            seg_stress = _stress_at(seg.get("start_ms", 0), voice_summary, speaker=spk)
+            if seg_stress is not None and seg_stress > spk_avg * 1.5:
+                importance += 2
+            if len(text) < 50:
+                importance -= 2
+            if importance > 0:
+                scored.append((importance, seg))
+        scored.sort(key=lambda x: -x[0])
         topic_details = []
-        for seg in candidates[:3]:
+        for _, seg in scored[:4]:
             ts_s = seg["start_ms"] // 1000
             m, s = divmod(ts_s, 60)
             topic_details.append({
@@ -1401,9 +1411,15 @@ def _fallback_narrative(
                 for seg_b in spk_segs[i + 5:]:
                     if not _CLAIM_PATTERN.search(seg_a["text"]) or not _CLAIM_PATTERN.search(seg_b["text"]):
                         continue
+                    if seg_a["text"].rstrip().endswith("?") or seg_b["text"].rstrip().endswith("?"):
+                        continue
+                    # Minimum 3-minute gap — too close = same thought, not a contradiction
+                    gap_ms = seg_b.get("start_ms", 0) - seg_a.get("start_ms", 0)
+                    if gap_ms < 180_000:
+                        continue
                     words_b = _content_words(seg_b["text"])
                     shared = words_a & words_b
-                    if len(shared) < 4:
+                    if len(shared) < 5:
                         continue
                     neg_a = bool(_NEG_PATTERN.search(seg_a["text"]))
                     neg_b = bool(_NEG_PATTERN.search(seg_b["text"]))

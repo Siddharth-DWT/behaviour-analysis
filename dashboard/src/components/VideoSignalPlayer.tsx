@@ -1096,7 +1096,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
       // same speaker. Deduplicate by keeping only the highest-confidence entry per pair.
       const best = new Map<string, VideoSignal>();
       for (const s of filtered) {
-        const key = `${s.speaker_id ?? ""}::${s.signal_type}`;
+        const key = `${s.speaker_id ?? ""}::${s.signal_type}::${s.value_text ?? ""}`;
         const prev = best.get(key);
         if (!prev || s.confidence > prev.confidence) best.set(key, s);
       }
@@ -1182,11 +1182,13 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   //      signals; no session-level pre-seeding, no cluster gate.
 
   const rosterLoaded = Object.keys(speakerRoster).length > 0;
-  const allSpeakerIds = [...new Set(signals.map((s) => s.speaker_id).filter(Boolean))] as string[];
+  // Raw IDs from signals — needed to build the toCanonical alias map before
+  // we can collapse aliases for the dropdown.
+  const rawSpeakerIds = [...new Set(signals.map((s) => s.speaker_id).filter(Boolean))] as string[];
 
   // Pass 1 — group by registry_id
   const registryGroups: Record<string, string[]> = {};
-  for (const spkId of allSpeakerIds) {
+  for (const spkId of rawSpeakerIds) {
     const regId = rosterLoaded ? speakerRoster[spkId]?.registry_id : undefined;
     if (regId) (registryGroups[regId] ??= []).push(spkId);
   }
@@ -1203,6 +1205,12 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
   }
   // Keep the ref in sync so computeActive can use it without being a dependency
   toCanonicalRef.current = toCanonical;
+
+  // Dropdown IDs — de-alias so each person appears exactly once.
+  // Alias Face_N entries (minority-signal tracks that share a registry_id with a
+  // canonical) are collapsed to their canonical. Selecting an alias in the old
+  // dropdown showed only that alias's signals, hiding the canonical's larger set.
+  const allSpeakerIds = [...new Set(rawSpeakerIds.map((id) => toCanonical[id] ?? id))];
 
   // Window-bounded grouping — entries exist only while their signals are active.
   // No cluster gate, no pre-seeding. Entries self-clean when their windows close.

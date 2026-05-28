@@ -1529,10 +1529,14 @@ export default function SessionDetail() {
                           &ldquo;{c.statement_a?.text}&rdquo;
                         </p>
                         <div className="mt-1 text-[10px]">
-                          stress:{" "}
-                          <span className={c.statement_a?.voice_stress > 0.5 ? "text-red-400" : "text-green-400"}>
-                            {c.statement_a?.voice_stress?.toFixed(2)}
-                          </span>
+                          voice stress:{" "}
+                          {c.statement_a?.voice_stress != null ? (
+                            <span className={c.statement_a.voice_stress > 0.5 ? "text-red-400" : "text-green-400"}>
+                              {c.statement_a.voice_stress.toFixed(2)}
+                            </span>
+                          ) : (
+                            <span className="text-nexus-text-muted">N/A</span>
+                          )}
                         </div>
                       </div>
                       <div className="rounded bg-nexus-surface-hover p-2">
@@ -1541,14 +1545,18 @@ export default function SessionDetail() {
                           &ldquo;{c.statement_b?.text}&rdquo;
                         </p>
                         <div className="mt-1 text-[10px]">
-                          stress:{" "}
-                          <span className={c.statement_b?.voice_stress > 0.5 ? "text-red-400" : "text-green-400"}>
-                            {c.statement_b?.voice_stress?.toFixed(2)}
-                          </span>
+                          voice stress:{" "}
+                          {c.statement_b?.voice_stress != null ? (
+                            <span className={c.statement_b.voice_stress > 0.5 ? "text-red-400" : "text-green-400"}>
+                              {c.statement_b.voice_stress.toFixed(2)}
+                            </span>
+                          ) : (
+                            <span className="text-nexus-text-muted">N/A</span>
+                          )}
                         </div>
                       </div>
                     </div>
-                    {c.voice_delta && (
+                    {c.voice_delta && !c.voice_delta.includes("No voice stress data") && !c.voice_delta.includes("Voice stress data not available") && (
                       <p className="text-xs italic text-nexus-accent-purple">{c.voice_delta}</p>
                     )}
                     {c.significance && (
@@ -1613,7 +1621,7 @@ export default function SessionDetail() {
                       : (content.risk_assessment as any).risk_score < 0.8 ? "#F97316"
                       : "#EF4444",
                   }}>
-                    {(content.risk_assessment as any).false_confession_risk}
+                    {String((content.risk_assessment as any).false_confession_risk ?? "").replace(/_/g, " ")}
                   </span>
                   <span className="text-nexus-text-muted font-mono">
                     {((content.risk_assessment as any).risk_score * 100).toFixed(0)}%
@@ -1638,14 +1646,15 @@ export default function SessionDetail() {
                   {(content.risk_assessment as any).contributing_factors.map((f: any, i: number) => (
                     <span
                       key={i}
-                      className={`rounded px-1.5 py-0.5 text-[10px] ${
+                      className={`rounded px-2 py-1 text-[10px] leading-snug ${
                         f.present
-                          ? "bg-red-900/40 text-red-300"
-                          : "bg-gray-800 text-gray-500"
+                          ? "bg-red-900/60 text-red-200 border border-red-700/50"
+                          : "bg-gray-700/60 text-gray-300 border border-gray-600/40"
                       }`}
                     >
-                      {f.present ? "✓" : "✗"} {f.factor.replace(/_/g, " ")}
-                      {f.detail && <span className="ml-1 opacity-70">— {f.detail}</span>}
+                      <span className={f.present ? "text-red-400" : "text-gray-500"}>{f.present ? "✓" : "✗"}</span>
+                      {" "}{f.factor.replace(/_/g, " ")}
+                      {f.detail && <span className={`ml-1 ${f.present ? "text-red-300/80" : "text-gray-400"}`}>— {f.detail}</span>}
                     </span>
                   ))}
                 </div>

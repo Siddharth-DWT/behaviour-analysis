@@ -47,17 +47,21 @@ function RiskGauge({ score }: { score: number }) {
       ? "Elevated"
       : "High";
   return (
-    <div className="space-y-1">
-      <div className="flex items-center justify-between text-[10px]">
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between text-xs">
         <span style={{ color }} className="font-semibold">
           {label} Risk
         </span>
-        <span className="text-gray-400">{(score * 100).toFixed(0)}%</span>
+        <span className="font-medium text-gray-200">{(score * 100).toFixed(0)}%</span>
       </div>
-      <div className="h-2 w-full overflow-hidden rounded-full bg-gray-700">
+      <div className="h-3 w-full overflow-hidden rounded-full bg-gray-600">
         <div
           className="h-full rounded-full transition-all"
-          style={{ width: `${Math.min(score * 100, 100)}%`, backgroundColor: color }}
+          style={{
+            width: `${Math.max(score * 100, score > 0 ? 2 : 0)}%`,
+            backgroundColor: color,
+            boxShadow: score > 0 ? `0 0 6px ${color}88` : "none",
+          }}
         />
       </div>
     </div>
@@ -71,7 +75,7 @@ function RiskFactors({ metadata }: { metadata: Record<string, unknown> }) {
     const f = rf[key];
     if (!f) return false;
     if (key === "duration_risk")        return ((f.contribution as number) ?? 0) > 0;
-    if (key === "resistance_hardening") return !(f.present as boolean);  // absence = risk
+    if (key === "resistance_hardening") return !(f.present as boolean);
     const sc = (f.signal_count as number) ?? (f.weakening_count as number) ?? 0;
     return sc > 0;
   };
@@ -88,14 +92,20 @@ function RiskFactors({ metadata }: { metadata: Record<string, unknown> }) {
   const absent  = factors.filter((f) => !isActive(f.key));
   if (present.length === 0 && absent.length === 0) return null;
   return (
-    <div className="mt-1 flex flex-wrap gap-1">
+    <div className="mt-1.5 flex flex-wrap gap-1.5">
       {present.map((f) => (
-        <span key={f.key} className="rounded px-1 py-0.5 text-[9px] bg-red-900/40 text-red-300">
+        <span
+          key={f.key}
+          className="rounded border border-red-600/60 bg-red-900/60 px-2 py-0.5 text-xs font-medium text-red-200"
+        >
           ✓ {f.label}
         </span>
       ))}
       {absent.map((f) => (
-        <span key={f.key} className="rounded px-1 py-0.5 text-[9px] bg-gray-800 text-gray-500">
+        <span
+          key={f.key}
+          className="rounded border border-gray-600 bg-gray-700/60 px-2 py-0.5 text-xs text-gray-300"
+        >
           ✗ {f.label}
         </span>
       ))}
@@ -111,9 +121,8 @@ function DenialTrajectory({ signal }: { signal: VideoSignal }) {
   const lastLabel = typeof meta.last_label === "string" ? meta.last_label : "weak";
   const drop = Math.max(0, earlyMean - lateMean);
   return (
-    <div className="space-y-1">
-      <div className="relative h-2 w-full overflow-hidden rounded-full bg-gray-700">
-        {/* Early strength indicator */}
+    <div className="space-y-1.5">
+      <div className="relative h-3 w-full overflow-hidden rounded-full bg-gray-600">
         <div
           className="absolute left-0 top-0 h-full rounded-l-full"
           style={{
@@ -121,20 +130,19 @@ function DenialTrajectory({ signal }: { signal: VideoSignal }) {
             background: "linear-gradient(to right, #10B981, #F59E0B)",
           }}
         />
-        {/* Late strength indicator */}
         <div
           className="absolute top-0 h-full"
           style={{
             left: `${(1 - lateMean) * 100}%`,
             right: 0,
             background: "#EF4444",
-            opacity: 0.5,
+            opacity: 0.6,
           }}
         />
       </div>
-      <div className="flex items-center justify-between text-[9px] text-gray-400">
+      <div className="flex items-center justify-between text-xs text-gray-300">
         <span>{firstLabel}</span>
-        <span className="text-amber-400">−{(drop * 100).toFixed(0)}%</span>
+        <span className="font-semibold text-amber-400">−{(drop * 100).toFixed(0)}%</span>
         <span className="text-red-400">{lastLabel}</span>
       </div>
     </div>
@@ -147,25 +155,29 @@ function TechniqueBadge({ signal }: { signal: VideoSignal }) {
   const peaceCount = typeof meta.peace_count === "number" ? meta.peace_count : 0;
   const reidCount = typeof meta.reid_count === "number" ? meta.reid_count : 0;
   const colorMap: Record<string, string> = {
-    peace: "#10B981",
-    reid: "#F59E0B",
+    peace:    "#10B981",
+    reid:     "#F59E0B",
     coercive: "#EF4444",
-    mixed: "#6B7280",
+    mixed:    "#94A3B8",
   };
-  const color = colorMap[technique] ?? "#6B7280";
+  const color = colorMap[technique] ?? "#94A3B8";
   return (
     <div className="flex items-center gap-2">
       <span
-        className="rounded px-2 py-0.5 text-[10px] font-semibold uppercase"
-        style={{ backgroundColor: `${color}22`, color }}
+        className="rounded border px-2.5 py-1 text-xs font-bold uppercase tracking-wide"
+        style={{
+          backgroundColor: `${color}30`,
+          borderColor: `${color}60`,
+          color,
+        }}
       >
         {technique}
       </span>
       {peaceCount > 0 && (
-        <span className="text-[9px] text-emerald-400">PEACE ×{peaceCount}</span>
+        <span className="text-xs font-medium text-emerald-400">PEACE ×{peaceCount}</span>
       )}
       {reidCount > 0 && (
-        <span className="text-[9px] text-amber-400">Reid ×{reidCount}</span>
+        <span className="text-xs font-medium text-amber-400">Reid ×{reidCount}</span>
       )}
     </div>
   );
@@ -191,18 +203,18 @@ function ContaminationList({ signals }: { signals: VideoSignal[] }) {
 
   if (allTerms.length === 0) {
     return (
-      <span className="text-[10px] text-gray-500">No terms recorded in metadata</span>
+      <span className="text-xs text-gray-400">No terms recorded in metadata</span>
     );
   }
 
   const visible = expanded ? allTerms : allTerms.slice(0, 4);
   return (
-    <div className="space-y-1">
-      <div className="flex flex-wrap gap-1">
+    <div className="space-y-1.5">
+      <div className="flex flex-wrap gap-1.5">
         {visible.map(({ term, startMs, endMs }) => (
           <span
             key={term}
-            className="rounded border border-red-800/50 bg-red-900/20 px-1.5 py-0.5 text-[9px] text-red-300"
+            className="rounded border border-red-700/60 bg-red-900/30 px-2 py-0.5 text-xs text-red-200"
             title={`Adopted between ${fmtMs(startMs)} – ${fmtMs(endMs)}`}
           >
             "{term}"
@@ -212,12 +224,12 @@ function ContaminationList({ signals }: { signals: VideoSignal[] }) {
       {allTerms.length > 4 && (
         <button
           onClick={() => setExpanded((v) => !v)}
-          className="text-[9px] text-gray-500 hover:text-gray-300 transition-colors"
+          className="text-xs text-gray-400 hover:text-gray-200 transition-colors"
         >
           {expanded ? "Show less" : `+${allTerms.length - 4} more`}
         </button>
       )}
-      <p className="text-[9px] text-gray-500 italic">
+      <p className="text-xs text-gray-400 italic">
         Garrett 2011: present in 97.5% of proven false confessions
       </p>
     </div>
@@ -253,27 +265,27 @@ export default function InterrogationSummaryPanel({ signals }: Props) {
   );
 
   return (
-    <div className="rounded-lg border border-amber-900/40 bg-gray-900/60 p-3 space-y-3">
+    <div className="rounded-lg border border-amber-700/50 bg-gray-900/70 p-4 space-y-3">
       {/* Header */}
       <div className="flex items-center justify-between">
-        <span className="text-[11px] font-semibold text-amber-300">
+        <span className="text-sm font-semibold text-amber-300">
           Interrogation Analysis
         </span>
         <button
           onClick={() => setCollapsed((v) => !v)}
-          className="text-[10px] text-gray-500 hover:text-gray-300 transition-colors"
+          className="text-xs text-gray-400 hover:text-gray-200 transition-colors"
         >
           {collapsed ? "Expand" : "Collapse"}
         </button>
       </div>
 
       {!collapsed && (
-        <div className="space-y-3 divide-y divide-gray-800">
+        <div className="space-y-3 divide-y divide-gray-700">
 
           {/* False Confession Risk */}
           {riskSignal && (
-            <div className="space-y-1.5 pt-2 first:pt-0">
-              <span className="text-[10px] font-medium text-gray-300">
+            <div className="space-y-2 pt-2 first:pt-0">
+              <span className="text-xs font-semibold text-gray-200">
                 ⚖️ False Confession Risk
               </span>
               <RiskGauge score={riskSignal.value} />
@@ -285,8 +297,8 @@ export default function InterrogationSummaryPanel({ signals }: Props) {
 
           {/* Denial Trajectory */}
           {denialSignal && (
-            <div className="space-y-1.5 pt-2">
-              <span className="text-[10px] font-medium text-gray-300">
+            <div className="space-y-2 pt-3">
+              <span className="text-xs font-semibold text-gray-200">
                 📊 Denial Trajectory
               </span>
               <DenialTrajectory signal={denialSignal} />
@@ -295,8 +307,8 @@ export default function InterrogationSummaryPanel({ signals }: Props) {
 
           {/* Interrogation Technique */}
           {techniqueSignal && (
-            <div className="space-y-1.5 pt-2">
-              <span className="text-[10px] font-medium text-gray-300">
+            <div className="space-y-2 pt-3">
+              <span className="text-xs font-semibold text-gray-200">
                 🎭 Technique
               </span>
               <TechniqueBadge signal={techniqueSignal} />
@@ -305,8 +317,8 @@ export default function InterrogationSummaryPanel({ signals }: Props) {
 
           {/* Contamination */}
           {contaminationSignals.length > 0 && (
-            <div className="space-y-1.5 pt-2">
-              <span className="text-[10px] font-medium text-gray-300">
+            <div className="space-y-2 pt-3">
+              <span className="text-xs font-semibold text-gray-200">
                 ⚠️ Information Adopted ({contaminationSignals.length} signal
                 {contaminationSignals.length !== 1 ? "s" : ""})
               </span>
@@ -316,15 +328,15 @@ export default function InterrogationSummaryPanel({ signals }: Props) {
 
           {/* Capitulation Cascade */}
           {capitulationSignals.length > 0 && (
-            <div className="space-y-1 pt-2">
-              <span className="text-[10px] font-medium text-gray-300">
+            <div className="space-y-1.5 pt-3">
+              <span className="text-xs font-semibold text-gray-200">
                 📉 Capitulation Pattern
               </span>
               {capitulationSignals.map((s, i) => (
-                <div key={i} className="text-[9px] text-gray-400">
+                <div key={i} className="text-xs text-gray-300">
                   {fmtMs(s.start_ms)} → {fmtMs(s.end_ms)}
                   {s.value_text && (
-                    <span className="ml-1 text-gray-500">
+                    <span className="ml-1.5 text-gray-400">
                       ({s.value_text.replace(/_/g, " ")})
                     </span>
                   )}

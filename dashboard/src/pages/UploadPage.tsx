@@ -723,25 +723,29 @@ export default function UploadPage() {
   const startPolling = useCallback((sid: string) => {
     if (pollRef.current) clearInterval(pollRef.current);
     setPipelineStep("transcribing");
+    let tick = 0;
     pollRef.current = setInterval(async () => {
       try {
-        // Fetch step + session status in parallel
-        const [progress, detail] = await Promise.all([
-          getSessionProgress(sid).catch(() => ({ pipeline_step: null })),
-          getSession(sid),
+        tick += 1;
+        // Progress every 3 s for pipeline step; session detail every 30 s (10 ticks)
+        const [progress, maybeDetail] = await Promise.all([
+          getSessionProgress(sid).catch(() => ({ pipeline_step: null, status: null })),
+          tick % 10 === 0 ? getSession(sid) : Promise.resolve(null),
         ]);
 
         if (progress.pipeline_step) {
           setPipelineStep(progress.pipeline_step);
         }
 
-        const status = detail.session.status;
+        // Use session status when available; fall back to progress.status between 30 s ticks
+        const status = maybeDetail?.session?.status ?? (progress as any).status;
         // "partial" = some agents failed but transcript succeeded — show it
         if (status === "completed" || status === "partial" || status === "failed") {
           clearInterval(pollRef.current!);
           pollRef.current = null;
           setPipelineStep(null);
           if (status === "completed" || status === "partial") {
+            const detail = maybeDetail ?? await getSession(sid);
             const [txRes, reportRes] = await Promise.all([
               getTranscript(sid),
               getReport(sid).catch(() => null),

@@ -40,7 +40,7 @@ logger = logging.getLogger("nexus.video.features")
 # ─── Processing constants ──────────────────────────────────────────────────
 TARGET_FPS: int = 5
 WINDOW_MS: int = 2000
-MIN_LIP_SYNC_LINK_SCORE: float = 0.10
+MIN_LIP_SYNC_LINK_SCORE: float = 0.20
 ACTIVE_TILE_MIN_AREA:   float = 0.08   # face_box_area above this → dominant/active-speaker tile
 
 # Blink detection (Soukupova & Cech 2016)
@@ -3036,10 +3036,10 @@ class FaceEmbeddingExtractor:
 
 class LightASDClassifier:
     """
-    Active Speaker Detection via Light-ASD (Liao et al., ICASSP 2023).
+    Active Speaker Detection via LR-ASD (Liao et al., IJCV 2025).
 
-    Replaces MediaPipe jawOpen lip-sync correlation with a learned audio-visual
-    model.  94.1% precision on AVA-ActiveSpeaker benchmark.
+    LR-ASD: 94.45% mAP on AVA-ActiveSpeaker, SOTA cross-domain robustness.
+    Source: https://github.com/Junhua-Liao/LR-ASD
 
     Pipeline:
       face_crops_sequence + audio  →  per-frame speaking probabilities
@@ -3051,23 +3051,20 @@ class LightASDClassifier:
       • Large/active-speaker tiles    — jaw saturation (always near open)
       • Side profiles                 — jawOpen not visible at yaw > 60°
 
-    Model loading (priority order):
-      1. ONNX        — <model_dir>/light_asd/light_asd.onnx  (onnxruntime)
-      2. TorchScript — <model_dir>/light_asd/light_asd.pt   (torch.jit)
-      3. Disabled    — falls back to MediaPipe lip-sync correlation
+    Model loading:
+      1. LR-ASD ONNX  — <model_dir>/lr_asd/lr_asd.onnx
+      2. LR-ASD PT    — <model_dir>/lr_asd/lr_asd.pt  (TorchScript)
+      3. Disabled      — falls back to lip-sync correlation
 
-    Audio features: 40-dim log-mel filterbank, AUDIO_FRAMES_PER_VIDEO
-    sub-frames per sampled video frame (librosa required).
-
-    Obtain model: https://github.com/Junhua-Liao/Light-ASD
-    Export to ONNX and place at models/light_asd/light_asd.onnx.
+    Audio: 13-dim MFCC, hop = sr/(fps×4) → 4 audio frames per video frame.
+    Visual: 112×112 grayscale, raw 0-255 — model normalises internally.
 
     Singleton — model loaded once per process, reused across sessions.
     """
 
-    CROP_SIZE: int = 96               # Light-ASD standard face crop (96×96 gray)
-    N_MELS: int = 40                  # log-mel filterbank dimensions
-    AUDIO_FRAMES_PER_VIDEO: int = 4   # audio temporal resolution per video frame
+    CROP_SIZE: int = 112              # LR-ASD face crop size
+    N_MELS: int = 13                  # MFCC coefficients (matches LR-ASD training)
+    AUDIO_FRAMES_PER_VIDEO: int = 4   # audio frames per video frame (ratio matches 100fps MFCC / 25fps training)
     VITERBI_SELF_TRANS: float = 0.92  # HMM self-transition — high = smoother labels
     _LOG_EPS: float = 1e-7
 
@@ -3085,43 +3082,46 @@ class LightASDClassifier:
         self._available: bool = False
         self._librosa_ok: bool = False
         self._sr: int = 16000
+        self._model_name: str = "none"
 
-        onnx_path = Path(model_dir) / "light_asd" / "light_asd.onnx"
-        pt_path   = Path(model_dir) / "light_asd" / "light_asd.pt"
+        lr_asd_onnx = Path(model_dir) / "lr_asd" / "lr_asd.onnx"
+        lr_asd_pt   = Path(model_dir) / "lr_asd" / "lr_asd.pt"
 
-        if onnx_path.exists():
+        if lr_asd_onnx.exists():
             try:
                 import onnxruntime as ort
                 self._sess = ort.InferenceSession(
-                    str(onnx_path), providers=["CPUExecutionProvider"]
+                    str(lr_asd_onnx), providers=["CPUExecutionProvider"]
                 )
                 self._available = True
-                logger.info("LightASD: ONNX model loaded — %s", onnx_path)
+                self._model_name = "LR-ASD (ONNX)"
+                logger.info("LR-ASD: ONNX model loaded — %s", lr_asd_onnx)
             except Exception as exc:
-                logger.warning("LightASD: ONNX load failed: %s", exc)
+                logger.warning("LR-ASD: ONNX load failed: %s", exc)
 
-        if not self._available and pt_path.exists():
+        if not self._available and lr_asd_pt.exists():
             try:
                 import torch
-                self._torch_model = torch.jit.load(str(pt_path), map_location="cpu")
+                self._torch_model = torch.jit.load(str(lr_asd_pt), map_location="cpu")
                 self._torch_model.eval()
                 self._available = True
-                logger.info("LightASD: TorchScript model loaded — %s", pt_path)
+                self._model_name = "LR-ASD"
+                logger.info("LR-ASD: TorchScript model loaded — %s", lr_asd_pt)
             except Exception as exc:
-                logger.warning("LightASD: PyTorch load failed: %s", exc)
+                logger.warning("LR-ASD: PyTorch load failed: %s", exc)
 
         if not self._available:
             logger.info(
-                "LightASD model not found at %s — "
+                "LR-ASD model not found (checked lr_asd/ in %s) — "
                 "active speaker detection disabled, using lip-sync fallback",
-                Path(model_dir) / "light_asd",
+                model_dir,
             )
 
         try:
             import librosa as _lr  # noqa: F401
             self._librosa_ok = True
         except ImportError:
-            logger.debug("LightASD: librosa unavailable — ASD disabled")
+            logger.debug("LR-ASD: librosa unavailable — ASD disabled")
 
     @property
     def available(self) -> bool:
@@ -3150,9 +3150,9 @@ class LightASDClassifier:
             return {}
 
         try:
-            log_mel = self._load_log_mel(audio_path, fps)   # [N_MELS, T_audio]
+            log_mel = self._load_mfcc(audio_path, fps)   # [N_MELS=13, T_audio]
         except Exception as exc:
-            logger.warning("LightASD: audio feature extraction failed: %s", exc)
+            logger.warning("LR-ASD: audio feature extraction failed: %s", exc)
             return {}
 
         results: "dict[int, list[tuple[int, float]]]" = {}
@@ -3164,33 +3164,34 @@ class LightASDClassifier:
                 if smoothed:
                     results[track_id] = smoothed
             except Exception as exc:
-                logger.debug("LightASD: track %d failed: %s", track_id, exc)
+                logger.debug("LR-ASD: track %d failed: %s", track_id, exc)
 
         logger.info(
-            "LightASD: scored %d / %d tracks", len(results), len(face_crops_sequence)
+            "LR-ASD: scored %d / %d tracks", len(results), len(face_crops_sequence)
         )
         return results
 
     # ── Private helpers ────────────────────────────────────────────────────
 
-    def _load_log_mel(self, audio_path: str, fps: float) -> np.ndarray:
+    def _load_mfcc(self, audio_path: str, fps: float) -> np.ndarray:
         """
-        Compute log-mel spectrogram aligned to video frames.
+        Compute 13-dim MFCC aligned to video frames.
 
         hop_length = sr / (fps × AUDIO_FRAMES_PER_VIDEO)
-        → exactly AUDIO_FRAMES_PER_VIDEO columns per sampled video frame.
-        Returns shape [N_MELS, T_audio].
+        → exactly AUDIO_FRAMES_PER_VIDEO MFCC columns per sampled video frame.
+        Matches LR-ASD training: 13 coefficients, 100fps audio (25fps video × 4).
+        Returns shape [N_MELS=13, T_audio].
         """
         import librosa
         y, _ = librosa.load(audio_path, sr=self._sr, mono=True)
         hop = max(1, int(self._sr / (fps * self.AUDIO_FRAMES_PER_VIDEO)))
-        mel = librosa.feature.melspectrogram(
+        mfcc = librosa.feature.mfcc(
             y=y, sr=self._sr,
-            n_mels=self.N_MELS,
+            n_mfcc=self.N_MELS,
             n_fft=min(512, len(y)),
             hop_length=hop,
         )
-        return np.log(mel + self._LOG_EPS).astype(np.float32)
+        return mfcc.astype(np.float32)  # [13, T_audio]
 
     def _score_track(
         self,
@@ -3220,7 +3221,7 @@ class LightASDClassifier:
         fps: float,
     ) -> list[float]:
         """
-        Build audio [1, T×4, N_MELS] and visual [1, T, 1, H, W] tensors,
+        Build audio [1, T×4, 13] and visual [1, T, 112, 112] tensors,
         run one model forward pass, return per-frame speaking probabilities.
         """
         import cv2 as _cv2
@@ -3241,10 +3242,8 @@ class LightASDClassifier:
                     (self.CROP_SIZE, self.CROP_SIZE),
                     interpolation=_cv2.INTER_AREA,
                 )
-            frames_arr.append(gray.astype(np.float32) / 255.0)
-        vis_batch = (
-            np.stack(frames_arr, axis=0)[:, np.newaxis, :, :][np.newaxis]
-        )  # [1, T, 1, H, W]
+            frames_arr.append(gray.astype(np.float32))  # raw 0-255; model normalises internally
+        vis_batch = np.stack(frames_arr, axis=0)[np.newaxis]  # [1, T, 112, 112]
 
         # ── Audio — align first sub-frame to crops[0] timestamp ──────────
         first_ts_ms = crops[0][0]
@@ -3293,7 +3292,7 @@ class LightASDClassifier:
                 )
             return np.array(self._sess.run(None, feeds)[0], dtype=np.float32)
         except Exception as exc:
-            logger.debug("LightASD ONNX error: %s", exc)
+            logger.debug("LR-ASD ONNX error: %s", exc)
             return None
 
     def _run_torch(
@@ -3311,7 +3310,7 @@ class LightASDClassifier:
                 )
             return out.numpy() if hasattr(out, "numpy") else np.array(out, dtype=np.float32)
         except Exception as exc:
-            logger.debug("LightASD PyTorch error: %s", exc)
+            logger.debug("LR-ASD PyTorch error: %s", exc)
             return None
 
     def _viterbi_smooth(self, probs: np.ndarray) -> np.ndarray:
@@ -3488,19 +3487,17 @@ class VideoFeatureExtractor:
         frames: list[FrameFeatures],
     ) -> dict[int, list[tuple[int, float]]]:
         """
-        Build a per-face-index timeseries of lip/mouth activity from raw frames.
+        Build per-face lip activity using frame-to-frame DELTA + MAD normalization.
+        Delta measures jaw MOTION — scale-independent across face sizes.
 
-        Each entry: (timestamp_ms, lip_activity_score)
+        Steps:
+          1. Compute raw composite per frame (same weights as before)
+          2. |delta| between consecutive frames per face → O(T)
+          3. MAD-normalize per face → O(T)
 
-        Composite blendshape score (Haider 2021: jawOpen is the strongest single
-        predictor of active speech in MediaPipe, r=0.82 with ground-truth VAD):
-          jawOpen          × 0.50  — primary mouth-opening during speech
-          mouthLowerDown   × 0.20  — lower-lip descent (averaged L+R)
-          mouthFunnel      × 0.15  — vowel articulation ("oo", "oh")
-          mouthPucker      × 0.10  — lip rounding
-          (1 - mouthClose) × 0.05  — inverse: high mouthClose = mouth shut
+        DSA: O(F × T) where F = faces, T = frames per face.
         """
-        lip_map: dict[int, list[tuple[int, float]]] = defaultdict(list)
+        raw_by_face: dict[int, list[tuple[int, float]]] = defaultdict(list)
 
         for ff in frames:
             if not ff.face_detected or not ff.blendshapes:
@@ -3509,25 +3506,50 @@ class VideoFeatureExtractor:
             face_idx = getattr(ff, "face_index", 0)
             bs = ff.blendshapes
 
-            jaw_open       = bs.get("jawOpen", 0.0)
-            mouth_funnel   = bs.get("mouthFunnel", 0.0)
-            mouth_pucker   = bs.get("mouthPucker", 0.0)
-            mouth_close    = bs.get("mouthClose", 0.0)
+            jaw_open         = bs.get("jawOpen", 0.0)
+            mouth_funnel     = bs.get("mouthFunnel", 0.0)
+            mouth_pucker     = bs.get("mouthPucker", 0.0)
+            mouth_close      = bs.get("mouthClose", 0.0)
             mouth_lower_down = (
                 bs.get("mouthLowerDownLeft", 0.0) + bs.get("mouthLowerDownRight", 0.0)
             ) / 2.0
 
-            lip_score = (
+            composite = (
                 jaw_open         * 0.50
                 + mouth_lower_down * 0.20
                 + mouth_funnel     * 0.15
                 + mouth_pucker     * 0.10
                 + (1.0 - mouth_close) * 0.05
             )
+            raw_by_face[face_idx].append((ff.timestamp_ms, composite))
 
-            lip_map[face_idx].append((ff.timestamp_ms, lip_score))
+        result: dict[int, list[tuple[int, float]]] = {}
+        for fi, raw_series in raw_by_face.items():
+            if len(raw_series) < 3:
+                result[fi] = [(ts, 0.0) for ts, _ in raw_series]
+                continue
 
-        return dict(lip_map)
+            raw_series.sort(key=lambda x: x[0])
+
+            deltas: list[tuple[int, float]] = []
+            for i in range(1, len(raw_series)):
+                delta = abs(raw_series[i][1] - raw_series[i - 1][1])
+                deltas.append((raw_series[i][0], delta))
+
+            delta_values = [d for _, d in deltas]
+            median_delta = sorted(delta_values)[len(delta_values) // 2]
+            abs_devs = [abs(d - median_delta) for d in delta_values]
+            mad = sorted(abs_devs)[len(abs_devs) // 2]
+
+            scale = mad * 1.4826 + 1e-6
+            normalized: list[tuple[int, float]] = []
+            for ts, delta in deltas:
+                norm_score = max(0.0, (delta - median_delta) / scale)
+                normalized.append((ts, round(norm_score, 4)))
+
+            result[fi] = normalized
+
+        return result
 
     def burn_landmarks_and_labels(
         self,
@@ -4433,6 +4455,16 @@ class VideoFeatureExtractor:
         except Exception as exc:
             logger.warning("ArcFace warmup failed (non-fatal): %s", exc)
 
+        try:
+            model_dir = os.path.join(os.path.dirname(__file__), "..", "..", "models")
+            asd = LightASDClassifier.get_instance(model_dir=model_dir)
+            if asd.available:
+                logger.info("LR-ASD warmup complete — %s loaded.", asd._model_name)
+            else:
+                logger.info("LR-ASD model not available — lip-sync fallback will be used.")
+        except Exception as exc:
+            logger.warning("LR-ASD warmup failed (non-fatal): %s", exc)
+
     @staticmethod
     def _compute_frame_behavioral_state(ff: "FrameFeatures") -> None:
         """
@@ -5317,18 +5349,20 @@ class VideoFeatureExtractor:
             if min_fh >= 0.07:
                 # Both normal-sized: standard threshold minus pose discount
                 effective = max(threshold - pose_discount, 0.35)
-                # Cross-tile guard: if two normal-sized tracks sit at clearly
-                # different grid positions (dist > 0.20) with similarity below 0.55,
-                # they are almost certainly different people. Raise the bar to 0.55
-                # to block false merges (sim 0.40-0.49) without affecting same-tile
-                # same-person pairs (dist < 0.05) or high-confidence matches.
-                if sim < 0.55 and centroids:
+                # Cross-tile guard: two faces at clearly different screen positions
+                # (centroid dist > 0.20 ≈ one tile width in a 2×2 grid) must have
+                # very high similarity to merge. The old guard only fired below
+                # sim=0.55, leaving a blind spot at 0.55-0.79 where two people
+                # in adjacent grid tiles with similar face embeddings were merged.
+                # Tile position is definitive identity in grid layouts — different
+                # tiles, different people unless ArcFace is near-certain (≥0.80).
+                if centroids:
                     ca = centroids.get(tid_a)
                     cb = centroids.get(tid_b)
                     if ca and cb:
                         pos_dist = ((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5
                         if pos_dist > 0.20:
-                            effective = max(effective, 0.55)
+                            effective = max(effective, 0.80)
                 return effective
             if max_fh < 0.07:
                 # SYMMETRIC: both tiny → strict floor minus small pose discount
@@ -6110,60 +6144,77 @@ class SpeakerFaceMapper:
         lip_activity_map: dict[int, list[tuple[int, float]]],
     ) -> tuple[dict[int, str], dict[int, float]]:
         """
-        Correlate each face's jawOpen composite with each speaker's active intervals.
+        Segment-level voting: per-diar-segment speech_mean - silence_mean,
+        weighted by segment duration, with quality gates.
 
-        For each (face, speaker) pair:
-            speaking_score = mean lip_activity over frames where speaker is active
-            silence_score  = mean lip_activity over frames where speaker is NOT active
-            correlation    = speaking_score − silence_score
+        Quality gates per segment:
+          - Duration ≥ 500ms
+          - Face visible ratio ≥ 0.50
 
-        Positive  → face moves more when this speaker talks   (good match)
-        Near zero → face moves equally regardless             (listener / background)
-        Negative  → face moves less when this speaker talks   (wrong face)
+        DSA: bisect O(log T) per segment boundary; O(F × S × log T) total.
         """
-        # Build IntervalSet per speaker once — O(k log k) sort, O(log k) per lookup.
-        speaker_isets: dict[str, IntervalSet] = {
-            spk: IntervalSet.from_segments(diar_segments, spk)
-            for spk in speakers
-        }
-        # Silence baseline uses only frames where NO speaker is active.
-        # Skipping frames where other speakers are talking removes baseline
-        # contamination from listener reactions (smiling, nodding) during
-        # multi-face grid meetings.
-        anyone_speaking_iset = IntervalSet.from_all_segments(diar_segments)
-
         scores: dict[tuple[int, str], float] = {}
 
-        for face_idx in face_indices:
-            lip_data = lip_activity_map.get(face_idx, [])
-            if not lip_data:
+        for fi in face_indices:
+            series = lip_activity_map.get(fi, [])
+            if not series:
                 continue
+            timestamps = [t for t, _ in series]
+            values = [v for _, v in series]
 
-            for speaker in speakers:
-                iset = speaker_isets[speaker]
-                speaking_sum = 0.0
-                silence_sum  = 0.0
-                speaking_n   = 0
-                silence_n    = 0
+            for spk in speakers:
+                spk_segs = [s for s in diar_segments if s.get("speaker") == spk]
+                if not spk_segs:
+                    continue
 
-                for ts_ms, lip_score in lip_data:
-                    if iset.contains(ts_ms):
-                        speaking_sum += lip_score
-                        speaking_n   += 1
-                    elif not anyone_speaking_iset.contains(ts_ms):
-                        # True silence — no speaker active; clean baseline
-                        silence_sum += lip_score
-                        silence_n   += 1
-                    # else: another speaker is active — skip to avoid contamination
+                seg_scores: list[float] = []
+                seg_weights: list[float] = []
+                for seg in spk_segs:
+                    seg_start = seg.get("start_ms", 0)
+                    seg_end   = seg.get("end_ms", 0)
+                    seg_dur   = seg_end - seg_start
+                    if seg_dur < 500:
+                        continue
 
-                avg_speaking = speaking_sum / max(speaking_n, 1)
-                avg_silence  = silence_sum  / max(silence_n,  1)
-                scores[(face_idx, speaker)] = avg_speaking - avg_silence
+                    i_start = bisect.bisect_left(timestamps, seg_start)
+                    i_end   = bisect.bisect_right(timestamps, seg_end)
+                    speech_vals = values[i_start:i_end]
+
+                    total_possible = i_end - i_start
+                    if total_possible > 0 and len(speech_vals) < total_possible * 0.50:
+                        continue
+                    if not speech_vals:
+                        continue
+
+                    speech_mean = sum(speech_vals) / len(speech_vals)
+
+                    sil_start = max(0, seg_start - 2000)
+                    sil_end   = min(timestamps[-1] if timestamps else seg_end, seg_end + 2000)
+                    i_sil_s   = bisect.bisect_left(timestamps, sil_start)
+                    i_sil_e   = bisect.bisect_right(timestamps, sil_end)
+                    silence_vals = values[i_sil_s:i_start] + values[i_end:i_sil_e]
+                    silence_mean = sum(silence_vals) / len(silence_vals) if silence_vals else 0.0
+
+                    seg_scores.append(speech_mean - silence_mean)
+                    seg_weights.append(float(seg_dur))
+
+                    logger.debug(
+                        "lip_sync seg  face=%d × %s: spk_mean=%.4f n=%d  sil_mean=%.4f  dur=%dms",
+                        fi, spk, speech_mean, len(speech_vals), silence_mean, seg_dur,
+                    )
+
+                if seg_scores and sum(seg_weights) > 0:
+                    total_w = sum(seg_weights)
+                    scores[(fi, spk)] = max(
+                        0.0,
+                        sum(s * w for s, w in zip(seg_scores, seg_weights)) / total_w,
+                    )
+                else:
+                    scores[(fi, spk)] = 0.0
 
                 logger.debug(
-                    "lip_sync score  face=%d × %s: %.4f  (spk_avg=%.4f n=%d  sil_avg=%.4f n=%d)",
-                    face_idx, speaker,
-                    avg_speaking - avg_silence, avg_speaking, speaking_n, avg_silence, silence_n,
+                    "lip_sync score face=%d × %s: %.4f  (%d segs)",
+                    fi, spk, scores[(fi, spk)], len(seg_scores),
                 )
 
         return self._hungarian_assign(face_indices, speakers, scores)

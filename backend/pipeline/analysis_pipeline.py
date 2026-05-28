@@ -49,7 +49,7 @@ logger = logging.getLogger("nexus.backend.pipeline")
 
 _UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/recordings"))
 _RECORDING_RETENTION_DAYS = int(os.getenv("RECORDING_RETENTION_DAYS", "3"))
-_SESSION_FACE_LOCK_MIN_SCORE = float(os.getenv("SESSION_FACE_LOCK_MIN_SCORE", "0.06"))
+_SESSION_FACE_LOCK_MIN_SCORE = float(os.getenv("SESSION_FACE_LOCK_MIN_SCORE", "0.10"))
 
 
 class AnalysisPipeline:
@@ -208,47 +208,53 @@ class AnalysisPipeline:
 
         async def _run_language() -> dict:
             try:
+                result: dict = {}
                 if run_behavioural or run_sentiment:
                     if not transcript_segments:
                         logger.warning("[%s] No segments — skipping Language", session_id)
-                        return {}
-                    resp = await self._language.analyse(
-                        LanguageAnalysisRequest(
-                            segments=transcript_segments,
-                            session_id=session_id,
-                            meeting_type=meeting_type,
-                            run_intent_classification=True,
+                    else:
+                        resp = await self._language.analyse(
+                            LanguageAnalysisRequest(
+                                segments=transcript_segments,
+                                session_id=session_id,
+                                meeting_type=meeting_type,
+                                run_intent_classification=True,
+                            )
                         )
-                    )
-                    agent_status["language"] = "completed"
-                    return resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+                        agent_status["language"] = "completed"
+                        result = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
 
-                if run_entity_extraction and transcript_segments:
+                elif run_entity_extraction and transcript_segments:
                     assemblyai_raw = voice_result.get("assemblyai_entities")
                     if assemblyai_raw is not None:
                         entities = _format_assemblyai_entities(assemblyai_raw)
-                        return {"summary": {"entities": entities}}
-                    try:
-                        ee = getattr(self._language, "_entity_extractor", None)
-                        if ee:
-                            entities = await ee.extract(transcript_segments, meeting_type)
-                            return {"summary": {"entities": entities}}
-                    except Exception as exc:
-                        logger.warning("[%s] Entity extraction failed (non-fatal): %s", session_id, exc)
-                    return {}
+                        result = {"summary": {"entities": entities}}
+                    else:
+                        try:
+                            ee = getattr(self._language, "_entity_extractor", None)
+                            if ee:
+                                entities = await ee.extract(transcript_segments, meeting_type)
+                                result = {"summary": {"entities": entities}}
+                        except Exception as exc:
+                            logger.warning("[%s] Entity extraction failed (non-fatal): %s", session_id, exc)
 
-                return {}
+                # Language done — advance the step to video so "language" is visible
+                # for its full duration before video takes over the display.
+                if run_video:
+                    await self._set_step(session_id, "video")
+                return result
             except Exception as exc:
                 agent_status["language"] = "failed"
                 logger.warning("[%s] Language Agent failed (continuing): %s", session_id, exc)
+                if run_video:
+                    await self._set_step(session_id, "video")
                 return {}
 
-        async def _run_video() -> tuple[list[dict], dict, dict, dict]:
-            """Returns (signals, face_embeddings, face_to_speaker, lip_sync_scores)."""
+        async def _run_video() -> tuple[list[dict], dict, dict, dict, dict]:
+            """Returns (signals, face_embeddings, face_to_speaker, lip_sync_scores, vid_cal_conf)."""
             if not run_video or video_path is None:
-                return [], {}, {}, {}
+                return [], {}, {}, {}, {}
             try:
-                await self._set_step(session_id, "video")
                 result = await self._video.analyse(
                     session_id=session_id,
                     video_path=video_path,
@@ -260,19 +266,25 @@ class AnalysisPipeline:
                 face_embs = result.get("face_embeddings", {})
                 f2s = {int(k): v for k, v in result.get("face_to_speaker", {}).items()}
                 lip_scores = result.get("lip_sync_scores", {})
+                # {speaker_id: calibration_confidence} for Face_N speaker upsert
+                vid_cal_conf: dict[str, float] = {
+                    s["speaker_id"]: float(s.get("calibration_confidence") or 0.0)
+                    for s in result.get("speaker_summaries", [])
+                    if s.get("speaker_id")
+                }
                 agent_status["video"] = "completed"
                 logger.info(
                     "[%s] Video: %d signals, %d face embeddings",
                     session_id, len(sigs), len(face_embs),
                 )
-                return sigs, face_embs, f2s, lip_scores
+                return sigs, face_embs, f2s, lip_scores, vid_cal_conf
             except Exception as exc:
                 agent_status["video"] = "failed"
                 logger.warning("[%s] Video Agent failed (continuing): %s", session_id, exc)
-                return [], {}, {}, {}
+                return [], {}, {}, {}, {}
 
         _t0 = time.monotonic()
-        lang_outcome, (vid_signals, face_embeddings_from_video, face_to_speaker, lip_sync_scores) = (
+        lang_outcome, (vid_signals, face_embeddings_from_video, face_to_speaker, lip_sync_scores, video_cal_conf) = (
             await asyncio.gather(_run_language(), _run_video())
         )
         _t_lang_video = time.monotonic() - _t0
@@ -319,6 +331,10 @@ class AnalysisPipeline:
         _t_conv = time.monotonic() - _t0
 
         # ── Step 4: Video signal filtering + registry matching ────────────────
+        # Advance to fusion now — conversation agent is done.
+        # Registry matching + video signal persist below are fusion preparation,
+        # not conversation work, so they display under "Fusion & signal scoring".
+        await self._set_step(session_id, "fusion")
         video_signals: list[dict] = []
         video_speaker_map = dict(speaker_map)
 
@@ -355,7 +371,13 @@ class AnalysisPipeline:
                     from core.database import upsert_speakers
                     new_face_speakers = await upsert_speakers(
                         session_id,
-                        [{"speaker_id": fid} for fid in unmatched_face_ids],
+                        [
+                            {
+                                "speaker_id": fid,
+                                "calibration_confidence": video_cal_conf.get(fid, 0.0),
+                            }
+                            for fid in unmatched_face_ids
+                        ],
                     )
                     video_speaker_map.update(new_face_speakers)
                 except Exception as exc:
@@ -524,7 +546,6 @@ class AnalysisPipeline:
                 )
 
         # ── Step 5: Fusion ────────────────────────────────────────────────────
-        await self._set_step(session_id, "fusion")
         _t0 = time.monotonic()
         fusion_signals: list[dict] = []
         alerts: list[dict] = []
@@ -651,21 +672,24 @@ class AnalysisPipeline:
         )
         logger.info("[%s] Pipeline complete status=%s agents=%s", session_id, final_status, agent_status)
 
-        await self._post_process(
-            session_id=session_id,
-            run_behavioural=run_behavioural,
-            run_knowledge_graph=analysis_config.get("run_knowledge_graph", True),
-            transcript_segments=transcript_segments,
-            all_signals=(
-                voice_signals + language_signals + conversation_signals
-                + video_signals + fusion_signals
-            ),
-            entities=entities,
-            report_content=report_content,
-            graph_analytics=graph_analytics,
-            conversation_summary=conversation_summary,
-            pool=pool,
-        )
+        try:
+            await asyncio.shield(self._post_process(
+                session_id=session_id,
+                run_behavioural=run_behavioural,
+                run_knowledge_graph=analysis_config.get("run_knowledge_graph", True),
+                transcript_segments=transcript_segments,
+                all_signals=(
+                    voice_signals + language_signals + conversation_signals
+                    + video_signals + fusion_signals
+                ),
+                entities=entities,
+                report_content=report_content,
+                graph_analytics=graph_analytics,
+                conversation_summary=conversation_summary,
+                pool=pool,
+            ))
+        except BaseException as exc:
+            logger.warning("[%s] Post-process interrupted (%s) — embeddings may be incomplete", session_id, type(exc).__name__)
 
         # Completion email — only for full behavioural runs (takes 5-30+ min)
         if run_behavioural and user_email:
@@ -815,16 +839,20 @@ class AnalysisPipeline:
                     "graph_analytics": graph_analytics or {},
                     "conversation_summary": conversation_summary or {},
                 })
-            except Exception as exc:
-                logger.warning("[%s] Knowledge store failed (non-fatal): %s", session_id, exc)
+            except BaseException as exc:
+                logger.warning("[%s] Knowledge store failed (%s): %s", session_id, type(exc).__name__, exc)
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
 
         await self._set_step(session_id, "knowledge_graph")
         if run_knowledge_graph:
             try:
                 from core.neo4j_sync import sync_session as neo4j_sync_session
                 await neo4j_sync_session(pool, session_id)
-            except Exception as exc:
-                logger.warning("[%s] Neo4j sync failed (non-fatal): %s", session_id, exc)
+            except BaseException as exc:
+                logger.warning("[%s] Neo4j sync failed (%s): %s", session_id, type(exc).__name__, exc)
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
 
             try:
                 from core.neo4j_sync import sync_speaker_registry_to_neo4j
@@ -834,8 +862,10 @@ class AnalysisPipeline:
                 )
                 for row in reg_rows:
                     await sync_speaker_registry_to_neo4j(pool, str(row["registry_id"]))
-            except Exception as exc:
-                logger.warning("[%s] Speaker registry Neo4j sync failed (non-fatal): %s", session_id, exc)
+            except BaseException as exc:
+                logger.warning("[%s] Speaker registry Neo4j sync failed (%s): %s", session_id, type(exc).__name__, exc)
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
 
 
 # ── Module-level helpers (stateless — no self reference needed) ───────────────
