@@ -72,10 +72,6 @@ function matchSignalsToSegment(
     const overlapStart = Math.max(s.window_start_ms, segment.start_ms);
     const overlapEnd = Math.min(s.window_end_ms, segment.end_ms);
     if (overlapEnd <= overlapStart) return false;
-    // Video signals are keyed by face position (Face_N) which may not match
-    // diarization speaker labels. Match by time overlap only so emotion/gaze/
-    // gesture indicators always reach the transcript block.
-    if (s.agent === "video") return true;
     if (
       s.speaker_label &&
       segment.speaker_label &&
@@ -1206,6 +1202,7 @@ export default function SessionDetail() {
           <VideoSignalPlayer
             sessionId={id!}
             signals={videoSignalData.signals}
+            techniqueAnalysis={content?.technique_analysis}
           />
         </div>
       )}

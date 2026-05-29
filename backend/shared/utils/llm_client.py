@@ -380,7 +380,17 @@ async def _acomplete_openai(
                 **kwargs,
             )
 
-        return response.choices[0].message.content.strip()
+        content = response.choices[0].message.content
+        if not content:
+            # Reasoning models can return content=None when finish_reason=stop
+            # and actual output is in refusal or when token budget is exhausted.
+            finish = response.choices[0].finish_reason if response.choices else "unknown"
+            logger.warning(
+                "LLM returned empty content (model=%s finish_reason=%s)",
+                resolved_model, finish,
+            )
+            return ""
+        return content.strip()
     except ImportError:
         # Fallback to sync in executor
         import asyncio

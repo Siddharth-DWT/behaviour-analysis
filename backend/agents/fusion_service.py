@@ -433,6 +433,7 @@ class FusionAgentService(BaseAgentService):
                 conversation_summary=conversation_summary,
                 video_summary=video_summary,
                 transcript_segments=request.transcript_segments or [],
+                speaker_names=request.speaker_names or {},
             )
             logger.info("[%s] Narrative report in %.1fs", session_id, time.time() - t_rep)
 

@@ -1,9 +1,12 @@
 import { useMemo, useState } from "react";
-import type { VideoSignal } from "../api/client";
+import type { VideoSignal, Report } from "../api/client";
+
+type TechniqueAnalysis = NonNullable<Report["content"]["technique_analysis"]>;
 
 interface Props {
   signals: VideoSignal[];
   durationMs: number;
+  techniqueAnalysis?: TechniqueAnalysis;
 }
 
 const INTERROGATION_TYPES = new Set([
@@ -149,11 +152,24 @@ function DenialTrajectory({ signal }: { signal: VideoSignal }) {
   );
 }
 
-function TechniqueBadge({ signal }: { signal: VideoSignal }) {
-  const technique = signal.value_text ?? "unknown";
-  const meta = (signal.metadata ?? {}) as Record<string, unknown>;
-  const peaceCount = typeof meta.peace_count === "number" ? meta.peace_count : 0;
-  const reidCount = typeof meta.reid_count === "number" ? meta.reid_count : 0;
+function TechniqueBadge({
+  signal,
+  reportTechnique,
+}: {
+  signal?: VideoSignal;
+  reportTechnique?: TechniqueAnalysis;
+}) {
+  // Prefer the LLM report analysis over the rule-based signal when available
+  const technique = reportTechnique?.primary ?? signal?.value_text ?? "unknown";
+  const peaceCount = reportTechnique?.peace_markers
+    ?? (typeof (signal?.metadata as Record<string, unknown>)?.peace_count === "number"
+      ? (signal!.metadata as Record<string, unknown>).peace_count as number
+      : 0);
+  const reidCount = reportTechnique?.reid_markers
+    ?? (typeof (signal?.metadata as Record<string, unknown>)?.reid_count === "number"
+      ? (signal!.metadata as Record<string, unknown>).reid_count as number
+      : 0);
+  const coerciveCount = reportTechnique?.coercive_markers ?? 0;
   const colorMap: Record<string, string> = {
     peace:    "#10B981",
     reid:     "#F59E0B",
@@ -162,22 +178,30 @@ function TechniqueBadge({ signal }: { signal: VideoSignal }) {
   };
   const color = colorMap[technique] ?? "#94A3B8";
   return (
-    <div className="flex items-center gap-2">
-      <span
-        className="rounded border px-2.5 py-1 text-xs font-bold uppercase tracking-wide"
-        style={{
-          backgroundColor: `${color}30`,
-          borderColor: `${color}60`,
-          color,
-        }}
-      >
-        {technique}
-      </span>
-      {peaceCount > 0 && (
-        <span className="text-xs font-medium text-emerald-400">PEACE ×{peaceCount}</span>
-      )}
-      {reidCount > 0 && (
-        <span className="text-xs font-medium text-amber-400">Reid ×{reidCount}</span>
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center gap-2">
+        <span
+          className="rounded border px-2.5 py-1 text-xs font-bold uppercase tracking-wide"
+          style={{
+            backgroundColor: `${color}30`,
+            borderColor: `${color}60`,
+            color,
+          }}
+        >
+          {technique}
+        </span>
+        {peaceCount > 0 && (
+          <span className="text-xs font-medium text-emerald-400">PEACE ×{peaceCount}</span>
+        )}
+        {reidCount > 0 && (
+          <span className="text-xs font-medium text-amber-400">Reid ×{reidCount}</span>
+        )}
+        {coerciveCount > 0 && (
+          <span className="text-xs font-medium text-red-400">Coercive ×{coerciveCount}</span>
+        )}
+      </div>
+      {reportTechnique?.assessment && (
+        <p className="text-xs text-gray-400 leading-relaxed">{reportTechnique.assessment}</p>
       )}
     </div>
   );
@@ -238,7 +262,7 @@ function ContaminationList({ signals }: { signals: VideoSignal[] }) {
 
 // ── Main component ─────────────────────────────────────────────────────────────
 
-export default function InterrogationSummaryPanel({ signals }: Props) {
+export default function InterrogationSummaryPanel({ signals, techniqueAnalysis }: Props) {
   const [collapsed, setCollapsed] = useState(false);
 
   const interrogationSignals = useMemo(
@@ -246,7 +270,7 @@ export default function InterrogationSummaryPanel({ signals }: Props) {
     [signals]
   );
 
-  if (interrogationSignals.length === 0) return null;
+  if (interrogationSignals.length === 0 && !techniqueAnalysis) return null;
 
   const riskSignal = interrogationSignals.find(
     (s) => s.signal_type === "false_confession_risk"
@@ -305,13 +329,16 @@ export default function InterrogationSummaryPanel({ signals }: Props) {
             </div>
           )}
 
-          {/* Interrogation Technique */}
-          {techniqueSignal && (
+          {/* Interrogation Technique — prefer LLM report over rule-based signal */}
+          {(techniqueAnalysis ?? techniqueSignal) && (
             <div className="space-y-2 pt-3">
               <span className="text-xs font-semibold text-gray-200">
                 🎭 Technique
               </span>
-              <TechniqueBadge signal={techniqueSignal} />
+              <TechniqueBadge
+                signal={techniqueSignal}
+                reportTechnique={techniqueAnalysis}
+              />
             </div>
           )}
 

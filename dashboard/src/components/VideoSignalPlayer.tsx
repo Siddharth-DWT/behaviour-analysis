@@ -999,9 +999,10 @@ function FaceDetailPanel({
 interface Props {
   sessionId: string;
   signals: VideoSignal[];
+  techniqueAnalysis?: import("../api/client").Report["content"]["technique_analysis"];
 }
 
-export default function VideoSignalPlayer({ sessionId, signals }: Props) {
+export default function VideoSignalPlayer({ sessionId, signals, techniqueAnalysis }: Props) {
   const token = getAccessToken();
   const rawVideoUrl      = `/api/sessions/${sessionId}/video${token ? `?token=${encodeURIComponent(token)}` : ""}`;
   const annotatedVideoUrl = `/api/sessions/${sessionId}/video/annotated${token ? `?token=${encodeURIComponent(token)}` : ""}`;
@@ -1341,12 +1342,12 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
                 const visibleSigs = showExpanded ? prioritySigs : prioritySigs.slice(0, 3);
                 const hasPresence = activeSignals.some((s: VideoSignal) => s.signal_type === "presence_detected" && (toCanonical[s.speaker_id ?? ""] ?? s.speaker_id) === speakerId);
                 if (visibleSigs.length === 0 && !hasPresence) return null;
-                // Thumbnail gate: hide faces that have NO thumbnail AND NO behavioral signals.
-                // A face with real signals (body, gaze, head) is shown even without a thumbnail
-                // (ArcFace can fail on small/profile faces while rule engines still fire).
-                // Also skip the gate until the roster has loaded to avoid a flash where all
-                // faces are hidden during the initial roster fetch.
-                if (rosterLoaded && !speakerRoster[rawId]?.thumbnail_url && visibleSigs.length === 0 && !hasPresence) return null;
+                // Thumbnail gate: Face_N tracks with no thumbnail and no behavioral signals
+                // are junk tracks (presence_detected fired but ArcFace never got a clean crop).
+                // Hide them — presence alone is not enough to show a face panel entry.
+                // Faces WITH behavioral signals are shown even without a thumbnail (ArcFace
+                // can fail on small/profile faces while rule engines still fire).
+                if (/^Face_\d+$/.test(rawId) && rosterLoaded && !speakerRoster[rawId]?.thumbnail_url && visibleSigs.length === 0) return null;
                 return (
                   <div key={speakerId} className="flex flex-col gap-1">
                     <SpeakerGroupHeader
@@ -1448,7 +1449,7 @@ export default function VideoSignalPlayer({ sessionId, signals }: Props) {
       </div>
 
       {/* Interrogation summary panel — mounts only when interrogation signals present */}
-      <InterrogationSummaryPanel signals={signals} durationMs={durationMs} />
+      <InterrogationSummaryPanel signals={signals} durationMs={durationMs} techniqueAnalysis={techniqueAnalysis} />
 
       {/* Signal timeline bar */}
       <div className="rounded-lg border border-nexus-border bg-nexus-surface p-3">

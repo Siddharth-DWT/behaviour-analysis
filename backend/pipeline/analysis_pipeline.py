@@ -577,6 +577,13 @@ class AnalysisPipeline:
                 all_voice_side += [_to_fusion_input(s, "video") for s in video_signals]
                 video_summary_for_fusion = _build_video_summary(video_signals)
 
+            # Build confirmed speaker name map from registry for the narrative LLM
+            speaker_names: dict[str, str] = {
+                label: info["display_name"]
+                for label, info in speaker_identity_map.items()
+                if info.get("display_name") and info["display_name"] != label
+            }
+
             try:
                 fusion_resp = await self._fusion.analyse(
                     FusionAnalyseRequest(
@@ -592,6 +599,7 @@ class AnalysisPipeline:
                         language_summary=language_summary,
                         video_summary=video_summary_for_fusion,
                         transcript_segments=transcript_segments or [],
+                        speaker_names=speaker_names or None,
                     )
                 )
                 fusion_result = fusion_resp.model_dump() if hasattr(fusion_resp, "model_dump") else dict(fusion_resp)

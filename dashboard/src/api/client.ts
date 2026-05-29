@@ -218,13 +218,11 @@ export interface Report {
       context?: string;
     }>;
     technique_analysis?: {
-      techniques?: Array<{
-        name?: string;
-        classification?: string;
-        count?: number;
-        timestamps?: string[];
-        effectiveness?: string;
-      }>;
+      primary?: string;
+      peace_markers?: number;
+      reid_markers?: number;
+      coercive_markers?: number;
+      assessment?: string;
     };
     deal_assessment?: {
       close_probability?: number;

@@ -15,6 +15,7 @@ Report types (from docs/PLAN.md):
 For Phase 1, we implement a general-purpose report structure that covers
 sales calls (the primary use case for the audio-only vertical slice).
 """
+import asyncio
 import bisect
 import os
 import json
@@ -55,6 +56,7 @@ async def generate_session_narrative(
     conversation_summary: Optional[dict] = None,
     video_summary: Optional[dict] = None,
     transcript_segments: Optional[list[dict]] = None,
+    speaker_names: Optional[dict] = None,
 ) -> Optional[dict]:
     """
     Generate a structured narrative report for the session using the LLM.
@@ -101,22 +103,46 @@ async def generate_session_narrative(
         entities, graph_analytics, conversation_summary,
         video_summary=video_summary,
         transcript_segments=transcript_segments,
+        speaker_names=speaker_names,
     )
 
-    system_prompt, user_prompt = _build_prompt(context, meeting_type)
+    is_interrogation = (meeting_type == "interrogation_video")
+    system_prompt, main_prompt = _build_main_prompt(context, meeting_type)
 
     try:
         from shared.utils.llm_client import acomplete
-        raw_text = await acomplete(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            max_tokens=4096,
-            json_response=True,
-        )
 
-        # Parse structured response
-        report = _parse_narrative_response(raw_text, speakers)
-        report["raw_response"] = raw_text
+        if is_interrogation:
+            deep_system, deep_prompt = _build_interrogation_deep_prompt(context)
+            main_raw, deep_raw = await asyncio.gather(
+                acomplete(
+                    system_prompt=system_prompt,
+                    user_prompt=main_prompt,
+                    model="gpt-4o-mini",
+                    max_tokens=4096,
+                    json_response=True,
+                ),
+                acomplete(
+                    system_prompt=deep_system,
+                    user_prompt=deep_prompt,
+                    model="gpt-5",
+                    max_tokens=8192,
+                    json_response=True,
+                ),
+            )
+            report = _parse_main_response(main_raw, speakers)
+            report.update(_parse_interrogation_response(deep_raw))
+        else:
+            main_raw = await acomplete(
+                system_prompt=system_prompt,
+                user_prompt=main_prompt,
+                model="gpt-4o-mini",
+                max_tokens=4096,
+                json_response=True,
+            )
+            report = _parse_main_response(main_raw, speakers)
+
+        report["raw_response"] = main_raw
         return report
 
     except Exception as e:
@@ -126,56 +152,12 @@ async def generate_session_narrative(
             transcript_segments=transcript_segments,
             video_summary=video_summary,
             conversation_summary=conversation_summary,
+            meeting_type=meeting_type,
         )
 
 
-_COMMON_WORDS = {
-    "about", "after", "again", "already", "also", "always", "another", "before",
-    "being", "between", "during", "every", "first", "going", "great", "guessing",
-    "having", "known", "maybe", "might", "never", "other", "really", "right",
-    "since", "still", "their", "there", "these", "thing", "think", "those",
-    "through", "under", "until", "using", "where", "which", "while", "would",
-}
-
-def _is_valid_person_name(name: str) -> bool:
-    """Return True only for strings that look like actual person names."""
-    if not name or len(name) < 3:
-        return False
-    # Pure numbers ("20", "100") or names starting with digit
-    if name[0].isdigit() or name.isdigit():
-        return False
-    # Must start with an uppercase letter (proper noun)
-    if not name[0].isupper():
-        return False
-    # Must contain at least one alphabetic character
-    if not any(c.isalpha() for c in name):
-        return False
-    # Reject common English words mistaken for names
-    if name.lower() in _COMMON_WORDS:
-        return False
-    return True
-
-
-def _build_speaker_name_map(entities: dict) -> dict[str, str]:
-    """
-    Build a mapping from speaker label → display name using extracted people entities.
-    e.g. {"Speaker_0": "John (Seller)", "Speaker_1": "Sarah (Prospect)"}
-    Falls back to the label itself when no name is known.
-    Filters out false NER extractions (verbs, numbers, common words).
-    """
-    name_map: dict[str, str] = {}
-    for p in entities.get("people", []):
-        label = p.get("speaker_label", "")
-        name = p.get("name", "")
-        role = p.get("role", "")
-        if label and name and _is_valid_person_name(name):
-            display = f"{name} ({role.capitalize()})" if role else name
-            name_map[label] = display
-    return name_map
-
-
 def _display(speaker_id: str, name_map: dict[str, str]) -> str:
-    """Return display name for a speaker label, e.g. 'John (Seller)' or 'Speaker_0'."""
+    """Return the resolved display name for a speaker, falling back to the raw label."""
     return name_map.get(speaker_id, speaker_id)
 
 
@@ -243,24 +225,35 @@ def _build_context(
     conversation_summary: Optional[dict] = None,
     video_summary: Optional[dict] = None,
     transcript_segments: Optional[list[dict]] = None,
+    speaker_names: Optional[dict] = None,
 ) -> str:
     """Build a structured text context block for the LLM."""
     entities = entities or {}
-    name_map = _build_speaker_name_map(entities)
+    # name_map: Speaker_N → confirmed real name from registry (populated when available)
+    name_map: dict[str, str] = {
+        k: v for k, v in (speaker_names or {}).items()
+        if v and v != k
+    }
 
     lines = []
     lines.append(f"SESSION: {session_id}")
     lines.append(f"DURATION: {duration_seconds:.0f} seconds ({duration_seconds/60:.1f} minutes)")
 
-    # Show speakers with real names if known
-    speaker_display = [_display(s, name_map) for s in speakers]
-    lines.append(f"SPEAKERS: {', '.join(speaker_display)}")
-
-    # Speaker name legend so LLM always has the mapping
+    # Show resolved names alongside labels so the LLM uses them consistently
     if name_map:
-        lines.append("SPEAKER NAME MAP (use these names in the report, not Speaker_X labels):")
-        for label, display in name_map.items():
-            lines.append(f"  {label} = {display}")
+        speaker_display = ", ".join(
+            f"{sid} ({name_map[sid]})" if sid in name_map else sid
+            for sid in speakers
+        )
+        lines.append(f"SPEAKERS: {speaker_display}")
+        lines.append("\n=== SPEAKER IDENTIFICATION ===")
+        lines.append("(Use these confirmed names throughout the report, not Speaker_N labels)")
+        for sid in speakers:
+            if sid in name_map:
+                lines.append(f"  {sid} = {name_map[sid]}")
+    else:
+        lines.append(f"SPEAKERS: {', '.join(speakers)}")
+        lines.append("NOTE: No confirmed names from registry. Infer real names from the transcript where speakers address each other by name.")
     lines.append("")
 
     # Voice summary per speaker
@@ -521,16 +514,10 @@ def _build_context(
                 lines.append(f"  Active alerts: {json.dumps(alerts)}")
 
     # Entities (from Language Agent entity extraction)
+    # Note: PEOPLE block intentionally omitted — spaCy NER produces false positives
+    # (verbs, numbers, common words). LLM infers speaker names from the raw transcript.
     if entities:
         lines.append("\n=== EXTRACTED ENTITIES ===")
-
-        people = entities.get("people", [])
-        if people:
-            lines.append("PEOPLE:")
-            for p in people:
-                role = p.get("role", "unknown")
-                label = p.get("speaker_label", "")
-                lines.append(f"  {p.get('name', '?')} — role: {role}, speaker: {label}")
 
         topics = entities.get("topics", [])
         if topics:
@@ -684,7 +671,7 @@ def _build_context(
     return "\n".join(lines)
 
 
-def _build_prompt(context: str, meeting_type: str) -> tuple[str, str]:
+def _build_main_prompt(context: str, meeting_type: str) -> tuple[str, str]:
     """Build system + user prompts for narrative generation."""
     type_instructions = {
         # ── Sales-specific ──
@@ -770,37 +757,22 @@ def _build_prompt(context: str, meeting_type: str) -> tuple[str, str]:
             "If video data is present: shared smiles, mirroring signals, "
             "head nod synchrony, and facial warmth indicators."
         ),
-        # ── Interrogation ──
+        # ── Interrogation (Call 1: behavioral profile only — forensic analysis handled separately) ──
         "interrogation_video": (
             "This is a law enforcement interrogation session. Focus on: "
-            "false confession risk level and contributing factors (contamination, denial weakening, "
-            "session duration, coercive technique); "
-            "denial trajectory — how denial strength changed from session start to end; "
-            "interrogation technique classification (PEACE / Reid / Coercive) and its implications; "
-            "statement contamination events (case-specific terms the suspect adopted from the interrogator); "
-            "capitulation cascade patterns (multi-signal compliance); "
-            "behavioural indicators (freezing response, blink suppression, motor inhibition, "
-            "evidence-response processing delays). "
-            "SPEAKER ANALYSIS: Profile the suspect's behavioral trajectory across the session — "
-            "how did their stress, denial strength, body language, and speech patterns evolve? "
-            "Profile the interrogator's technique shifts and their effect on the suspect. "
-            "CROSS-MODAL INSIGHTS: Focus on moments where voice/face/body signals diverge — "
-            "stress peaks without verbal acknowledgment, calm speech during facial distress, "
-            "body freezing after specific questions. "
-            "OUTPUT STRUCTURE: Include 'risk_assessment' with false_confession_risk level (low/low_moderate/"
-            "moderate/elevated/high), risk_score (0.0-1.0), contributing_factors array (each with 'factor', "
-            "'present' boolean, 'detail' string) for: contamination, session_duration, coercive_technique, "
-            "denial_weakening, processing_delays, capitulation_pattern. Include 'ethical_note' string. "
-            "Include 'contamination_timeline' array (each with 'term', 'interrogator_first', "
-            "'suspect_adopted', 'context'). Include 'technique_analysis' with 'primary', 'peace_markers', "
-            "'reid_markers', 'coercive_markers', 'assessment'. "
+            "how each participant's behavioral state evolved across the session — "
+            "stress trajectory, speech pattern changes, compliance and engagement signals; "
+            "notable cross-modal incongruences (calm speech during facial distress, stress peaks "
+            "after specific questions, body language shifts at topic transitions); "
+            "key moments in the session timeline where multi-modal signals converge or diverge. "
+            "SPEAKER ANALYSIS: Profile each participant's behavioral arc. For the suspect: how did "
+            "stress, body language, and speech patterns evolve over time? For the interrogator: what "
+            "was the questioning style, pacing, and observable effect on the suspect? "
+            "CROSS-MODAL INSIGHTS: Focus on moments where voice/face/body signals disagree — "
+            "what was being said at those moments? "
             "CRITICAL ETHICAL CONSTRAINTS: Never claim guilt or deception. All findings are "
-            "probabilistic indicators only, never binary determinations. "
-            "Distinguish between genuine recall difficulty and stress-induced compliance. "
-            "Frame every risk indicator with its alternative innocent explanation. "
-            "Use 'incongruence', 'stress indicator', 'risk factor' — never 'deception' or 'lying'. "
-            "If coercive technique detected, flag elevated false confession risk regardless of other signals. "
-            "Research basis: Kassin et al. (2010, 2012), Garrett (2011), Vrij (2005, 2008)."
+            "probabilistic indicators only. Use 'stress indicator', 'incongruence', 'risk factor' — "
+            "never 'deception' or 'lying'."
         ),
         # ── Legacy types ──
         "client_meeting": (
@@ -841,8 +813,10 @@ def _build_prompt(context: str, meeting_type: str) -> tuple[str, str]:
         "When VIDEO ANALYSIS data is present (facial, gaze, body), you MUST incorporate it into "
         "the executive summary, key moments, and cross-modal insights. Do not ignore body language "
         "or facial expression data even if voice/language data is richer. "
-        "IMPORTANT: Always use real names (e.g. 'John', 'Sarah') instead of Speaker_X labels "
-        "wherever a name is available from the SPEAKER NAME MAP. Only use Speaker_X when no name is known. "
+        "IMPORTANT: Use the confirmed names from the SPEAKER IDENTIFICATION section (e.g. "
+        "'Speaker_0 = Robert Beaver'). If no SPEAKER IDENTIFICATION section is present, "
+        "infer names from the transcript where speakers address each other by name. "
+        "Use Speaker_X labels only as a last resort when no name can be determined. "
         "STRUCTURE REQUIREMENTS: "
         "1. general_summary: 5-7 bullet points covering the key themes, decisions, and outcomes. "
         "Each bullet is one standalone sentence. No paragraphs. Scannable. "
@@ -862,9 +836,18 @@ def _build_prompt(context: str, meeting_type: str) -> tuple[str, str]:
     # ── Content-type isolation instructions ──────────────────────────────────
     if meeting_type == "interrogation_video":
         extra_fields = (
-            "REQUIRED for this interrogation session: include 'risk_assessment', "
-            "'contamination_timeline', and 'technique_analysis' fields as described in FOCUS. "
-            "Do NOT include 'deal_assessment' or 'objection_handling'."
+            "INTERROGATION SESSION RULES: "
+            "Return an empty array [] for 'action_items' — interrogation sessions have no "
+            "follow-up tasks, commitments, or business-style action items to extract. "
+            "Do NOT hallucinate action items (e.g. 'schedule a follow-up', 'send a report'). "
+            "For 'notes': use the CONVERSATION PHASES from the EXTRACTED ENTITIES section as topic "
+            "headings. Under each phase, include 2-4 behavioral observations — what the suspect "
+            "discussed in that phase, how their stress/body language shifted, and any notable "
+            "cross-modal changes. Omit phases with no behavioral content. "
+            "Do NOT include 'risk_assessment', 'contamination_timeline', 'technique_analysis', "
+            "'contradiction_analysis', 'voice_text_correlations', 'deal_assessment', or "
+            "'objection_handling' — those are produced by the parallel forensic analysis call. "
+            "Focus only on behavioral profiles, key moments, cross-modal insights, and recommendations."
         )
     elif meeting_type in ("sales_call", "client_meeting"):
         extra_fields = (
@@ -969,34 +952,8 @@ Respond with a JSON object containing these fields:
       "action": "specific actionable recommendation",
       "rationale": "brief reason based on the evidence"
     }}
-  ],
-
-  "contradiction_analysis": [
-    {{
-      "speaker": "Speaker name",
-      "statement_a": {{"text": "What they said first", "timestamp": "MM:SS", "voice_stress": 0.22}},
-      "statement_b": {{"text": "What they said later that contradicts", "timestamp": "MM:SS", "voice_stress": 0.71}},
-      "contradiction_type": "factual_reversal | number_change | negation_flip | narrative_shift",
-      "voice_delta": "How voice/stress signals changed between the two statements",
-      "significance": "Why this matters behaviorally"
-    }}
-  ],
-
-  "voice_text_correlations": [
-    {{
-      "timestamp": "MM:SS",
-      "speaker": "Speaker name",
-      "anomaly_type": "stress_peak | pitch_elevation | speech_rate_drop | hesitation_cluster",
-      "anomaly_value": "stress=0.78 (baseline=0.25)",
-      "transcript_text": "What was being said at this moment",
-      "additional_signals": "Other voice/face/body signals active at this timestamp",
-      "context": "Why this moment matters — what topic was being discussed"
-    }}
   ]
 }}
-
-CONTRADICTION ANALYSIS: Review the POTENTIAL STATEMENT CONTRADICTIONS section above. A genuine contradiction requires ALL of these to be true: (1) SAME speaker making both statements, (2) both statements are first-person claims ("I know", "I didn't", "I was") about the SAME specific fact, (3) the later claim is DIRECTLY INCOMPATIBLE with the earlier one — not an elaboration, update, or narrative progression. Contradiction types: factual_reversal (opposite first-person claims), number_change (different figures stated by same speaker), negation_flip (same speaker denied then admitted the same fact). Do NOT flag: case background narrated by an interrogator, information updates, emotional reactions to new information, or one speaker describing what another person did. The voice_delta must describe how stress/pitch/pace changed between statement A and B. Return an empty array if no genuine first-person contradictions are found.
-VOICE-TEXT CORRELATIONS: For each voice anomaly in the VOICE ANOMALIES WITH TRANSCRIPT CONTEXT section, produce one entry with the anomaly details and what was being said. Focus on the top 5 most significant moments where voice and text together tell a richer story than either alone. Omit this field (empty array) if no relevant transcript text was found near the anomaly timestamps.
 
 {extra_fields}
 
@@ -1005,8 +962,99 @@ Return ONLY the JSON object, no other text."""
     return system_prompt, user_prompt
 
 
-def _parse_narrative_response(raw_text: str, speakers: list[str]) -> dict:
-    """Parse the LLM response into structured report."""
+def _build_interrogation_deep_prompt(context: str) -> tuple[str, str]:
+    """
+    Build the system + user prompt for the GPT-5 forensic deep-analysis call.
+    Interrogation sessions only. Returns contradiction_analysis, voice_text_correlations,
+    risk_assessment, contamination_timeline, technique_analysis.
+    """
+    system_prompt = (
+        "You are a forensic behavioral analyst specializing in interrogation risk assessment. "
+        "You analyse law enforcement interrogation recordings using multi-modal signal data "
+        "(voice stress, language patterns, facial expressions, body language, gaze) together "
+        "with the raw transcript. "
+        "You produce PROBABILISTIC INDICATORS only — never binary determinations. "
+        "Never claim guilt or deception. Use 'stress indicator', 'incongruence', 'risk factor' — "
+        "never 'deception' or 'lying'. Every finding must include its alternative innocent explanation. "
+        "Research basis: Kassin et al. (2010, 2012), Garrett (2011), Vrij (2005, 2008)."
+    )
+
+    user_prompt = f"""Analyse the following multi-modal signal data and transcript from a law enforcement interrogation.
+Produce a forensic deep analysis covering: statement contradictions, voice anomalies, false confession risk, contamination timeline, and interrogation technique.
+
+{context}
+
+Return ONLY a valid JSON object with exactly these five fields:
+
+{{
+  "contradiction_analysis": [
+    {{
+      "speaker": "Speaker name or label",
+      "statement_a": {{"text": "First-person claim made earlier", "timestamp": "MM:SS", "voice_stress": 0.22}},
+      "statement_b": {{"text": "Later statement directly incompatible with the first", "timestamp": "MM:SS", "voice_stress": 0.71}},
+      "contradiction_type": "factual_reversal | number_change | negation_flip | narrative_shift",
+      "voice_delta": "How voice stress/pitch/pace changed between the two statements",
+      "significance": "Why this matters behaviorally"
+    }}
+  ],
+
+  "voice_text_correlations": [
+    {{
+      "timestamp": "MM:SS",
+      "speaker": "Speaker name or label",
+      "anomaly_type": "stress_peak | pitch_elevation | speech_rate_drop | hesitation_cluster",
+      "anomaly_value": "stress=0.78 (baseline=0.25)",
+      "transcript_text": "What was being said at this moment",
+      "additional_signals": "Other voice/face/body signals active at this timestamp",
+      "context": "Why this moment matters — what topic was being discussed"
+    }}
+  ],
+
+  "risk_assessment": {{
+    "false_confession_risk": "low | low_moderate | moderate | elevated | high",
+    "risk_score": 0.0,
+    "contributing_factors": [
+      {{"factor": "contamination", "present": false, "detail": ""}},
+      {{"factor": "session_duration", "present": false, "detail": ""}},
+      {{"factor": "coercive_technique", "present": false, "detail": ""}},
+      {{"factor": "denial_weakening", "present": false, "detail": ""}},
+      {{"factor": "processing_delays", "present": false, "detail": ""}},
+      {{"factor": "capitulation_pattern", "present": false, "detail": ""}}
+    ],
+    "ethical_note": "Risk score indicates probability of coerced compliance, NOT guilt or deception. All factors have alternative innocent explanations."
+  }},
+
+  "contamination_timeline": [
+    {{
+      "term": "case-specific term",
+      "interrogator_first": "MM:SS",
+      "suspect_adopted": "MM:SS",
+      "context": "What the term refers to and significance of adoption"
+    }}
+  ],
+
+  "technique_analysis": {{
+    "primary": "peace | reid | coercive | mixed",
+    "peace_markers": 0,
+    "reid_markers": 0,
+    "coercive_markers": 0,
+    "assessment": "Brief description of technique approach and its effect on the subject"
+  }}
+}}
+
+CONTRADICTION ANALYSIS: A genuine contradiction requires ALL of these: (1) SAME speaker making both statements, (2) both are first-person claims ("I know", "I didn't", "I was") about the SAME specific fact, (3) the later claim is DIRECTLY INCOMPATIBLE — not an elaboration or narrative update. Do NOT flag: case background narrated by interrogator, information updates, emotional reactions to new evidence, or one speaker describing another person. Return an empty array if no genuine contradictions are found.
+VOICE-TEXT CORRELATIONS: Focus on the top 5 most significant moments from the VOICE STRESS PEAKS section where voice anomaly + transcript text together reveal hidden state. Return empty array if no relevant peaks found.
+RISK ASSESSMENT: Use the INTERROGATION ANALYSIS section signals (false_confession_risk, denial_weakening, statement_contamination, capitulation_cascade, interrogator_technique) to derive the risk score. If no interrogation signals are present, return risk_score=0.0 and all factors present=false.
+CONTAMINATION TIMELINE: Extract only from STATEMENT CONTAMINATION signals in the data. Return empty array if none detected.
+TECHNIQUE ANALYSIS: Use the INTERROGATOR TECHNIQUE signal if present; otherwise infer from the transcript patterns.
+
+Return ONLY the JSON object, no other text."""
+
+    return system_prompt, user_prompt
+
+
+def _parse_main_response(raw_text: str, speakers: list[str]) -> dict:
+    """Parse the GPT-4o mini main report response into structured fields."""
 
     def _extract_json(text: str) -> dict:
         """Try multiple strategies to extract a JSON object from text."""
@@ -1056,16 +1104,15 @@ def _parse_narrative_response(raw_text: str, speakers: list[str]) -> dict:
             "key_moments": parsed.get("key_moments", []),
             "cross_modal_insights": parsed.get("cross_modal_insights", []),
             "recommendations": parsed.get("recommendations", []),
-            # Interrogation-specific (None when absent — frontend guards on contentType)
-            "risk_assessment": parsed.get("risk_assessment"),
-            "contamination_timeline": parsed.get("contamination_timeline"),
-            "technique_analysis": parsed.get("technique_analysis"),
             # Sales-specific
             "deal_assessment": parsed.get("deal_assessment"),
             "objection_handling": parsed.get("objection_handling"),
-            # Cross-modal text analysis
-            "contradiction_analysis": parsed.get("contradiction_analysis", []),
-            "voice_text_correlations": parsed.get("voice_text_correlations", []),
+            # Forensic fields default to empty — overwritten by _parse_interrogation_response for interrogation sessions
+            "risk_assessment": None,
+            "contamination_timeline": None,
+            "technique_analysis": None,
+            "contradiction_analysis": [],
+            "voice_text_correlations": [],
         }
     except json.JSONDecodeError:
         logger.warning("Failed to parse LLM narrative as JSON, returning raw text")
@@ -1079,13 +1126,110 @@ def _parse_narrative_response(raw_text: str, speakers: list[str]) -> dict:
             "key_moments": [],
             "cross_modal_insights": [],
             "recommendations": [],
+            "deal_assessment": None,
+            "objection_handling": None,
             "risk_assessment": None,
             "contamination_timeline": None,
             "technique_analysis": None,
-            "deal_assessment": None,
-            "objection_handling": None,
             "contradiction_analysis": [],
             "voice_text_correlations": [],
+        }
+
+
+def _parse_interrogation_response(raw_text: str) -> dict:
+    """
+    Parse the GPT-5 forensic deep-analysis response.
+    Returns only the 5 interrogation-specific fields; merges into the main report via dict.update().
+    """
+
+    def _normalize(text: str) -> str:
+        """Coerce common non-standard JSON patterns into valid JSON."""
+        # Python literals → JSON equivalents
+        text = re.sub(r'\bNone\b', 'null', text)
+        text = re.sub(r'\bTrue\b', 'true', text)
+        text = re.sub(r'\bFalse\b', 'false', text)
+        # Trailing commas before ] or } (common in LLM outputs)
+        text = re.sub(r',\s*([}\]])', r'\1', text)
+        return text
+
+    def _extract_json(text: str) -> dict:
+        text = text.strip()
+
+        # Strategy 1: direct parse
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 2: strip markdown code fences (handles ```json ... ``` and ``` ... ```)
+        if "```" in text:
+            # Find all fenced blocks and try each
+            fence_starts = [i for i in range(len(text)) if text[i:i+3] == "```"]
+            for i in range(0, len(fence_starts) - 1, 2):
+                block = text[fence_starts[i]:fence_starts[i+1] + 3]
+                # Strip the opening fence line (e.g. ```json\n)
+                inner = block.split("\n", 1)[1] if "\n" in block else block[3:]
+                inner = inner.rsplit("```", 1)[0].strip()
+                try:
+                    return json.loads(inner)
+                except json.JSONDecodeError:
+                    try:
+                        return json.loads(_normalize(inner))
+                    except json.JSONDecodeError:
+                        pass
+
+        # Strategy 3: extract outermost { ... } block
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            candidate = text[start:end + 1]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                # Strategy 4: normalize then retry
+                try:
+                    return json.loads(_normalize(candidate))
+                except json.JSONDecodeError:
+                    pass
+
+        # Strategy 5: normalize the whole text then retry strategies 1 + 3
+        normalized = _normalize(text)
+        try:
+            return json.loads(normalized)
+        except json.JSONDecodeError:
+            pass
+        s2 = normalized.find("{")
+        e2 = normalized.rfind("}")
+        if s2 != -1 and e2 > s2:
+            try:
+                return json.loads(normalized[s2:e2 + 1])
+            except json.JSONDecodeError:
+                pass
+
+        raise json.JSONDecodeError("No valid JSON found", text, 0)
+
+    try:
+        parsed = _extract_json(raw_text)
+        return {
+            "contradiction_analysis": parsed.get("contradiction_analysis", []),
+            "voice_text_correlations": parsed.get("voice_text_correlations", []),
+            "risk_assessment": parsed.get("risk_assessment"),
+            "contamination_timeline": parsed.get("contamination_timeline"),
+            "technique_analysis": parsed.get("technique_analysis"),
+        }
+    except json.JSONDecodeError:
+        # Log the raw response so we can see exactly what GPT-5 returned
+        logger.warning(
+            "Failed to parse interrogation deep-analysis response as JSON. "
+            "Raw response (first 1000 chars): %.1000s",
+            raw_text or "<empty>",
+        )
+        return {
+            "contradiction_analysis": [],
+            "voice_text_correlations": [],
+            "risk_assessment": None,
+            "contamination_timeline": None,
+            "technique_analysis": None,
         }
 
 
@@ -1098,10 +1242,13 @@ def _fallback_narrative(
     transcript_segments: Optional[list[dict]] = None,
     video_summary: Optional[dict] = None,
     conversation_summary: Optional[dict] = None,
+    meeting_type: str = "sales_call",
 ) -> dict:
     """
     Generate a basic narrative without LLM API.
     Used when API key is not configured or API call fails.
+    Contradiction analysis and voice-text correlations are only computed
+    for interrogation_video sessions.
     """
     entities = entities or {}
     insights = []
@@ -1393,10 +1540,11 @@ def _fallback_narrative(
             ),
         }
 
-    # ── Contradiction analysis (negation-flip pairs from transcript) ─────────
+    # ── Contradiction analysis + voice-text correlations (interrogation only) ──
     contradiction_analysis: list[dict] = []
+    voice_text_correlations: list[dict] = []
     segs = transcript_segments or []
-    if len(segs) > 10:
+    if meeting_type == "interrogation_video" and len(segs) > 10:
         by_spk: dict[str, list[dict]] = defaultdict(list)
         for seg in segs:
             spk = seg.get("speaker", "")
@@ -1459,28 +1607,27 @@ def _fallback_narrative(
             if len(contradiction_analysis) >= 5:
                 break
 
-    # ── Voice-text correlations ──────────────────────────────────────────────
-    voice_text_correlations: list[dict] = []
-    all_peaks = voice_summary.get("stress_peaks", [])
-    seg_starts_fb = [s.get("start_ms", 0) for s in segs]
-    for p in all_peaks[:5]:
-        time_ms = p.get("time_ms", 0)
-        idx = bisect.bisect_right(seg_starts_fb, time_ms) - 1
-        if 0 <= idx < len(segs):
-            seg = segs[idx]
-            if abs(seg.get("start_ms", 0) - time_ms) < 5000:
-                text = seg.get("text", "").strip()
-                if text:
-                    m, s_val = divmod(time_ms // 1000, 60)
-                    voice_text_correlations.append({
-                        "timestamp": f"{m}:{s_val:02d}",
-                        "speaker": p.get("speaker", ""),
-                        "anomaly_type": "stress_peak",
-                        "anomaly_value": f"stress={p.get('stress_score', 0):.3f}",
-                        "transcript_text": text[:200],
-                        "additional_signals": "",
-                        "context": "Voice stress peaked during this statement",
-                    })
+    if meeting_type == "interrogation_video":
+        all_peaks = voice_summary.get("stress_peaks", [])
+        seg_starts_fb = [s.get("start_ms", 0) for s in segs]
+        for p in all_peaks[:5]:
+            time_ms = p.get("time_ms", 0)
+            idx = bisect.bisect_right(seg_starts_fb, time_ms) - 1
+            if 0 <= idx < len(segs):
+                seg = segs[idx]
+                if abs(seg.get("start_ms", 0) - time_ms) < 5000:
+                    text = seg.get("text", "").strip()
+                    if text:
+                        m, s_val = divmod(time_ms // 1000, 60)
+                        voice_text_correlations.append({
+                            "timestamp": f"{m}:{s_val:02d}",
+                            "speaker": p.get("speaker", ""),
+                            "anomaly_type": "stress_peak",
+                            "anomaly_value": f"stress={p.get('stress_score', 0):.3f}",
+                            "transcript_text": text[:200],
+                            "additional_signals": "",
+                            "context": "Voice stress peaked during this statement",
+                        })
 
     # ── Build executive_summary as a flowing analyst paragraph ──────────────
     _exec: list[str] = []

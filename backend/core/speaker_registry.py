@@ -355,17 +355,28 @@ async def _store_thumbnail(
 ) -> None:
     try:
         thumb_bytes = base64.b64decode(face_data["thumbnail_b64"])
-        await pool.execute("""
-            INSERT INTO face_thumbnails
-                (registry_id, session_id, thumbnail, quality_score, is_primary)
-            VALUES ($1, $2, $3, $4,
-                    NOT EXISTS(SELECT 1 FROM face_thumbnails WHERE registry_id = $1))
-        """,
-            _coerce_uuid(registry_id),
-            _coerce_uuid(session_id),
-            thumb_bytes,
-            quality_score,
-        )
+        reg_uuid = _coerce_uuid(registry_id)
+        ses_uuid = _coerce_uuid(session_id)
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # Always insert as non-primary first
+                await conn.execute("""
+                    INSERT INTO face_thumbnails
+                        (registry_id, session_id, thumbnail, quality_score, is_primary)
+                    VALUES ($1, $2, $3, $4, false)
+                """, reg_uuid, ses_uuid, thumb_bytes, quality_score)
+                # Promote the highest quality crop to primary — covers both the
+                # first-ever insert and the case where a better crop arrives later.
+                await conn.execute("""
+                    UPDATE face_thumbnails
+                    SET is_primary = (id = (
+                        SELECT id FROM face_thumbnails
+                        WHERE registry_id = $1
+                        ORDER BY quality_score DESC, created_at ASC
+                        LIMIT 1
+                    ))
+                    WHERE registry_id = $1
+                """, reg_uuid)
     except Exception as exc:
         logger.debug(f"Thumbnail store failed (non-fatal): {exc}")
 
