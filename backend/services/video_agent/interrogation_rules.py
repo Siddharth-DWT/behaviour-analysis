@@ -408,7 +408,7 @@ class InterrogationVideoRules:
         if baseline_movement <= 0:
             return []
 
-        conf = _QUALITY_CONF["motor_inhibition"][tier]
+        quality_tier_cap = _QUALITY_CONF["motor_inhibition"][tier]
 
         signals: list[dict] = []
         for w in windows:
@@ -416,19 +416,23 @@ class InterrogationVideoRules:
             current = w.gesture_velocity_mean
             if current < baseline_movement * MOTOR_INHIBIT_THRESHOLD:
                 reduction_pct = round((1 - current / baseline_movement) * 100, 1)
+                # Dynamic confidence: scales with severity of reduction, capped by quality tier
+                reduction_ratio = max(0.0, min(1.0, 1.0 - current / max(baseline_movement, 0.001)))
+                dyn_conf = min(reduction_ratio * 0.50, quality_tier_cap)
                 meta: dict = {
                     "rule_id":         "MOTOR-INHIBIT-01",
                     "quality_tier":    tier.value,
                     "baseline_mean":   round(baseline_movement, 4),
                     "current_mean":    round(current, 4),
                     "reduction_pct":   reduction_pct,
+                    "display_mode":    "continuous",
                     "research_note":   "OPPOSITE of folk wisdom. Liars show DECREASED fidgeting (DePaulo 2003: d = -0.10). Mechanism: inhibitory control + cognitive load.",
                     "context":         "Indicates cognitive effort — not necessarily deception. Occurs during any complex mental task.",
                     "recommendation":  "Pair with blink pattern and response latency.",
                 }
                 if tier == VideoQualityTier.CCTV_QUALITY:
                     meta["quality_disclaimer"] = (
-                        "Confidence reduced from 0.35 to 0.15 — CCTV resolution limits "
+                        "Confidence reduced — CCTV resolution limits "
                         "gesture velocity accuracy. Only gross movement changes are reliable."
                     )
                 signals.append({
@@ -437,7 +441,7 @@ class InterrogationVideoRules:
                     "signal_type":      "motor_inhibition",
                     "value":            round(reduction_pct / 100, 3),
                     "value_text":       "reduced_movement",
-                    "confidence":       conf,
+                    "confidence":       dyn_conf,
                     "window_start_ms":  w.window_start_ms,
                     "window_end_ms":    w.window_end_ms,
                     "metadata":         meta,

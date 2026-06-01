@@ -4,6 +4,40 @@ import type { VideoSignal, SpeakerInfo } from "../api/client";
 import { getSignalDisplay } from "../config/signalDisplayConfig";
 import InterrogationSummaryPanel from "./InterrogationSummaryPanel";
 
+// ── Behavioral category system (mirrors backend SIGNAL_TO_CATEGORY) ──────────
+const SIGNAL_TO_CATEGORY: Record<string, string> = {
+  // Stressed
+  vocal_stress_score: "Stressed", facial_stress: "Stressed",
+  shoulder_tension: "Stressed", freezing_response: "Stressed",
+  agitated_high_arousal_tone: "Stressed", tension_cluster: "Stressed",
+  stress_anxiety_cluster: "Stressed",
+  // Guarded
+  emotional_suppression: "Guarded", hidden_disagreement: "Guarded",
+  lip_pursing: "Guarded", motor_inhibition: "Guarded",
+  arms_crossed: "Guarded", self_touch: "Guarded", face_region_touch: "Guarded",
+  // Engaged
+  head_nod: "Engaged", smile_type: "Engaged", body_lean: "Engaged",
+  buying_signal: "Engaged", facial_engagement: "Engaged",
+  attention_level: "Engaged", genuine_engagement: "Engaged",
+  gesture_animation: "Engaged", laughter: "Engaged",
+  // Deflecting
+  gaze_direction_shift: "Deflecting", sustained_distraction: "Deflecting",
+  topic_shift: "Deflecting", active_disengagement: "Deflecting",
+  blink_rate_anomaly: "Deflecting",
+  // Resistant
+  head_shake: "Resistant", objection_signal: "Resistant",
+  conflict_detection: "Resistant", frustration_cluster: "Resistant",
+  resistance_hardening: "Resistant", head_body_incongruence: "Resistant",
+  // Processing
+  pause_classification: "Processing", strategic_pause: "Processing",
+  evaluation_cluster: "Processing", cognitive_overload: "Processing",
+  evidence_response_processing_delay: "Processing", decision_engagement: "Processing",
+  // Dominant
+  interruption_event: "Dominant", dominance_display: "Dominant",
+  dominance_score: "Dominant", arm_posture: "Dominant",
+  finger_steepling: "Dominant", peak_performance: "Dominant",
+};
+
 // ── Signal display configuration ──────────────────────────────────────────────
 
 type SignalConfigEntry = {
@@ -1020,7 +1054,7 @@ export default function VideoSignalPlayer({ sessionId, signals, techniqueAnalysi
   const [selectedSpeaker, setSelectedSpeaker] = useState("all");
   const [showAnnotated, setShowAnnotated] = useState(false);
   const [annotatedAvailable, setAnnotatedAvailable] = useState(false);
-  const [showExpanded, setShowExpanded] = useState(false);
+  // showExpanded removed — category labels don't need a "show more" toggle
   const [speakerRoster, setSpeakerRoster] = useState<Record<string, SpeakerInfo>>({});
   const [highlightedSpeaker, setHighlightedSpeaker] = useState<string | null>(null);
   const [detailSpeaker, setDetailSpeaker] = useState<string | null>(null);
@@ -1215,6 +1249,43 @@ export default function VideoSignalPlayer({ sessionId, signals, techniqueAnalysi
 
   // Window-bounded grouping — entries exist only while their signals are active.
   // No cluster gate, no pre-seeding. Entries self-clean when their windows close.
+  // Per-speaker stress baselines computed once from all signals
+  const speakerBaselines = useMemo(() => {
+    const stressValues: Record<string, number[]> = {};
+    for (const s of signals) {
+      if (s.signal_type === "vocal_stress_score" && s.speaker_id) {
+        (stressValues[s.speaker_id] ??= []).push(s.value ?? 0);
+      }
+    }
+    const baselines: Record<string, number> = {};
+    for (const [spk, vals] of Object.entries(stressValues)) {
+      baselines[spk] = vals.reduce((a, b) => a + b, 0) / vals.length;
+    }
+    return baselines;
+  }, [signals]);
+
+  function getActiveCategories(sigs: VideoSignal[], speakerId: string): string[] {
+    const baseline = speakerBaselines[speakerId] ?? 0.25;
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (const s of sigs) {
+      if ((s.confidence ?? 0) < 0.30) continue;
+      if (s.signal_type === "presence_detected") continue;
+      const cat = SIGNAL_TO_CATEGORY[s.signal_type];
+      if (!cat) continue;
+      // Gate: Stressed via vocal_stress_score only when > 1.5× baseline
+      if (cat === "Stressed" && s.signal_type === "vocal_stress_score") {
+        if ((s.value ?? 0) < baseline * 1.5) continue;
+      }
+      // Gate: Engaged body_lean only for forward lean
+      if (s.signal_type === "body_lean" && s.value_text !== "forward_lean") continue;
+      // Gate: Engaged attention_level only for high
+      if (s.signal_type === "attention_level" && s.value_text !== "high_attention") continue;
+      if (!seen.has(cat)) { seen.add(cat); result.push(cat); }
+    }
+    return result;
+  }
+
   const visibleByFace = useMemo(() => {
     const groups: Record<
       string,
@@ -1330,24 +1401,14 @@ export default function VideoSignalPlayer({ sessionId, signals, techniqueAnalysi
           ) : (
             <>
               {Object.entries(visibleByFace).map(([speakerId, { label, rawId, signals: sigs }]) => {
-                const prioritySigs = sigs
-                  .filter((s: VideoSignal) => {
-                    if (s.agent === "fusion") return false;
-                    if (s.signal_type === "presence_detected") return false;
-                    if (SIGNAL_CONFIG[s.signal_type]?.hidden) return false;
-                    const display = getSignalDisplay(s.signal_type, s.value_text ?? "");
-                    return display.priority <= (showExpanded ? 2 : 1);
-                  })
-                  .sort((a: VideoSignal, b: VideoSignal) => (b.confidence || 0) - (a.confidence || 0));
-                const visibleSigs = showExpanded ? prioritySigs : prioritySigs.slice(0, 3);
-                const hasPresence = activeSignals.some((s: VideoSignal) => s.signal_type === "presence_detected" && (toCanonical[s.speaker_id ?? ""] ?? s.speaker_id) === speakerId);
-                if (visibleSigs.length === 0 && !hasPresence) return null;
-                // Thumbnail gate: Face_N tracks with no thumbnail and no behavioral signals
-                // are junk tracks (presence_detected fired but ArcFace never got a clean crop).
-                // Hide them — presence alone is not enough to show a face panel entry.
-                // Faces WITH behavioral signals are shown even without a thumbnail (ArcFace
-                // can fail on small/profile faces while rule engines still fire).
-                if (/^Face_\d+$/.test(rawId) && rosterLoaded && !speakerRoster[rawId]?.thumbnail_url && visibleSigs.length === 0) return null;
+                const categories = getActiveCategories(sigs, rawId);
+                const hasPresence = activeSignals.some((s: VideoSignal) =>
+                  s.signal_type === "presence_detected" &&
+                  (toCanonical[s.speaker_id ?? ""] ?? s.speaker_id) === speakerId
+                );
+                if (categories.length === 0 && !hasPresence) return null;
+                // Hide junk Face_N tracks: no thumbnail, no signals, only presence marker
+                if (/^Face_\d+$/.test(rawId) && rosterLoaded && !speakerRoster[rawId]?.thumbnail_url && categories.length === 0) return null;
                 return (
                   <div key={speakerId} className="flex flex-col gap-1">
                     <SpeakerGroupHeader
@@ -1362,61 +1423,21 @@ export default function VideoSignalPlayer({ sessionId, signals, techniqueAnalysi
                       }
                       onDetail={() => setDetailSpeaker(speakerId)}
                     />
-                    {visibleSigs.length === 0 && hasPresence && (
+                    {categories.length === 0 && hasPresence ? (
                       <span className="px-2 text-[9px] text-white/25 italic">in frame</span>
-                    )}
-                    {visibleSigs.map((s: VideoSignal, i: number) => {
-                      const display = getSignalDisplay(s.signal_type, s.value_text ?? "");
-                      const color = display.color;
-                      return (
+                    ) : (
+                      categories.map((cat) => (
                         <div
-                          key={`${s.signal_type}-${i}`}
-                          className="flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium text-white"
-                          style={{
-                            backgroundColor: `${color}22`,
-                            border: `1px solid ${color}55`,
-                          }}
-                          title={display.description}
+                          key={cat}
+                          className="px-2.5 py-1 text-xs font-medium text-white/80 tracking-wide"
                         >
-                          <span className="font-mono text-[11px]">{display.icon}</span>
-                          <span className="truncate">{display.label}</span>
-                          {s.confidence >= 0.5 && (
-                            <span className="ml-auto shrink-0 text-[10px] opacity-50">
-                              {Math.round(s.confidence * 100)}%
-                            </span>
-                          )}
+                          {cat}
                         </div>
-                      );
-                    })}
+                      ))
+                    )}
                   </div>
                 );
               })}
-              {(() => {
-                const hiddenCount = showExpanded ? 0 : Object.values(visibleByFace).reduce(
-                  (total: number, { signals: sigs }) => {
-                    if (sigs.length === 0) return total;
-                    const sort = (a: VideoSignal, b: VideoSignal) =>
-                      (b.confidence || 0) - (a.confidence || 0);
-                    const shownNow = sigs
-                      .filter((s: VideoSignal) => getSignalDisplay(s.signal_type, s.value_text ?? "").priority <= 1)
-                      .sort(sort)
-                      .slice(0, 3).length;
-                    const shownExpanded = sigs
-                      .filter((s: VideoSignal) => getSignalDisplay(s.signal_type, s.value_text ?? "").priority <= 2)
-                      .sort(sort).length;
-                    return total + (shownExpanded - shownNow);
-                  },
-                  0,
-                );
-                return hiddenCount > 0 || showExpanded ? (
-                  <button
-                    onClick={() => setShowExpanded((v) => !v)}
-                    className="mt-1 text-[9px] text-white/30 hover:text-white/60 transition-colors text-center"
-                  >
-                    {showExpanded ? "Show less" : `+${hiddenCount} more`}
-                  </button>
-                ) : null;
-              })()}
             </>
           )}
         </div>

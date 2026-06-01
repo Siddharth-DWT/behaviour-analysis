@@ -129,7 +129,7 @@ class BodyRuleEngine(BaseVideoRuleEngine):
 
     # Head nod/shake
     NOD_MIN_CROSSINGS    = 3      # ≥3 pitch direction reversals (1.5 nod cycles)
-    NOD_VELOCITY_MIN     = 15.0   # degrees/s peak pitch velocity for nod
+    NOD_VELOCITY_MIN     = 22.0   # degrees/s peak pitch velocity for nod — raised to filter micro-adjustments
     SHAKE_MIN_CROSSINGS  = 3
     SHAKE_VELOCITY_MIN   = 20.0   # degrees/s peak yaw velocity for shake
 
@@ -384,6 +384,7 @@ class BodyRuleEngine(BaseVideoRuleEngine):
                     "spine_delta_deg": round(spine_delta, 2),
                     "spine_angle_mean": round(w.spine_angle_mean, 2),
                     "baseline": round(bl.spine_angle_mean, 2),
+                    "display_mode": "continuous",
                 },
             ))
         elif spine_delta < self.SPINE_UPRIGHT_THRESHOLD:
@@ -401,12 +402,15 @@ class BodyRuleEngine(BaseVideoRuleEngine):
                     "spine_delta_deg": round(spine_delta, 2),
                     "spine_angle_mean": round(w.spine_angle_mean, 2),
                     "baseline": round(bl.spine_angle_mean, 2),
+                    "display_mode": "continuous",
                 },
             ))
 
-        # Shoulder tension check
-        if w.shoulder_angle_std > self.SHOULDER_ASYMM_THRESHOLD:
-            confidence = min((w.shoulder_angle_std / 10.0) * conf_mult * 0.7, 0.50)
+        # Shoulder tension — fires only when tension INCREASES from person's own baseline
+        baseline_sh_std = getattr(bl, "shoulder_angle_std", 5.0)
+        delta_sh_std = w.shoulder_angle_std - baseline_sh_std
+        if delta_sh_std > 3.0:
+            confidence = min((delta_sh_std / 8.0) * conf_mult * 0.7, 0.50)
             signals.append(self._make_signal(
                 rule_id="BODY-POST-01",
                 signal_type="shoulder_tension",
@@ -416,7 +420,12 @@ class BodyRuleEngine(BaseVideoRuleEngine):
                 confidence=confidence,
                 window_start_ms=w.window_start_ms,
                 window_end_ms=w.window_end_ms,
-                metadata={"shoulder_angle_std": round(w.shoulder_angle_std, 2)},
+                metadata={
+                    "shoulder_angle_std": round(w.shoulder_angle_std, 2),
+                    "baseline_std": round(baseline_sh_std, 2),
+                    "delta_from_baseline": round(delta_sh_std, 2),
+                    "display_mode": "continuous",
+                },
             ))
 
         return signals

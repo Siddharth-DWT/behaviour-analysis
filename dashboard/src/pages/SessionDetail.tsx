@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useParams, Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -608,6 +608,22 @@ export default function SessionDetail() {
   });
 
 
+  // useMemo hooks must be declared before any early returns (React rules of hooks)
+  const speakerBaselines = useMemo(() => {
+    const rawSignals = signalData?.signals ?? [];
+    const buckets: Record<string, number[]> = {};
+    for (const s of rawSignals) {
+      if (s.signal_type === "vocal_stress_score" && s.speaker_id) {
+        (buckets[s.speaker_id] ??= []).push(s.value ?? 0);
+      }
+    }
+    const result: Record<string, number> = {};
+    for (const [spk, vals] of Object.entries(buckets)) {
+      result[spk] = vals.reduce((a, b) => a + b, 0) / vals.length;
+    }
+    return result;
+  }, [signalData]);
+
   if (loadingDetail) {
     return (
       <div className="flex items-center justify-center py-20 text-sm text-nexus-text-muted">
@@ -663,6 +679,62 @@ export default function SessionDetail() {
     if (!label) return "Unknown";
     return speakerNames[label] || label;
   };
+
+  // Mirrors SIGNAL_TO_CATEGORY in VideoSignalPlayer.tsx
+  const SIGNAL_TO_CAT: Record<string, string> = {
+    vocal_stress_score: "Stressed", facial_stress: "Stressed",
+    shoulder_tension: "Stressed", freezing_response: "Stressed",
+    agitated_high_arousal_tone: "Stressed", tension_cluster: "Stressed",
+    stress_anxiety_cluster: "Stressed",
+    emotional_suppression: "Guarded", hidden_disagreement: "Guarded",
+    lip_pursing: "Guarded", motor_inhibition: "Guarded",
+    arms_crossed: "Guarded", self_touch: "Guarded", face_region_touch: "Guarded",
+    head_nod: "Engaged", smile_type: "Engaged", body_lean: "Engaged",
+    buying_signal: "Engaged", facial_engagement: "Engaged",
+    attention_level: "Engaged", genuine_engagement: "Engaged",
+    gesture_animation: "Engaged", laughter: "Engaged",
+    gaze_direction_shift: "Deflecting", sustained_distraction: "Deflecting",
+    topic_shift: "Deflecting", active_disengagement: "Deflecting",
+    blink_rate_anomaly: "Deflecting",
+    head_shake: "Resistant", objection_signal: "Resistant",
+    conflict_detection: "Resistant", frustration_cluster: "Resistant",
+    resistance_hardening: "Resistant", head_body_incongruence: "Resistant",
+    pause_classification: "Processing", strategic_pause: "Processing",
+    evaluation_cluster: "Processing", cognitive_overload: "Processing",
+    evidence_response_processing_delay: "Processing", decision_engagement: "Processing",
+    interruption_event: "Dominant", dominance_display: "Dominant",
+    dominance_score: "Dominant", arm_posture: "Dominant",
+    finger_steepling: "Dominant", peak_performance: "Dominant",
+  };
+
+  function getActiveCategories(segSignals: Signal[], speakerId: string | null): { categories: string[]; stressRatio: number } {
+    const baseline = speakerId ? (speakerBaselines[speakerId] ?? 0.25) : 0.25;
+    const stress = segSignals.find((s) => s.signal_type === "vocal_stress_score");
+    const stressRatio = stress ? (stress.value ?? 0) / Math.max(baseline, 0.01) : 1.0;
+    const seen = new Set<string>();
+    const categories: string[] = [];
+    for (const s of segSignals) {
+      if ((s.confidence ?? 0) < 0.30) continue;
+      if (s.signal_type === "presence_detected") continue;
+      const cat = SIGNAL_TO_CAT[s.signal_type];
+      if (!cat) continue;
+      if (cat === "Stressed" && s.signal_type === "vocal_stress_score") {
+        if ((s.value ?? 0) < baseline * 1.5) continue;
+      }
+      if (s.signal_type === "body_lean" && s.value_text !== "forward_lean") continue;
+      if (!seen.has(cat)) { seen.add(cat); categories.push(cat); }
+    }
+    return { categories, stressRatio };
+  }
+
+  function phaseToColor(phase: string): string {
+    const map: Record<string, string> = {
+      Stressed: "#EF4444", Resistant: "#F97316", Guarded: "#F59E0B",
+      Engaged: "#22C55E", Deflecting: "#A855F7", Processing: "#3B82F6",
+      Dominant: "#EC4899",
+    };
+    return map[phase] ?? "#6B7280";
+  }
 
   // Extract fusion signals
   const fusionSignals = signals.filter((s) => s.agent === "fusion");
@@ -1250,15 +1322,21 @@ export default function SessionDetail() {
           </div>
         ) : transcriptViewMode === "list" ? (
           <div className="space-y-2 max-h-[700px] overflow-y-auto pr-1">
-            {segments.map((segment) => (
-              <TranscriptBlock
-                key={segment.id}
-                segment={segment}
-                signals={matchSignalsToSegment(segment, signals)}
-                speakerRole={segment.speaker_label ? speakerRoles[segment.speaker_label] : undefined}
-                speakerName={segment.speaker_label ? speakerNames[segment.speaker_label] : undefined}
-              />
-            ))}
+            {segments.map((segment) => {
+              const segSigs = matchSignalsToSegment(segment, signals);
+              const { categories, stressRatio } = getActiveCategories(segSigs, segment.speaker_label ?? null);
+              return (
+                <TranscriptBlock
+                  key={segment.id}
+                  segment={segment}
+                  signals={segSigs}
+                  speakerRole={segment.speaker_label ? speakerRoles[segment.speaker_label] : undefined}
+                  speakerName={segment.speaker_label ? speakerNames[segment.speaker_label] : undefined}
+                  categories={categories}
+                  stressRatio={stressRatio}
+                />
+              );
+            })}
           </div>
         ) : (
           <TranscriptView
@@ -1999,6 +2077,128 @@ export default function SessionDetail() {
                   </div>
                 ))}
               </div>
+            </section>
+          )}
+
+          {/* Behavioral Analysis — 4 subsections */}
+          {content?.behavioral_analysis && Object.keys(content.behavioral_analysis).length > 0 && (
+            <section className="rounded-lg border border-nexus-border bg-nexus-surface p-5">
+              <h2 className="mb-4 text-sm font-semibold text-nexus-text-primary">
+                Behavioral Analysis
+              </h2>
+
+              {/* Key Moments */}
+              {(content.behavioral_analysis.hotspots ?? []).length > 0 && (
+                <div className="mb-5">
+                  <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-nexus-text-muted">
+                    Key Moments
+                  </h3>
+                  <div className="space-y-1">
+                    {content.behavioral_analysis.hotspots!.map((h, i) => (
+                      <div key={i} className="flex items-start gap-2 rounded p-1.5 text-sm hover:bg-nexus-surface-hover">
+                        <span className="w-10 shrink-0 font-mono text-xs text-nexus-text-muted">{h.timestamp}</span>
+                        <span className="shrink-0 font-medium">{h.speaker}</span>
+                        <span className="flex-1 text-nexus-text-secondary">&ldquo;{(h.text ?? "").slice(0, 80)}&rdquo;</span>
+                        <span className="shrink-0 text-[10px] font-medium text-nexus-text-muted">
+                          {(h.categories ?? []).join(" · ")}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Behavioral Arc */}
+              {content.behavioral_analysis.speaker_trajectories &&
+               Object.keys(content.behavioral_analysis.speaker_trajectories).length > 0 && (
+                <div className="mb-5">
+                  <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-nexus-text-muted">
+                    Behavioral Arc
+                  </h3>
+                  {Object.entries(content.behavioral_analysis.speaker_trajectories).map(([spk, tl]) => (
+                    <div key={spk} className="mb-3">
+                      <div className="mb-1 text-xs font-medium">{spk}</div>
+                      {tl.summary && (
+                        <div className="mb-1.5 text-xs italic text-nexus-text-secondary">{tl.summary}</div>
+                      )}
+                      {(tl.phases ?? []).length > 0 && (
+                        <div className="flex h-6 gap-0.5 overflow-hidden rounded">
+                          {tl.phases!.map((phase, i) => (
+                            <div
+                              key={i}
+                              className="flex flex-1 items-center justify-center text-[8px] font-medium text-white"
+                              style={{ backgroundColor: phaseToColor(phase) }}
+                              title={phase}
+                            >
+                              {phase}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Key Exchanges */}
+              {(content.behavioral_analysis.exchange_analysis ?? []).length > 0 && (
+                <div className="mb-5">
+                  <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-nexus-text-muted">
+                    Key Exchanges
+                  </h3>
+                  <div className="space-y-2">
+                    {content.behavioral_analysis.exchange_analysis!.map((ex, i) => (
+                      <div key={i} className="rounded border border-nexus-border p-2.5">
+                        <div className="text-xs text-nexus-text-muted">{ex.stimulus}</div>
+                        <div className="mt-1 flex items-center gap-2">
+                          <span className="text-nexus-text-muted">→</span>
+                          <span className="text-sm font-medium">
+                            {(ex.response_categories ?? []).join(" · ")}
+                          </span>
+                          {(ex.stress_impact ?? 0) > 1.5 && (
+                            <span className="text-[10px] text-nexus-text-muted">
+                              {ex.stress_impact!.toFixed(1)}× baseline
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Topic Sensitivity */}
+              {content.behavioral_analysis.topic_sensitivity &&
+               Object.keys(content.behavioral_analysis.topic_sensitivity).length > 0 && (
+                <div>
+                  <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-nexus-text-muted">
+                    Topic Sensitivity
+                  </h3>
+                  {Object.entries(content.behavioral_analysis.topic_sensitivity).map(([spk, data]) => (
+                    <div key={spk} className="mb-2 text-xs">
+                      <div className="mb-1 font-medium">{spk}</div>
+                      {data.most_sensitive && (
+                        <div className="text-nexus-text-secondary">
+                          Most reactive: <span className="font-medium">{data.most_sensitive}</span>
+                        </div>
+                      )}
+                      {data.least_sensitive && (
+                        <div className="text-nexus-text-muted">
+                          Least reactive: {data.least_sensitive}
+                        </div>
+                      )}
+                      {(data.topics ?? []).map((t, i) => (
+                        <div key={i} className="mt-0.5 flex items-center gap-2">
+                          <span className="w-4 text-nexus-text-muted">#{i + 1}</span>
+                          <span className="flex-1">{t.topic}</span>
+                          <span className="w-16 text-nexus-text-muted">{t.dominant_category}</span>
+                          <span className="w-8 text-nexus-text-muted">{(t.stress_ratio ?? 1).toFixed(1)}×</span>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
             </section>
           )}
 

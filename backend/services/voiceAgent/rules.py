@@ -206,10 +206,12 @@ class VoiceRuleEngine:
                      new_tone["confidence_raw"] * cal_conf,
                      new_tone.get("evidence", {}))
             elif tone is not None:
-                _add("VOICE-TONE-03", "tone_classification",
-                     tone["confidence_raw"], tone["tone"],
-                     tone["confidence_raw"] * cal_conf,
-                     tone.get("evidence", {}))
+                # Suppress neutral at low confidence — adds zero information
+                if tone["confidence_raw"] >= 0.40:
+                    _add("VOICE-TONE-03", "tone_classification",
+                         tone["confidence_raw"], tone["tone"],
+                         tone["confidence_raw"] * cal_conf,
+                         tone.get("evidence", {}))
 
         # ── VOICE-ENERGY-01: Energy Level Classification ──
         energy = self._rule_energy_01(features, baseline)
@@ -218,18 +220,6 @@ class VoiceRuleEngine:
                  energy["value"], energy["value_text"],
                  energy["confidence_raw"] * cal_conf,
                  energy.get("evidence", {}))
-
-        # ── VOICE-VOL-01: Volume Shift From Baseline ──
-        vol = self._rule_vol_01(features, baseline)
-        if vol is not None:
-            _add("VOICE-VOL-01", "volume_shift",
-                 vol["delta_db"], vol["level"],
-                 vol["confidence_raw"] * cal_conf,
-                 {
-                     "delta_db": vol["delta_db"],
-                     "energy_current_db": vol["energy_current_db"],
-                     "energy_baseline_db": vol["energy_baseline_db"],
-                 })
 
         # ── VOICE-PAUSE-01: Pause Classification ──
         # extended_pause_ms: threshold for extended_hesitation. Default 2000ms;

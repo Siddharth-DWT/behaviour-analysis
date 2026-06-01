@@ -419,6 +419,10 @@ class FusionAgentService(BaseAgentService):
             all_ts = [_to_int(s.get("window_end_ms", 0)) for s in voice_dicts + language_dicts]
             duration_seconds = (max(all_ts) - min(all_ts)) / 1000.0 if all_ts else 0
 
+            # Collect raw audio signals for per-segment behavioral profiling
+            conv_sigs = conversation_summary.get("signals", []) if conversation_summary else []
+            all_audio_signals = pure_voice_dicts + language_dicts + conv_sigs
+
             report = await generate_session_narrative(
                 session_id=session_id,
                 duration_seconds=duration_seconds,
@@ -434,6 +438,7 @@ class FusionAgentService(BaseAgentService):
                 video_summary=video_summary,
                 transcript_segments=request.transcript_segments or [],
                 speaker_names=request.speaker_names or {},
+                all_audio_signals=all_audio_signals,
             )
             logger.info("[%s] Narrative report in %.1fs", session_id, time.time() - t_rep)
 

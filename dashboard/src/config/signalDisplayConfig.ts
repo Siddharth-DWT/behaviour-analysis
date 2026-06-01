@@ -751,11 +751,6 @@ const SIGNAL_MAP: Record<string, SignalDisplay> = {
     description: 'Vocal energy relative to baseline — elevated indicates arousal, depressed indicates fatigue',
     icon: '⚡', color: '#F59E0B', category: 'voice', priority: 2,
   },
-  'volume_shift': {
-    label: 'Volume Shift',
-    description: 'Speaking louder or quieter than baseline — dominance, emphasis, or withdrawal',
-    icon: '🔊', color: '#8B5CF6', category: 'voice', priority: 2,
-  },
   'pause_classification': {
     label: 'Pause Detected',
     description: 'Extended hesitation or thinking pause — cognitive load or uncertainty',

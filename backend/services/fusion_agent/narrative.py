@@ -21,7 +21,7 @@ import os
 import json
 import logging
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Optional
 from dataclasses import asdict
 
@@ -57,6 +57,7 @@ async def generate_session_narrative(
     video_summary: Optional[dict] = None,
     transcript_segments: Optional[list[dict]] = None,
     speaker_names: Optional[dict] = None,
+    all_audio_signals: Optional[list[dict]] = None,
 ) -> Optional[dict]:
     """
     Generate a structured narrative report for the session using the LLM.
@@ -87,6 +88,20 @@ async def generate_session_narrative(
     entities = entities or {}
     graph_analytics = graph_analytics or {}
     conversation_summary = conversation_summary or {}
+
+    # Pre-compute per-segment behavioral profiles (used in both context + fallback)
+    name_map_pre: dict[str, str] = {
+        k: v for k, v in (speaker_names or {}).items() if v and v != k
+    }
+    signal_analysis = _build_signal_analysis(
+        transcript_segments=transcript_segments or [],
+        all_audio_signals=all_audio_signals or [],
+        voice_summary=voice_summary,
+        speakers=speakers,
+        name_map=name_map_pre,
+        entities=entities,
+    )
+
     llm_complete = _get_llm_complete()
     if llm_complete is None:
         return _fallback_narrative(
@@ -94,6 +109,8 @@ async def generate_session_narrative(
             transcript_segments=transcript_segments,
             video_summary=video_summary,
             conversation_summary=conversation_summary,
+            all_audio_signals=all_audio_signals,
+            signal_analysis=signal_analysis,
         )
 
     # ── Build the structured context for the LLM ──
@@ -104,6 +121,7 @@ async def generate_session_narrative(
         video_summary=video_summary,
         transcript_segments=transcript_segments,
         speaker_names=speaker_names,
+        signal_analysis=signal_analysis,
     )
 
     is_interrogation = (meeting_type == "interrogation_video")
@@ -153,6 +171,8 @@ async def generate_session_narrative(
             video_summary=video_summary,
             conversation_summary=conversation_summary,
             meeting_type=meeting_type,
+            all_audio_signals=all_audio_signals,
+            signal_analysis=signal_analysis,
         )
 
 
@@ -212,6 +232,265 @@ def _content_words(text: str) -> set[str]:
     return words - _STOP
 
 
+# ── Behavioral category system ────────────────────────────────────────────────
+# Every signal maps to ONE of 7 plain-English categories.
+# SIGNAL_TO_CATEGORY is the O(1) reverse lookup used by all analysis layers.
+
+BEHAVIORAL_CATEGORIES: dict[str, dict] = {
+    "Stressed": {
+        "signals": frozenset({
+            "vocal_stress_score", "facial_stress", "shoulder_tension",
+            "tension_cluster", "freezing_response", "stress_anxiety_cluster",
+            "agitated_high_arousal_tone",
+        }),
+    },
+    "Guarded": {
+        "signals": frozenset({
+            "emotional_suppression", "hidden_disagreement", "lip_pursing",
+            "motor_inhibition", "arms_crossed", "self_touch", "face_region_touch",
+        }),
+    },
+    "Engaged": {
+        "signals": frozenset({
+            "head_nod", "smile_type", "body_lean", "buying_signal",
+            "facial_engagement", "attention_level", "genuine_engagement",
+            "gesture_animation", "laughter",
+        }),
+    },
+    "Deflecting": {
+        "signals": frozenset({
+            "gaze_direction_shift", "sustained_distraction", "topic_shift",
+            "active_disengagement", "blink_rate_anomaly",
+        }),
+    },
+    "Resistant": {
+        "signals": frozenset({
+            "head_shake", "objection_signal", "conflict_detection",
+            "frustration_cluster", "resistance_hardening", "head_body_incongruence",
+        }),
+    },
+    "Processing": {
+        "signals": frozenset({
+            "pause_classification", "strategic_pause", "evaluation_cluster",
+            "cognitive_overload", "evidence_response_processing_delay",
+            "decision_engagement",
+        }),
+    },
+    "Dominant": {
+        "signals": frozenset({
+            "interruption_event", "dominance_display", "dominance_score",
+            "arm_posture", "finger_steepling", "peak_performance",
+        }),
+    },
+}
+
+# Build reverse lookup once at module load — O(1) per signal type
+SIGNAL_TO_CATEGORY: dict[str, str] = {
+    sig: cat
+    for cat, data in BEHAVIORAL_CATEGORIES.items()
+    for sig in data["signals"]
+}
+
+
+def _build_signal_analysis(
+    transcript_segments: list[dict],
+    all_audio_signals: list[dict],
+    voice_summary: dict,
+    speakers: list[str],
+    name_map: dict[str, str],
+    entities: Optional[dict] = None,
+) -> dict:
+    """
+    Compute 4 behavioral analysis layers from raw audio signals + transcript.
+    Uses SIGNAL_TO_CATEGORY (O(1) HashMap) to map signals → category words.
+
+    Layer 1 — Segment profiles: active category words per segment
+    Layer 2 — Trajectory: per-speaker phase arc using category runs
+    Layer 3 — Stimulus-response pairs: question→answer behavioral pairs
+    Layer 4 — Topic sensitivity: dominant category + stress ratio per topic
+
+    DSA:
+      bisect.bisect_right — O(log N) segment lookup
+      defaultdict         — O(1) per-speaker grouping
+      SIGNAL_TO_CATEGORY  — O(1) category membership via pre-built HashMap
+    """
+    if not transcript_segments or not all_audio_signals:
+        return {}
+
+    entities = entities or {}
+    seg_starts = [s.get("start_ms", 0) for s in transcript_segments]
+
+    # ── Layer 1: map signals → segments, compute active categories ───────────
+    signals_by_seg: dict[tuple[str, int], list[dict]] = defaultdict(list)
+    for sig in all_audio_signals:
+        w_start = sig.get("window_start_ms", 0)
+        w_end   = sig.get("window_end_ms", w_start + 2000)
+        spk     = sig.get("speaker_id", "")
+        if not spk:
+            continue
+        idx = bisect.bisect_right(seg_starts, w_start) - 1
+        if 0 <= idx < len(transcript_segments):
+            seg = transcript_segments[idx]
+            seg_end = seg.get("end_ms", seg.get("start_ms", 0) + 2000)
+            if seg.get("start_ms", 0) < w_end and w_start < seg_end:
+                signals_by_seg[(spk, idx)].append(sig)
+
+    segment_profiles: list[dict] = []
+    for (spk, seg_idx), sigs in signals_by_seg.items():
+        seg  = transcript_segments[seg_idx]
+        text = seg.get("text", "").strip()
+        if not text or len(text) < 10:
+            continue
+
+        spk_avg = voice_summary.get("per_speaker", {}).get(spk, {}).get("avg_stress", 0.25)
+
+        # Determine active categories via SIGNAL_TO_CATEGORY HashMap
+        seen_cats: list[str] = []
+        for sig in sigs:
+            conf     = sig.get("confidence", 0)
+            sig_type = sig.get("signal_type", "")
+            if conf < 0.30:
+                continue
+            cat = SIGNAL_TO_CATEGORY.get(sig_type)
+            if not cat:
+                continue
+            # Gate: "Stressed" via vocal_stress_score only when > 1.5× baseline
+            if cat == "Stressed" and sig_type == "vocal_stress_score":
+                if float(sig.get("value", 0)) < spk_avg * 1.5:
+                    continue
+            # Gate: "Engaged" via body_lean only for forward lean
+            if sig_type == "body_lean" and sig.get("value_text", "") != "forward_lean":
+                continue
+            if cat not in seen_cats:
+                seen_cats.append(cat)
+
+        # Stress ratio for display
+        stress_sig  = next((s for s in sigs if s.get("signal_type") == "vocal_stress_score"), None)
+        stress_val  = float(stress_sig.get("value", 0)) if stress_sig else 0.0
+        stress_ratio = stress_val / max(spk_avg, 0.01) if stress_val > 0 else 1.0
+
+        # Intensity = sum of qualifying confidences
+        intensity = sum(s.get("confidence", 0) for s in sigs if s.get("confidence", 0) >= 0.30)
+
+        m, s_val = divmod(seg.get("start_ms", 0) // 1000, 60)
+        segment_profiles.append({
+            "speaker":      spk,
+            "timestamp":    f"{m}:{s_val:02d}",
+            "timestamp_ms": seg.get("start_ms", 0),
+            "text":         text[:200],
+            "categories":   seen_cats,          # ["Stressed", "Guarded"]
+            "stress_ratio": round(stress_ratio, 1),
+            "intensity":    round(intensity, 1),
+            "signal_count": len([s for s in sigs if s.get("confidence", 0) >= 0.30]),
+        })
+
+    # Top 15 hotspots by intensity
+    hotspots = sorted(segment_profiles, key=lambda x: x["intensity"], reverse=True)[:15]
+
+    # ── Layer 2: speaker trajectories ────────────────────────────────────────
+    by_spk: dict[str, list[dict]] = defaultdict(list)
+    for p in segment_profiles:
+        by_spk[p["speaker"]].append(p)
+
+    speaker_trajectories: dict[str, dict] = {}
+    for spk_id, profs in by_spk.items():
+        profs_sorted  = sorted(profs, key=lambda x: x["timestamp_ms"])
+        # Dominant category per segment = first in the list (highest-priority signal fired)
+        dom_cats      = [p["categories"][0] if p["categories"] else "" for p in profs_sorted]
+        stress_ratios = [p["stress_ratio"] for p in profs_sorted]
+
+        # Phase = run of 2+ consecutive same dominant category
+        phases: list[str] = []
+        i = 0
+        while i < len(dom_cats):
+            cat = dom_cats[i]
+            run = 1
+            while i + run < len(dom_cats) and dom_cats[i + run] == cat:
+                run += 1
+            if run >= 2 and cat:
+                phases.append(cat)
+            i += run
+        if not phases and dom_cats:
+            first = next((c for c in dom_cats if c), "")
+            if first:
+                phases = [first]
+
+        avg_sr = sum(stress_ratios) / len(stress_ratios) if stress_ratios else 1.0
+        trajectory_summary = " → ".join(phases) if phases else ""
+        speaker_trajectories[spk_id] = {
+            "phases":             phases,
+            "trajectory_summary": trajectory_summary,
+            "avg_stress_ratio":   round(avg_sr, 2),
+            "segment_count":      len(profs_sorted),
+        }
+
+    # ── Layer 3: stimulus-response pairs ─────────────────────────────────────
+    conv_dom = {spk_id: len(profs) for spk_id, profs in by_spk.items()}
+    dominant_spk = max(conv_dom, key=lambda k: conv_dom[k]) if conv_dom else ""
+
+    stimulus_response_pairs: list[dict] = []
+    all_sorted = sorted(segment_profiles, key=lambda x: x["timestamp_ms"])
+    for i, prof in enumerate(all_sorted):
+        if prof["speaker"] != dominant_spk:
+            continue
+        for resp in all_sorted[i + 1:]:
+            if resp["speaker"] == dominant_spk:
+                continue
+            if resp["timestamp_ms"] - prof["timestamp_ms"] > 60_000:
+                break
+            stress_r = resp["stress_ratio"]
+            impact   = "high" if stress_r > 2.0 else "medium" if stress_r > 1.3 else "low"
+            stimulus_response_pairs.append({
+                "stimulus":   {"speaker": dominant_spk, "text": prof["text"][:120],
+                               "timestamp": prof["timestamp"]},
+                "response":   {"speaker": resp["speaker"], "text": resp["text"][:120],
+                               "timestamp": resp["timestamp"], "categories": resp["categories"]},
+                "stress_ratio": round(stress_r, 2),
+                "impact":     impact,
+            })
+            break
+        if len(stimulus_response_pairs) >= 10:
+            break
+
+    # ── Layer 4: topic sensitivity ────────────────────────────────────────────
+    topic_sensitivity: dict[str, dict] = {}
+    for topic in entities.get("topics", []):
+        t_start = topic.get("start_ms", 0)
+        t_end   = topic.get("end_ms", t_start + 1)
+        for spk_id in speakers:
+            profs = [
+                p for p in by_spk.get(spk_id, [])
+                if t_start <= p["timestamp_ms"] <= t_end
+            ]
+            if not profs:
+                continue
+            avg_sr  = sum(p["stress_ratio"] for p in profs) / len(profs)
+            all_cats = [c for p in profs for c in p["categories"]]
+            dom_cat  = Counter(all_cats).most_common(1)[0][0] if all_cats else ""
+            entry   = {
+                "topic":             topic.get("name", "Unknown"),
+                "stress_ratio":      round(avg_sr, 2),
+                "dominant_category": dom_cat,
+                "segment_count":     len(profs),
+                "sensitivity_rank":  0,  # filled in below
+            }
+            topic_sensitivity.setdefault(spk_id, {"topics": []})["topics"].append(entry)
+
+    # Sort each speaker's topics by stress_ratio descending and assign rank
+    for spk_id, data in topic_sensitivity.items():
+        data["topics"].sort(key=lambda x: x["stress_ratio"], reverse=True)
+        for rank, t in enumerate(data["topics"], 1):
+            t["sensitivity_rank"] = rank
+
+    return {
+        "segment_profiles":        segment_profiles,
+        "hotspots":                hotspots,
+        "speaker_trajectories":    speaker_trajectories,
+        "stimulus_response_pairs": stimulus_response_pairs,
+        "topic_sensitivity":       topic_sensitivity,
+    }
+
+
 def _build_context(
     session_id: str,
     duration_seconds: float,
@@ -226,6 +505,7 @@ def _build_context(
     video_summary: Optional[dict] = None,
     transcript_segments: Optional[list[dict]] = None,
     speaker_names: Optional[dict] = None,
+    signal_analysis: Optional[dict] = None,
 ) -> str:
     """Build a structured text context block for the LLM."""
     entities = entities or {}
@@ -668,6 +948,62 @@ def _build_context(
                     f"({min(voice_stress, face_stress):.2f}) — delta {delta:.2f}"
                 )
 
+    # ── Signal-level behavioral analysis (4 layers, category-based) ──────────
+    if signal_analysis:
+        hotspots = signal_analysis.get("hotspots", [])
+        if hotspots:
+            lines.append("\n=== BEHAVIORAL HOTSPOTS (top moments by signal intensity) ===")
+            for h in hotspots[:15]:
+                spk_d = _display(h.get("speaker", "?"), name_map)
+                cats  = ", ".join(h.get("categories", [])) or "—"
+                lines.append(
+                    f"  [{h.get('timestamp', '?')}] {spk_d}: "
+                    f"\"{h.get('text', '')[:100]}\" — {cats} "
+                    f"(stress {h.get('stress_ratio', 1.0):.1f}×, {h.get('signal_count', 0)} signals)"
+                )
+
+        trajectories = signal_analysis.get("speaker_trajectories", {})
+        if trajectories:
+            lines.append("\n=== BEHAVIORAL TRAJECTORY (per speaker) ===")
+            for spk_id, traj in trajectories.items():
+                spk_d   = _display(spk_id, name_map)
+                summary = traj.get("trajectory_summary", " → ".join(traj.get("phases", [])))
+                lines.append(
+                    f"  {spk_d}: {summary} "
+                    f"(avg stress {traj.get('avg_stress_ratio', 1.0):.1f}×)"
+                )
+
+        stimulus_pairs = signal_analysis.get("stimulus_response_pairs", [])
+        if stimulus_pairs:
+            lines.append("\n=== STIMULUS → RESPONSE ANALYSIS ===")
+            for pair in [p for p in stimulus_pairs if p.get("impact") in ("high", "medium")][:8]:
+                stim = pair.get("stimulus", {})
+                resp = pair.get("response", {})
+                resp_cats = ", ".join(resp.get("categories", [])) or "—"
+                resp_spk  = _display(resp.get("speaker", "?"), name_map)
+                lines.append(
+                    f"  [{stim.get('timestamp', '?')}] {_display(stim.get('speaker', '?'), name_map)}: "
+                    f"\"{stim.get('text', '')[:80]}\""
+                )
+                lines.append(
+                    f"    → [{resp.get('timestamp', '?')}] {resp_spk}: "
+                    f"\"{resp.get('text', '')[:80]}\" — {resp_cats} "
+                    f"(stress {pair.get('stress_ratio', 1.0):.1f}×)"
+                )
+
+        topic_sensitivity = signal_analysis.get("topic_sensitivity", {})
+        if topic_sensitivity:
+            lines.append("\n=== TOPIC SENSITIVITY MAP ===")
+            for spk_id, ts_data in topic_sensitivity.items():
+                spk_d = _display(spk_id, name_map)
+                lines.append(f"  [{spk_d}]")
+                for t in ts_data.get("topics", [])[:5]:
+                    lines.append(
+                        f"    #{t.get('sensitivity_rank', '?')} \"{t.get('topic', '?')}\": "
+                        f"dominant={t.get('dominant_category', '—')}, "
+                        f"stress={t.get('stress_ratio', 1.0):.2f}×"
+                    )
+
     return "\n".join(lines)
 
 
@@ -952,7 +1288,42 @@ Respond with a JSON object containing these fields:
       "action": "specific actionable recommendation",
       "rationale": "brief reason based on the evidence"
     }}
-  ]
+  ],
+
+  "behavioral_analysis": {{
+    "hotspots": [
+      {{
+        "timestamp": "1:14",
+        "speaker": "Name or Speaker_N",
+        "text": "What was said at this moment",
+        "categories": ["Stressed", "Guarded"],
+        "stress_ratio": 2.9,
+        "interpretation": "Why this moment matters behaviorally"
+      }}
+    ],
+    "speaker_trajectories": {{
+      "Speaker_0": {{
+        "summary": "Narrative of how behavioral state evolved across the session",
+        "phases": ["Resistant", "Stressed", "Guarded", "Deflecting"],
+        "turning_points": ["1:14 — first Stressed response under evidence pressure"]
+      }}
+    }},
+    "exchange_analysis": [
+      {{
+        "stimulus": "What the interrogator/seller said",
+        "response_categories": ["Stressed", "Guarded"],
+        "stress_impact": 2.9,
+        "interpretation": "What this exchange reveals about the subject's state"
+      }}
+    ],
+    "topic_sensitivity": {{
+      "Speaker_0": {{
+        "most_sensitive": "topic name with highest stress response",
+        "least_sensitive": "topic with lowest stress response",
+        "interpretation": "What the topic sensitivity hierarchy reveals"
+      }}
+    }}
+  }}
 }}
 
 {extra_fields}
@@ -1113,6 +1484,8 @@ def _parse_main_response(raw_text: str, speakers: list[str]) -> dict:
             "technique_analysis": None,
             "contradiction_analysis": [],
             "voice_text_correlations": [],
+            # Behavioral analysis — populated from LLM output when present
+            "behavioral_analysis": parsed.get("behavioral_analysis", {}),
         }
     except json.JSONDecodeError:
         logger.warning("Failed to parse LLM narrative as JSON, returning raw text")
@@ -1133,6 +1506,7 @@ def _parse_main_response(raw_text: str, speakers: list[str]) -> dict:
             "technique_analysis": None,
             "contradiction_analysis": [],
             "voice_text_correlations": [],
+            "behavioral_analysis": {},
         }
 
 
@@ -1243,6 +1617,8 @@ def _fallback_narrative(
     video_summary: Optional[dict] = None,
     conversation_summary: Optional[dict] = None,
     meeting_type: str = "sales_call",
+    all_audio_signals: Optional[list[dict]] = None,
+    signal_analysis: Optional[dict] = None,
 ) -> dict:
     """
     Generate a basic narrative without LLM API.
@@ -1715,6 +2091,51 @@ def _fallback_narrative(
 
     executive_summary = " ".join(_exec)
 
+    # Build behavioral_analysis from pre-computed signal_analysis (no LLM needed)
+    sa = signal_analysis or {}
+    behavioral_analysis: dict = {}
+    if sa.get("hotspots"):
+        behavioral_analysis["hotspots"] = [
+            {
+                "timestamp":   h.get("timestamp", ""),
+                "speaker":     h.get("speaker", ""),
+                "text":        h.get("text", "")[:120],
+                "categories":  h.get("categories", []),
+                "stress_ratio": h.get("stress_ratio", 1.0),
+            }
+            for h in sa["hotspots"][:10]
+        ]
+    if sa.get("speaker_trajectories"):
+        behavioral_analysis["speaker_trajectories"] = {
+            spk: {
+                "phases":   traj.get("phases", []),
+                "summary":  traj.get("trajectory_summary") or (
+                    f"{' → '.join(traj.get('phases', []))} "
+                    f"across {traj.get('segment_count', 0)} segments"
+                ),
+            }
+            for spk, traj in sa["speaker_trajectories"].items()
+        }
+    if sa.get("stimulus_response_pairs"):
+        behavioral_analysis["exchange_analysis"] = [
+            {
+                "stimulus":           p.get("stimulus", {}).get("text", "")[:100],
+                "response_categories": p.get("response", {}).get("categories", []),
+                "stress_impact":       p.get("stress_ratio", 1.0),
+            }
+            for p in sa["stimulus_response_pairs"][:6]
+            if p.get("impact") in ("high", "medium")
+        ]
+    if sa.get("topic_sensitivity"):
+        behavioral_analysis["topic_sensitivity"] = {
+            spk: {
+                "most_sensitive":  data["topics"][0]["topic"] if data.get("topics") else "",
+                "least_sensitive": data["topics"][-1]["topic"] if data.get("topics") else "",
+                "topics": data.get("topics", []),
+            }
+            for spk, data in sa["topic_sensitivity"].items()
+        }
+
     return {
         "general_summary": general_summary,
         "notes": notes,
@@ -1735,4 +2156,5 @@ def _fallback_narrative(
         "objection_handling": None,
         "contradiction_analysis": contradiction_analysis,
         "voice_text_correlations": voice_text_correlations,
+        "behavioral_analysis": behavioral_analysis,
     }

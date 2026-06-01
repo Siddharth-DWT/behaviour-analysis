@@ -273,6 +273,38 @@ export interface Report {
       score: number;
     }>;
     graph_analytics?: Record<string, unknown>;
+    behavioral_analysis?: {
+      hotspots?: Array<{
+        timestamp?: string;
+        speaker?: string;
+        text?: string;
+        categories?: string[];
+        stress_ratio?: number;
+        interpretation?: string;
+      }>;
+      speaker_trajectories?: Record<string, {
+        phases?: string[];
+        summary?: string;
+        turning_points?: string[];
+      }>;
+      exchange_analysis?: Array<{
+        stimulus?: string;
+        response_categories?: string[];
+        stress_impact?: number;
+        interpretation?: string;
+      }>;
+      topic_sensitivity?: Record<string, {
+        most_sensitive?: string;
+        least_sensitive?: string;
+        interpretation?: string;
+        topics?: Array<{
+          topic?: string;
+          stress_ratio?: number;
+          dominant_category?: string;
+          sensitivity_rank?: number;
+        }>;
+      }>;
+    };
   };
   narrative: string | null;
   generated_at: string;

@@ -144,9 +144,11 @@ interface Props {
   signals: Signal[];
   speakerRole?: string;
   speakerName?: string;
+  categories?: string[];
+  stressRatio?: number;
 }
 
-export default function TranscriptBlock({ segment, signals, speakerRole, speakerName }: Props) {
+export default function TranscriptBlock({ segment, signals, speakerRole, speakerName, categories, stressRatio }: Props) {
   const speaker = speakerName || segment.speaker_label || "Speaker";
   const badges = filterSmartBadges(signals, 3);
   const borderColor = getBorderColor(signals);
@@ -172,9 +174,17 @@ export default function TranscriptBlock({ segment, signals, speakerRole, speaker
         )}
       </div>
 
-      {/* Transcript text */}
+      {/* Transcript text + inline category labels */}
       <p className="text-sm leading-relaxed text-nexus-text-primary">
         {segment.text}
+        {categories && categories.length > 0 && (
+          <span className="ml-2 text-[9px] font-medium text-white/50 tracking-wide">
+            {categories.join(" · ")}
+            {stressRatio != null && stressRatio > 1.3 && (
+              <span className="ml-1 text-white/40">{stressRatio.toFixed(1)}×</span>
+            )}
+          </span>
+        )}
       </p>
 
       {/* Smart signal badges (audio/language — max 3) */}
