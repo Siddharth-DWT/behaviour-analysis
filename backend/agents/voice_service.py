@@ -437,6 +437,20 @@ class VoiceAgentService(BaseAgentService):
                     session_id=session_id,
                 )
                 all_signals.extend(delay_signals)
+                # Wire up the two interrogation voice rules that previously had
+                # zero call sites but are expected by fusion/api (NEXUS audit 4.5).
+                hesitation_signals = ivr.vocal_hesitation_cluster(
+                    voice_signals=all_signals,
+                    diar_segments=transcript["segments"],
+                    session_id=session_id,
+                )
+                all_signals.extend(hesitation_signals)
+                rate_signals = ivr.speech_rate_change(
+                    voice_signals=all_signals,
+                    diar_segments=transcript["segments"],
+                    session_id=session_id,
+                )
+                all_signals.extend(rate_signals)
             except Exception as exc:
                 logger.warning("[%s] Interrogation voice rules failed (non-fatal): %s", session_id, exc)
 

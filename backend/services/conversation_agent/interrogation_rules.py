@@ -3,13 +3,21 @@
 Interrogation-specific conversation rules (NEXUS INTERROGATION_IMPLEMENTATION.MD v2.0).
 
 Rules implemented:
-  INTERROG-CONV-01  Evidence Response Processing Delay  (conf 0.65 — Hartwig et al. 2014-2016, d=1.83)
+  INTERROG-CONV-01  Evidence Response Processing Delay    (Hartwig et al. 2014-2016, d=1.83)
+  INTERROG-CONV-02  Interrogator Technique Classification (Meissner et al. 2014)  [InterrogatorTechniqueClassifier]
+  INTERROG-CONV-03  Verbal Uncertainty Cluster            (CBCA Criterion 15, Steller & Köhnken 1989)
 
-Research: SUE (Strategic Use of Evidence) framework. Long response latency after
-evidence disclosure is the highest-evidence interrogation signal (85% field accuracy),
+INTERROG-CONV-01 research: SUE (Strategic Use of Evidence) framework. Long response latency
+after evidence disclosure is the highest-evidence interrogation signal (85% field accuracy),
 but is equally present in innocent suspects confronted with fabricated or unexpected evidence.
 Confidence scales from 0.40 → 0.85 with latency magnitude (§5 table: 0.85 all quality tiers
 because signal is timestamp-based, not video/audio quality dependent).
+
+INTERROG-CONV-03 research: CBCA Criterion 15 (Steller & Köhnken 1989) classifies "Admissions
+of Lack of Memory" as a TRUTHFULNESS indicator — truth tellers admit memory gaps more often
+than liars, who fabricate certainty. DePaulo et al. (2003) meta-analysis: uncertainty
+expressions show small/null effect for deception detection. Signal indicates cognitive load,
+NOT deception, and MUST NOT feed into FalseConfessionRiskAssessor.
 """
 from __future__ import annotations
 
@@ -19,7 +27,16 @@ from collections import defaultdict
 
 logger = logging.getLogger("nexus.conversation.interrogation")
 
-# Evidence disclosure keywords — interrogator presents facts/evidence
+
+try:
+    from shared.utils.interrogator_detection import detect_interrogators as _detect_interrogators
+except ImportError:
+    from backend.shared.utils.interrogator_detection import detect_interrogators as _detect_interrogators
+
+# Evidence disclosure keywords (CONV-01) — originally forensic evidence only,
+# extended to cover deposition/cross-examination challenges so CONV-01 fires
+# in sworn-testimony contexts where the interrogator confronts facts rather
+# than presenting physical evidence.
 _EVIDENCE_RE = re.compile(
     r"\b("
     r"we found|forensics|DNA|fingerprint(s)?|"
@@ -34,7 +51,11 @@ _EVIDENCE_RE = re.compile(
     r"(cell tower|GPS|location data|timestamp|CCTV|security footage)|"
     r"I have (proof|evidence|a witness)|"
     r"the (report|analysis|findings?) (shows?|says?|indicates?)|"
-    r"your (blood|DNA|prints?|hair|fibres?) (was|were|matched|found)"
+    r"your (blood|DNA|prints?|hair|fibres?) (was|were|matched|found)|"
+    r"is (this|that) the same (man|person|woman|individual)|"
+    r"you (said|told|claimed|stated|testified) (that|to |you )|"
+    r"how do you explain|isn'?t (it|that) (true|correct|right)|"
+    r"why did you (call|go|leave|come|stay|meet|send|delete|hide|text)"
     r")\b",
     re.IGNORECASE,
 )
@@ -45,6 +66,42 @@ _LATENCY_THRESHOLD_MS = 2_000
 # Do not associate a response if the gap to the next speaker exceeds this
 # (interrogator asked multiple questions in between, or there is a long unrelated pause)
 _MAX_ASSOCIATION_GAP_MS = 20_000
+
+# ── CONV-03 patterns ──────────────────────────────────────────────────────────
+
+# Verbal uncertainty markers — cognitive load expressed as words, not silence.
+# CBCA Criterion 15 (Steller & Köhnken 1989): admissions of lack of memory are
+# MORE common in truthful accounts. These mark cognitive load, NOT deception.
+_UNCERTAINTY_RE = re.compile(
+    r"\b("
+    r"I don'?t know|I'?m not sure|I don'?t remember|I can'?t remember|"
+    r"I don'?t recall|I can'?t recall|I'?m not certain|"
+    r"I have no idea|have no idea|"          # "I have no idea" is a very common hedge
+    r"Don'?t know|"                          # "Don't know" without leading "I"
+    r"I think|I guess|I believe|I suppose|I imagine|"
+    r"maybe|possibly|probably|perhaps|"
+    r"I barely|I couldn'?t|I can'?t really|"
+    r"not really|not exactly|sort of|kind of"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Challenging question patterns — covers depositions and cross-examinations
+# in addition to police interrogations.
+_CHALLENGE_QUESTION_RE = re.compile(
+    r"\b("
+    r"do you (remember|recall|know)|"
+    r"would you (remember|recall)|"
+    r"can you (explain|tell me|describe)|"
+    r"is (this|that) (the same|true|correct|right)|"
+    r"why did you|how did you|when did you|where did you|"
+    r"did you (not|ever|actually)|"
+    r"isn'?t (it|that) (true|correct|right)|"
+    r"you (said|told|claimed|stated|testified|mentioned)|"
+    r"how (do you|would you|can you) explain"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 class InterrogationConversationRules:
@@ -70,12 +127,21 @@ class InterrogationConversationRules:
         if not normed:
             return []
 
+        # Detect interrogators BEFORE the loop so we only treat turns from
+        # interrogator speakers as evidence-disclosure turns.  Without this gate
+        # a suspect saying "you said that to me first" would generate an
+        # evidence_response_processing_delay attributed to themselves.
+        interrogators, _ = _detect_interrogators(normed)
+
         signals: list[dict] = []
         for i, turn in enumerate(normed[:-1]):
+            # Gate: only interrogator turns can disclose evidence
+            if interrogators and turn["speaker"] not in interrogators:
+                continue
             if not _EVIDENCE_RE.search(turn["text"]):
                 continue
 
-            # Find the immediately next turn from a different speaker
+            # Find the immediately next turn from a different speaker (the suspect).
             next_turn: dict | None = None
             for j in range(i + 1, len(normed)):
                 if normed[j]["speaker"] != turn["speaker"]:
@@ -85,7 +151,18 @@ class InterrogationConversationRules:
             if next_turn is None:
                 continue
 
-            latency_ms = next_turn["start_ms"] - turn["end_ms"]
+            # Measure latency from the END of the LAST interrogator segment that
+            # precedes the suspect's response turn — not just the evidence segment.
+            # If the interrogator continued talking after the evidence disclosure,
+            # their own speech would otherwise count as "processing delay".
+            last_interrog_end = turn["end_ms"]
+            for k in range(i + 1, len(normed)):
+                if normed[k] is next_turn:
+                    break
+                if normed[k]["speaker"] == turn["speaker"]:
+                    last_interrog_end = normed[k]["end_ms"]
+
+            latency_ms = next_turn["start_ms"] - last_interrog_end
             if latency_ms <= 0 or latency_ms > _MAX_ASSOCIATION_GAP_MS:
                 continue
             if latency_ms <= _LATENCY_THRESHOLD_MS:
@@ -124,6 +201,178 @@ class InterrogationConversationRules:
                 },
             })
 
+        # INTERROG-CONV-03: Verbal Uncertainty Cluster
+        interrogators, _ = _detect_interrogators(normed)
+        if interrogators:
+            signals.extend(self._verbal_uncertainty_cluster(normed, interrogators, session_id))
+
+        return signals
+
+    def _verbal_uncertainty_cluster(
+        self,
+        normed: list[dict],
+        interrogators: set[str],
+        session_id: str = "",
+    ) -> list[dict]:
+        """
+        INTERROG-CONV-03: Verbal Uncertainty Cluster.
+
+        Detects clusters of uncertainty expressions ("I don't know", "I'm not sure",
+        "I can't remember") in suspect responses to challenging questions.
+        Fires when ≥3 out of 5 consecutive challenge-response pairs contain
+        at least one uncertainty marker.
+
+        CRITICAL: This signal uses signal_type "verbal_uncertainty_cluster",
+        NOT "evidence_response_processing_delay". It intentionally does NOT feed
+        FalseConfessionRiskAssessor (which only uses _PROCESSING_TYPES =
+        {"evidence_response_processing_delay"}).
+
+        Research:
+          CBCA Criterion 15 (Steller & Köhnken 1989): "Admissions of Lack of
+          Memory" are a TRUTHFULNESS indicator — more common in truthful accounts.
+          Porter & Yuille (1996): memory admissions significantly higher in truthful.
+          DePaulo et al. (2003): uncertainty expressions show small/null effect.
+          → Cognitive load indicator with multiple valid interpretations.
+
+        DSA: O(S) single pass to build pairs, O(P) sliding window.
+        Confidence cap: 0.40 — not a reliable deception cue.
+        """
+        if len(normed) < 5:
+            return []
+
+        # Build challenge-response pairs: interrogator question → suspect answer.
+        # Dedupe by response-turn identity so consecutive interrogator segments that
+        # all pair with the SAME response only produce ONE pair (prevents MIN_HITS=3
+        # from being met by a single "I don't know" via duplicate pair inflation).
+        pairs: list[dict] = []
+        _seen_response_ids: set[int] = set()
+        for i, turn in enumerate(normed):
+            if turn["speaker"] not in interrogators:
+                continue
+            if not (("?" in turn["text"]) or _detect_interrogators([turn])[0]):
+                # Use punctuation check first; the shared helper covers no-punctuation
+                if "?" not in turn["text"]:
+                    continue
+
+            # Next non-interrogator turn is the response
+            response: dict | None = None
+            for j in range(i + 1, len(normed)):
+                if normed[j]["speaker"] not in interrogators:
+                    response = normed[j]
+                    break
+
+            if response is None:
+                continue
+
+            # Apply same 20s max-gap as CONV-01 to prevent minute-2 question
+            # pairing with a minute-30 answer
+            gap_ms = response["start_ms"] - turn["end_ms"]
+            if gap_ms > _MAX_ASSOCIATION_GAP_MS:
+                continue
+
+            # Dedupe: skip if this response turn was already paired with a
+            # previous question segment
+            if id(response) in _seen_response_ids:
+                continue
+            _seen_response_ids.add(id(response))
+
+            markers = _UNCERTAINTY_RE.findall(response["text"])
+            # findall on a group-less regex returns strings; on a group-ful regex
+            # returns tuples. Normalise to plain strings.
+            marker_strs = [m if isinstance(m, str) else m[0] for m in markers]
+
+            pairs.append({
+                "challenge":          turn,
+                "response":           response,
+                "marker_count":       len(marker_strs),
+                "markers":            [m.lower() for m in marker_strs],
+                "is_memory_challenge": bool(_CHALLENGE_QUESTION_RE.search(turn["text"])),
+            })
+
+        WINDOW      = 5
+        MIN_HITS    = 3
+
+        # Need at least WINDOW pairs for the sliding window to have one iteration.
+        # (range(len(pairs) - WINDOW + 1) is empty for len < WINDOW)
+        if len(pairs) < WINDOW:
+            return []
+        signals: list[dict] = []
+
+        for start in range(len(pairs) - WINDOW + 1):
+            window = pairs[start : start + WINDOW]
+
+            uncertain = [p for p in window if p["marker_count"] >= 1]
+            if len(uncertain) < MIN_HITS:
+                continue
+
+            total_markers   = sum(p["marker_count"] for p in window)
+            memory_chal     = sum(1 for p in window if p["is_memory_challenge"])
+            first_resp      = window[0]["response"]
+            last_resp       = window[-1]["response"]
+            respondent      = first_resp["speaker"]
+
+            all_markers: list[str] = []
+            for p in uncertain:
+                all_markers.extend(p["markers"])
+            sample_markers = list(dict.fromkeys(all_markers))[:5]
+
+            # Skip if a signal for the same speaker already covers this window
+            overlap = any(
+                e["speaker_id"] == respondent
+                and e["window_start_ms"] <= last_resp["end_ms"]
+                and e["window_end_ms"] >= first_resp["start_ms"]
+                for e in signals
+            )
+            if overlap:
+                continue
+
+            # conf: 0.25 base + 0.05 per uncertain pair beyond MIN_HITS, cap 0.40
+            conf = round(min(0.40, 0.25 + (len(uncertain) - MIN_HITS) * 0.05), 4)
+
+            signals.append({
+                "agent":           "conversation",
+                "speaker_id":      respondent,
+                "signal_type":     "verbal_uncertainty_cluster",
+                "value":           round(min(1.0, total_markers / (WINDOW * 3)), 4),
+                "value_text":      "uncertainty_cluster",
+                "confidence":      conf,
+                "window_start_ms": first_resp["start_ms"],
+                "window_end_ms":   last_resp["end_ms"],
+                "metadata": {
+                    "rule_id":           "INTERROG-CONV-03",
+                    "uncertain_pairs":   len(uncertain),
+                    "total_markers":     total_markers,
+                    "window_pairs":      WINDOW,
+                    "memory_challenges": memory_chal,
+                    "sample_markers":    sample_markers,
+                    "interpretations": [
+                        "Genuine memory difficulty — truthful speaker cannot recall details "
+                        "(CBCA Criterion 15: admissions of lack of memory are MORE common "
+                        "in truthful accounts, Steller & Köhnken 1989)",
+                        "Stress response — anxiety-driven uncertainty regardless of truthfulness "
+                        "(DePaulo et al. 2003: uncertainty is not a reliable deception discriminator)",
+                        "Evasion — speaker knows the answer but avoids committing to a position",
+                        "Cognitive overload — rapid or complex questioning causes response fatigue",
+                    ],
+                    "research": (
+                        "CBCA Criterion 15 (Steller & Köhnken 1989): admissions of lack of memory "
+                        "are a TRUTHFULNESS indicator — presence suggests genuine recall difficulty. "
+                        "Porter & Yuille (1996): memory admissions significantly higher in truthful. "
+                        "DePaulo et al. (2003): uncertainty expressions show small/null effect."
+                    ),
+                    "critical_note": (
+                        "COGNITIVE LOAD indicator, NOT a deception indicator. "
+                        "Research shows truthful speakers use more uncertainty expressions. "
+                        "Does NOT feed FalseConfessionRiskAssessor."
+                    ),
+                },
+            })
+
+        if signals:
+            logger.info(
+                "[%s] INTERROG-CONV-03: %d verbal uncertainty cluster(s)",
+                session_id, len(signals),
+            )
         return signals
 
     @staticmethod
@@ -249,16 +498,11 @@ class InterrogatorTechniqueClassifier:
         if not normed:
             return []
 
-        # Identify interrogator: speaker with most question marks
-        question_counts: dict[str, int] = defaultdict(int)
-        for seg in normed:
-            if "?" in seg["text"]:
-                question_counts[seg["speaker"]] += seg["text"].count("?")
-
-        if not question_counts:
+        # Identify ALL interrogators by question proportion (≥15% of all ?s)
+        interrogators, interrogator = _detect_interrogators(normed)
+        if not interrogators:
             return []
 
-        interrogator = max(question_counts, key=question_counts.get)
         interrog_segs = [s for s in normed if s["speaker"] == interrogator]
 
         if len(interrog_segs) < 3:
@@ -316,6 +560,7 @@ class InterrogatorTechniqueClassifier:
             "metadata": {
                 "rule_id":               "INTERROG-CONV-02",
                 "interrogator_id":       interrogator,
+                "all_interrogators":     sorted(interrogators),
                 "technique":             technique,
                 "peace_open_count":      peace_count,
                 "reid_accusatory_count": reid_acc,

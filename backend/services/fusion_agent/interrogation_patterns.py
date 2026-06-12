@@ -26,6 +26,7 @@ DESIGN PRINCIPLES:
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 logger = logging.getLogger("nexus.fusion.interrogation")
 
@@ -387,17 +388,50 @@ class FalseConfessionRiskAssessor:
         all_signals: list[dict],
         speakers: list[str],
         session_id: str = "",
+        interrogators: "Optional[set[str]]" = None,
     ) -> list[dict]:
         """
-        Assess false confession risk for each speaker.
+        Assess false confession risk for each NON-INTERROGATOR speaker.
 
-        all_signals — flat list of all session signals from all agents/fusion.
-        speakers    — speaker IDs to assess (all; interrogator naturally scores near-zero).
+        all_signals  — flat list of all session signals from all agents/fusion.
+        speakers     — speaker IDs to assess.
+        interrogators — set of speaker IDs to EXCLUDE. When None, auto-detected
+                        from interrogator_technique signals and all_interrogators
+                        metadata in all_signals.
 
-        Returns one signal per speaker that has enough data for an assessment.
+        Returns one signal per non-interrogator speaker with enough data.
         """
         if not all_signals or not speakers:
             return []
+
+        # Auto-detect interrogators when not explicitly provided
+        if interrogators is None:
+            interrogators = set()
+            for s in all_signals:
+                if s.get("signal_type") == "interrogator_technique":
+                    # Primary interrogator from signal's speaker_id
+                    primary = s.get("speaker_id", "")
+                    if primary:
+                        interrogators.add(primary)
+                    # All interrogators from metadata (populated by _detect_interrogators)
+                    meta = s.get("metadata") or {}
+                    for iid in meta.get("all_interrogators", []):
+                        if iid:
+                            interrogators.add(iid)
+                # Preceding speaker in evidence delay signal is an interrogator
+                if s.get("signal_type") == "evidence_response_processing_delay":
+                    meta = s.get("metadata") or {}
+                    # CONV-01 stores the interrogator under "evidence_turn_speaker";
+                    # VOICE INTERROG-VOICE-02 stores it under "preceding_speaker".
+                    preceding = meta.get("evidence_turn_speaker") or meta.get("preceding_speaker", "")
+                    if preceding:
+                        interrogators.add(preceding)
+
+        if interrogators:
+            logger.info(
+                "[%s] FalseConfessionRisk: excluding %d interrogator(s): %s",
+                session_id, len(interrogators), sorted(interrogators),
+            )
 
         all_ends   = [_ms(s, "window_end_ms")   for s in all_signals if _ms(s, "window_end_ms")   > 0]
         all_starts = [_ms(s, "window_start_ms") for s in all_signals if _ms(s, "window_start_ms") >= 0]
@@ -405,6 +439,12 @@ class FalseConfessionRiskAssessor:
 
         results: list[dict] = []
         for spk in speakers:
+            if spk in interrogators:
+                logger.debug(
+                    "[%s] FalseConfessionRisk: skipping %s — identified as interrogator",
+                    session_id, spk,
+                )
+                continue
             spk_signals = [s for s in all_signals if s.get("speaker_id") == spk]
             sig = self._assess_speaker(spk, spk_signals, session_duration_ms, session_id)
             if sig is not None:

@@ -130,6 +130,7 @@ _VOICE_INTERROG_TYPES = [
 _CONVERSATION_INTERROG_TYPES = [
     "evidence_response_processing_delay",
     "interrogator_technique",
+    "verbal_uncertainty_cluster",
 ]
 
 # Fusion-agent session-level interrogation signals consumed by InterrogationSummaryPanel.
@@ -1026,7 +1027,7 @@ async def chat_with_session(
         user_prompt = f"Previous conversation:\n{history_text}\n\n{user_prompt}"
 
     try:
-        answer = await acomplete(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=600, model="gpt-4o")
+        answer = await acomplete(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=3000, model="gpt-5")
     except Exception as exc:
         logger.error("Chat LLM call failed: %s", exc)
         raise HTTPException(502, f"LLM generation failed: {exc}")

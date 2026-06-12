@@ -18,6 +18,8 @@ import httpx
 
 logger = logging.getLogger("nexus.parakeet")
 
+PARAKEET_MODEL = os.getenv("PARAKEET_MODEL", "parakeet-tdt-0.6b-v3")
+
 PARAKEET_URL = os.getenv("PARAKEET_URL", "")
 API_KEY = os.getenv("EXTERNAL_API_KEY", "")
 REQUEST_TIMEOUT = 600
@@ -88,7 +90,7 @@ class ParakeetClient:
                 resp = client.post(
                     f"{self.base_url}/transcribe",
                     files={"file": (audio_file.name, f, "audio/wav")},
-                    data={"word_timestamps": "true"},
+                    data={"word_timestamps": "true", "model": PARAKEET_MODEL},
                     headers=self._headers,
                 )
 
@@ -146,7 +148,7 @@ class ParakeetClient:
             "duration_seconds": duration,
             "segments": segments,
             "backend": "parakeet",
-            "model": data.get("model", "parakeet-tdt-0.6b-v2"),
+            "model": data.get("model", PARAKEET_MODEL),
             "processing_time": elapsed,
         }
 

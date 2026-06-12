@@ -702,6 +702,7 @@ export default function SessionDetail() {
     pause_classification: "Processing", strategic_pause: "Processing",
     evaluation_cluster: "Processing", cognitive_overload: "Processing",
     evidence_response_processing_delay: "Processing", decision_engagement: "Processing",
+    verbal_uncertainty_cluster: "Processing",
     interruption_event: "Dominant", dominance_display: "Dominant",
     dominance_score: "Dominant", arm_posture: "Dominant",
     finger_steepling: "Dominant", peak_performance: "Dominant",

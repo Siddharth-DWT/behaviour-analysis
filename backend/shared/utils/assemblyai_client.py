@@ -99,7 +99,7 @@ class AssemblyAIClient:
         # universal-3-pro does not support the format_text parameter — omit it.
         request_body: dict = {
             "audio_url": upload_url,
-            "speech_models": ["universal-3-pro"],
+            "speech_models": ["universal-3-pro", "universal-2"],
             "speaker_labels": speaker_labels,
             "punctuate": auto_punctuation,
             "disfluencies": keep_filler_words,

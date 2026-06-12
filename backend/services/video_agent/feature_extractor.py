@@ -43,6 +43,11 @@ WINDOW_MS: int = 2000
 MIN_LIP_SYNC_LINK_SCORE: float = 0.20
 ACTIVE_TILE_MIN_AREA:   float = 0.08   # face_box_area above this → dominant/active-speaker tile
 
+# Face-height ratio above which video is treated as grid/video-call (vs conference room).
+# Used by both _compute_merge_threshold and the grid_mode parameter passed to
+# _merge_tracks_by_embedding so the two stay in sync.
+_GRID_FACE_H_THRESHOLD: float = 0.20
+
 # Blink detection (Soukupova & Cech 2016)
 BLINK_EAR_THRESHOLD: float = 0.20
 BLINK_CONSEC_FRAMES: int = 2
@@ -1553,32 +1558,6 @@ class TiledFrameProcessor:
             if face_crop.size < 64:
                 continue
 
-            try:
-                fc_h, fc_w = face_crop.shape[:2]
-                fc_mp  = mp.Image(
-                    image_format=mp.ImageFormat.SRGB,
-                    data=np.ascontiguousarray(face_crop),
-                )
-                fc_res = self._face_lm.detect(fc_mp)
-                if fc_res.face_landmarks:
-                    remapped_face = [
-                        _Pt(
-                            x=(fc_x1 + lm.x * fc_w) / fw,
-                            y=(fc_y1 + lm.y * fc_h) / fh,
-                            z=lm.z,
-                        )
-                        for lm in fc_res.face_landmarks[0]
-                    ]
-                    all_face_lm.append(remapped_face)
-                    all_face_bs.append(
-                        fc_res.face_blendshapes[0] if fc_res.face_blendshapes else None
-                    )
-                    all_face_mat.append(
-                        fc_res.facial_transformation_matrixes[0]
-                        if fc_res.facial_transformation_matrixes else None
-                    )
-            except Exception as exc:
-                logger.debug(f"[tiled] face crop error: {exc}")
 
             # ── Body crop (face bbox extended downward, clamped to tile) ──────
             # Skip pose for tiny tiles: body crop < ~200 px tall produces noisy
@@ -3875,7 +3854,7 @@ class VideoFeatureExtractor:
                             track_ids = centroid_tracker.update(centroids)
                             ci = 0
                             for ff in frame_features_list:
-                                if ff.face_detected and ci < len(track_ids):
+                                if ff.face_detected and ff.face_box_area > 0.02 and ci < len(track_ids):
                                     ff.face_index = track_ids[ci]
                                     ci += 1
 
@@ -4184,6 +4163,8 @@ class VideoFeatureExtractor:
                             pose_quality=track_pose_quality,
                             track_first_ms=_track_first_ms,
                             track_last_ms=_track_last_ms,
+                            grid_mode=avg_face_h > _GRID_FACE_H_THRESHOLD,
+                            has_cuts=bool(_cut_timestamps),
                         )
                         if _cut_timestamps:
                             canonical = self._cross_shot_merge(
@@ -5275,7 +5256,7 @@ class VideoFeatureExtractor:
             (floor was 0.48 — too strict, left too many fragments unmerged)
         """
         duration_min = duration_s / 60.0
-        if avg_face_height_ratio > 0.20:
+        if avg_face_height_ratio > _GRID_FACE_H_THRESHOLD:
             base  = min(0.65, max(0.50, 0.35 + avg_face_height_ratio * 1.5))
             decay = duration_min * 0.012
             floor = 0.42
@@ -5295,6 +5276,8 @@ class VideoFeatureExtractor:
         pose_quality: dict[int, float] | None = None,
         track_first_ms: dict[int, float] | None = None,
         track_last_ms: dict[int, float] | None = None,
+        grid_mode: bool = False,
+        has_cuts: bool = False,
     ) -> dict[int, int]:
         """
         Merge CentroidTracker track_ids that belong to the same physical person.
@@ -5315,6 +5298,11 @@ class VideoFeatureExtractor:
         Pose discount: off-angle tracks (|yaw| > 30°) have degraded embeddings.
         _effective_thresh lowers the floor by up to 0.05 so same-person profile
         pairs can merge when embedding noise is from pose, not identity mismatch.
+
+        Cross-tile guard: only active in grid_mode (avg_face_h > 0.20, i.e. video
+        calls where each tile is a fixed person). In room/broadcast footage the
+        same person appears at different screen positions across camera cuts, so
+        position is not a reliable identity signal and the guard must stay off.
 
         Returns {track_id: canonical_track_id} for ALL input track_ids.
         Tracks that match nothing keep their own ID as canonical.
@@ -5361,7 +5349,7 @@ class VideoFeatureExtractor:
                     cb = centroids.get(tid_b)
                     if ca and cb:
                         pos_dist = ((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5
-                        if pos_dist > 0.20:
+                        if (grid_mode or not has_cuts) and pos_dist > 0.20:
                             effective = max(effective, 0.80)
                 return effective
             if max_fh < 0.07:
@@ -6181,7 +6169,8 @@ class SpeakerFaceMapper:
                     speech_vals = values[i_start:i_end]
 
                     total_possible = i_end - i_start
-                    if total_possible > 0 and len(speech_vals) < total_possible * 0.50:
+                    expected_samples = (seg_dur / 1000.0) * TARGET_FPS
+                    if total_possible < expected_samples * 0.50:
                         continue
                     if not speech_vals:
                         continue

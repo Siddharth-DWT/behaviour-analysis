@@ -33,6 +33,12 @@ from typing import Optional
 
 logger = logging.getLogger("nexus.language.interrogation")
 
+
+try:
+    from shared.utils.interrogator_detection import detect_interrogators as _detect_interrogators
+except ImportError:
+    from backend.shared.utils.interrogator_detection import detect_interrogators as _detect_interrogators
+
 # ── Validated stopwords — import chain per spec §1.2 ─────────────────────────
 # Source priority: NLTK (179 words, Snowball project) → spaCy (326 words,
 # Stone/Denis/Kwantes 2010) → sklearn → empty (regex-only fallback).
@@ -59,6 +65,8 @@ except Exception:
 _INTERROGATION_DOMAIN_STOPWORDS: frozenset[str] = frozenset({
     "yeah", "okay", "alright", "gonna", "wanna", "gotta",
     "stuff", "kinda", "sorta", "nah", "nope", "yep",
+    # Confirmed false positives from 54-min session (test_no_false_positives_on_filler_words)
+    "guess", "driving", "told",
 })
 # Filter to pure alphabetic tokens only — spaCy includes contraction suffixes
 # like "'ll" and "'ve" which sklearn's tokenizer splits into "ll"/"ve", causing
@@ -246,30 +254,36 @@ class ContaminationDetector:
     def detect(
         self,
         segments: list[dict],
-        interrogator_id: str,
+        interrogator_ids,  # set[str] | str — backward compat
         min_matches: int = 2,
     ) -> list[dict]:
         """
         Full contamination detection. O(n + m) — n interrogator segs, m suspect segs.
 
+        interrogator_ids: set of ALL interrogator speaker IDs, or a single string
+        (backward compat). Terms from ALL interrogators are tracked so a second
+        detective mentioning "the knife" is treated the same as the primary.
+
         Pass 1: build interrogator term timeline — {term: first_mention_ms}
-        Pass 2: scan suspect segments for terms adopted AFTER interrogator introduced them
+        Pass 2: scan suspect segments for terms adopted AFTER any interrogator introduced them
         """
-        if not interrogator_id:
+        if isinstance(interrogator_ids, str):
+            interrogator_ids = {interrogator_ids} if interrogator_ids else set()
+        if not interrogator_ids:
             return []
 
-        # Pre-compute TF-IDF vocabulary across all interrogator texts (Stage 2)
+        # Pre-compute TF-IDF vocabulary across ALL interrogator texts (Stage 2)
         interrogator_texts = [
             seg.get("text", "") or ""
             for seg in segments
-            if seg.get("speaker", seg.get("speaker_id", "")) == interrogator_id
+            if seg.get("speaker", seg.get("speaker_id", "")) in interrogator_ids
         ]
         tfidf_vocab = self._tfidf_significant_terms(interrogator_texts) if self._tfidf_cls else set()
 
-        # Pass 1: build {term: earliest_ms} for interrogator-introduced terms
+        # Pass 1: build {term: earliest_ms} across all interrogators
         interrogator_timeline: dict[str, int] = {}
         for seg in segments:
-            if seg.get("speaker", seg.get("speaker_id", "")) != interrogator_id:
+            if seg.get("speaker", seg.get("speaker_id", "")) not in interrogator_ids:
                 continue
             text = seg.get("text", "") or ""
             start, _ = _seg_ms(seg)
@@ -280,7 +294,7 @@ class ContaminationDetector:
         if not interrogator_timeline:
             return []
 
-        # Pass 2: detect adoption in suspect segments
+        # Pass 2: detect adoption in suspect segments (any non-interrogator)
         suspect_vocabulary: set[str] = set()
         signals: list[dict] = []
 
@@ -289,7 +303,7 @@ class ContaminationDetector:
             text = seg.get("text", "") or ""
             start, end = _seg_ms(seg)
 
-            if spk == interrogator_id:
+            if spk in interrogator_ids:
                 continue
 
             seg_terms = self._extract_terms(text, tfidf_vocab)
@@ -354,26 +368,23 @@ class InterrogationLanguageRules:
         if not segments:
             return []
 
-        question_counts: dict[str, int] = defaultdict(int)
-        for seg in segments:
-            text = seg.get("text", "") or ""
-            spk  = seg.get("speaker", seg.get("speaker_id", ""))
-            if "?" in text:
-                question_counts[spk] += text.count("?")
-
-        interrogator_id = max(question_counts, key=question_counts.get) if question_counts else None
+        # Detect ALL interrogators — any speaker with ≥15% of all questions.
+        # Primary is used for contamination (tracks one style); the full set
+        # excludes all interrogators from suspect-only analysis rules.
+        interrogators, primary = _detect_interrogators(segments)
+        interrogator_id = primary  # backward compat for single-ID methods
 
         signals: list[dict] = []
-        signals.extend(self._detail_reduction(segments, interrogator_id))
-        signals.extend(self._narrative_consistency_drift(segments, interrogator_id))
-        signals.extend(self._contamination_detection(segments, interrogator_id))
-        signals.extend(self._denial_evolution(segments, interrogator_id))
+        signals.extend(self._detail_reduction(segments, interrogators))
+        signals.extend(self._narrative_consistency_drift(segments, interrogators))
+        signals.extend(self._contamination_detection(segments, interrogators))
+        signals.extend(self._denial_evolution(segments, interrogators))
         return signals
 
     # ── INTERROG-LANG-01: Detail Reduction ───────────────────────────────────
 
     def _detail_reduction(
-        self, segments: list[dict], interrogator_id: Optional[str]
+        self, segments: list[dict], interrogators: set[str]
     ) -> list[dict]:
         """
         Vrij et al. (2017): genuine episodic memories contain rich sensory and
@@ -386,7 +397,7 @@ class InterrogationLanguageRules:
         for seg in segments:
             spk  = seg.get("speaker", seg.get("speaker_id", ""))
             text = seg.get("text", "") or ""
-            if spk and spk != interrogator_id and len(text.split()) >= 5:
+            if spk and spk not in interrogators and len(text.split()) >= 5:
                 suspect_segs[spk].append(seg)
 
         def _sensory_density(seg_list: list[dict]) -> float:
@@ -441,7 +452,7 @@ class InterrogationLanguageRules:
     # ── INTERROG-LANG-02: Narrative Consistency Drift ─────────────────────────
 
     def _narrative_consistency_drift(
-        self, segments: list[dict], interrogator_id: Optional[str]
+        self, segments: list[dict], interrogators: set[str]
     ) -> list[dict]:
         """
         Fisher & Geiselman (1992): genuine episodic memories produce consistent
@@ -463,7 +474,7 @@ class InterrogationLanguageRules:
         suspect_seg_words: list[tuple[dict, set[str]]] = [
             (seg, _content_words(seg.get("text", "") or ""))
             for seg in segments
-            if seg.get("speaker", seg.get("speaker_id", "")) != interrogator_id
+            if seg.get("speaker", seg.get("speaker_id", "")) not in interrogators
             and len((seg.get("text", "") or "").split()) >= 10
         ]
 
@@ -549,12 +560,13 @@ class InterrogationLanguageRules:
     # ── INTERROG-LANG-03: Contamination Detection ─────────────────────────────
 
     def _contamination_detection(
-        self, segments: list[dict], interrogator_id: Optional[str]
+        self, segments: list[dict], interrogators: set[str]
     ) -> list[dict]:
-        """Delegates to ContaminationDetector (composition pattern)."""
-        if not interrogator_id:
+        """Delegates to ContaminationDetector (composition pattern).
+        Passes full interrogator set so terms from ALL interrogators are tracked."""
+        if not interrogators:
             return []
-        return self._contamination_detector.detect(segments, interrogator_id)
+        return self._contamination_detector.detect(segments, interrogators)
 
     # ── INTERROG-LANG-04: Denial Evolution Tracker ────────────────────────────
 
@@ -570,7 +582,7 @@ class InterrogationLanguageRules:
         return -4e-5 / scale
 
     def _denial_evolution(
-        self, segments: list[dict], interrogator_id: Optional[str]
+        self, segments: list[dict], interrogators: set[str] | None
     ) -> list[dict]:
         """
         Kassin et al. (2010): False confession trajectory — Strong denial →
@@ -582,13 +594,14 @@ class InterrogationLanguageRules:
 
         Confidence: 0.45 base + duration bonus (max 0.15) + data bonus (max 0.10).
         """
+        interrogators = interrogators or set()
         denial_history: dict[str, list[tuple[int, float, str]]] = defaultdict(list)
 
         for seg in segments:
             spk   = seg.get("speaker", seg.get("speaker_id", ""))
             text  = seg.get("text", "") or ""
             start, _ = _seg_ms(seg)
-            if spk == interrogator_id:
+            if spk in interrogators:
                 continue
             result = _classify_denial(text)
             if result:
@@ -600,11 +613,17 @@ class InterrogationLanguageRules:
             if len(history) < 3:
                 continue
 
-            timestamps = [h[0] for h in history]
-            strengths  = [h[1] for h in history]
-            duration_ms = timestamps[-1] - timestamps[0]
+            timestamps_ms = [h[0] for h in history]
+            strengths     = [h[1] for h in history]
+            duration_ms   = timestamps_ms[-1] - timestamps_ms[0]
 
-            # ── Linear regression slope ───────────────────────────────────────
+            # Convert timestamps to minutes so the slope is per-minute and
+            # matches the thresholds in _calculate_adaptive_denial_threshold()
+            # which were calibrated in per-minute units (slope_threshold ~ -4e-5
+            # per minute, not per millisecond).
+            timestamps = [t / 60_000 for t in timestamps_ms]
+
+            # ── Linear regression slope (per minute) ─────────────────────────
             n = len(timestamps)
             t_mean = sum(timestamps) / n
             s_mean = sum(strengths) / n
@@ -646,7 +665,7 @@ class InterrogationLanguageRules:
             if windowed_triggered:
                 value = round(windowed_drop, 4)
             else:
-                value = round(abs(slope) * 60_000, 4)
+                value = round(abs(slope), 4)
 
             first_label = history[0][2]
             last_label  = history[-1][2]
@@ -658,8 +677,8 @@ class InterrogationLanguageRules:
                 "value":            value,
                 "value_text":       f"{first_label}_to_{last_label}",
                 "confidence":       confidence,
-                "window_start_ms":  timestamps[0],
-                "window_end_ms":    timestamps[-1],
+                "window_start_ms":  timestamps_ms[0],
+                "window_end_ms":    timestamps_ms[-1],
                 "metadata": {
                     "rule_id":              "INTERROG-LANG-04",
                     "denial_count":         n,
@@ -668,7 +687,7 @@ class InterrogationLanguageRules:
                     "first_strength":       strengths[0],
                     "last_strength":        strengths[-1],
                     "duration_ms":          duration_ms,
-                    "slope_per_min":        round(slope * 60_000, 8),
+                    "slope_per_min":        round(slope, 8),
                     "windowed_drop":        round(windowed_drop, 4),
                     "trigger":              (
                         "slope+window" if slope_triggered and windowed_triggered

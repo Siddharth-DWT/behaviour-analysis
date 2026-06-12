@@ -769,7 +769,7 @@ class AssemblyAIClient:
         payload = {
             "audio_url": audio_url,
             "speaker_labels": True,
-            "speech_models": ["universal-3-pro"],
+            "speech_models": ["universal-3-pro", "universal-2"],
         }
 
         with httpx.Client(timeout=self.timeout) as client:

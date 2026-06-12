@@ -842,6 +842,11 @@ const SIGNAL_MAP: Record<string, SignalDisplay> = {
     description: 'Extended pause (>2s) after evidence presented — processing time. Equally present in innocent suspects confronted with unexpected information.',
     icon: '⏸️', color: '#EF4444', category: 'pattern', priority: 1,
   },
+  'verbal_uncertainty_cluster': {
+    label: 'Uncertainty Cluster',
+    description: 'Multiple uncertainty expressions ("I don\'t know", "I\'m not sure") in consecutive responses to challenging questions. CBCA Criterion 15 (Steller & Köhnken 1989): admissions of lack of memory are MORE common in truthful accounts. Indicates cognitive load — not deception.',
+    icon: '💭', color: '#94A3B8', category: 'pattern', priority: 2,
+  },
   'statement_contamination': {
     label: 'Information Adopted',
     description: 'Suspect using case-specific terms first introduced by interrogator — strongest false confession risk indicator (Garrett 2011: present in 97.5% of proven false confessions).',

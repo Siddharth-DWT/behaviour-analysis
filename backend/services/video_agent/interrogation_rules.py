@@ -218,7 +218,7 @@ class InterrogationVideoRules:
         diar_segments: list[dict],
         session_id: str = "",
         video_fps: float = 30.0,
-        handcuffed: bool = False,
+        cuffed_speakers: "frozenset[str] | set[str]" = frozenset(),
     ) -> list[dict]:
         """
         Run all video interrogation rules for all speakers.
@@ -228,7 +228,8 @@ class InterrogationVideoRules:
         SUPPRESSED).  Default 30.0 → HIGH_QUALITY → identical behaviour to pre-tier
         implementation when caller does not supply fps.
 
-        handcuffed=True activates the HANDCUFFED tier:
+        cuffed_speakers contains the speaker IDs confirmed restrained (per-speaker).
+        For each speaker in the set the HANDCUFFED tier is activated:
           - motor_inhibition suppressed (arms restrained → gesture velocity invalid)
           - self_adaptor_increase suppressed (wrist restraint blocks self-touch)
           - freezing_response confidence capped at 0.40 (body can still freeze)
@@ -254,12 +255,12 @@ class InterrogationVideoRules:
                 session_id, video_fps,
             )
 
-        if handcuffed:
+        if cuffed_speakers:
             logger.info(
-                "[%s] HANDCUFFED tier active — motor_inhibition suppressed, "
+                "[%s] HANDCUFFED tier active for %s — motor_inhibition suppressed, "
                 "self_adaptor_increase suppressed, "
                 "freezing_response capped at conf=0.40",
-                session_id,
+                session_id, sorted(cuffed_speakers),
             )
 
         signals: list[dict] = []
@@ -275,12 +276,14 @@ class InterrogationVideoRules:
             if facial_bl.calibration_confidence < _MIN_CAL_CONF:
                 continue
 
+            spk_cuffed = spk in cuffed_speakers
+
             signals.extend(self._blink_pattern(spk, windows, facial_bl, tier))
-            signals.extend(self._motor_inhibition(spk, windows, body_bl, tier, handcuffed=handcuffed))
+            signals.extend(self._motor_inhibition(spk, windows, body_bl, tier, handcuffed=spk_cuffed))
             signals.extend(self._inappropriate_affect(spk, windows, diar_segments, tier))
             signals.extend(self._gaze_saccades(spk, windows, gaze_bl, tier))
-            signals.extend(self._freezing_response(spk, windows, body_bl, tier, handcuffed=handcuffed))
-            signals.extend(self._self_adaptor_increase(spk, windows, tier, handcuffed=handcuffed))
+            signals.extend(self._freezing_response(spk, windows, body_bl, tier, handcuffed=spk_cuffed))
+            signals.extend(self._self_adaptor_increase(spk, windows, tier, handcuffed=spk_cuffed))
 
         # Room camera gate: oblique angle makes gaze-based signals unreliable
         gated = [s for s in signals if s["signal_type"] in _ROOM_CAMERA_GATED]

@@ -356,7 +356,12 @@ async def _acomplete_openai(
         _uses_completion_tokens = any(resolved_model.startswith(p) for p in ("o1", "o3", "gpt-5"))
 
         if _uses_completion_tokens:
-            # o1 / o3 / gpt-5: temperature not supported; response_format not supported
+            # o1 / o3 / gpt-5: temperature not supported, but response_format IS supported
+            # on gpt-5. Sending json_object mode prevents empty content when reasoning
+            # tokens consume the full budget.
+            kwargs_r = {}
+            if json_response:
+                kwargs_r["response_format"] = {"type": "json_object"}
             response = await client.chat.completions.create(
                 model=resolved_model,
                 max_completion_tokens=max_tokens,
@@ -364,6 +369,7 @@ async def _acomplete_openai(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
+                **kwargs_r,
             )
         else:
             kwargs = {}

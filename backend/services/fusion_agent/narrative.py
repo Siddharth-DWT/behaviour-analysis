@@ -114,9 +114,25 @@ async def generate_session_narrative(
         )
 
     # ── Build the structured context for the LLM ──
+    # Conversation-agent interrogation signals live in all_audio_signals (via
+    # conv_sigs), not in fusion_signals.  Merge them in so _build_context sees
+    # verbal_uncertainty_cluster, evidence_response_processing_delay, and
+    # interrogator_technique from the conversation agent.
+    _CONV_INTERROG = frozenset({
+        "verbal_uncertainty_cluster",
+        "evidence_response_processing_delay",
+        "interrogator_technique",
+        "narrative_consistency_drift",   # language agent signal in all_audio_signals, not fusion_signals
+    })
+    _existing_sig_ids = {id(s) for s in fusion_signals}
+    context_signals = fusion_signals + [
+        s for s in (all_audio_signals or [])
+        if s.get("signal_type") in _CONV_INTERROG and id(s) not in _existing_sig_ids
+    ]
+
     context = _build_context(
         session_id, duration_seconds, speakers,
-        voice_summary, language_summary, fusion_signals, unified_states,
+        voice_summary, language_summary, context_signals, unified_states,
         entities, graph_analytics, conversation_summary,
         video_summary=video_summary,
         transcript_segments=transcript_segments,
@@ -136,31 +152,60 @@ async def generate_session_narrative(
                 acomplete(
                     system_prompt=system_prompt,
                     user_prompt=main_prompt,
-                    model="gpt-4o-mini",
-                    max_tokens=4096,
+                    model="gpt-5-mini",
+                    max_tokens=8192,
                     json_response=True,
                 ),
                 acomplete(
                     system_prompt=deep_system,
                     user_prompt=deep_prompt,
                     model="gpt-5",
-                    max_tokens=8192,
+                    max_tokens=16384,
                     json_response=True,
                 ),
+                return_exceptions=True,
             )
-            report = _parse_main_response(main_raw, speakers)
-            report.update(_parse_interrogation_response(deep_raw))
+
+            main_failed = isinstance(main_raw, BaseException)
+            deep_failed = isinstance(deep_raw, BaseException)
+
+            if main_failed:
+                logger.error("[%s] gpt-5-mini main narrative call failed: %s", session_id, main_raw)
+            if deep_failed:
+                logger.warning("[%s] GPT-5 forensic call failed (non-fatal): %s", session_id, deep_raw)
+
+            if main_failed:
+                # Main failed — build from fallback, then graft forensic data if available
+                report = _fallback_narrative(
+                    speakers, voice_summary, language_summary, fusion_signals, entities,
+                    transcript_segments=transcript_segments,
+                    video_summary=video_summary,
+                    conversation_summary=conversation_summary,
+                    meeting_type=meeting_type,
+                    all_audio_signals=all_audio_signals,
+                    signal_analysis=signal_analysis,
+                )
+                if not deep_failed:
+                    parsed = _parse_interrogation_response(deep_raw)
+                    report.update({k: v for k, v in parsed.items() if v})
+            else:
+                # Main succeeded — build from LLM output, merge forensic if available
+                report = _parse_main_response(main_raw, speakers)
+                if not deep_failed:
+                    report.update(_parse_interrogation_response(deep_raw))
+                report["raw_response"] = main_raw
         else:
             main_raw = await acomplete(
                 system_prompt=system_prompt,
                 user_prompt=main_prompt,
-                model="gpt-4o-mini",
-                max_tokens=4096,
+                model="gpt-5-mini",
+                max_tokens=8192,
                 json_response=True,
             )
             report = _parse_main_response(main_raw, speakers)
+            if isinstance(main_raw, str):
+                report["raw_response"] = main_raw
 
-        report["raw_response"] = main_raw
         return report
 
     except Exception as e:
@@ -273,7 +318,7 @@ BEHAVIORAL_CATEGORIES: dict[str, dict] = {
         "signals": frozenset({
             "pause_classification", "strategic_pause", "evaluation_cluster",
             "cognitive_overload", "evidence_response_processing_delay",
-            "decision_engagement",
+            "decision_engagement", "verbal_uncertainty_cluster",
         }),
     },
     "Dominant": {
@@ -567,12 +612,29 @@ def _build_context(
     segs = transcript_segments or []
     if segs:
         lines.append("\n=== FULL TRANSCRIPT ===")
-        for seg in segs[:400]:          # cap at 400 segments (~12k tokens worst-case)
+        # Keep head (first 150) + tail (last 250) so late-session capitulation/confession
+        # is always present for the gpt-5 contradiction and risk analysis.
+        # A marker line is inserted when segments are omitted.
+        HEAD = 150
+        TAIL = 250
+        if len(segs) <= HEAD + TAIL:
+            display_segs = segs
+        else:
+            omitted = len(segs) - HEAD - TAIL
+            display_segs = segs[:HEAD] + [{"_omitted": omitted}] + segs[-TAIL:]
+        for seg in display_segs:
+            if seg.get("_omitted"):
+                lines.append(f"  [... {seg['_omitted']} segments omitted ...]")
+                continue
             m, s = divmod(seg.get("start_ms", 0) // 1000, 60)
             spk = _display(seg.get("speaker", "?"), name_map)
             text = seg.get("text", "").strip()
             if text:
-                lines.append(f"  [{m}:{s:02d}] {spk}: {text[:150]}")
+                # Truncate at word boundary to avoid cutting mid-word
+                if len(text) > 200:
+                    cut = text[:200].rsplit(" ", 1)[0]
+                    text = cut + "…"
+                lines.append(f"  [{m}:{s:02d}] {spk}: {text}")
 
     # ── Voice stress peaks (raw) ──────────────────────────────────────────────
     if peaks:
@@ -664,32 +726,29 @@ def _build_context(
                 f"categories={m.get('categories', [])}"
             )
 
-    # Conversation dynamics
+    # Conversation dynamics — real schema: {"per_speaker": {...}, "session": {...}}
     conversation_summary = conversation_summary or {}
-    if conversation_summary:
+    _conv_session = conversation_summary.get("session", {})
+    _conv_per_spk = conversation_summary.get("per_speaker", {})
+    if _conv_session:
         lines.append("\n=== CONVERSATION DYNAMICS ===")
-        turn_taking = conversation_summary.get("turn_taking", {})
-        if turn_taking:
-            lines.append(f"  Turn count: {turn_taking.get('total_turns', 0)}")
-            lines.append(f"  Avg turn duration: {turn_taking.get('avg_turn_duration_ms', 0):.0f} ms")
-            lines.append(f"  Turn rate: {turn_taking.get('turns_per_minute', 0):.1f} turns/min")
-        rapport = conversation_summary.get("rapport", {})
-        if rapport:
-            lines.append(f"  Rapport score: {rapport.get('score', 0):.2f}")
-            lines.append(f"  Rapport level: {rapport.get('level', 'unknown')}")
-        dominance = conversation_summary.get("dominance", {})
-        if dominance:
-            lines.append(f"  Dominance index: {dominance.get('index', 0):.2f}")
-            for sid, pct in dominance.get("per_speaker", {}).items():
-                lines.append(f"    {_display(sid, name_map)}: {pct:.1f}% talk time")
-        interruptions = conversation_summary.get("interruptions", {})
-        if interruptions:
-            lines.append(f"  Total interruptions: {interruptions.get('total', 0)}")
-            for sid, cnt in interruptions.get("per_speaker", {}).items():
-                lines.append(f"    {_display(sid, name_map)}: {cnt} interruptions")
-        response_latency = conversation_summary.get("response_latency", {})
-        if response_latency:
-            lines.append(f"  Avg response latency: {response_latency.get('avg_ms', 0):.0f} ms")
+        turn_rate = _conv_session.get("turn_rate_per_minute")
+        if turn_rate is not None:
+            lines.append(f"  Turn rate: {turn_rate:.1f} turns/min")
+        rapport = _conv_session.get("rapport_score")
+        if rapport is not None:
+            level = "strong" if rapport >= 0.65 else "moderate" if rapport >= 0.40 else "low"
+            lines.append(f"  Rapport score: {rapport:.2f} ({level})")
+        dom = _conv_session.get("dominance_index")
+        if dom is not None:
+            lines.append(f"  Dominance index: {dom:.2f}")
+        for sid, spk_data in _conv_per_spk.items():
+            talk_pct = spk_data.get("talk_time_percent") or spk_data.get("talk_time_pct")
+            if talk_pct is not None:
+                lines.append(f"    {_display(sid, name_map)}: {talk_pct:.1f}% talk time")
+        total_int = _conv_session.get("total_interruptions")
+        if total_int:
+            lines.append(f"  Total interruptions: {total_int}")
 
     # ── Interrogation-specific signal block ──────────────────────────────────
     _INTERROG_TYPES = {
@@ -697,6 +756,7 @@ def _build_context(
         "statement_contamination", "capitulation_cascade", "resistance_hardening",
         "freezing_response", "blink_suppression_spike", "motor_inhibition",
         "evidence_response_processing_delay", "narrative_consistency_drift",
+        "verbal_uncertainty_cluster",
     }
     interrog_signals = [s for s in fusion_signals if s.get("signal_type") in _INTERROG_TYPES]
     if interrog_signals:
@@ -708,11 +768,25 @@ def _build_context(
             lines.append(f"\nFALSE CONFESSION RISK: {risk_sig.get('value_text', '?')} "
                          f"(score={risk_sig.get('value', 0):.2f}, "
                          f"confidence={risk_sig.get('confidence', 0):.2f})")
-            factors = {k: meta.get(k) for k in
-                       ("contamination", "capitulation", "denial_drop", "duration",
-                        "coercive_technique", "processing_delays") if meta.get(k)}
-            if factors:
-                lines.append(f"  Risk factors present: {', '.join(factors.keys())}")
+            # risk_factors is a nested dict — old flat lookup never matched because
+            # the keys live under meta["risk_factors"], not at the top level.
+            rf = meta.get("risk_factors") or {}
+            label_map = {
+                "denial_evolution":     "denial_weakening",
+                "contamination":        "contamination",
+                "capitulation_cascade": "capitulation",
+                "duration_risk":        "long_duration",
+                "processing_delays":    "processing_delays",
+            }
+            active_factors = []
+            for key, label in label_map.items():
+                entry = rf.get(key) or {}
+                has_contribution = (entry.get("contribution") or 0) > 0
+                has_signals = (entry.get("signal_count") or entry.get("weakening_count") or 0) > 0
+                if has_contribution or has_signals:
+                    active_factors.append(label)
+            if active_factors:
+                lines.append(f"  Active risk factors: {', '.join(active_factors)}")
             if meta.get("duration_minutes"):
                 lines.append(f"  Session duration: {meta['duration_minutes']:.0f} min")
 
@@ -765,6 +839,45 @@ def _build_context(
                 lines.append(f"  {start_s}s — {s['signal_type']} "
                              f"(value={s.get('value', 0):.2f}, "
                              f"conf={s.get('confidence', 0):.2f})")
+
+        # narrative_consistency_drift was collected (it's in _INTERROG_TYPES) but
+        # previously had no render block — silently dropped from LLM context.
+        drift_sigs = [s for s in interrog_signals if s["signal_type"] == "narrative_consistency_drift"]
+        if drift_sigs:
+            lines.append(f"\nNARRATIVE CONSISTENCY DRIFT: {len(drift_sigs)} inconsistency event(s)")
+            for s in sorted(drift_sigs, key=lambda x: x.get("value", 0), reverse=True)[:5]:
+                meta_d = s.get("metadata") or {}
+                start_s = s.get("window_start_ms", 0) // 1000
+                drift_v = s.get("value", 0)
+                sim = meta_d.get("similarity", round(1.0 - drift_v, 3))
+                gap = meta_d.get("gap_minutes", 0)
+                lines.append(
+                    f"  {start_s // 60}:{start_s % 60:02d}: drift={drift_v:.3f}, "
+                    f"similarity={sim:.3f} ({gap:.1f} min between retellings)"
+                )
+
+        # INTERROG-CONV-03: verbal uncertainty clusters
+        uncertainty_sigs = [s for s in interrog_signals if s["signal_type"] == "verbal_uncertainty_cluster"]
+        if uncertainty_sigs:
+            total_markers = sum((s.get("metadata") or {}).get("total_markers", 0) for s in uncertainty_sigs)
+            lines.append(f"\nVERBAL UNCERTAINTY CLUSTERS: {len(uncertainty_sigs)} cluster(s), "
+                         f"{total_markers} total markers")
+            lines.append(
+                "  RESEARCH NOTE: CBCA Criterion 15 (Steller & Köhnken 1989) classifies "
+                "admissions of lack of memory as a TRUTHFULNESS indicator — more common in "
+                "truthful accounts. These clusters indicate cognitive load with multiple "
+                "interpretations. Do NOT treat as a deception indicator."
+            )
+            for s in uncertainty_sigs[:3]:
+                meta_u = s.get("metadata") or {}
+                start_s = s.get("window_start_ms", 0) // 1000
+                end_s = s.get("window_end_ms", 0) // 1000
+                samples = ", ".join(f'"{m}"' for m in meta_u.get("sample_markers", [])[:3])
+                lines.append(
+                    f"  {start_s // 60}:{start_s % 60:02d}–{end_s // 60}:{end_s % 60:02d}: "
+                    f"{meta_u.get('uncertain_pairs', 0)}/{meta_u.get('window_pairs', 0)} responses "
+                    f"contained uncertainty — e.g. {samples}"
+                )
 
     # Fusion signals (non-interrogation)
     non_interrog = [s for s in fusion_signals if s.get("signal_type") not in _INTERROG_TYPES] \
@@ -1415,7 +1528,13 @@ Return ONLY a valid JSON object with exactly these five fields:
 
 CONTRADICTION ANALYSIS: A genuine contradiction requires ALL of these: (1) SAME speaker making both statements, (2) both are first-person claims ("I know", "I didn't", "I was") about the SAME specific fact, (3) the later claim is DIRECTLY INCOMPATIBLE — not an elaboration or narrative update. Do NOT flag: case background narrated by interrogator, information updates, emotional reactions to new evidence, or one speaker describing another person. Return an empty array if no genuine contradictions are found.
 VOICE-TEXT CORRELATIONS: Focus on the top 5 most significant moments from the VOICE STRESS PEAKS section where voice anomaly + transcript text together reveal hidden state. Return empty array if no relevant peaks found.
-RISK ASSESSMENT: Use the INTERROGATION ANALYSIS section signals (false_confession_risk, denial_weakening, statement_contamination, capitulation_cascade, interrogator_technique) to derive the risk score. If no interrogation signals are present, return risk_score=0.0 and all factors present=false.
+RISK ASSESSMENT: The signals in the INTERROGATION ANALYSIS section are authoritative pre-computed measurements from the rule engine. Do NOT re-derive whether a factor is present by re-reading the transcript — trust the signal values as ground truth and add qualitative context in the "detail" field. Specific bindings:
+• denial_weakening: If DENIAL TRAJECTORY shows "weakening_detected", set present=true. "Denial weakening" means the SUSPECT's own denial STRENGTH declined over time (e.g. categorical → hedged → weak). It does NOT mean the interrogator used minimization tactics. A strength drop in the DENIAL TRAJECTORY signal is sufficient — set present=true.
+• contamination: If STATEMENT CONTAMINATION signals appear, set present=true.
+• capitulation_pattern: If CAPITULATION CASCADE signals appear, set present=true.
+• processing_delays: If BEHAVIOURAL INDICATORS include evidence_response_processing_delay, or NARRATIVE CONSISTENCY DRIFT events are present, set present=true.
+• coercive_technique: If INTERROGATOR TECHNIQUE is "coercive" or "mixed", set present=true. If "peace", set present=false.
+Use risk_score and false_confession_risk label from the FALSE CONFESSION RISK signal directly. If no INTERROGATION ANALYSIS section is present, return risk_score=0.0 and all factors present=false.
 CONTAMINATION TIMELINE: Extract only from STATEMENT CONTAMINATION signals in the data. Return empty array if none detected.
 TECHNIQUE ANALYSIS: Use the INTERROGATOR TECHNIQUE signal if present; otherwise infer from the transcript patterns.
 
@@ -1806,7 +1925,7 @@ def _fallback_narrative(
                 general_summary.append(
                     f"{spk} displayed predominantly {emotion} facial affect (confidence {conf:.0%})."
                 )
-    conv_rapport = (conversation_summary or {}).get("rapport_score")
+    conv_rapport = (conversation_summary or {}).get("session", {}).get("rapport_score")
     if conv_rapport is not None:
         label = "strong" if conv_rapport >= 0.65 else "moderate" if conv_rapport >= 0.40 else "low"
         general_summary.append(f"Overall conversational rapport was {label} ({conv_rapport:.2f}).")
@@ -2064,7 +2183,7 @@ def _fallback_narrative(
         )
 
     # Rapport
-    _rapport = (conversation_summary or {}).get("rapport_score")
+    _rapport = (conversation_summary or {}).get("session", {}).get("rapport_score")
     if _rapport is not None:
         _rlabel = "strong" if _rapport >= 0.65 else "moderate" if _rapport >= 0.40 else "low"
         _exec.append(

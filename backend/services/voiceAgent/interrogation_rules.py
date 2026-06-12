@@ -151,11 +151,13 @@ class InterrogationVoiceRules:
         Both are small in practice (< 100 each for a typical interrogation).
         """
         # Filter to extended_hesitation pauses >= 3 000 ms only
+        # VOICE-PAUSE-01 stores the evidence dict DIRECTLY as metadata (not nested
+        # under an "evidence" key), so read max_pause_ms at the top level.
         pause_sigs = [
             s for s in voice_signals
             if s.get("signal_type") == "pause_classification"
             and s.get("value_text") == "extended_hesitation"
-            and s.get("metadata", {}).get("evidence", {}).get("max_pause_ms", 0) >= 3_000
+            and s.get("metadata", {}).get("max_pause_ms", 0) >= 3_000
         ]
         if not pause_sigs or not diar_segments:
             return []
@@ -178,7 +180,7 @@ class InterrogationVoiceRules:
         for ps in pause_sigs:
             ps_start   = ps.get("window_start_ms", 0)
             ps_speaker = ps.get("speaker_id", "")
-            pause_ms   = ps.get("metadata", {}).get("evidence", {}).get("max_pause_ms", 3_000)
+            pause_ms   = ps.get("metadata", {}).get("max_pause_ms", 3_000)
 
             # Walk backward through sorted segments to find the most recent
             # different-speaker turn that ended within 5 s before the pause window

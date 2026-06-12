@@ -127,8 +127,8 @@ async def global_chat(
         answer = await acomplete(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_tokens=600,
-            model="gpt-4o",
+            max_tokens=3000,
+            model="gpt-5",
         )
     except Exception as exc:
         logger.error("Global chat LLM call failed: %s", exc)

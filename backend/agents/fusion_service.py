@@ -296,11 +296,17 @@ class FusionAgentService(BaseAgentService):
                 )
                 all_fusion_signals.extend(temporal_sigs)
 
+        # Extract conversation summary once — needed by steps 2.6, 2.7 (risk
+        # assessor + interrogator scan) and later by the signal graph / narrative.
+        # Must happen BEFORE step 2.6 so conv_sigs is in scope for all_source.
+        conversation_summary = (request.voice_summary or {}).get("conversation", {})
+        conv_sigs = conversation_summary.get("signals", []) if conversation_summary else []
+
         # ── Step 2.6: Interrogation compound patterns (session-level) ─────────
         if content_type == "interrogation_video":
             try:
                 from services.fusion_agent.interrogation_patterns import InterrogationCompoundPatterns
-                all_source = pure_voice_dicts + language_dicts + video_dicts
+                all_source = pure_voice_dicts + language_dicts + video_dicts + conv_sigs
                 interrog_compound = InterrogationCompoundPatterns().evaluate(
                     all_signals=all_source + all_fusion_signals,
                     speakers=speakers,
@@ -322,11 +328,27 @@ class FusionAgentService(BaseAgentService):
         if content_type == "interrogation_video":
             try:
                 from services.fusion_agent.interrogation_patterns import FalseConfessionRiskAssessor
-                all_source = pure_voice_dicts + language_dicts + video_dicts
+
+                # Build the full interrogator set from conversation agent's output.
+                # interrogator_technique is a conversation-agent signal in conv_sigs,
+                # NOT in all_fusion_signals — scan both to avoid missing it.
+                interrogator_ids: set[str] = set()
+                for s in conv_sigs + all_fusion_signals:
+                    if s.get("signal_type") == "interrogator_technique":
+                        primary = s.get("speaker_id", "")
+                        if primary:
+                            interrogator_ids.add(primary)
+                        meta = s.get("metadata") or {}
+                        for iid in meta.get("all_interrogators", []):
+                            if iid:
+                                interrogator_ids.add(iid)
+
+                all_source = pure_voice_dicts + language_dicts + video_dicts + conv_sigs
                 risk_signals = FalseConfessionRiskAssessor().evaluate(
                     all_signals=all_source + all_fusion_signals,
                     speakers=speakers,
                     session_id=session_id,
+                    interrogators=interrogator_ids or None,  # None → auto-detect fallback
                 )
                 all_fusion_signals.extend(risk_signals)
                 if risk_signals:
@@ -374,9 +396,9 @@ class FusionAgentService(BaseAgentService):
                     pass
             logger.info("[%s] Published %d fusion signals + %d alerts", session_id, published, len(all_alerts))
 
-        # Extract entities + conversation from upstream summaries
+        # Extract entities + video from upstream summaries
+        # (conversation_summary and conv_sigs extracted earlier, before step 2.6)
         entities = (request.language_summary or {}).get("entities", {})
-        conversation_summary = (request.voice_summary or {}).get("conversation", {})
         video_summary = request.video_summary or {}
 
         # ── Step 4: Signal graph + analytics ───────────────────────────────
@@ -420,7 +442,6 @@ class FusionAgentService(BaseAgentService):
             duration_seconds = (max(all_ts) - min(all_ts)) / 1000.0 if all_ts else 0
 
             # Collect raw audio signals for per-segment behavioral profiling
-            conv_sigs = conversation_summary.get("signals", []) if conversation_summary else []
             all_audio_signals = pure_voice_dicts + language_dicts + conv_sigs
 
             report = await generate_session_narrative(

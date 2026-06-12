@@ -21,6 +21,7 @@ const INTERROGATION_TYPES = new Set([
   "freezing_response",
   "evidence_response_processing_delay",
   "narrative_consistency_drift",
+  "verbal_uncertainty_cluster",
 ]);
 
 function fmtMs(ms: number): string {
@@ -77,23 +78,27 @@ function RiskFactors({ metadata }: { metadata: Record<string, unknown> }) {
   const isActive = (key: string): boolean => {
     const f = rf[key];
     if (!f) return false;
-    if (key === "duration_risk")        return ((f.contribution as number) ?? 0) > 0;
-    if (key === "resistance_hardening") return !(f.present as boolean);
+    if (key === "duration_risk") return ((f.contribution as number) ?? 0) > 0;
     const sc = (f.signal_count as number) ?? (f.weakening_count as number) ?? 0;
     return sc > 0;
   };
 
-  const factors: { key: string; label: string }[] = [
+  // Risk factors — presence of these signals INCREASES risk (shown red when active)
+  const riskFactors: { key: string; label: string }[] = [
     { key: "contamination",        label: "contamination" },
     { key: "capitulation_cascade", label: "capitulation" },
     { key: "denial_evolution",     label: "denial drop" },
     { key: "duration_risk",        label: "long duration" },
     { key: "processing_delays",    label: "response delays" },
-    { key: "resistance_hardening", label: "no resistance" },
   ];
-  const present = factors.filter((f) => isActive(f.key));
-  const absent  = factors.filter((f) => !isActive(f.key));
-  if (present.length === 0 && absent.length === 0) return null;
+  const present = riskFactors.filter((f) => isActive(f.key));
+  const absent  = riskFactors.filter((f) => !isActive(f.key));
+
+  // Resistance hardening is PROTECTIVE (−0.05) — shown separately in green when detected,
+  // silent when absent (absence is the baseline, not a risk indicator)
+  const hardeningPresent = (rf["resistance_hardening"] as Record<string, unknown> | undefined)?.present === true;
+
+  if (present.length === 0 && absent.length === 0 && !hardeningPresent) return null;
   return (
     <div className="mt-1.5 flex flex-wrap gap-1.5">
       {present.map((f) => (
@@ -112,6 +117,11 @@ function RiskFactors({ metadata }: { metadata: Record<string, unknown> }) {
           ✗ {f.label}
         </span>
       ))}
+      {hardeningPresent && (
+        <span className="rounded border border-emerald-600/60 bg-emerald-900/40 px-2 py-0.5 text-xs font-medium text-emerald-300">
+          ✓ resistance confirmed
+        </span>
+      )}
     </div>
   );
 }
@@ -272,8 +282,15 @@ export default function InterrogationSummaryPanel({ signals, techniqueAnalysis }
 
   if (interrogationSignals.length === 0 && !techniqueAnalysis) return null;
 
-  const riskSignal = interrogationSignals.find(
-    (s) => s.signal_type === "false_confession_risk"
+  // Collect ALL speakers with a non-zero risk score — one signal emitted per speaker.
+  // Detectives score 0 and are excluded. Suspects with any measured risk are shown,
+  // each with their own gauge and factor breakdown, sorted highest-first.
+  const riskSignals = useMemo(
+    () =>
+      interrogationSignals
+        .filter((s) => s.signal_type === "false_confession_risk" && (s.value ?? 0) > 0)
+        .sort((a, b) => (b.value ?? 0) - (a.value ?? 0)),
+    [interrogationSignals]
   );
   const denialSignal = interrogationSignals.find(
     (s) => s.signal_type === "denial_weakening"
@@ -286,6 +303,9 @@ export default function InterrogationSummaryPanel({ signals, techniqueAnalysis }
   );
   const capitulationSignals = interrogationSignals.filter(
     (s) => s.signal_type === "capitulation_cascade"
+  );
+  const uncertaintyClusters = interrogationSignals.filter(
+    (s) => s.signal_type === "verbal_uncertainty_cluster"
   );
 
   return (
@@ -306,16 +326,25 @@ export default function InterrogationSummaryPanel({ signals, techniqueAnalysis }
       {!collapsed && (
         <div className="space-y-3 divide-y divide-gray-700">
 
-          {/* False Confession Risk */}
-          {riskSignal && (
-            <div className="space-y-2 pt-2 first:pt-0">
+          {/* False Confession Risk — one row per speaker with non-zero score */}
+          {riskSignals.length > 0 && (
+            <div className="space-y-3 pt-2 first:pt-0">
               <span className="text-xs font-semibold text-gray-200">
                 ⚖️ False Confession Risk
               </span>
-              <RiskGauge score={riskSignal.value} />
-              <RiskFactors
-                metadata={(riskSignal.metadata ?? {}) as Record<string, unknown>}
-              />
+              {riskSignals.map((sig) => (
+                <div key={sig.speaker_id ?? sig.start_ms} className="space-y-1.5">
+                  {riskSignals.length > 1 && sig.speaker_id && (
+                    <span className="text-[10px] font-medium uppercase tracking-wide text-amber-400/70">
+                      {sig.speaker_id}
+                    </span>
+                  )}
+                  <RiskGauge score={sig.value ?? 0} />
+                  <RiskFactors
+                    metadata={(sig.metadata ?? {}) as Record<string, unknown>}
+                  />
+                </div>
+              ))}
             </div>
           )}
 
@@ -369,6 +398,46 @@ export default function InterrogationSummaryPanel({ signals, techniqueAnalysis }
                   )}
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* Verbal Uncertainty Clusters */}
+          {uncertaintyClusters.length > 0 && (
+            <div className="space-y-2 pt-3">
+              <span className="text-xs font-semibold text-gray-200">
+                💭 Verbal Uncertainty Clusters
+              </span>
+              {uncertaintyClusters.map((s, i) => {
+                const meta = (s.metadata ?? {}) as Record<string, unknown>;
+                const pairs = meta.uncertain_pairs as number ?? 0;
+                const total = meta.window_pairs as number ?? 5;
+                const markers = (meta.sample_markers as string[] ?? []).slice(0, 3);
+                return (
+                  <div key={i} className="space-y-1">
+                    <div className="text-xs text-gray-300">
+                      {fmtMs(s.start_ms)} → {fmtMs(s.end_ms)}
+                      <span className="ml-1.5 text-slate-400">
+                        {pairs}/{total} responses hedged
+                      </span>
+                    </div>
+                    {markers.length > 0 && (
+                      <div className="flex flex-wrap gap-1">
+                        {markers.map((m) => (
+                          <span
+                            key={m}
+                            className="rounded border border-slate-600 bg-slate-800/60 px-1.5 py-0.5 text-[10px] text-slate-300"
+                          >
+                            "{m}"
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              <p className="text-[10px] text-gray-500 italic leading-relaxed">
+                CBCA Criterion 15: memory admissions more common in truthful accounts (Steller &amp; Köhnken 1989). Cognitive load indicator — not a deception cue.
+              </p>
             </div>
           )}
 

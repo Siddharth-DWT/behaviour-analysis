@@ -554,8 +554,14 @@ class AnalysisPipeline:
 
         if run_behavioural:
             enriched_voice_summary = dict(voice_summary)
-            if conversation_summary:
-                enriched_voice_summary["conversation"] = conversation_summary
+            # Embed conversation signals so fusion_service.py:406,439 both receive
+            # them via voice_summary["conversation"]["signals"].
+            # rerun_fusion.py uses the same shape: {"signals": [...]}.
+            # We merge into the existing summary dict to also preserve per_speaker/session
+            # keys that narrative.py reads.
+            conv_entry: dict = dict(conversation_summary) if conversation_summary else {}
+            conv_entry["signals"] = conversation_signals
+            enriched_voice_summary["conversation"] = conv_entry
 
             # Convert signals to FusionSignalInput format (mirrors _to_fusion_input in gateway)
             def _to_fusion_input(sig: dict, agent: str) -> dict:

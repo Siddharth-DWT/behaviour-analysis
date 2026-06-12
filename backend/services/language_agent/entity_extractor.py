@@ -142,7 +142,6 @@ Return ONLY the JSON object."""
             user_prompt=user_prompt,
             max_tokens=2000,
             temperature=0.1,
-            timeout=60,
         )
 
         # Parse JSON from LLM response

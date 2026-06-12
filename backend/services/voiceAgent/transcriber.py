@@ -40,7 +40,7 @@ logger = logging.getLogger("nexus.voice.transcriber")
 load_dotenv(Path(__file__).parent.parent.parent / ".env")
 
 # ── Configuration ──
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3-turbo")
 USE_PYANNOTE = os.getenv("USE_PYANNOTE", "false").lower() == "true"
 
 # External Whisper API (GPU-accelerated)
@@ -63,7 +63,8 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 EXTERNAL_TRANSCRIBE_DIARIZE_URL = os.getenv("EXTERNAL_WHISPER_URL", "")
 
 # Parakeet TDT (fast transcription with word timestamps, needs separate diarizer)
-PARAKEET_URL = os.getenv("PARAKEET_URL", "")
+PARAKEET_URL   = os.getenv("PARAKEET_URL", "")
+PARAKEET_MODEL = os.getenv("PARAKEET_MODEL", "parakeet-tdt-0.6b-v3")
 
 # ── Pyannote Community-1 Pipeline (global singleton — loaded once) ──
 _pyannote_community_pipeline = None
@@ -393,6 +394,11 @@ class Transcriber:
         self._run_behavioural = run_behavioural
         self._translate_to = translate_to
         self._entity_detection = entity_detection
+        # Reset per-request state that must not bleed into subsequent sessions.
+        # The finally block resets some of these too, but resetting here ensures
+        # the MFCC fallback at line ~483 only activates when THIS session's
+        # diarization produced no embeddings (not a previous session's).
+        self._last_speaker_embeddings = {}
         self._tmp_wav = None  # Track temp WAV for cleanup
         self._tmp_cloud_audio = None  # Track temp cloud audio extract for cleanup
 
@@ -673,7 +679,7 @@ class Transcriber:
         return {
             "duration_seconds": duration,
             "backend": "parakeet",
-            "model": result.get("model", "parakeet-tdt-0.6b-v2"),
+            "model": result.get("model", PARAKEET_MODEL),
             "processing_time": proc_time,
             "segments": segments,
             "diarization_backend": self._last_diarization_backend,
@@ -1861,8 +1867,16 @@ class Transcriber:
         else:
             audio_input = audio_path
 
-        # Run diarization with explicit speaker count
-        diarize_kwargs = {"num_speakers": min(max(1, num_speakers), 10)}
+        # Pass max_speakers so pyannote finds the best count up to the hint.
+        # Passing num_speakers forces an EXACT count (pyannote treats it as a
+        # hard constraint), so a 2-person call gets force-split into more
+        # clusters when the hint is higher than the actual speaker count.
+        # Only pass num_speakers when the caller explicitly specified an exact count
+        # (num_speakers == 1 is always exact; otherwise it's a hint/cap).
+        if num_speakers == 1:
+            diarize_kwargs = {"num_speakers": 1}
+        else:
+            diarize_kwargs = {"max_speakers": min(max(1, num_speakers), 10)}
 
         diarization = pipeline(audio_input, **diarize_kwargs)
 
@@ -1914,10 +1928,17 @@ class Transcriber:
                         w_end = word.get("end", seg_end)
                         if w_start < chunk_end and w_end > chunk_start:
                             chunk_words.append(word)
+                # Rebuild text from the filtered words for this chunk so each
+                # chunk only contains the words that fall within its time range.
+                # Fall back to the full segment text only when word timings are absent.
+                if chunk_words:
+                    chunk_text = " ".join(w.get("word", "") for w in chunk_words).strip()
+                else:
+                    chunk_text = seg["text"]
                 new_segments.append({
                     "start_ms": int(chunk_start * 1000),
                     "end_ms": int(chunk_end * 1000),
-                    "text": seg["text"],
+                    "text": chunk_text,
                     "words": chunk_words,
                     "speaker": spk,
                 })

@@ -308,12 +308,15 @@ class ConversationFeatureExtractor:
                     if self._is_question(prev.get("text", "")):
                         qa_pairs += 1
 
-                # Compute stats
+                # Compute stats — use positive-only latencies for avg so negative
+                # overlap values don't drag the mean toward "overlapping" label
+                # (CONVO-LAT-01 in rules.py uses avg to classify turn behaviour).
                 latencies_positive = [l for l in latencies if l >= 0]
                 avg_latency = (
-                    sum(latencies) / len(latencies) if latencies else 0
+                    sum(latencies_positive) / len(latencies_positive)
+                    if latencies_positive else 0
                 )
-                median_latency = self._median(latencies) if latencies else 0
+                median_latency = self._median(latencies_positive) if latencies_positive else 0
 
                 result[pair_key] = {
                     "response_latency_ms_avg": round(avg_latency, 1),

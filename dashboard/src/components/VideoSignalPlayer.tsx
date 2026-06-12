@@ -32,6 +32,7 @@ const SIGNAL_TO_CATEGORY: Record<string, string> = {
   pause_classification: "Processing", strategic_pause: "Processing",
   evaluation_cluster: "Processing", cognitive_overload: "Processing",
   evidence_response_processing_delay: "Processing", decision_engagement: "Processing",
+  verbal_uncertainty_cluster: "Processing",
   // Dominant
   interruption_event: "Dominant", dominance_display: "Dominant",
   dominance_score: "Dominant", arm_posture: "Dominant",
@@ -661,6 +662,12 @@ const SIGNAL_CONFIG: Record<string, SignalConfigEntry> = {
     icon: "⏱",
     label: (s) => `Evidence Response Delay: ${((s.value ?? 0) * 10).toFixed(1)}s`,
     color: "#F59E0B",
+    category: "compound",
+  },
+  verbal_uncertainty_cluster: {
+    icon: "💭",
+    label: (s) => { const m = s.metadata as Record<string,unknown>; return `Uncertainty Cluster (${m?.uncertain_pairs ?? "?"} / ${m?.window_pairs ?? 5} responses)`; },
+    color: "#94A3B8",
     category: "compound",
   },
   vocal_hesitation_cluster: {
@@ -1371,6 +1378,7 @@ export default function VideoSignalPlayer({ sessionId, signals, techniqueAnalysi
     () =>
       new Set([
         "evidence_response_processing_delay",
+        "verbal_uncertainty_cluster",
         "statement_contamination",
         "capitulation_cascade",
         "freezing_response",

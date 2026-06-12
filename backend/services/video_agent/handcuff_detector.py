@@ -107,11 +107,14 @@ class HandcuffDetector:
         Returns:
             {
                 "handcuffs_detected": bool,
+                "cuffed_speakers": set[str],   # empty when not detected
                 "confidence": float,
                 "method": "visual_pose",
                 "evidence": dict
             }
         """
+        cuffed: set[str] = set()
+
         for spk, windows in windows_by_speaker.items():
             if len(windows) < self._VISUAL_MIN_WINDOWS:
                 continue
@@ -136,15 +139,16 @@ class HandcuffDetector:
                 "[%s] HandcuffDetector visual: %s arms_crossed_pct=%.2f var=%.4f → HANDCUFFED",
                 session_id, spk, mean_cross, variance,
             )
+            cuffed.add(spk)
+
+        if cuffed:
             return {
                 "handcuffs_detected": True,
-                "confidence": 0.75,
-                "method": "visual_pose",
+                "cuffed_speakers":    cuffed,
+                "confidence":         0.75,
+                "method":             "visual_pose",
                 "evidence": {
-                    "speaker_id":          spk,
-                    "mean_arms_crossed":   round(mean_cross, 4),
-                    "variance":            round(variance, 4),
-                    "sample_windows":      len(sample),
+                    "cuffed_speakers": sorted(cuffed),
                     "interpretation": (
                         "Consistently high arms-crossing posture with low variance "
                         "indicates structural wrist restraint rather than behavioural "
@@ -155,9 +159,10 @@ class HandcuffDetector:
 
         return {
             "handcuffs_detected": False,
-            "confidence": 0.0,
-            "method": "visual_pose",
-            "evidence": {},
+            "cuffed_speakers":    set(),
+            "confidence":         0.0,
+            "method":             "visual_pose",
+            "evidence":           {},
         }
 
     def detect_contextual(
@@ -242,6 +247,12 @@ class HandcuffDetector:
         visual     = self.detect_visual(windows_by_speaker, session_id=session_id)
         contextual = self.detect_contextual(transcript)
 
+        # Collect per-speaker cuffed set; contextual detection can't identify
+        # which speaker is restrained, so it applies to all speakers.
+        cuffed_speakers: set[str] = set(visual.get("cuffed_speakers") or [])
+        if contextual["handcuffs_detected"]:
+            cuffed_speakers.update(windows_by_speaker.keys())
+
         if visual["handcuffs_detected"] or contextual["handcuffs_detected"]:
             confidence = max(visual["confidence"], contextual["confidence"])
 
@@ -254,6 +265,7 @@ class HandcuffDetector:
 
             return {
                 "handcuffs_detected": True,
+                "cuffed_speakers":    cuffed_speakers,
                 "confidence":         confidence,
                 "method":             method,
                 "evidence":           {**visual.get("evidence", {}), **contextual.get("evidence", {})},
@@ -261,6 +273,7 @@ class HandcuffDetector:
 
         return {
             "handcuffs_detected": False,
+            "cuffed_speakers":    set(),
             "confidence":         0.0,
             "method":             "visual_pose+contextual_transcript",
             "evidence":           {},

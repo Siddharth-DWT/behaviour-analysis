@@ -11,6 +11,7 @@ Produces per-utterance feature vectors containing:
   - Lexical statistics: word count, sentence length, question detection
 """
 import re
+import json
 import time
 import logging
 from typing import Optional
@@ -37,6 +38,54 @@ def _get_vader_analyzer():
         except ImportError:
             logger.warning("vaderSentiment not installed — sentiment will be neutral.")
     return _vader_analyzer
+
+
+def _parse_llm_sentiment_text(text: str, batch_size: int) -> list[float] | None:
+    """
+    Parse LLM sentiment response into a list of floats (one per batch item).
+
+    Tries in order:
+      1. Direct JSON parse of an array
+      2. Bracketed substring JSON parse
+      3. Per-line fallback: split on newlines, take the LAST float on each line
+         so numbered output like "1. 0.5\\n2. -0.3" maps correctly (line index
+         → batch index). This avoids the bug where re.findall captures the line
+         numbers as scores.
+
+    Returns a list of floats ≤ batch_size, or None if parsing fails entirely.
+    """
+    try:
+        scores = json.loads(text)
+        if isinstance(scores, list):
+            return [float(v) for v in scores[:batch_size]]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    lb, rb = text.find("["), text.rfind("]")
+    if lb >= 0 and rb > lb:
+        try:
+            scores = json.loads(text[lb:rb + 1])
+            if isinstance(scores, list):
+                return [float(v) for v in scores[:batch_size]]
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Per-line fallback: take the LAST float on each non-empty line.
+    _float_re = re.compile(r"-?\d*\.?\d+")
+    scores = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        floats = _float_re.findall(line)
+        if floats:
+            try:
+                scores.append(float(floats[-1]))
+            except ValueError:
+                pass
+        if len(scores) >= batch_size:
+            break
+    return scores if scores else None
 
 
 def _load_sentiment_model():
@@ -519,13 +568,7 @@ class LanguageFeatureExtractor:
                         except json.JSONDecodeError:
                             pass
                 if scores is None:
-                    import re
-                    floats = re.findall(r"-?\d*\.?\d+", text)
-                    if floats:
-                        try:
-                            scores = [float(f) for f in floats[:len(batch)]]
-                        except ValueError:
-                            scores = None
+                    scores = _parse_llm_sentiment_text(text, len(batch))
 
                 if not isinstance(scores, list):
                     logger.warning(f"LLM returned non-array sentiment: {text[:100]}")
@@ -796,13 +839,7 @@ class LanguageFeatureExtractor:
                         except json.JSONDecodeError:
                             pass
                 if scores is None:
-                    import re
-                    floats = re.findall(r"-?\d*\.?\d+", text)
-                    if floats:
-                        try:
-                            scores = [float(f) for f in floats[:len(batch)]]
-                        except ValueError:
-                            scores = None
+                    scores = _parse_llm_sentiment_text(text, len(batch))
 
                 if not isinstance(scores, list):
                     logger.warning(f"LLM returned non-array sentiment: {text[:100]}")

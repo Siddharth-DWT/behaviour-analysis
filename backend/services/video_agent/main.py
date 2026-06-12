@@ -690,6 +690,7 @@ class VideoPipeline:
                     session_id=session_id,
                 )
                 _handcuffed = _hc_result["handcuffs_detected"]
+                _cuffed_speakers: frozenset[str] = frozenset(_hc_result.get("cuffed_speakers") or [])
 
                 from .interrogation_rules import InterrogationVideoRules
                 interrog_signals = InterrogationVideoRules().evaluate(
@@ -698,13 +699,13 @@ class VideoPipeline:
                     diar_segments=diar_segments,
                     session_id=session_id,
                     video_fps=_real_fps,
-                    handcuffed=_handcuffed,
+                    cuffed_speakers=_cuffed_speakers,
                 )
                 all_signals.extend(interrog_signals)
                 if interrog_signals:
                     logger.info(
-                        "[%s] Interrogation video rules: %d signals (handcuffed=%s)",
-                        session_id, len(interrog_signals), _handcuffed,
+                        "[%s] Interrogation video rules: %d signals (handcuffed=%s, cuffed_speakers=%s)",
+                        session_id, len(interrog_signals), _handcuffed, sorted(_cuffed_speakers),
                     )
             except Exception as exc:
                 logger.warning("[%s] Interrogation video rules failed (non-fatal): %s", session_id, exc)
@@ -903,7 +904,7 @@ class VideoPipeline:
                 f"[{session_id}] Burning landmarks + {len(all_signals)} signal labels onto video "
                 f"→ {output_path}"
             )
-            with _extractor_lock:
+            with self._extractor_lock:
                 self._extractor._diar_segments = diar_segments or []
             self._extractor.burn_landmarks_and_labels(
                 video_path, all_signals, output_path=output_path,
@@ -974,6 +975,7 @@ async def _run_video_job(
         extractor=_get_extractor(),
         mapper=_get_mapper(),
         calibrator=_get_calibrator(),
+        extractor_lock=_extractor_lock,
     )
     lock_token = await _lock_manager.acquire(session_id, "video")
     if not lock_token:

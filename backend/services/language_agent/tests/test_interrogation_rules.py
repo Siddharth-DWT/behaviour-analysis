@@ -284,6 +284,9 @@ class TestIntegration:
         not on common words. Expects 1-4 hits (not 26 as in the unfixed version).
         """
         segments = [
+            # Opening question so detective is detected as interrogator by _detect_interrogators
+            _seg(DETECTIVE, "Where were you on the evening of the 15th?", 50_000, 55_000),
+
             # Early interrogator introduces case facts
             _seg(DETECTIVE, "We have footage from the parking lot of Westgate Mall.", 60_000, 65_000),
             _seg(DETECTIVE, "Your car, a blue Honda, was captured on camera.", 65_000, 70_000),

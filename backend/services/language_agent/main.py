@@ -164,153 +164,178 @@ async def analyse_transcript(request: AnalysisRequest):
     lock_token = await lock_manager.acquire(session_id, "language")
     if not lock_token:
         raise HTTPException(409, "Language agent is already processing this session")
-    await redis_repo.set_session_state(session_id, SessionStateRecord(status="running", current_step="language"))
-    await redis_repo.set_agent_status(session_id, "language", AgentStatusRecord(status="running", summary_key="summary:language"))
-    await event_store.append(
-        session_id,
-        EventRecord(session_id=session_id, agent="language", event_type="agent_started", payload={"segment_count": len(request.segments)}),
-    )
-
-    # Determine content type (affects which rules are active)
-    content_type = request.content_type or request.meeting_type or "sales_call"
-    rule_engine.set_content_type(content_type)
-
-    # Create content-type profile for gating/renaming/confidence
-    _profile = None
+    completed = False
     try:
-        from shared.config.content_type_profile import ContentTypeProfile
-        _profile = ContentTypeProfile(content_type)
-    except ImportError:
-        pass
-
-    logger.info(
-        f"[{session_id}] Analysing {len(request.segments)} segments "
-        f"(content_type={content_type})"
-    )
-
-    # Convert to dicts (segments may already be dicts or Pydantic models)
-    segments = [seg.model_dump() if hasattr(seg, 'model_dump') else dict(seg) for seg in request.segments]
-
-    # ── Step 1: Extract non-LLM features (fast — buying, objection, power, lexical) ──
-    logger.info(f"[{session_id}] Step 1: Extracting linguistic features (non-LLM)...")
-    features_list = feature_extractor.extract_all_no_llm(segments)
-    # Build texts list matching features_list (non-empty segments only)
-    texts = [f["text"] for f in features_list]
-    logger.info(f"[{session_id}] Extracted features for {len(features_list)} segments")
-
-    # ── Step 2: Run LLM tasks in parallel (sentiment + intent + entities) ──
-    t_llm = time.time()
-    logger.info(f"[{session_id}] Step 2: Running LLM tasks in parallel (sentiment + intent + entities)...")
-
-    async def _safe_sentiment():
-        try:
-            return await feature_extractor.batch_sentiment_async(texts)
-        except Exception as e:
-            logger.warning(f"[{session_id}] Async sentiment failed: {e}")
-            return [{"label": "NEUTRAL", "score": 0.0}] * len(texts)
-
-    async def _safe_intent():
-        if not request.run_intent_classification:
-            return []
-        try:
-            return await rule_engine.evaluate_batch_intent(features_list, profile=_profile)
-        except Exception as e:
-            logger.warning(f"[{session_id}] Intent classification failed: {e}")
-            return []
-
-    async def _safe_entities():
-        try:
-            return await entity_extractor.extract(segments, content_type)
-        except Exception as e:
-            logger.warning(f"[{session_id}] Entity extraction failed (non-fatal): {e}")
-            return {}
-
-    sentiments, intent_signals, entities = await asyncio.gather(
-        _safe_sentiment(), _safe_intent(), _safe_entities()
-    )
-    logger.info(
-        f"[{session_id}] Step 2 done: {len(sentiments)} sentiments, "
-        f"{len(intent_signals)} intents, entities={bool(entities)} in {time.time()-t_llm:.1f}s"
-    )
-
-    # ── Step 3: Merge sentiment into features ──
-    for i, features in enumerate(features_list):
-        sent = sentiments[i] if i < len(sentiments) else {"label": "NEUTRAL", "score": 0.0}
-        features["sentiment_label"] = sent["label"]
-        features["sentiment_score"] = sent["score"]
-        features["sentiment_value"] = sent["score"]
-
-    # ── Step 4: Run synchronous rules (SENT, BUY, OBJ, PWR) — now with sentiment populated ──
-    logger.info(f"[{session_id}] Step 4: Running rule engine (content_type={content_type})...")
-    all_signals = []
-
-    for i, features in enumerate(features_list):
-        speaker_id = features.get("speaker_id", "unknown")
-        signals = rule_engine.evaluate(
-            features=features, speaker_id=speaker_id, content_type=content_type,
-            all_features_list=features_list, current_index=i,
-            profile=_profile,
+        await redis_repo.set_session_state(session_id, SessionStateRecord(status="running", current_step="language"))
+        await redis_repo.set_agent_status(session_id, "language", AgentStatusRecord(status="running", summary_key="summary:language"))
+        await event_store.append(
+            session_id,
+            EventRecord(session_id=session_id, agent="language", event_type="agent_started", payload={"segment_count": len(request.segments)}),
         )
-        all_signals.extend(signals)
 
-    # Add intent signals from parallel LLM task
-    all_signals.extend(intent_signals)
-    logger.info(
-        f"[{session_id}] Sentiment: {len(sentiments)} scores, "
-        f"Intent: {len(intent_signals)} intents, "
-        f"Entities: {len(entities.get('people', []))} people, "
-        f"{len(entities.get('topics', []))} topics, "
-        f"{len(entities.get('commitments', []))} commitments"
-    )
+        # Determine content type (affects which rules are active)
+        content_type = request.content_type or request.meeting_type or "sales_call"
+        rule_engine.set_content_type(content_type)
 
-    # ── Step 4: Publish to Redis Streams ──
-    if HAS_MESSAGE_BUS:
-        published = 0
-        for signal in all_signals:
+        # Create content-type profile for gating/renaming/confidence
+        _profile = None
+        try:
+            from shared.config.content_type_profile import ContentTypeProfile
+            _profile = ContentTypeProfile(content_type)
+        except ImportError:
+            pass
+
+        logger.info(
+            f"[{session_id}] Analysing {len(request.segments)} segments "
+            f"(content_type={content_type})"
+        )
+
+        # Convert to dicts (segments may already be dicts or Pydantic models)
+        segments = [seg.model_dump() if hasattr(seg, 'model_dump') else dict(seg) for seg in request.segments]
+
+        # ── Step 1: Extract non-LLM features (fast — buying, objection, power, lexical) ──
+        logger.info(f"[{session_id}] Step 1: Extracting linguistic features (non-LLM)...")
+        features_list = feature_extractor.extract_all_no_llm(segments)
+        # Build texts list matching features_list (non-empty segments only)
+        texts = [f["text"] for f in features_list]
+        logger.info(f"[{session_id}] Extracted features for {len(features_list)} segments")
+
+        # ── Step 2: Run LLM tasks in parallel (sentiment + intent + entities) ──
+        t_llm = time.time()
+        logger.info(f"[{session_id}] Step 2: Running LLM tasks in parallel (sentiment + intent + entities)...")
+
+        async def _safe_sentiment():
             try:
-                await message_bus.publish_signal(
-                    session_id=session_id,
-                    agent="language",
-                    speaker_id=signal.get("speaker_id", "unknown"),
-                    signal_type=signal.get("signal_type", ""),
-                    value=signal.get("value"),
-                    value_text=signal.get("value_text", ""),
-                    confidence=signal.get("confidence", 0.5),
-                    window_start_ms=signal.get("window_start_ms", 0),
-                    window_end_ms=signal.get("window_end_ms", 0),
-                    metadata=signal.get("metadata"),
-                )
-                published += 1
+                return await feature_extractor.batch_sentiment_async(texts)
             except Exception as e:
-                logger.warning(f"Failed to publish signal to Redis: {e}")
-        logger.info(f"[{session_id}] Published {published} signals to Redis")
+                logger.warning(f"[{session_id}] Async sentiment failed: {e}")
+                return [{"label": "NEUTRAL", "score": 0.0}] * len(texts)
 
-    # ── Step 5: Build summary ──
-    elapsed = time.time() - start_time
-    speakers = list(set(f.get("speaker_id", "unknown") for f in features_list))
-    logger.info(f"[{session_id}] Language Agent complete: {len(all_signals)} signals in {elapsed:.1f}s")
+        async def _safe_intent():
+            if not request.run_intent_classification:
+                return []
+            try:
+                return await rule_engine.evaluate_batch_intent(features_list, profile=_profile)
+            except Exception as e:
+                logger.warning(f"[{session_id}] Intent classification failed: {e}")
+                return []
 
-    summary = _build_summary(all_signals, features_list, speakers, profile=_profile)
-    summary["entities"] = entities
-    await redis_repo.write_artifact(session_id, "summary:language", {"summary": summary, "entities": entities})
-    await redis_repo.set_agent_status(
-        session_id,
-        "language",
-        AgentStatusRecord(status="completed", signal_count=len(all_signals), summary_key="summary:language"),
-    )
-    await event_store.append(
-        session_id,
-        EventRecord(session_id=session_id, agent="language", event_type="agent_completed", payload={"signal_count": len(all_signals)}),
-    )
-    await lock_manager.release(session_id, "language", lock_token)
+        async def _safe_entities():
+            try:
+                return await entity_extractor.extract(segments, content_type)
+            except Exception as e:
+                logger.warning(f"[{session_id}] Entity extraction failed (non-fatal): {e}")
+                return {}
 
-    return AnalysisResponse(
-        session_id=session_id,
-        segment_count=len(features_list),
-        speakers=speakers,
-        signals=all_signals,
-        summary=summary,
-    )
+        sentiments, intent_signals, entities = await asyncio.gather(
+            _safe_sentiment(), _safe_intent(), _safe_entities()
+        )
+        logger.info(
+            f"[{session_id}] Step 2 done: {len(sentiments)} sentiments, "
+            f"{len(intent_signals)} intents, entities={bool(entities)} in {time.time()-t_llm:.1f}s"
+        )
+
+        # ── Step 3: Merge sentiment into features ──
+        for i, features in enumerate(features_list):
+            sent = sentiments[i] if i < len(sentiments) else {"label": "NEUTRAL", "score": 0.0}
+            features["sentiment_label"] = sent["label"]
+            features["sentiment_score"] = sent["score"]
+            features["sentiment_value"] = sent["score"]
+
+        # ── Step 4: Run synchronous rules (SENT, BUY, OBJ, PWR) — now with sentiment populated ──
+        logger.info(f"[{session_id}] Step 4: Running rule engine (content_type={content_type})...")
+        all_signals = []
+
+        for i, features in enumerate(features_list):
+            speaker_id = features.get("speaker_id", "unknown")
+            signals = rule_engine.evaluate(
+                features=features, speaker_id=speaker_id, content_type=content_type,
+                all_features_list=features_list, current_index=i,
+                profile=_profile,
+            )
+            all_signals.extend(signals)
+
+        # Add intent signals from parallel LLM task
+        all_signals.extend(intent_signals)
+        logger.info(
+            f"[{session_id}] Sentiment: {len(sentiments)} scores, "
+            f"Intent: {len(intent_signals)} intents, "
+            f"Entities: {len(entities.get('people', []))} people, "
+            f"{len(entities.get('topics', []))} topics, "
+            f"{len(entities.get('commitments', []))} commitments"
+        )
+
+        # ── Step 4: Publish to Redis Streams ──
+        if HAS_MESSAGE_BUS:
+            published = 0
+            for signal in all_signals:
+                try:
+                    await message_bus.publish_signal(
+                        session_id=session_id,
+                        agent="language",
+                        speaker_id=signal.get("speaker_id", "unknown"),
+                        signal_type=signal.get("signal_type", ""),
+                        value=signal.get("value"),
+                        value_text=signal.get("value_text", ""),
+                        confidence=signal.get("confidence", 0.5),
+                        window_start_ms=signal.get("window_start_ms", 0),
+                        window_end_ms=signal.get("window_end_ms", 0),
+                        metadata=signal.get("metadata"),
+                    )
+                    published += 1
+                except Exception as e:
+                    logger.warning(f"Failed to publish signal to Redis: {e}")
+            logger.info(f"[{session_id}] Published {published} signals to Redis")
+
+        # ── Step 5: Build summary ──
+        elapsed = time.time() - start_time
+        speakers = list(set(f.get("speaker_id", "unknown") for f in features_list))
+        logger.info(f"[{session_id}] Language Agent complete: {len(all_signals)} signals in {elapsed:.1f}s")
+
+        summary = _build_summary(all_signals, features_list, speakers, profile=_profile)
+        summary["entities"] = entities
+        await redis_repo.write_artifact(session_id, "summary:language", {"summary": summary, "entities": entities})
+        await redis_repo.set_agent_status(
+            session_id,
+            "language",
+            AgentStatusRecord(status="completed", signal_count=len(all_signals), summary_key="summary:language"),
+        )
+        await event_store.append(
+            session_id,
+            EventRecord(session_id=session_id, agent="language", event_type="agent_completed", payload={"signal_count": len(all_signals)}),
+        )
+        completed = True
+
+        return AnalysisResponse(
+            session_id=session_id,
+            segment_count=len(features_list),
+            speakers=speakers,
+            signals=all_signals,
+            summary=summary,
+        )
+    except Exception as exc:
+        if not completed:
+            try:
+                await redis_repo.set_agent_status(
+                    session_id, "language",
+                    AgentStatusRecord(status="failed", summary_key="summary:language"),
+                )
+                await event_store.append(
+                    session_id,
+                    EventRecord(
+                        session_id=session_id, agent="language",
+                        event_type="agent_failed",
+                        payload={"error": str(exc)},
+                    ),
+                )
+            except Exception:
+                logger.warning("failed to write failed-status (agent=language, session=%s)", session_id, exc_info=True)
+        raise
+    finally:
+        try:
+            await lock_manager.release(session_id, "language", lock_token)
+        except Exception:
+            logger.warning("lock release failed (agent=language, session=%s)", session_id, exc_info=True)
 
 
 def _build_summary(signals: list[dict], features_list: list[dict], speakers: list[str], profile=None) -> dict:

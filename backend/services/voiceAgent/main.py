@@ -22,6 +22,7 @@ import uuid
 import json
 import time
 import logging
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
@@ -251,246 +252,271 @@ async def analyse_audio(request: AnalysisRequest):
     lock_token = await lock_manager.acquire(session_id, "voice")
     if not lock_token:
         raise HTTPException(409, "Voice agent is already processing this session")
-    await redis_repo.set_session_state(session_id, SessionStateRecord(status="running", current_step="transcribing"))
-    await redis_repo.set_agent_status(session_id, "voice", AgentStatusRecord(status="running", summary_key="summary:voice"))
-    await event_store.append(
-        session_id,
-        EventRecord(session_id=session_id, agent="voice", event_type="agent_started", payload={"file_path": str(file_path)}),
-    )
-    
-    logger.info(f"[{session_id}] Analysing: {file_path.name}")
-
-    # ── Load audio once (reused by diarisation + feature extraction) ──
+    completed = False
     try:
-        from shared.utils.audio_loader import load_audio
-        audio_data = load_audio(str(file_path), sr=16000)
-    except ImportError:
-        import librosa as _lr
-        audio_data = _lr.load(str(file_path), sr=16000, mono=True)
+        await redis_repo.set_session_state(session_id, SessionStateRecord(status="running", current_step="transcribing"))
+        await redis_repo.set_agent_status(session_id, "voice", AgentStatusRecord(status="running", summary_key="summary:voice"))
+        await event_store.append(
+            session_id,
+            EventRecord(session_id=session_id, agent="voice", event_type="agent_started", payload={"file_path": str(file_path)}),
+        )
 
-    # ── Create content-type profile ──
-    meeting_type = request.meeting_type or "sales_call"
-    _profile = None
-    try:
-        from shared.config.content_type_profile import ContentTypeProfile
-        _profile = ContentTypeProfile(meeting_type)
-    except ImportError:
-        pass
+        logger.info(f"[{session_id}] Analysing: {file_path.name}")
 
-    # ── Step 1: Transcribe + diarise ──
-    tc = request.transcription_config
-    ac = request.analysis_config
-    t_step = time.time()
-    logger.info(
-        f"[{session_id}] Step 1: Transcribing "
-        f"(num_speakers={request.num_speakers}, meeting_type={meeting_type}, "
-        f"model_pref={getattr(tc, 'model_preference', None)}, "
-        f"lang={getattr(tc, 'language', None)})"
-    )
-    transcript = transcriber.transcribe(
-        str(file_path),
-        num_speakers=request.num_speakers,
-        audio_data=audio_data,
-        meeting_type=meeting_type,
-        language=getattr(tc, "language", None) if tc else None,
-        model_preference=getattr(tc, "model_preference", None) if tc else None,
-        custom_prompt=getattr(tc, "custom_prompt", None) if tc else None,
-        key_terms=getattr(tc, "key_terms", None) if tc else None,
-        multichannel=getattr(tc, "multichannel", False) if tc else False,
-        keep_filler_words=getattr(tc, "keep_filler_words", False) if tc else False,
-        text_formatting=getattr(tc, "text_formatting", False) if tc else False,
-        auto_punctuation=getattr(tc, "auto_punctuation", True) if tc else True,
-        temperature=getattr(tc, "temperature", None) if tc else None,
-        run_diarization=getattr(ac, "run_diarization", True) if ac else True,
-        run_behavioural=getattr(ac, "run_behavioural", True) if ac else True,
-        translate_to=getattr(ac, "translate_to", None) if ac else None,
-        entity_detection=(not getattr(ac, "run_behavioural", True) and getattr(ac, "run_entity_extraction", True)) if ac else False,
-    )
+        # ── Load audio once (reused by diarisation + feature extraction) ──
+        try:
+            from shared.utils.audio_loader import load_audio
+            audio_data = load_audio(str(file_path), sr=16000)
+        except ImportError:
+            import librosa as _lr
+            audio_data = _lr.load(str(file_path), sr=16000, mono=True)
 
-    duration_sec = transcript["duration_seconds"]
-    speakers = list(set(seg["speaker"] for seg in transcript["segments"]))
-    logger.info(
-        f"[{session_id}] Step 1 done: {duration_sec:.1f}s audio, {len(speakers)} speakers, "
-        f"{len(transcript['segments'])} segments in {time.time()-t_step:.1f}s"
-    )
+        # ── Create content-type profile ──
+        meeting_type = request.meeting_type or "sales_call"
+        _profile = None
+        try:
+            from shared.config.content_type_profile import ContentTypeProfile
+            _profile = ContentTypeProfile(meeting_type)
+        except ImportError:
+            pass
 
-    # ── Early return: transcript-only mode (behavioural analysis disabled) ──
-    run_behavioural = getattr(ac, "run_behavioural", True) if ac else True
+        # ── Step 1: Transcribe + diarise ──
+        tc = request.transcription_config
+        ac = request.analysis_config
+        t_step = time.time()
+        logger.info(
+            f"[{session_id}] Step 1: Transcribing "
+            f"(num_speakers={request.num_speakers}, meeting_type={meeting_type}, "
+            f"model_pref={getattr(tc, 'model_preference', None)}, "
+            f"lang={getattr(tc, 'language', None)})"
+        )
+        transcript = transcriber.transcribe(
+            str(file_path),
+            num_speakers=request.num_speakers,
+            audio_data=audio_data,
+            meeting_type=meeting_type,
+            language=getattr(tc, "language", None) if tc else None,
+            model_preference=getattr(tc, "model_preference", None) if tc else None,
+            custom_prompt=getattr(tc, "custom_prompt", None) if tc else None,
+            key_terms=getattr(tc, "key_terms", None) if tc else None,
+            multichannel=getattr(tc, "multichannel", False) if tc else False,
+            keep_filler_words=getattr(tc, "keep_filler_words", False) if tc else False,
+            text_formatting=getattr(tc, "text_formatting", False) if tc else False,
+            auto_punctuation=getattr(tc, "auto_punctuation", True) if tc else True,
+            temperature=getattr(tc, "temperature", None) if tc else None,
+            run_diarization=getattr(ac, "run_diarization", True) if ac else True,
+            run_behavioural=getattr(ac, "run_behavioural", True) if ac else True,
+            translate_to=getattr(ac, "translate_to", None) if ac else None,
+            entity_detection=(not getattr(ac, "run_behavioural", True) and getattr(ac, "run_entity_extraction", True)) if ac else False,
+        )
 
-    if not run_behavioural:
-        elapsed = time.time() - start_time
-        logger.info(f"[{session_id}] Transcript-only mode — skipping features/rules ({elapsed:.1f}s)")
-        word_counts: dict[str, int] = {}
-        transcript_speech_quick: dict[str, float] = {}
+        duration_sec = transcript["duration_seconds"]
+        speakers = list(set(seg["speaker"] for seg in transcript["segments"]))
+        logger.info(
+            f"[{session_id}] Step 1 done: {duration_sec:.1f}s audio, {len(speakers)} speakers, "
+            f"{len(transcript['segments'])} segments in {time.time()-t_step:.1f}s"
+        )
+
+        # ── Early return: transcript-only mode (behavioural analysis disabled) ──
+        run_behavioural = getattr(ac, "run_behavioural", True) if ac else True
+
+        if not run_behavioural:
+            elapsed = time.time() - start_time
+            logger.info(f"[{session_id}] Transcript-only mode — skipping features/rules ({elapsed:.1f}s)")
+            word_counts: dict[str, int] = {}
+            transcript_speech_quick: dict[str, float] = {}
+            for seg in transcript["segments"]:
+                spk = seg["speaker"]
+                word_counts[spk] = word_counts.get(spk, 0) + len(seg.get("text", "").split())
+                transcript_speech_quick[spk] = transcript_speech_quick.get(spk, 0.0) + (seg["end_ms"] - seg["start_ms"]) / 1000.0
+            total_speech_sec_quick = sum(transcript_speech_quick.values()) or duration_sec
+            speaker_payload = [
+                {
+                    "speaker_id": sid,
+                    "baseline": None,
+                    "signal_count": 0,
+                    "talk_time_ms": int(transcript_speech_quick.get(sid, 0.0) * 1000),
+                    "talk_time_pct": round(transcript_speech_quick.get(sid, 0.0) / total_speech_sec_quick * 100, 2),
+                    "total_words": word_counts.get(sid, 0),
+                    "calibration_confidence": 0.0,
+                }
+                for sid in speakers
+            ]
+            speaker_embeddings = getattr(transcriber, "_last_speaker_embeddings", None) or None
+            await _publish_voice_outputs(session_id, transcript, speaker_payload, [], {}, speaker_embeddings)
+            await redis_repo.set_agent_status(session_id, "voice", AgentStatusRecord(status="completed", summary_key="summary:voice"))
+            await event_store.append(
+                session_id,
+                EventRecord(session_id=session_id, agent="voice", event_type="agent_completed", payload={"signal_count": 0}),
+            )
+            completed = True
+            return AnalysisResponse(
+                session_id=session_id,
+                duration_seconds=duration_sec,
+                speakers=speaker_payload,
+                signals=[],
+                summary={},
+                transcript_segments=transcript["segments"],
+                speaker_embeddings=speaker_embeddings,
+            )
+
+        # ── Step 2: Extract acoustic features ──
+        t_step = time.time()
+        logger.info(f"[{session_id}] Step 2: Extracting acoustic features...")
+        try:
+            features_by_speaker = feature_extractor.extract_all(
+                str(file_path),
+                transcript["segments"],
+                audio_data=audio_data,
+            )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Audio file could not be decoded — it may be empty or corrupted. ({e})",
+            )
+
+        # ── Step 3: Build baselines ──
+        # Compute true speaking time per speaker from transcript (not feature windows)
+        # so calibration confidence isn't penalised by skipped short windows.
+        total_windows = sum(len(v) for v in features_by_speaker.values())
+        logger.info(
+            f"[{session_id}] Step 2 done: {len(features_by_speaker)} speakers, "
+            f"{total_windows} windows extracted in {time.time()-t_step:.1f}s"
+        )
+        transcript_speech = {}
         for seg in transcript["segments"]:
             spk = seg["speaker"]
-            word_counts[spk] = word_counts.get(spk, 0) + len(seg.get("text", "").split())
-            transcript_speech_quick[spk] = transcript_speech_quick.get(spk, 0.0) + (seg["end_ms"] - seg["start_ms"]) / 1000.0
-        total_speech_sec_quick = sum(transcript_speech_quick.values()) or duration_sec
-        speaker_payload = [
+            transcript_speech[spk] = transcript_speech.get(spk, 0.0) + (seg["end_ms"] - seg["start_ms"]) / 1000.0
+
+        t_step = time.time()
+        logger.info(f"[{session_id}] Step 3: Calibrating baselines...")
+        calibration = CalibrationModule()
+        baselines = {}
+        for speaker_id, features_list in features_by_speaker.items():
+            baseline = calibration.build_baseline(
+                speaker_id, session_id, features_list,
+                transcript_speech_sec=transcript_speech.get(speaker_id, 0.0),
+            )
+            baselines[speaker_id] = baseline
+            logger.info(
+                f"[{session_id}] Baseline for {speaker_id}: "
+                f"F0={baseline.f0_mean:.1f}Hz, rate={baseline.speech_rate_wpm:.0f}wpm, "
+                f"confidence={baseline.calibration_confidence:.2f}"
+            )
+
+        logger.info(f"[{session_id}] Step 3 done: baselines built in {time.time()-t_step:.1f}s")
+
+        # ── Step 4: Run rules ──
+        t_step = time.time()
+        logger.info(f"[{session_id}] Step 4: Running rule engine...")
+        all_signals = []
+
+        for speaker_id, features_list in features_by_speaker.items():
+            baseline = baselines.get(speaker_id)
+            if not baseline:
+                continue
+
+            for features in features_list:
+                # All segments in this window (all speakers) for interruption detection
+                window_all_segments = [
+                    s for s in transcript["segments"]
+                    if s["end_ms"] > features["window_start_ms"]
+                    and s["start_ms"] < features["window_end_ms"]
+                ]
+                signals = rule_engine.evaluate(
+                    features=features,
+                    baseline=baseline,
+                    speaker_id=speaker_id,
+                    transcript_segments=window_all_segments,
+                    profile=_profile,
+                )
+                all_signals.extend(signals)
+
+        # ── Step 4b: Talk time signals (session-level) ──
+        talk_time_signals = VoiceRuleEngine._emit_talk_time_signals(
+            features_by_speaker, duration_sec
+        )
+        all_signals.extend(talk_time_signals)
+        if talk_time_signals:
+            logger.info(f"[{session_id}] Talk time: {len(talk_time_signals)} imbalance signals")
+
+        logger.info(f"[{session_id}] Step 4 done: {len(all_signals)} signals in {time.time()-t_step:.1f}s")
+
+        # ── Step 5: Build summary ──
+        elapsed = time.time() - start_time
+        logger.info(f"[{session_id}] Voice Agent complete: {len(all_signals)} signals in {elapsed:.1f}s")
+
+        summary = _build_summary(all_signals, baselines, transcript)
+
+        # Compute per-speaker word counts from transcript segments
+        word_counts = {}
+        for seg in transcript["segments"]:
+            spk = seg["speaker"]
+            words = len(seg.get("text", "").split())
+            word_counts[spk] = word_counts.get(spk, 0) + words
+
+        total_speech_sec = sum(transcript_speech.values()) or duration_sec
+
+        speaker_data = [
             {
                 "speaker_id": sid,
-                "baseline": None,
-                "signal_count": 0,
-                "talk_time_ms": int(transcript_speech_quick.get(sid, 0.0) * 1000),
-                "talk_time_pct": round(transcript_speech_quick.get(sid, 0.0) / total_speech_sec_quick * 100, 2),
+                "baseline": baselines[sid].to_dict() if sid in baselines else None,
+                "signal_count": len([s for s in all_signals if s.get("speaker_id") == sid]),
+                "talk_time_ms": int(transcript_speech.get(sid, 0.0) * 1000),
+                "talk_time_pct": round(transcript_speech.get(sid, 0.0) / total_speech_sec * 100, 2),
                 "total_words": word_counts.get(sid, 0),
-                "calibration_confidence": 0.0,
+                "calibration_confidence": round(
+                    baselines[sid].calibration_confidence if sid in baselines else 0.0, 4
+                ),
             }
             for sid in speakers
         ]
+
+        signal_dicts = [s if isinstance(s, dict) else s.to_dict() for s in all_signals]
         speaker_embeddings = getattr(transcriber, "_last_speaker_embeddings", None) or None
-        await _publish_voice_outputs(session_id, transcript, speaker_payload, [], {}, speaker_embeddings)
-        await redis_repo.set_agent_status(session_id, "voice", AgentStatusRecord(status="completed", summary_key="summary:voice"))
+        await _publish_voice_outputs(session_id, transcript, speaker_data, signal_dicts, summary, speaker_embeddings)
+        await redis_repo.set_agent_status(
+            session_id,
+            "voice",
+            AgentStatusRecord(status="completed", signal_count=len(signal_dicts), summary_key="summary:voice"),
+        )
         await event_store.append(
             session_id,
-            EventRecord(session_id=session_id, agent="voice", event_type="agent_completed", payload={"signal_count": 0}),
+            EventRecord(session_id=session_id, agent="voice", event_type="agent_completed", payload={"signal_count": len(signal_dicts)}),
         )
-        await lock_manager.release(session_id, "voice", lock_token)
+        completed = True
         return AnalysisResponse(
             session_id=session_id,
             duration_seconds=duration_sec,
-            speakers=speaker_payload,
-            signals=[],
-            summary={},
+            speakers=speaker_data,
+            signals=signal_dicts,
+            summary=summary,
             transcript_segments=transcript["segments"],
             speaker_embeddings=speaker_embeddings,
         )
-
-    # ── Step 2: Extract acoustic features ──
-    t_step = time.time()
-    logger.info(f"[{session_id}] Step 2: Extracting acoustic features...")
-    try:
-        features_by_speaker = feature_extractor.extract_all(
-            str(file_path),
-            transcript["segments"],
-            audio_data=audio_data,
-        )
-    except ValueError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Audio file could not be decoded — it may be empty or corrupted. ({e})",
-        )
-
-    # ── Step 3: Build baselines ──
-    # Compute true speaking time per speaker from transcript (not feature windows)
-    # so calibration confidence isn't penalised by skipped short windows.
-    total_windows = sum(len(v) for v in features_by_speaker.values())
-    logger.info(
-        f"[{session_id}] Step 2 done: {len(features_by_speaker)} speakers, "
-        f"{total_windows} windows extracted in {time.time()-t_step:.1f}s"
-    )
-    transcript_speech = {}
-    for seg in transcript["segments"]:
-        spk = seg["speaker"]
-        transcript_speech[spk] = transcript_speech.get(spk, 0.0) + (seg["end_ms"] - seg["start_ms"]) / 1000.0
-
-    t_step = time.time()
-    logger.info(f"[{session_id}] Step 3: Calibrating baselines...")
-    calibration = CalibrationModule()
-    baselines = {}
-    for speaker_id, features_list in features_by_speaker.items():
-        baseline = calibration.build_baseline(
-            speaker_id, session_id, features_list,
-            transcript_speech_sec=transcript_speech.get(speaker_id, 0.0),
-        )
-        baselines[speaker_id] = baseline
-        logger.info(
-            f"[{session_id}] Baseline for {speaker_id}: "
-            f"F0={baseline.f0_mean:.1f}Hz, rate={baseline.speech_rate_wpm:.0f}wpm, "
-            f"confidence={baseline.calibration_confidence:.2f}"
-        )
-
-    logger.info(f"[{session_id}] Step 3 done: baselines built in {time.time()-t_step:.1f}s")
-
-    # ── Step 4: Run rules ──
-    t_step = time.time()
-    logger.info(f"[{session_id}] Step 4: Running rule engine...")
-    all_signals = []
-
-    for speaker_id, features_list in features_by_speaker.items():
-        baseline = baselines.get(speaker_id)
-        if not baseline:
-            continue
-
-        for features in features_list:
-            # All segments in this window (all speakers) for interruption detection
-            window_all_segments = [
-                s for s in transcript["segments"]
-                if s["end_ms"] > features["window_start_ms"]
-                and s["start_ms"] < features["window_end_ms"]
-            ]
-            signals = rule_engine.evaluate(
-                features=features,
-                baseline=baseline,
-                speaker_id=speaker_id,
-                transcript_segments=window_all_segments,
-                profile=_profile,
-            )
-            all_signals.extend(signals)
-
-    # ── Step 4b: Talk time signals (session-level) ──
-    talk_time_signals = VoiceRuleEngine._emit_talk_time_signals(
-        features_by_speaker, duration_sec
-    )
-    all_signals.extend(talk_time_signals)
-    if talk_time_signals:
-        logger.info(f"[{session_id}] Talk time: {len(talk_time_signals)} imbalance signals")
-
-    logger.info(f"[{session_id}] Step 4 done: {len(all_signals)} signals in {time.time()-t_step:.1f}s")
-
-    # ── Step 5: Build summary ──
-    elapsed = time.time() - start_time
-    logger.info(f"[{session_id}] Voice Agent complete: {len(all_signals)} signals in {elapsed:.1f}s")
-
-    summary = _build_summary(all_signals, baselines, transcript)
-
-    # Compute per-speaker word counts from transcript segments
-    word_counts = {}
-    for seg in transcript["segments"]:
-        spk = seg["speaker"]
-        words = len(seg.get("text", "").split())
-        word_counts[spk] = word_counts.get(spk, 0) + words
-
-    total_speech_sec = sum(transcript_speech.values()) or duration_sec
-
-    speaker_data = [
-        {
-            "speaker_id": sid,
-            "baseline": baselines[sid].to_dict() if sid in baselines else None,
-            "signal_count": len([s for s in all_signals if s.get("speaker_id") == sid]),
-            "talk_time_ms": int(transcript_speech.get(sid, 0.0) * 1000),
-            "talk_time_pct": round(transcript_speech.get(sid, 0.0) / total_speech_sec * 100, 2),
-            "total_words": word_counts.get(sid, 0),
-            "calibration_confidence": round(
-                baselines[sid].calibration_confidence if sid in baselines else 0.0, 4
-            ),
-        }
-        for sid in speakers
-    ]
-
-    signal_dicts = [s if isinstance(s, dict) else s.to_dict() for s in all_signals]
-    speaker_embeddings = getattr(transcriber, "_last_speaker_embeddings", None) or None
-    await _publish_voice_outputs(session_id, transcript, speaker_data, signal_dicts, summary, speaker_embeddings)
-    await redis_repo.set_agent_status(
-        session_id,
-        "voice",
-        AgentStatusRecord(status="completed", signal_count=len(signal_dicts), summary_key="summary:voice"),
-    )
-    await event_store.append(
-        session_id,
-        EventRecord(session_id=session_id, agent="voice", event_type="agent_completed", payload={"signal_count": len(signal_dicts)}),
-    )
-    await lock_manager.release(session_id, "voice", lock_token)
-    return AnalysisResponse(
-        session_id=session_id,
-        duration_seconds=duration_sec,
-        speakers=speaker_data,
-        signals=signal_dicts,
-        summary=summary,
-        transcript_segments=transcript["segments"],
-        speaker_embeddings=speaker_embeddings,
-    )
+    except Exception as exc:
+        if not completed:
+            try:
+                await redis_repo.set_agent_status(
+                    session_id, "voice",
+                    AgentStatusRecord(status="failed", summary_key="summary:voice"),
+                )
+                await event_store.append(
+                    session_id,
+                    EventRecord(
+                        session_id=session_id, agent="voice",
+                        event_type="agent_failed",
+                        payload={"error": str(exc)},
+                    ),
+                )
+            except Exception:
+                logger.warning("failed to write failed-status (agent=voice, session=%s)", session_id, exc_info=True)
+        raise
+    finally:
+        try:
+            await lock_manager.release(session_id, "voice", lock_token)
+        except Exception:
+            logger.warning("lock release failed (agent=voice, session=%s)", session_id, exc_info=True)
 
 
 @app.post("/analyse/upload")

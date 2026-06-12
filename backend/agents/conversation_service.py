@@ -103,148 +103,173 @@ class ConversationAgentService(BaseAgentService):
         if not lock_token:
             raise RuntimeError(f"Conversation agent already processing session {session_id}")
 
-        await self._redis_repo.set_session_state(
-            session_id, SessionStateRecord(status="running", current_step=self.name)
-        )
-        await self._redis_repo.set_agent_status(
-            session_id, self.name,
-            AgentStatusRecord(status="running", summary_key="summary:conversation"),
-        )
-        await self._event_store.append(
-            session_id,
-            EventRecord(
-                session_id=session_id, agent=self.name,
-                event_type="agent_started",
-                payload={"segment_count": len(segments)},
-            ),
-        )
-
-        _profile = None
+        completed = False
         try:
-            from shared.config.content_type_profile import ContentTypeProfile
-            _profile = ContentTypeProfile(content_type)
-        except ImportError:
-            pass
+            await self._redis_repo.set_session_state(
+                session_id, SessionStateRecord(status="running", current_step=self.name)
+            )
+            await self._redis_repo.set_agent_status(
+                session_id, self.name,
+                AgentStatusRecord(status="running", summary_key="summary:conversation"),
+            )
+            await self._event_store.append(
+                session_id,
+                EventRecord(
+                    session_id=session_id, agent=self.name,
+                    event_type="agent_started",
+                    payload={"segment_count": len(segments)},
+                ),
+            )
 
-        logger.info(
-            "[%s] Analysing %d segments, %s speakers, content_type=%s",
-            session_id, len(segments),
-            len(speakers) if speakers else "auto-detect",
-            content_type,
-        )
-
-        # ── Step 1: Feature Extraction ──────────────────────────────────────
-        features = self._extractor.extract_all(segments, speakers or None)
-        per_speaker = features.get("per_speaker", {})
-        per_pair = features.get("per_pair", {})
-        session_features = features.get("session", {})
-        detected_speakers = list(per_speaker.keys())
-
-        logger.info(
-            "[%s] Features: %d speakers, %d turns, %.0fms",
-            session_id, len(detected_speakers),
-            session_features.get("total_turns", 0),
-            session_features.get("total_duration_ms", 0),
-        )
-
-        # ── Step 2: Rule Engine ─────────────────────────────────────────────
-        language_signals = getattr(request, "language_signals", None) or None
-        signals = self._rule_engine.evaluate(
-            features, content_type,
-            language_signals=language_signals,
-            profile=_profile,
-        )
-        logger.info("[%s] Rule engine: %d signals", session_id, len(signals))
-
-        # ── Step 2b: Interrogation-specific conversation rules ──────────────
-        if content_type == "interrogation_video":
+            _profile = None
             try:
-                from services.conversation_agent.interrogation_rules import InterrogationConversationRules
-                interrog_signals = InterrogationConversationRules().evaluate(
-                    segments=segments,
-                    session_id=session_id,
-                )
-                signals.extend(interrog_signals)
-                if interrog_signals:
-                    logger.info(
-                        "[%s] Interrogation conversation rules: %d signals",
-                        session_id, len(interrog_signals),
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "[%s] Interrogation conversation rules failed (non-fatal): %s",
-                    session_id, exc,
-                )
+                from shared.config.content_type_profile import ContentTypeProfile
+                _profile = ContentTypeProfile(content_type)
+            except ImportError:
+                pass
 
-        # ── Step 2c: Interrogator technique classification ───────────────────
-        if content_type == "interrogation_video":
-            try:
-                from services.conversation_agent.interrogation_rules import InterrogatorTechniqueClassifier
-                technique_signals = InterrogatorTechniqueClassifier().evaluate(
-                    segments=segments,
-                    session_id=session_id,
-                )
-                signals.extend(technique_signals)
-                if technique_signals:
-                    technique = technique_signals[0].get("value_text", "unknown")
-                    logger.info(
-                        "[%s] InterrogatorTechnique: %s",
-                        session_id, technique,
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "[%s] Interrogator technique classification failed (non-fatal): %s",
-                    session_id, exc,
-                )
+            logger.info(
+                "[%s] Analysing %d segments, %s speakers, content_type=%s",
+                session_id, len(segments),
+                len(speakers) if speakers else "auto-detect",
+                content_type,
+            )
 
-        # ── Step 3: Build Summary ───────────────────────────────────────────
-        summary = _build_summary(per_speaker, per_pair, session_features, signals, detected_speakers)
+            # ── Step 1: Feature Extraction ──────────────────────────────────────
+            features = self._extractor.extract_all(segments, speakers or None)
+            per_speaker = features.get("per_speaker", {})
+            per_pair = features.get("per_pair", {})
+            session_features = features.get("session", {})
+            detected_speakers = list(per_speaker.keys())
 
-        # ── Step 4: Publish to Redis Streams ────────────────────────────────
-        if _HAS_BUS and signals:
-            try:
-                for sig in signals:
-                    await message_bus.publish_signal(
+            logger.info(
+                "[%s] Features: %d speakers, %d turns, %.0fms",
+                session_id, len(detected_speakers),
+                session_features.get("total_turns", 0),
+                session_features.get("total_duration_ms", 0),
+            )
+
+            # ── Step 2: Rule Engine ─────────────────────────────────────────────
+            language_signals = getattr(request, "language_signals", None) or None
+            signals = self._rule_engine.evaluate(
+                features, content_type,
+                language_signals=language_signals,
+                profile=_profile,
+            )
+            logger.info("[%s] Rule engine: %d signals", session_id, len(signals))
+
+            # ── Step 2b: Interrogation-specific conversation rules ──────────────
+            if content_type == "interrogation_video":
+                try:
+                    from services.conversation_agent.interrogation_rules import InterrogationConversationRules
+                    interrog_signals = InterrogationConversationRules().evaluate(
+                        segments=segments,
                         session_id=session_id,
-                        agent=self.name,
-                        speaker_id=sig.get("speaker_id", "unknown"),
-                        signal_type=sig.get("signal_type", ""),
-                        value=sig.get("value"),
-                        value_text=sig.get("value_text", ""),
-                        confidence=sig.get("confidence", 0.5),
-                        window_start_ms=sig.get("window_start_ms", 0),
-                        window_end_ms=sig.get("window_end_ms", 0),
-                        metadata=sig.get("metadata"),
                     )
-            except Exception as exc:
-                self._warn(f"Redis publish failed (non-fatal): {exc}")
+                    signals.extend(interrog_signals)
+                    if interrog_signals:
+                        logger.info(
+                            "[%s] Interrogation conversation rules: %d signals",
+                            session_id, len(interrog_signals),
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Interrogation conversation rules failed (non-fatal): %s",
+                        session_id, exc,
+                    )
 
-        elapsed = time.time() - t0
-        logger.info("[%s] Conversation analysis complete in %.2fs", session_id, elapsed)
+            # ── Step 2c: Interrogator technique classification ───────────────────
+            if content_type == "interrogation_video":
+                try:
+                    from services.conversation_agent.interrogation_rules import InterrogatorTechniqueClassifier
+                    technique_signals = InterrogatorTechniqueClassifier().evaluate(
+                        segments=segments,
+                        session_id=session_id,
+                    )
+                    signals.extend(technique_signals)
+                    if technique_signals:
+                        technique = technique_signals[0].get("value_text", "unknown")
+                        logger.info(
+                            "[%s] InterrogatorTechnique: %s",
+                            session_id, technique,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Interrogator technique classification failed (non-fatal): %s",
+                        session_id, exc,
+                    )
 
-        await self._redis_repo.write_artifact(
-            session_id, "summary:conversation", {"summary": summary}
-        )
-        await self._redis_repo.set_agent_status(
-            session_id, self.name,
-            AgentStatusRecord(status="completed", signal_count=len(signals), summary_key="summary:conversation"),
-        )
-        await self._event_store.append(
-            session_id,
-            EventRecord(
-                session_id=session_id, agent=self.name,
-                event_type="agent_completed",
-                payload={"signal_count": len(signals)},
-            ),
-        )
-        await self._lock_manager.release(session_id, self.name, lock_token)
+            # ── Step 3: Build Summary ───────────────────────────────────────────
+            summary = _build_summary(per_speaker, per_pair, session_features, signals, detected_speakers)
 
-        return ConversationAnalysisResponse(
-            session_id=session_id,
-            speaker_count=len(detected_speakers),
-            signals=list(signals),
-            summary=summary,
-        )
+            # ── Step 4: Publish to Redis Streams ────────────────────────────────
+            if _HAS_BUS and signals:
+                try:
+                    for sig in signals:
+                        await message_bus.publish_signal(
+                            session_id=session_id,
+                            agent=self.name,
+                            speaker_id=sig.get("speaker_id", "unknown"),
+                            signal_type=sig.get("signal_type", ""),
+                            value=sig.get("value"),
+                            value_text=sig.get("value_text", ""),
+                            confidence=sig.get("confidence", 0.5),
+                            window_start_ms=sig.get("window_start_ms", 0),
+                            window_end_ms=sig.get("window_end_ms", 0),
+                            metadata=sig.get("metadata"),
+                        )
+                except Exception as exc:
+                    self._warn(f"Redis publish failed (non-fatal): {exc}")
+
+            elapsed = time.time() - t0
+            logger.info("[%s] Conversation analysis complete in %.2fs", session_id, elapsed)
+
+            await self._redis_repo.write_artifact(
+                session_id, "summary:conversation", {"summary": summary}
+            )
+            await self._redis_repo.set_agent_status(
+                session_id, self.name,
+                AgentStatusRecord(status="completed", signal_count=len(signals), summary_key="summary:conversation"),
+            )
+            await self._event_store.append(
+                session_id,
+                EventRecord(
+                    session_id=session_id, agent=self.name,
+                    event_type="agent_completed",
+                    payload={"signal_count": len(signals)},
+                ),
+            )
+            completed = True
+
+            return ConversationAnalysisResponse(
+                session_id=session_id,
+                speaker_count=len(detected_speakers),
+                signals=list(signals),
+                summary=summary,
+            )
+        except Exception as exc:
+            if not completed:
+                try:
+                    await self._redis_repo.set_agent_status(
+                        session_id, self.name,
+                        AgentStatusRecord(status="failed", summary_key="summary:conversation"),
+                    )
+                    await self._event_store.append(
+                        session_id,
+                        EventRecord(
+                            session_id=session_id, agent=self.name,
+                            event_type="agent_failed",
+                            payload={"error": str(exc)},
+                        ),
+                    )
+                except Exception:
+                    logger.warning("failed to write failed-status (agent=%s, session=%s)", self.name, session_id, exc_info=True)
+            raise
+        finally:
+            try:
+                await self._lock_manager.release(session_id, self.name, lock_token)
+            except Exception:
+                logger.warning("lock release failed (agent=%s, session=%s)", self.name, session_id, exc_info=True)
 
 
 # ── Module-level helpers (pure functions — identical to conversation_agent/main.py) ──
