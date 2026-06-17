@@ -68,6 +68,48 @@ def _tier_from_fps(fps: float) -> VideoQualityTier:
     return VideoQualityTier.SUPPRESSED
 
 
+# ── Face-quality tiers for resolution-adaptive gate thresholds ────────────────
+# Separate from VideoQualityTier (which is fps-based for interrogation confidence).
+# FaceQualityTier is resolution+sharpness-based and applies to ALL meeting types.
+
+class FaceQualityTier(Enum):
+    PRISTINE = "PRISTINE"   # ≥1440p + sharp — lower pixel floors to admit crisp distant faces
+    STANDARD = "STANDARD"   # ~1080p / neutral — today's behavior exactly (zero regression)
+    DEGRADED = "DEGRADED"   # 720p / soft — raise pixel floors (blurry pixels are unreliable)
+    POOR     = "POOR"       # <720p / blurry — maximum restriction
+
+
+def tier_from_quality(
+    fps: float,
+    frame_h: int,
+    sharpness_norm: float,
+) -> "tuple[VideoQualityTier, FaceQualityTier]":
+    """
+    Return (VideoQualityTier, FaceQualityTier) for a given fps + resolution + sharpness.
+
+    VideoQualityTier: fps-based (existing, for interrogation confidence tables).
+    FaceQualityTier:  resolution-dominant, sharpness-modulated (new, for gate selection).
+
+    sharpness_norm: 0.0 = fully soft (Laplacian var ≤ SOFT threshold),
+                    1.0 = sharp (≥ SHARP threshold). 0.5 = neutral / unknown.
+
+    PRISTINE is only reached at ≥1440p AND sharp (sharpness_norm ≥ 0.5) to prevent
+    upscaled or soft high-res video from being incorrectly treated as high quality.
+    """
+    video_tier = _tier_from_fps(fps)
+
+    if frame_h >= 1440 and sharpness_norm >= 0.5:
+        face_tier = FaceQualityTier.PRISTINE
+    elif frame_h >= 1080:
+        face_tier = FaceQualityTier.STANDARD   # 1080p: no benefit, no penalty regardless of sharpness
+    elif frame_h >= 720:
+        face_tier = FaceQualityTier.DEGRADED
+    else:
+        face_tier = FaceQualityTier.POOR
+
+    return video_tier, face_tier
+
+
 # Signal types that require reliable frontal gaze tracking.
 # Interrogation rooms use corner/ceiling-mounted cameras — oblique angle makes
 # gaze direction unreliable regardless of fps. Suppressed for ALL interrogation sessions.

@@ -110,7 +110,9 @@ class FacialRuleEngine(BaseVideoRuleEngine):
         baselines: dict,
         session_id: str = "",
         meeting_type: str = "general",
+        video_quality: Optional[object] = None,
     ) -> list[dict]:
+        self._video_quality = video_quality
         signals: list[dict] = []
         for speaker_id, windows in windows_by_speaker.items():
             windows = sorted(windows, key=lambda x: x.window_start_ms)
@@ -137,6 +139,12 @@ class FacialRuleEngine(BaseVideoRuleEngine):
                 face_lum = getattr(w, "face_luminance", 0.5)
                 if face_lum < 0.35:
                     conf_mult *= 0.85
+
+                # Quality-adaptive multiplier: small faces admitted by lower pixel gates
+                # have noisier blendshape predictions — ramp confidence down to 0.6 floor.
+                conf_mult *= self._face_quality_mult(
+                    getattr(w, "face_box_area_mean", 1.0) or 1.0, video_quality
+                )
 
                 window_signals: list[dict] = []
                 window_signals += self._rule_emotion(w, facial_bl, speaker_id, conf_mult)

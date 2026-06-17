@@ -625,14 +625,17 @@ class VideoPipeline:
         # ── Step 4: Rule engines ──────────────────────────────────────────────────
         # Facial and Gaze are fully stateless and mutually independent — run in parallel.
         # Body depends on their outputs (extra_signals) — runs strictly after both finish.
+        _vq_for_rules = getattr(self._extractor, "_video_quality", None)
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as rule_pool:
             facial_future = rule_pool.submit(
                 self._facial_rules.evaluate,
                 windows_by_speaker, baselines, session_id, meeting_type,
+                _vq_for_rules,
             )
             gaze_future = rule_pool.submit(
                 self._gaze_rules.evaluate,
                 windows_by_speaker, baselines, session_id, meeting_type,
+                _vq_for_rules,
             )
             facial_signals = facial_future.result()
             gaze_signals   = gaze_future.result()

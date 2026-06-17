@@ -177,6 +177,7 @@ class BodyRuleEngine(BaseVideoRuleEngine):
         session_id: str = "",
         meeting_type: str = "general",
         extra_signals: Optional[list[dict]] = None,
+        video_quality: Optional[object] = None,
     ) -> list[dict]:
         signals: list[dict] = []
         state_machines: dict[str, PostureStateMachine] = {}

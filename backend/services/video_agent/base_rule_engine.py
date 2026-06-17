@@ -26,6 +26,7 @@ class BaseVideoRuleEngine(ABC):
         baselines: dict,
         session_id: str = "",
         meeting_type: str = "general",
+        video_quality: "Optional[object]" = None,
     ) -> list[dict]:
         """
         Run all rules for every speaker.
@@ -35,10 +36,39 @@ class BaseVideoRuleEngine(ABC):
             baselines:          {speaker_id: (FacialBaseline, BodyBaseline, GazeBaseline)}
             session_id:         for logging
             meeting_type:       "sales" | "interview" | "general"
+            video_quality:      VideoQuality descriptor from feature_extractor, or None
 
         Returns:
             list of Signal.to_dict()
         """
+
+    @staticmethod
+    def _face_quality_mult(face_box_area: float, video_quality: "Optional[object]") -> float:
+        """
+        Per-face confidence multiplier for quality-adaptive tracking.
+
+        Only fires in PRISTINE tier (FACE_QUALITY_ADAPTIVE=1, ≥1440p sharp video)
+        where the tracker admits faces down to 90px vs the normal 153px floor.
+        Faces in the newly-admitted 90-153px band are penalized because MediaPipe
+        blendshapes and gaze predictions are less reliable at those sizes.
+
+        Ramp: 0.6 at min_track_area (90px in PRISTINE, admission gate)
+              1.0 at quality_mult_ceiling_area (153px equivalent, standard-reliable)
+        For all non-PRISTINE tiers ceiling == min_track_area → range is empty
+        → always returns 1.0.  Returns 1.0 when video_quality is None (static mode).
+        """
+        if video_quality is None:
+            return 1.0
+        min_area = getattr(video_quality, "min_track_area", 0.0)
+        ceiling  = getattr(video_quality, "quality_mult_ceiling_area", min_area)
+        # Ceiling equals min_area for STANDARD/DEGRADED/POOR — no penalty range.
+        if ceiling <= min_area or face_box_area >= ceiling:
+            return 1.0
+        if face_box_area <= min_area:
+            return 0.6
+        # Linear ramp: 0.6 at the tracker admission floor, 1.0 at the standard floor.
+        t = (face_box_area - min_area) / (ceiling - min_area)
+        return round(0.6 + 0.4 * max(0.0, min(1.0, t)), 4)
 
     def _make_signal(
         self,

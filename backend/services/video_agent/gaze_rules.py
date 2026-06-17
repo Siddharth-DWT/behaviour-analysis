@@ -11,6 +11,7 @@ Research anchors:
 """
 import logging
 import math
+from typing import Optional
 
 from .base_rule_engine import BaseVideoRuleEngine
 from .feature_extractor import WindowFeatures
@@ -51,7 +52,9 @@ class GazeRuleEngine(BaseVideoRuleEngine):
         baselines: dict,
         session_id: str = "",
         meeting_type: str = "general",
+        video_quality: Optional[object] = None,
     ) -> list[dict]:
+        self._video_quality = video_quality
         signals: list[dict] = []
         for speaker_id, windows in windows_by_speaker.items():
             windows = sorted(windows, key=lambda x: x.window_start_ms)
@@ -59,7 +62,7 @@ class GazeRuleEngine(BaseVideoRuleEngine):
                 speaker_id,
                 (None, None, GazeBaseline(speaker_id=speaker_id)),
             )
-            signals += [s for s in self._per_window_rules(windows, gaze_bl, speaker_id) if s is not None]
+            signals += [s for s in self._per_window_rules(windows, gaze_bl, speaker_id, video_quality) if s is not None]
             signals += [s for s in self._rule_screen_contact(windows, gaze_bl, speaker_id) if s is not None]
             signals += [s for s in self._rule_distraction(windows, gaze_bl, speaker_id) if s is not None]
 
@@ -75,6 +78,7 @@ class GazeRuleEngine(BaseVideoRuleEngine):
         windows: list[WindowFeatures],
         bl: GazeBaseline,
         speaker_id: str,
+        video_quality: Optional[object] = None,
     ) -> list[dict]:
         signals: list[dict] = []
         for w in windows:
@@ -85,7 +89,9 @@ class GazeRuleEngine(BaseVideoRuleEngine):
             # calibration_confidence is already enforced by MIN_GAZE_RATE above; using it as
             # a direct multiplier here permanently halves all gaze confidence when baselines
             # are sparse, pushing signals below the 0.30 display threshold.
-            conf_mult = w.face_detection_rate
+            conf_mult = w.face_detection_rate * self._face_quality_mult(
+                getattr(w, "face_box_area_mean", 1.0) or 1.0, video_quality
+            )
 
             window_signals: list[dict] = []
             window_signals += self._rule_gaze_direction(w, bl, speaker_id, conf_mult)

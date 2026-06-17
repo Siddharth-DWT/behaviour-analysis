@@ -39,6 +39,32 @@ logger = logging.getLogger("nexus.video.features")
 
 # ─── Processing constants ──────────────────────────────────────────────────
 TARGET_FPS: int = 5
+# ASD crop rate — independent of TARGET_FPS. LR-ASD was trained at ~25fps.
+# Lower via ASD_TARGET_FPS env var (e.g. 15) if CPU cost on the ASD path is too high.
+ASD_TARGET_FPS: int = int(os.getenv("ASD_TARGET_FPS", "25"))
+
+# Quality-adaptive face tracking — default OFF ("0").
+# When "1", pixel-based thresholds replace fixed normalized gates so 4K/1440p
+# faces are not penalized for occupying a small fraction of a large frame.
+# STANDARD tier reproduces today's constants at 1080p exactly (zero regression).
+FACE_QUALITY_ADAPTIVE: bool = os.getenv("FACE_QUALITY_ADAPTIVE", "1") == "1"
+# Laplacian variance anchors for sharpness scoring on 96×96 grayscale ASD crops.
+FACE_SHARP_VAR_SHARP: float = float(os.getenv("FACE_SHARP_VAR_SHARP", "120"))
+FACE_SHARP_VAR_SOFT:  float = float(os.getenv("FACE_SHARP_VAR_SOFT",  "40"))
+
+# Per-tier pixel thresholds for the four quality-adaptive face gates.
+# STANDARD rows reproduce today's normalized constants at 1080p:
+#   min_track_px=153 → (153/1080)² ≈ 0.0201   (today's area > 0.02)
+#   arcface_px=76    → (76/1080)²  ≈ 0.00494  (today's min_face_area = 0.005)
+#   asd_px=34        → (34/1080)²  ≈ 0.000992 (today's area >= 0.001)
+#   merge_guard_px=76→  76/1080    ≈ 0.0704   (today's face_h < 0.07 guard)
+_FACE_TIER_PIXELS: dict[str, dict[str, int]] = {
+    "PRISTINE": {"min_track_px": 90,  "arcface_px": 60,  "asd_px": 28, "merge_guard_px": 60},
+    "STANDARD": {"min_track_px": 153, "arcface_px": 76,  "asd_px": 34, "merge_guard_px": 76},
+    "DEGRADED": {"min_track_px": 153, "arcface_px": 90,  "asd_px": 40, "merge_guard_px": 90},
+    "POOR":     {"min_track_px": 175, "arcface_px": 110, "asd_px": 48, "merge_guard_px": 110},
+}
+
 WINDOW_MS: int = 2000
 MIN_LIP_SYNC_LINK_SCORE: float = 0.20
 ACTIVE_TILE_MIN_AREA:   float = 0.08   # face_box_area above this → dominant/active-speaker tile
@@ -298,6 +324,85 @@ class FrameSample:
 
 
 @dataclass
+class VideoQuality:
+    """
+    Per-video quality descriptor for quality-adaptive face tracking.
+
+    When FACE_QUALITY_ADAPTIVE=False (default), VideoQuality.default() is used and all
+    derived thresholds reproduce today's normalized gate constants at 1080p exactly.
+    When enabled, thresholds scale with resolution+sharpness so that genuinely crisp
+    4K/1440p faces (small fraction of the frame) are tracked and embedded correctly.
+
+    Gate fields are normalized (fraction of frame) matching the comparisons in the code.
+    Use face_tier_value (str) instead of the enum directly to avoid a module-level import
+    of interrogation_rules — comparisons use `== "PRISTINE"` etc.
+    """
+    frame_w: int
+    frame_h: int
+    fps: float
+    sharpness_norm: float           # 0.0=soft, 1.0=sharp; 0.5=neutral/unknown
+    face_tier_value: str            # "PRISTINE" | "STANDARD" | "DEGRADED" | "POOR"
+    min_track_area: float           # CentroidTracker input gate  (area fraction)
+    arcface_min_area: float         # ArcFace reliable embedding gate (area fraction)
+    asd_min_area: float             # ASD crop buffer gate (area fraction)
+    merge_guard_h: float            # Tiny-face ArcFace merge guard (height fraction)
+    quality_mult_ceiling_area: float  # Upper ramp anchor for _face_quality_mult:
+                                    # PRISTINE → (STANDARD min_track_px / h)^2  (≈(153/h)^2)
+                                    # others   → min_track_area  (range is empty → always 1.0)
+
+    @classmethod
+    def default(cls) -> "VideoQuality":
+        """1080p / neutral — today's gate constants exactly. No behavior change."""
+        px = _FACE_TIER_PIXELS["STANDARD"]
+        h  = 1080
+        mt = (px["min_track_px"] / h) ** 2     # ≈ 0.02007
+        return cls(
+            frame_w=1920, frame_h=h, fps=30.0,
+            sharpness_norm=0.5, face_tier_value="STANDARD",
+            min_track_area=mt,
+            arcface_min_area=(px["arcface_px"]  / h) ** 2,     # ≈ 0.00494
+            asd_min_area=(px["asd_px"]          / h) ** 2,     # ≈ 0.000992
+            merge_guard_h=px["merge_guard_px"]  / h,            # ≈ 0.07037
+            quality_mult_ceiling_area=mt,                        # STANDARD: no penalty range
+        )
+
+    @classmethod
+    def from_frame(
+        cls,
+        frame_w: int,
+        frame_h: int,
+        fps: float,
+        sharpness_norm: float = 0.5,
+    ) -> "VideoQuality":
+        """Build descriptor from resolution + sharpness, then derive pixel thresholds."""
+        from .interrogation_rules import tier_from_quality
+        _, face_tier = tier_from_quality(fps, frame_h, sharpness_norm)
+        tier_val = face_tier.value
+        px = _FACE_TIER_PIXELS[tier_val]
+        std_px = _FACE_TIER_PIXELS["STANDARD"]
+        h  = max(frame_h, 1)
+        mt = (px["min_track_px"] / h) ** 2
+        # PRISTINE admits smaller faces (90px) than STANDARD (153px).
+        # quality_mult_ceiling_area is the STANDARD threshold at this frame height —
+        # faces above it are "standard-reliable"; below it ramps confidence to 0.6.
+        # For non-PRISTINE tiers the gate is the same or larger, so no penalty needed.
+        ceiling = (
+            (std_px["min_track_px"] / h) ** 2
+            if tier_val == "PRISTINE"
+            else mt
+        )
+        return cls(
+            frame_w=frame_w, frame_h=frame_h, fps=fps,
+            sharpness_norm=sharpness_norm, face_tier_value=tier_val,
+            min_track_area=mt,
+            arcface_min_area=(px["arcface_px"]  / h) ** 2,
+            asd_min_area=(px["asd_px"]          / h) ** 2,
+            merge_guard_h=px["merge_guard_px"]  / h,
+            quality_mult_ceiling_area=ceiling,
+        )
+
+
+@dataclass
 class MeetingProfile:
     """
     Configuration bundle derived from pre-scan probe.
@@ -318,6 +423,7 @@ class MeetingProfile:
     tracker_max_disappeared: int = 90       # CentroidTracker expiry; 90 = 18s at 5fps (CLAUDE.md min)
     num_faces_override: Optional[int] = None
     min_detection_confidence: float = 0.15  # Bug 5: 0.30 for room/interrogation (large faces, fewer FPs)
+    face_quality_adaptive_enabled: bool = False  # quality-adaptive tiny-face tracking; overrides env knob when True
 
     @classmethod
     def grid(cls, face_count: int) -> "MeetingProfile":
@@ -3403,8 +3509,9 @@ class VideoFeatureExtractor:
         self._profile_merge_offset        = profile.merge_threshold_offset
         self._profile_static_filter       = profile.static_face_filter_enabled
         self._profile_body_conf_cap       = profile.body_rules_confidence_cap
-        self._profile_tracker_max_disapp  = profile.tracker_max_disappeared
-        self._profile_min_det_conf        = profile.min_detection_confidence
+        self._profile_tracker_max_disapp      = profile.tracker_max_disappeared
+        self._profile_min_det_conf            = profile.min_detection_confidence
+        self._profile_face_quality_enabled    = profile.face_quality_adaptive_enabled
 
         if profile.num_faces_override and profile.num_faces_override > self._num_faces:
             old = self._num_faces
@@ -3651,6 +3758,7 @@ class VideoFeatureExtractor:
 
         video_fps: float = cap.get(cv2.CAP_PROP_FPS) or 30.0
         skip: int = max(1, round(video_fps / self._target_fps))
+        asd_skip: int = max(1, round(video_fps / ASD_TARGET_FPS))
         _total_frames: int = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
         _video_duration_s: float = _total_frames / video_fps if _total_frames else 0.0
         if _total_frames:
@@ -3677,14 +3785,48 @@ class VideoFeatureExtractor:
 
         _tracker_threshold = getattr(self, "_profile_tracker_threshold", 0.10)
         _tracker_max_disapp = getattr(self, "_profile_tracker_max_disapp", 90)
+
+        # Frame dimensions — read here (before tracker + VideoQuality) so all
+        # downstream objects can use pixel-based thresholds from the start.
+        _frame_w: int = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        _frame_h: int = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Quality-adaptive face tracking: pixel-based gates replace the fixed
+        # normalized area > 0.02 gate, scaling with resolution and sharpness.
+        # FACE_QUALITY_ADAPTIVE=0 (default) → VideoQuality.default() which
+        # reproduces today's 1080p constants exactly — zero regression.
+        _adaptive_enabled: bool = (
+            FACE_QUALITY_ADAPTIVE
+            or getattr(self, "_profile_face_quality_enabled", False)
+        )
+        _vq: VideoQuality = (
+            VideoQuality.from_frame(_frame_w, _frame_h, video_fps)
+            if _adaptive_enabled
+            else VideoQuality.default()
+        )
+        _min_track_area: float   = _vq.min_track_area
+        _arcface_min_area: float = _vq.arcface_min_area
+        _asd_min_area: float     = _vq.asd_min_area
+        # Sharpness accumulation — finalize _vq after first 20 ASD crops.
+        # Only runs in adaptive mode; static mode skips finalization entirely.
+        _sharpness_vars: list[float] = []
+        _vq_finalized: bool = not _adaptive_enabled
+
+        if _adaptive_enabled:
+            logger.info(
+                "VideoQuality (initial): tier=%s frame=%dx%d fps=%.1f "
+                "min_track_area=%.4f arcface_min_area=%.5f merge_guard_h=%.4f",
+                _vq.face_tier_value, _frame_w, _frame_h, video_fps,
+                _min_track_area, _arcface_min_area, _vq.merge_guard_h,
+            )
+            if _vq.face_tier_value == "PRISTINE":
+                # Tighter match distance prevents ID inflation on admitted small faces.
+                _tracker_threshold = _tracker_threshold * max(0.6, 90 / 153)
+
         centroid_tracker = CentroidTracker(
             max_disappeared=_tracker_max_disapp,
             match_threshold=_tracker_threshold,
         )
-
-        # Frame dimensions for IdentityVerifier centroid normalisation
-        _frame_w: int = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        _frame_h: int = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         # Identity verifier — periodic ArcFace swap detection during frame loop.
         # Reuses the singleton FaceEmbeddingExtractor already loaded for post-loop
@@ -3695,7 +3837,7 @@ class VideoFeatureExtractor:
             embedder_app=_embedder._app if _embedder.available else None,
             check_interval=_verifier_interval,
             similarity_threshold=0.50,
-            min_face_area=0.005,
+            min_face_area=_arcface_min_area,
         )
 
         # Cache last MediaPipe results — reused for overlay on non-sampled frames
@@ -3736,8 +3878,8 @@ class VideoFeatureExtractor:
         _track_last_ms:  dict[int, int] = {} # track_id → last frame timestamp_ms
         # Tracks stable layout value to detect any layout change (even within-family).
         # When the large tile changes occupant (solo→active_speaker, gallery→active_speaker),
-        # face count stays 1 because the small tile is filtered by area < 0.02 — so the
-        # face count check misses the swap. Any layout value change triggers a force check.
+        # face count stays 1 because the small tile is filtered by area < _min_track_area —
+        # so the face count check misses the swap. Any layout value change triggers a force check.
         _prev_stable_layout: str = ""
 
         # Border detector — platform-native active-speaker signal (Zoom/Meet/Teams).
@@ -3750,6 +3892,9 @@ class VideoFeatureExtractor:
         # is invariant through TrackletSplitter and ArcFace merge.  After the loop,
         # remapped to canonical face IDs and stored as self._face_crops_sequence.
         _crop_by_position: "dict[tuple[int, int, int], np.ndarray]" = {}
+        # Face positions cached from last 5fps detection for intermediate ASD crops.
+        # Each entry: (cx_1000, cy_1000, x_px, y_px, w_px, h_px).
+        _last_asd_face_info: list[tuple[int, int, int, int, int, int]] = []
 
         try:
             while cap.isOpened():
@@ -3847,14 +3992,14 @@ class VideoFeatureExtractor:
                         centroids = [
                             (ff.face_centre_x, ff.face_centre_y)
                             for ff in frame_features_list
-                            if ff.face_detected and ff.face_box_area > 0.02
+                            if ff.face_detected and ff.face_box_area > _min_track_area
                         ]
 
                         if centroids:
                             track_ids = centroid_tracker.update(centroids)
                             ci = 0
                             for ff in frame_features_list:
-                                if ff.face_detected and ff.face_box_area > 0.02 and ci < len(track_ids):
+                                if ff.face_detected and ff.face_box_area > _min_track_area and ci < len(track_ids):
                                     ff.face_index = track_ids[ci]
                                     ci += 1
 
@@ -3906,7 +4051,7 @@ class VideoFeatureExtractor:
                         # through TrackletSplitter; remapped to canonical IDs after loop.
                         import cv2 as _cv2
                         for _ff, (_x, _y, _w, _h) in zip(detected_ffs, face_boxes_px):
-                            if _w > 0 and _h > 0 and _ff.face_box_area >= 0.001:
+                            if _w > 0 and _h > 0 and _ff.face_box_area >= _asd_min_area:
                                 _raw = bgr[_y : _y + _h, _x : _x + _w]
                                 if _raw.size > 0:
                                     _gray = _cv2.cvtColor(_raw, _cv2.COLOR_BGR2GRAY)
@@ -3921,6 +4066,35 @@ class VideoFeatureExtractor:
                                         int(_ff.face_centre_x * 1000),
                                         int(_ff.face_centre_y * 1000),
                                     )] = _crop
+                                    # Sharpness finalization: accumulate Laplacian variance
+                                    # from first 20 ASD crops (zero extra decode cost —
+                                    # _gray is already computed above).
+                                    if not _vq_finalized and len(_sharpness_vars) < 20:
+                                        _sharpness_vars.append(
+                                            float(_cv2.Laplacian(_gray, _cv2.CV_64F).var())
+                                        )
+                                        if len(_sharpness_vars) == 20:
+                                            _raw_s = float(np.mean(_sharpness_vars))
+                                            _sn = min(1.0, max(0.0, (
+                                                _raw_s - FACE_SHARP_VAR_SOFT
+                                            ) / max(FACE_SHARP_VAR_SHARP - FACE_SHARP_VAR_SOFT, 1.0)))
+                                            _vq = VideoQuality.from_frame(_frame_w, _frame_h, video_fps, _sn)
+                                            _min_track_area  = _vq.min_track_area
+                                            _arcface_min_area = _vq.arcface_min_area
+                                            _asd_min_area    = _vq.asd_min_area
+                                            _vq_finalized    = True
+                                            logger.info(
+                                                "VideoQuality finalized: tier=%s sharpness_norm=%.2f (var=%.1f)",
+                                                _vq.face_tier_value, _sn, _raw_s,
+                                            )
+
+                        # Cache face positions so intermediate ASD frames can reuse them.
+                        _last_asd_face_info = [
+                            (int(_ff2.face_centre_x * 1000), int(_ff2.face_centre_y * 1000),
+                             _x2, _y2, _w2, _h2)
+                            for _ff2, (_x2, _y2, _w2, _h2) in zip(detected_ffs, face_boxes_px)
+                            if _w2 > 0 and _h2 > 0 and _ff2.face_box_area >= _asd_min_area
+                        ]
 
                         border_box_idx = border_detector.detect_active_speaker(
                             bgr, face_boxes_px
@@ -3956,6 +4130,22 @@ class VideoFeatureExtractor:
                     except Exception as exc:
                         logger.warning(f"Frame {frame_idx} processing error (skipping): {exc}")
 
+                # Intermediate ASD crops: densify at ASD_TARGET_FPS using cached face boxes.
+                # Box-reuse approach: reuses last 5fps detection positions on intermediate
+                # frames — no full re-detection needed. ASD_TARGET_FPS is env-tunable.
+                if frame_idx % skip != 0 and frame_idx % asd_skip == 0 and _last_asd_face_info:
+                    import cv2 as _cv2
+                    for _cx_1000, _cy_1000, _x, _y, _w, _h in _last_asd_face_info:
+                        _raw = bgr[_y : _y + _h, _x : _x + _w]
+                        if _raw.size > 0:
+                            _gray = _cv2.cvtColor(_raw, _cv2.COLOR_BGR2GRAY)
+                            _crop = _cv2.resize(
+                                _gray,
+                                (LightASDClassifier.CROP_SIZE, LightASDClassifier.CROP_SIZE),
+                                interpolation=_cv2.INTER_AREA,
+                            )
+                            _crop_by_position[(timestamp_ms, _cx_1000, _cy_1000)] = _crop
+
                 # Write overlay on every original-fps frame using cached results
                 if writer is not None and renderer is not None:
                     try:
@@ -3988,6 +4178,9 @@ class VideoFeatureExtractor:
             f"Extracted {len(frames)} frames from {Path(video_path).name} "
             f"({frame_idx} total, every {skip}th frame at video_fps={video_fps:.1f})"
         )
+
+        # Store finalized VideoQuality for rule engines to use as a confidence multiplier.
+        self._video_quality: VideoQuality = _vq
 
         # ── Split contaminated tracks at ArcFace-verified swap points ────────
         # Must run BEFORE best-crop selection so crops are always from clean,
@@ -4044,9 +4237,13 @@ class VideoFeatureExtractor:
                     if not ret:
                         break
                     if read_idx == target_indices[target_pos]:
+                        # Crop floor scales with quality tier: for PRISTINE (4K/1440p crisp)
+                        # faces are proportionally smaller, so lower the floor from 250.
+                        # Formula: arcface_px × 3.3 reproduces exactly 250 for STANDARD@1080p.
+                        _crop_floor = max(int(_vq.arcface_min_area ** 0.5 * _fh * 3.3), 150)
                         for tid in frames_to_read[read_idx]:
                             _, _, cx, cy, area = best_frame_info[tid]
-                            face_size = max(int((area ** 0.5) * _fw * 1.15), 250)
+                            face_size = max(int((area ** 0.5) * _fw * 1.15), _crop_floor)
                             x1 = max(0, int(cx * _fw) - face_size // 2)
                             y1 = max(0, int(cy * _fh) - face_size // 2)
                             x2 = min(_fw, x1 + face_size)
@@ -4165,6 +4362,7 @@ class VideoFeatureExtractor:
                             track_last_ms=_track_last_ms,
                             grid_mode=avg_face_h > _GRID_FACE_H_THRESHOLD,
                             has_cuts=bool(_cut_timestamps),
+                            merge_guard_h=_vq.merge_guard_h,
                         )
                         if _cut_timestamps:
                             canonical = self._cross_shot_merge(
@@ -4328,9 +4526,11 @@ class VideoFeatureExtractor:
 
         # ── Remap face crops to canonical (post-split + post-ArcFace) IDs ──────
         # _crop_by_position uses (ts_ms, cx_int, cy_int) — invariant through splits.
-        # Iterating final `frames` gives us each ff's canonical face_index, allowing
-        # a clean O(F) rebuild without a second VideoCapture pass.
+        # Pass 1: exact key match for 5fps frames. Pass 2: intermediate ASD crops
+        # (when ASD_TARGET_FPS > TARGET_FPS) share cx/cy with their preceding 5fps
+        # frame — matched to the nearest 5fps timestamp for the same face position.
         _face_crops_seq: "dict[int, list[tuple[int, np.ndarray]]]" = defaultdict(list)
+        _matched_pos_keys: set = set()
         for ff in frames:
             if not ff.face_detected or ff.face_box_area < 0.001:
                 continue
@@ -4342,12 +4542,45 @@ class VideoFeatureExtractor:
             crop = _crop_by_position.get(pos_key)
             if crop is not None:
                 _face_crops_seq[ff.face_index].append((ff.timestamp_ms, crop))
+                _matched_pos_keys.add(pos_key)
+
+        if ASD_TARGET_FPS > TARGET_FPS and len(_crop_by_position) > len(_matched_pos_keys):
+            # (cx_1000, cy_1000) → sorted [(ts_ms, canonical_face_index), ...]
+            _pos_to_track: "dict[tuple[int, int], list[tuple[int, int]]]" = defaultdict(list)
+            for ff in frames:
+                if ff.face_detected and ff.face_box_area >= 0.001:
+                    _pos_to_track[(
+                        int(ff.face_centre_x * 1000),
+                        int(ff.face_centre_y * 1000),
+                    )].append((ff.timestamp_ms, ff.face_index))
+            for v in _pos_to_track.values():
+                v.sort()
+            for pos_key, crop in _crop_by_position.items():
+                if pos_key in _matched_pos_keys:
+                    continue
+                ts_ms, cx_1000, cy_1000 = pos_key
+                track_list = _pos_to_track.get((cx_1000, cy_1000))
+                if not track_list:
+                    continue
+                _ts_vals = [t for t, _ in track_list]
+                idx = bisect.bisect_left(_ts_vals, ts_ms)
+                best_cid, best_dist = None, float('inf')
+                for i in (idx - 1, idx):
+                    if 0 <= i < len(track_list):
+                        t, cid = track_list[i]
+                        d = abs(t - ts_ms)
+                        if d < best_dist:
+                            best_dist = d
+                            best_cid = cid
+                if best_cid is not None:
+                    _face_crops_seq[best_cid].append((ts_ms, crop))
+
         for seq in _face_crops_seq.values():
             seq.sort(key=lambda x: x[0])
         self._face_crops_sequence: "dict[int, list[tuple[int, np.ndarray]]]" = dict(
             _face_crops_seq
         )
-        self._last_video_fps: float = float(self._target_fps)
+        self._last_video_fps: float = float(video_fps) / asd_skip
         del _crop_by_position   # free ~9KB × n_face_frames before returning
 
         return frames
@@ -5278,6 +5511,7 @@ class VideoFeatureExtractor:
         track_last_ms: dict[int, float] | None = None,
         grid_mode: bool = False,
         has_cuts: bool = False,
+        merge_guard_h: float = 0.07,
     ) -> dict[int, int]:
         """
         Merge CentroidTracker track_ids that belong to the same physical person.
@@ -5334,7 +5568,7 @@ class VideoFeatureExtractor:
             pq_b = pq.get(tid_b, 1.0)
             pose_discount = max(0.0, (0.7 - min(pq_a, pq_b)) * 0.10)
 
-            if min_fh >= 0.07:
+            if min_fh >= merge_guard_h:
                 # Both normal-sized: standard threshold minus pose discount
                 effective = max(threshold - pose_discount, 0.35)
                 # Cross-tile guard: two faces at clearly different screen positions
@@ -5352,7 +5586,7 @@ class VideoFeatureExtractor:
                         if (grid_mode or not has_cuts) and pos_dist > 0.20:
                             effective = max(effective, 0.80)
                 return effective
-            if max_fh < 0.07:
+            if max_fh < merge_guard_h:
                 # SYMMETRIC: both tiny → strict floor minus small pose discount
                 floor = max(threshold, 0.55) - pose_discount
                 floor = max(floor, 0.40)
@@ -5392,7 +5626,7 @@ class VideoFeatureExtractor:
                 fh_top = face_hs.get(top_tid, 1.0)
                 eff_thresh = _effective_thresh(tid, top_tid, top)
                 pos_note = ""
-                if min(fh_tid, fh_top) < 0.07 and top < eff_thresh and top > 0.35:
+                if min(fh_tid, fh_top) < merge_guard_h and top < eff_thresh and top > 0.35:
                     ca, cb = centroids.get(tid), centroids.get(top_tid)
                     if ca and cb:
                         d = ((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5
