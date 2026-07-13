@@ -136,6 +136,7 @@ class VideoAgentService(BaseAgentService):
         diar_segments: list[dict],
         meeting_type: str = "general",
         num_speakers: int = 2,   # noqa: ARG002 — reserved for future face budget
+        produce_overlay: bool = True,
     ) -> dict:
         """
         Run Phase 1 video analysis; fire-and-forget Phase 2 overlay burn.
@@ -202,17 +203,30 @@ class VideoAgentService(BaseAgentService):
         result_dict = analysis.model_dump()
 
         # ── Phase 2: Overlay burn (fire-and-forget) ──────────────────────────
-        # Wait 15s grace period so AnalysisPipeline.run() can finish registry
-        # matching and write display names to Redis before burn starts.
-        asyncio.create_task(
-            self._burn_overlay(
-                session_id=session_id,
-                src_path=src_path,
-                all_signals=analysis.signals,
-                diar_segments=diar_segments,
-                lock_token=lock_token,
+        # Skipped when produce_overlay=False (retain_media=false requests) — the
+        # annotated video is stored disk, so we avoid producing it AND avoid the
+        # fire-and-forget task holding the source file open (lets the pipeline
+        # delete the raw upload cleanly with no race). Release the lock + emit the
+        # completion event here since _burn_overlay would normally do so.
+        if produce_overlay:
+            # Wait 15s grace period so AnalysisPipeline.run() can finish registry
+            # matching and write display names to Redis before burn starts.
+            asyncio.create_task(
+                self._burn_overlay(
+                    session_id=session_id,
+                    src_path=src_path,
+                    all_signals=analysis.signals,
+                    diar_segments=diar_segments,
+                    lock_token=lock_token,
+                )
             )
-        )
+        else:
+            logger.info("[%s] Overlay burn skipped (retain_media=false)", session_id)
+            await self._event_store.append(
+                session_id,
+                EventRecord(session_id=session_id, agent=self.name, event_type="agent_completed", payload={}),
+            )
+            await self._lock_manager.release(session_id, self.name, lock_token)
 
         return result_dict
 

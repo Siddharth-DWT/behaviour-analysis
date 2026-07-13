@@ -27,7 +27,6 @@ from starlette.responses import Response as StarletteResponse
 from core.auth import get_current_user, require_role, verify_access_token
 from core.database import (
     DEV_ORG_ID,
-    create_session,
     get_alerts,
     get_pool,
     get_report,
@@ -38,10 +37,10 @@ from core.database import (
     insert_transcript_segments,
     list_sessions,
     save_report,
-    update_session_status,
     upsert_speakers,
 )
 from dependencies import get_db_pool, get_pipeline, get_redis_repo
+from api._session_launch import create_session_and_dispatch
 from shared.models.requests import SessionListResponse
 
 logger = logging.getLogger("nexus.backend.sessions")
@@ -194,87 +193,28 @@ async def create_session_endpoint(
     title: str = Form(default=""),
     meeting_type: str = Form(default="sales_call"),
     config: str = Form(default="{}"),
+    retain_media: bool = Form(default=False),
     current_user: dict = Depends(require_role("member")),
     pipeline=Depends(get_pipeline),
     pool=Depends(get_db_pool),
 ):
     """Upload an audio/video file and start the analysis pipeline in the background."""
-    filename = file.filename or "upload.wav"
-    suffix = Path(filename).suffix.lower()
-    allowed = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm", ".mp4"}
-    if suffix not in allowed:
-        raise HTTPException(400, f"Unsupported file type: {suffix}. Allowed: {', '.join(sorted(allowed))}")
-
-    session_id = str(_uuid_module.uuid4())
-    file_name  = f"{session_id}{suffix}"
-    file_path  = UPLOAD_DIR / file_name
-    MAX_FILE_SIZE = 300 * 1024 * 1024
-
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-    file_size = 0
-    with open(file_path, "wb") as f:
-        while chunk := await file.read(1024 * 1024):
-            file_size += len(chunk)
-            if file_size > MAX_FILE_SIZE:
-                f.close()
-                file_path.unlink(missing_ok=True)
-                raise HTTPException(413, "File too large. Maximum size is 300 MB.")
-            f.write(chunk)
-
-    if not title:
-        title = Path(filename).stem
-
     try:
         config_dict = json.loads(config) if config and config.strip() else {}
     except json.JSONDecodeError:
         config_dict = {}
 
-    transcription_config = config_dict.get("transcription", {})
-    analysis_config      = config_dict.get("analysis", {})
-    if not meeting_type or meeting_type == "sales_call":
-        meeting_type = config_dict.get("meeting_type", meeting_type)
-    num_speakers = config_dict.get("num_speakers") or None
-
-    try:
-        _is_lightweight = not analysis_config.get("run_behavioural", True)
-        session = await create_session(
-            title=title,
-            session_type="lightweight" if _is_lightweight else "recording",
-            meeting_type=meeting_type,
-            media_url=str(file_path.resolve()),
-            user_id=current_user["id"],
-            upload_config=config_dict,
-        )
-        session_id = str(session["id"])
-        await update_session_status(session_id, "processing")
-    except Exception as exc:
-        logger.warning("[%s] DB create failed (continuing): %s", session_id, exc)
-
-    _video_path = str(file_path.resolve()) if suffix in {".mp4", ".webm"} else None
-    background_tasks.add_task(
-        pipeline.run,
-        session_id=session_id,
-        file_path=str(file_path.resolve()),
-        video_path=_video_path,
-        meeting_type=meeting_type,
-        num_speakers=num_speakers,
-        pool=pool,
-        org_id=current_user.get("org_id", DEV_ORG_ID),
-        user_id=current_user["id"],
-        run_behavioural=analysis_config.get("run_behavioural", True),
+    return await create_session_and_dispatch(
+        file=file,
         title=title,
-        transcription_config=transcription_config,
-        analysis_config=analysis_config,
-        user_email=current_user.get("email", ""),
+        meeting_type=meeting_type,
+        config_dict=config_dict,
+        current_user=current_user,
+        pipeline=pipeline,
+        pool=pool,
+        background_tasks=background_tasks,
+        retain_media=retain_media,
     )
-
-    return {
-        "session_id":   session_id,
-        "status":       "processing",
-        "title":        title,
-        "meeting_type": meeting_type,
-    }
 
 
 # ── POST /quick-transcribe ─────────────────────────────────────────────────────

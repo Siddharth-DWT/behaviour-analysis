@@ -158,6 +158,9 @@ services:
       - FROM_EMAIL=${FROM_EMAIL:-noreply@yourdomain.com}
       - FROM_NAME=${FROM_NAME:-NEXUS}
       - APP_URL=${APP_URL:-http://localhost:3006}
+      # ── Webhooks (programmatic API v1) ───────────────────────────────────────
+      - WEBHOOK_SIGNING_SECRET=${WEBHOOK_SIGNING_SECRET:-}
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       # ── CORS ─────────────────────────────────────────────────────────────────
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://localhost:3006,http://localhost:5173}
     volumes:

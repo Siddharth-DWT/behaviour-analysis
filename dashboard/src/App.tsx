@@ -11,7 +11,7 @@ import ReportView from "./pages/ReportView";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
 import VerifyEmail from "./pages/VerifyEmail";
-import ProfilePage from "./pages/ProfilePage";
+import SettingsPage from "./pages/SettingsPage";
 import ForgotPasswordPage from "./pages/ForgotPasswordPage";
 import ResetPasswordPage from "./pages/ResetPasswordPage";
 
@@ -132,17 +132,19 @@ export default function App() {
         }
       />
 
-      {/* ── Profile ── */}
+      {/* ── Settings (Profile | API Tokens | Webhooks) ── */}
       <Route
-        path="/profile"
+        path="/settings"
         element={
           <ProtectedRoute>
             <Layout>
-              <ProfilePage />
+              <SettingsPage />
             </Layout>
           </ProtectedRoute>
         }
       />
+      {/* Legacy redirect — /profile → Settings › Profile tab */}
+      <Route path="/profile" element={<Navigate to="/settings?tab=profile" replace />} />
 
 
       {/* Default → Upload */}

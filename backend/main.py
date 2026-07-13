@@ -136,6 +136,7 @@ def create_app() -> FastAPI:
     from api.speakers import router as speakers_router
     from api.team import router as team_router
     from api.chat import router as chat_router
+    from api.v1 import router as v1_router
 
     app.include_router(auth_router,     prefix="/auth")
     app.include_router(sessions_router)
@@ -143,6 +144,7 @@ def create_app() -> FastAPI:
     app.include_router(speakers_router, prefix="/speakers")
     app.include_router(team_router,     prefix="/team")
     app.include_router(chat_router,     prefix="/chat")
+    app.include_router(v1_router,       prefix="/v1")
 
     # ── Health check ─────────────────────────────────────────────────────────
     @app.get("/health", tags=["health"])

@@ -25,6 +25,7 @@ import os
 import time
 import uuid as _uuid_module
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -97,6 +98,8 @@ class AnalysisPipeline:
         transcription_config: Optional[dict] = None,
         analysis_config: Optional[dict] = None,
         user_email: str = "",
+        retain_media: bool = False,
+        callback_url: Optional[str] = None,
     ) -> None:
         """
         Background task: full analysis pipeline.
@@ -149,6 +152,23 @@ class AnalysisPipeline:
                 SessionStateRecord(status="failed", current_step="transcribing", error=str(exc)),
             )
             await self._try_update_status(session_id, "failed", pool=pool)
+            await self._fire_webhook(
+                session_id=session_id,
+                event="analysis.failed",
+                status="failed",
+                callback_url=callback_url,
+                pool=pool,
+                title=title,
+                meeting_type=meeting_type,
+                duration_seconds=0.0,
+                signal_counts={},
+                error=str(exc),
+            )
+            if not retain_media:
+                try:
+                    Path(file_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
             return
 
         duration_seconds = voice_result.get("duration_seconds", 0)
@@ -261,6 +281,7 @@ class AnalysisPipeline:
                     diar_segments=diar_segments_for_video,
                     meeting_type=meeting_type,
                     num_speakers=speaker_count or (num_speakers or 2),
+                    produce_overlay=retain_media,
                 )
                 sigs = result.get("signals", [])
                 face_embs = result.get("face_embeddings", {})
@@ -737,6 +758,35 @@ class AnalysisPipeline:
             session_id,
             SessionStateRecord(status=final_status, current_step="completed"),
         )
+
+        # Completion webhook — signed POST to the caller's callback_url (non-fatal).
+        await self._fire_webhook(
+            session_id=session_id,
+            event="analysis.completed",
+            status=final_status,
+            callback_url=callback_url,
+            pool=pool,
+            title=title,
+            meeting_type=meeting_type,
+            duration_seconds=duration_seconds,
+            signal_counts={
+                "voice": len(voice_signals),
+                "language": len(language_signals),
+                "conversation": len(conversation_signals),
+                "video": len(video_signals),
+                "fusion": len(fusion_signals),
+            },
+        )
+
+        # Ephemeral media: delete the raw upload now that all analysis (and the
+        # skipped overlay burn) is done. media_url was already stored NULL.
+        if not retain_media:
+            try:
+                Path(file_path).unlink(missing_ok=True)
+                logger.info("[%s] Raw media deleted (retain_media=false)", session_id)
+            except Exception as exc:
+                logger.warning("[%s] Raw media delete failed (non-fatal): %s", session_id, exc)
+
         logger.info(
             "[%s] Pipeline finished: status=%s voice=%d lang=%d convo=%d video=%d fusion=%d alerts=%d report=%s",
             session_id, final_status,
@@ -744,6 +794,93 @@ class AnalysisPipeline:
             len(video_signals), len(fusion_signals),
             len(alerts), "yes" if report_generated else "no",
         )
+
+    async def _fire_webhook(
+        self,
+        *,
+        session_id: str,
+        event: str,
+        status: str,
+        callback_url: Optional[str],
+        pool,
+        title: str,
+        meeting_type: str,
+        duration_seconds: float,
+        signal_counts: dict,
+        error: Optional[str] = None,
+    ) -> None:
+        """
+        Fire a signed completion/failure webhook. Non-fatal.
+
+        Delivery resolution:
+          - per-request callback_url present  → deliver to it (global signing secret).
+          - otherwise → deliver to each of the session owner's ACTIVE managed webhook
+            endpoints, signed with that endpoint's own secret.
+        """
+        try:
+            from services.webhook_service import deliver_webhook
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            public_base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+            payload = {
+                "event": event,
+                "session_id": session_id,
+                "status": status,
+                "title": title,
+                "meeting_type": meeting_type,
+                "duration_seconds": duration_seconds,
+                "signal_counts": signal_counts,
+                "results_url": f"{public_base}/v1/sessions/{session_id}" if public_base else None,
+                "sent_at": now_iso,
+            }
+            if error is not None:
+                payload["error"] = error
+
+            # Read the owning user + api_key_id (for audit) from the session row.
+            key_id = None
+            owner_user_id = None
+            try:
+                row = await pool.fetchrow(
+                    "SELECT user_id, upload_config FROM sessions WHERE id = $1",
+                    _uuid_module.UUID(session_id),
+                )
+                if row:
+                    owner_user_id = str(row["user_id"]) if row["user_id"] else None
+                    if row["upload_config"]:
+                        cfg = row["upload_config"]
+                        if isinstance(cfg, str):
+                            cfg = json.loads(cfg)
+                        key_id = (cfg.get("webhook") or {}).get("api_key_id")
+            except Exception:
+                pass
+
+            # 1) Per-request callback_url — global signing secret.
+            if callback_url:
+                await deliver_webhook(
+                    session_id=session_id, event=event, payload=payload,
+                    callback_url=callback_url, key_id=key_id, pool=pool,
+                )
+                return
+
+            # 2) Fallback: the owner's managed endpoints — per-endpoint secret.
+            if not owner_user_id:
+                return
+            from core.webhook_endpoints import (
+                get_active_endpoints_for_user, mark_delivered,
+            )
+            endpoints = await get_active_endpoints_for_user(owner_user_id)
+            for ep in endpoints:
+                await deliver_webhook(
+                    session_id=session_id, event=event, payload=payload,
+                    callback_url=ep["url"], key_id=key_id, pool=pool,
+                    secret=ep["secret"],
+                )
+                try:
+                    await mark_delivered(ep["id"])
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("[%s] Webhook fire failed (non-fatal): %s", session_id, exc)
 
     async def run_quick_transcribe(
         self,

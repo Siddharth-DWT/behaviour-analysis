@@ -129,6 +129,24 @@ async def get_current_user(request: Request) -> dict:
         raise HTTPException(401, "Missing or invalid Authorization header")
 
     token = auth_header[7:]
+
+    # ── API-key branch: 'Bearer nxs_…' resolves via the API-key resolver and
+    # returns the SAME user dict shape, so require_role() / all routes work as-is. ──
+    if token.startswith("nxs_"):
+        from core.api_keys import resolve_api_key, DEFAULT_RATE_LIMIT
+        from core.rate_limit import enforce_rate_limit
+
+        api_user = await resolve_api_key(token)
+        if api_user is None:
+            raise HTTPException(401, "Invalid or revoked API key")
+        await enforce_rate_limit(
+            request,
+            api_user["_api_key_id"],
+            api_user.get("_rate_limit_per_min", DEFAULT_RATE_LIMIT),
+        )
+        return api_user
+
+    # ── JWT branch (unchanged) ──
     payload = verify_access_token(token)
 
     from core.database import get_pool  # updated import for monolith

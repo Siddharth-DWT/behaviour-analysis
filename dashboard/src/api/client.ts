@@ -486,6 +486,113 @@ export async function resendVerification(email: string): Promise<{ message: stri
   return request("/auth/resend-verification", { method: "POST", body: JSON.stringify({ email }) });
 }
 
+// ── API Tokens ──
+
+export interface ApiKey {
+  id: string;
+  name: string;
+  masked_key: string;
+  key_prefix: string;
+  key_last4: string;
+  rate_limit_per_min: number;
+  request_count: number;
+  role: string | null;
+  last_used_at: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  active: boolean;
+  created_at: string | null;
+}
+
+export interface ApiKeyCreated {
+  id: string;
+  name: string;
+  key: string; // plaintext — shown once
+  key_prefix: string;
+  last4: string;
+  rate_limit_per_min: number;
+  expires_at: string | null;
+  created_at: string | null;
+}
+
+export async function listApiKeys(): Promise<{ api_keys: ApiKey[] }> {
+  return request("/v1/api-keys");
+}
+
+export async function createApiKey(
+  name: string, rate_limit_per_min?: number, expires_in_days?: number
+): Promise<ApiKeyCreated> {
+  return request("/v1/api-keys", {
+    method: "POST",
+    body: JSON.stringify({ name, rate_limit_per_min, expires_in_days }),
+  });
+}
+
+export async function revokeApiKey(id: string): Promise<{ id: string; revoked: boolean }> {
+  return request(`/v1/api-keys/${id}`, { method: "DELETE" });
+}
+
+// ── Webhooks ──
+
+export interface WebhookEndpoint {
+  id: string;
+  url: string;
+  description: string | null;
+  active: boolean;
+  created_at: string | null;
+  last_delivery_at: string | null;
+}
+
+export interface WebhookEndpointCreated extends WebhookEndpoint {
+  secret: string; // whsec_… — shown once
+}
+
+export interface WebhookDelivery {
+  id: string;
+  session_id: string | null;
+  event: string;
+  callback_url: string;
+  attempts: number;
+  delivered: boolean;
+  last_status: number | null;
+  last_error: string | null;
+  created_at: string | null;
+  delivered_at: string | null;
+}
+
+export async function listWebhooks(): Promise<{ webhooks: WebhookEndpoint[] }> {
+  return request("/v1/webhooks");
+}
+
+export async function createWebhook(
+  url: string, description?: string
+): Promise<WebhookEndpointCreated> {
+  return request("/v1/webhooks", {
+    method: "POST",
+    body: JSON.stringify({ url, description }),
+  });
+}
+
+export async function updateWebhook(
+  id: string, patch: { url?: string; active?: boolean; description?: string }
+): Promise<WebhookEndpoint> {
+  return request(`/v1/webhooks/${id}`, { method: "PATCH", body: JSON.stringify(patch) });
+}
+
+export async function deleteWebhook(id: string): Promise<{ id: string; deleted: boolean }> {
+  return request(`/v1/webhooks/${id}`, { method: "DELETE" });
+}
+
+export async function rotateWebhookSecret(id: string): Promise<{ id: string; secret: string }> {
+  return request(`/v1/webhooks/${id}/rotate-secret`, { method: "POST" });
+}
+
+export async function listWebhookDeliveries(
+  limit = 50
+): Promise<{ deliveries: WebhookDelivery[]; count: number }> {
+  return request(`/v1/webhook-deliveries?limit=${limit}`);
+}
+
 // ── Speaker Registry ──
 
 export interface SpeakerRegistry {

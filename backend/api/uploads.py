@@ -200,6 +200,11 @@ async def complete_chunked_upload(
     meeting_type         = session.get("meeting_type") or config_dict.get("meeting_type", "sales_call")
     title                = session.get("title") or Path(session["filename"]).stem
     num_speakers         = config_dict.get("num_speakers") or None
+    # Media retention defaults to False (ephemeral) — consistent with /sessions
+    # and /v1/analyze. When False the pipeline deletes the raw file after
+    # analysis, so media_url must be NULL to avoid a dangling pointer.
+    retain_media         = bool(config_dict.get("retain_media", False))
+    config_dict["retain_media"] = retain_media
 
     try:
         _is_lightweight = not analysis_config.get("run_behavioural", True)
@@ -207,7 +212,7 @@ async def complete_chunked_upload(
             title=title,
             session_type="lightweight" if _is_lightweight else "recording",
             meeting_type=meeting_type,
-            media_url=str(final_path.resolve()),
+            media_url=str(final_path.resolve()) if retain_media else None,
             user_id=current_user["id"],
             upload_config=config_dict,
         )
@@ -232,6 +237,7 @@ async def complete_chunked_upload(
         transcription_config=transcription_config,
         analysis_config=analysis_config,
         user_email=current_user.get("email", ""),
+        retain_media=retain_media,
     )
 
     return {

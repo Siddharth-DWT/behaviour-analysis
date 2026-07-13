@@ -8,7 +8,7 @@ import {
   Sun,
   Moon,
   LogOut,
-  User,
+  Settings,
   ChevronDown,
   UploadCloud,
 } from "lucide-react";
@@ -18,6 +18,7 @@ import { useAuth } from "../contexts/AuthContext";
 const NAV_ITEMS = [
   { path: "/upload", label: "Upload", icon: UploadCloud },
   { path: "/sessions", label: "Sessions", icon: FolderOpen },
+  { path: "/settings", label: "Settings", icon: Settings },
 ];
 
 function UserInitials({ name }: { name: string }) {
@@ -175,11 +176,11 @@ export default function Layout({ children }: { children: ReactNode }) {
                     </div>
 
                     <button
-                      onClick={() => { setMenuOpen(false); navigate("/profile"); }}
+                      onClick={() => { setMenuOpen(false); navigate("/settings"); }}
                       className="flex w-full items-center gap-2 px-3 py-2 text-xs text-nexus-text-secondary hover:bg-nexus-surface-hover"
                     >
-                      <User className="h-3.5 w-3.5" />
-                      Profile
+                      <Settings className="h-3.5 w-3.5" />
+                      Settings
                     </button>
                     <div className="border-t border-nexus-border" />
 
