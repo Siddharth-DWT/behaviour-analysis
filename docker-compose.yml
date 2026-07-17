@@ -161,6 +161,7 @@ services:
       # ── Webhooks (programmatic API v1) ───────────────────────────────────────
       - WEBHOOK_SIGNING_SECRET=${WEBHOOK_SIGNING_SECRET:-}
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - WEBHOOK_MEDIA_BUFFER_HOURS=${WEBHOOK_MEDIA_BUFFER_HOURS:-24}
       # ── CORS ─────────────────────────────────────────────────────────────────
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://localhost:3006,http://localhost:5173}
     volumes:

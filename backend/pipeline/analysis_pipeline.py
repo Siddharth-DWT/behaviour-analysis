@@ -25,10 +25,15 @@ import os
 import time
 import uuid as _uuid_module
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+from core.database import (
+    clear_media_buffers,
+    list_expired_media_buffers,
+    set_session_media_buffer,
+)
 from shared.models.requests import (
     ConversationAnalysisRequest,
     FusionAnalyseRequest,
@@ -51,6 +56,7 @@ logger = logging.getLogger("nexus.backend.pipeline")
 _UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/recordings"))
 _RECORDING_RETENTION_DAYS = int(os.getenv("RECORDING_RETENTION_DAYS", "3"))
 _SESSION_FACE_LOCK_MIN_SCORE = float(os.getenv("SESSION_FACE_LOCK_MIN_SCORE", "0.10"))
+_WEBHOOK_MEDIA_BUFFER_HOURS = float(os.getenv("WEBHOOK_MEDIA_BUFFER_HOURS", "24"))
 
 
 class AnalysisPipeline:
@@ -100,6 +106,7 @@ class AnalysisPipeline:
         user_email: str = "",
         retain_media: bool = False,
         callback_url: Optional[str] = None,
+        include_media_in_webhook: bool = False,
     ) -> None:
         """
         Background task: full analysis pipeline.
@@ -754,10 +761,31 @@ class AnalysisPipeline:
                 logger.warning("[%s] Completion email failed (non-fatal): %s", session_id, exc)
 
         _cleanup_old_recordings()
+        await _cleanup_expired_media_buffers()
         await self._redis_repo.set_session_state(
             session_id,
             SessionStateRecord(status=final_status, current_step="completed"),
         )
+
+        # include_media_in_webhook: reference the file in the completion payload.
+        # For retain_media=True it's already kept long-term (RECORDING_RETENTION_DAYS
+        # sweep governs it). For retain_media=False, buffer it on disk for
+        # WEBHOOK_MEDIA_BUFFER_HOURS instead of deleting immediately below.
+        media_available = False
+        media_expires_at: Optional[datetime] = None
+        if include_media_in_webhook:
+            if retain_media:
+                media_available = True
+            else:
+                media_expires_at = datetime.now(timezone.utc) + timedelta(
+                    hours=_WEBHOOK_MEDIA_BUFFER_HOURS
+                )
+                await set_session_media_buffer(
+                    session_id,
+                    media_url=str(Path(file_path).resolve()),
+                    expires_at=media_expires_at,
+                )
+                media_available = True
 
         # Completion webhook — signed POST to the caller's callback_url (non-fatal).
         await self._fire_webhook(
@@ -776,11 +804,15 @@ class AnalysisPipeline:
                 "video": len(video_signals),
                 "fusion": len(fusion_signals),
             },
+            media_available=media_available,
+            media_expires_at=media_expires_at,
         )
 
         # Ephemeral media: delete the raw upload now that all analysis (and the
-        # skipped overlay burn) is done. media_url was already stored NULL.
-        if not retain_media:
+        # skipped overlay burn) is done — unless it's being buffered for the
+        # webhook (media_expires_at set above), in which case
+        # _cleanup_expired_media_buffers() removes it once that window elapses.
+        if not retain_media and media_expires_at is None:
             try:
                 Path(file_path).unlink(missing_ok=True)
                 logger.info("[%s] Raw media deleted (retain_media=false)", session_id)
@@ -808,6 +840,8 @@ class AnalysisPipeline:
         duration_seconds: float,
         signal_counts: dict,
         error: Optional[str] = None,
+        media_available: bool = False,
+        media_expires_at: Optional[datetime] = None,
     ) -> None:
         """
         Fire a signed completion/failure webhook. Non-fatal.
@@ -831,6 +865,11 @@ class AnalysisPipeline:
                 "duration_seconds": duration_seconds,
                 "signal_counts": signal_counts,
                 "results_url": f"{public_base}/v1/sessions/{session_id}" if public_base else None,
+                "media_url": (
+                    f"{public_base}/v1/sessions/{session_id}/media"
+                    if (media_available and public_base) else None
+                ),
+                "media_expires_at": media_expires_at.isoformat() if media_expires_at else None,
                 "sent_at": now_iso,
             }
             if error is not None:
@@ -1222,3 +1261,25 @@ def _cleanup_old_recordings() -> None:
                 pass
     if removed:
         logger.info("Cleaned up %d recording(s) older than %d days", removed, _RECORDING_RETENTION_DAYS)
+
+
+async def _cleanup_expired_media_buffers() -> None:
+    """
+    Delete files whose include_media_in_webhook buffer window has elapsed and
+    null the DB pointer. Runs opportunistically once per completed pipeline run,
+    same cadence as _cleanup_old_recordings().
+    """
+    expired = await list_expired_media_buffers()
+    if not expired:
+        return
+    deleted_ids = []
+    for row in expired:
+        try:
+            if row["media_url"]:
+                Path(row["media_url"]).unlink(missing_ok=True)
+            deleted_ids.append(row["id"])
+        except OSError:
+            pass
+    if deleted_ids:
+        await clear_media_buffers(deleted_ids)
+        logger.info("Cleaned up %d buffered media file(s) past their webhook window", len(deleted_ids))

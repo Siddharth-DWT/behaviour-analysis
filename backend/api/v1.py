@@ -12,11 +12,13 @@ read endpoints enforce that ownership (404 on mismatch — no existence leak).
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 from fastapi import (
     APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile,
 )
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from core.auth import get_current_user, require_role
@@ -29,6 +31,7 @@ from core.webhook_endpoints import (
 )
 from core.database import DEV_ORG_ID, get_report, get_session, get_signals
 from api._session_launch import create_session_and_dispatch
+from api.sessions import _VIDEO_MIME_TYPES
 from services.webhook_service import validate_callback_url
 from dependencies import get_db_pool, get_pipeline
 
@@ -105,6 +108,7 @@ async def analyze(
     config: str = Form(default="{}"),
     callback_url: Optional[str] = Form(default=None),
     retain_media: bool = Form(default=False),
+    include_media_in_webhook: bool = Form(default=False),
     current_user: dict = Depends(require_role("member")),
     pipeline=Depends(get_pipeline),
     pool=Depends(get_db_pool),
@@ -112,6 +116,16 @@ async def analyze(
     """
     Submit an audio/video file for analysis. Returns immediately with a session_id;
     poll GET /v1/sessions/{id} or register a callback_url for a signed webhook.
+
+    include_media_in_webhook: buffer the raw file on disk past pipeline completion
+    (even when retain_media=false) and include a media_url in the completion
+    webhook payload, fetchable via GET /v1/sessions/{id}/media. See
+    WEBHOOK_MEDIA_BUFFER_HOURS for how long the buffer window lasts.
+
+    retain_media on an audio-only file submitted here is kept indefinitely
+    (not swept after RECORDING_RETENTION_DAYS) — see create_session_and_dispatch's
+    from_api/is_permanent_audio handling. Video files still follow the normal
+    3-day sweep.
     """
     if callback_url:
         validate_callback_url(callback_url)  # SSRF guard at submit time
@@ -132,6 +146,8 @@ async def analyze(
         background_tasks=background_tasks,
         callback_url=callback_url,
         retain_media=retain_media,
+        include_media_in_webhook=include_media_in_webhook,
+        from_api=True,
     )
 
     await record_usage(
@@ -213,6 +229,31 @@ async def v1_get_report(
     if not report:
         raise HTTPException(404, "No report found for this session")
     return {"session_id": session_id, "report": report}
+
+
+@router.get("/sessions/{session_id}/media")
+async def v1_get_session_media(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Download the session's raw audio/video file, scoped to the token's owner.
+
+    Only available when the file is still on disk: retain_media=true sessions
+    (until RECORDING_RETENTION_DAYS), or include_media_in_webhook=true sessions
+    within their WEBHOOK_MEDIA_BUFFER_HOURS window. 404 otherwise.
+    """
+    session = await _owned_session(session_id, current_user)
+    media_url = session.get("media_url")
+    if not media_url:
+        raise HTTPException(404, "No media file for this session")
+
+    media_path = Path(media_url)
+    if not media_path.exists():
+        raise HTTPException(404, "Media file not found on disk")
+
+    media_type = _VIDEO_MIME_TYPES.get(media_path.suffix.lower(), "application/octet-stream")
+    return FileResponse(str(media_path), media_type=media_type, headers={"Accept-Ranges": "bytes"})
 
 
 # ── Managed webhook endpoints (JWT auth) ────────────────────────────────────

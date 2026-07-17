@@ -193,7 +193,11 @@ async def create_session_endpoint(
     title: str = Form(default=""),
     meeting_type: str = Form(default="sales_call"),
     config: str = Form(default="{}"),
-    retain_media: bool = Form(default=False),
+    # Dashboard uploads default to keeping the file (governed by the normal
+    # RECORDING_RETENTION_DAYS sweep, ~3 days) — this restores the original
+    # pre-API behavior, where every upload was kept until that sweep caught it.
+    # Only the programmatic API (/v1/analyze) defaults to immediate deletion.
+    retain_media: bool = Form(default=True),
     current_user: dict = Depends(require_role("member")),
     pipeline=Depends(get_pipeline),
     pool=Depends(get_db_pool),

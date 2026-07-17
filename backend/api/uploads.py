@@ -200,11 +200,16 @@ async def complete_chunked_upload(
     meeting_type         = session.get("meeting_type") or config_dict.get("meeting_type", "sales_call")
     title                = session.get("title") or Path(session["filename"]).stem
     num_speakers         = config_dict.get("num_speakers") or None
-    # Media retention defaults to False (ephemeral) — consistent with /sessions
-    # and /v1/analyze. When False the pipeline deletes the raw file after
-    # analysis, so media_url must be NULL to avoid a dangling pointer.
-    retain_media         = bool(config_dict.get("retain_media", False))
+    # Dashboard uploads default to keeping the file (governed by the normal
+    # RECORDING_RETENTION_DAYS sweep, ~3 days) — matches /sessions and restores
+    # the original pre-API behavior. Only /v1/analyze (programmatic API)
+    # defaults to immediate deletion.
+    retain_media         = bool(config_dict.get("retain_media", True))
     config_dict["retain_media"] = retain_media
+    # include_media_in_webhook is a programmatic-API-only feature (see /v1/analyze
+    # in api/v1.py) — deliberately NOT exposed on this dashboard upload path, so
+    # dashboard-originated sessions always behave exactly as before that feature
+    # was added (immediate delete when retain_media=false, no webhook media buffer).
 
     try:
         _is_lightweight = not analysis_config.get("run_behavioural", True)

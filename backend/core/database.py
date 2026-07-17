@@ -342,6 +342,53 @@ async def update_session_status(
 
 
 # ─────────────────────────────────────────────────────────
+# WEBHOOK MEDIA BUFFER
+# ─────────────────────────────────────────────────────────
+# Short-lived staging window for include_media_in_webhook=true sessions that
+# are NOT otherwise retained (retain_media=false) — see
+# pipeline/analysis_pipeline.py _fire_webhook / _cleanup_expired_media_buffers.
+
+
+async def set_session_media_buffer(
+    session_id: str,
+    media_url: str,
+    expires_at: datetime,
+    org_id: str = DEV_ORG_ID,
+) -> None:
+    """Point media_url at the buffered file and set its short-lived expiry."""
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE sessions SET media_url = $3, media_buffer_expires_at = $4 "
+        "WHERE id = $1 AND org_id = $2",
+        session_id, org_id, media_url, expires_at,
+    )
+
+
+async def list_expired_media_buffers() -> list[dict]:
+    """Sessions whose webhook media-buffer window has elapsed. Returns [{id, media_url}]."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT id, media_url FROM sessions
+        WHERE media_buffer_expires_at IS NOT NULL AND media_buffer_expires_at < NOW()
+        """
+    )
+    return [{"id": str(r["id"]), "media_url": r["media_url"]} for r in rows]
+
+
+async def clear_media_buffers(session_ids: list[str]) -> None:
+    """Null media_url + media_buffer_expires_at once a buffered file has been deleted."""
+    if not session_ids:
+        return
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE sessions SET media_url = NULL, media_buffer_expires_at = NULL "
+        "WHERE id = ANY($1::uuid[])",
+        [_uuid.UUID(sid) for sid in session_ids],
+    )
+
+
+# ─────────────────────────────────────────────────────────
 # SPEAKERS
 # ─────────────────────────────────────────────────────────
 

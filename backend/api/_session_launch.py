@@ -17,6 +17,10 @@ from core.database import DEV_ORG_ID, create_session, update_session_status
 logger = logging.getLogger("nexus.backend.session_launch")
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/recordings"))
+# _cleanup_old_recordings() (pipeline/analysis_pipeline.py) only scans UPLOAD_DIR's
+# direct children — it never recurses into subdirectories — so anything stored
+# under here is naturally exempt from the RECORDING_RETENTION_DAYS sweep.
+PERMANENT_AUDIO_DIR = UPLOAD_DIR / "permanent"
 ALLOWED_SUFFIXES = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm", ".mp4"}
 VIDEO_SUFFIXES = {".mp4", ".webm"}
 MAX_FILE_SIZE = 300 * 1024 * 1024
@@ -34,6 +38,8 @@ async def create_session_and_dispatch(
     background_tasks,
     callback_url: str | None = None,
     retain_media: bool = False,
+    include_media_in_webhook: bool = False,
+    from_api: bool = False,
 ) -> dict:
     """
     Validate + persist the upload, create the DB session, and dispatch the
@@ -42,6 +48,18 @@ async def create_session_and_dispatch(
     retain_media=False: media_url is stored NULL (the pipeline still receives the
     real file_path argument), the overlay burn is skipped, and the raw file is
     deleted when the pipeline finishes — see analysis_pipeline / video_service.
+
+    include_media_in_webhook=True: even when retain_media=False, the pipeline
+    buffers the raw file on disk for WEBHOOK_MEDIA_BUFFER_HOURS after completion
+    (instead of deleting it immediately) and includes a media_url in the
+    completion webhook payload — see analysis_pipeline._fire_webhook.
+
+    from_api=True (set only by POST /v1/analyze — never by the dashboard's
+    POST /sessions or POST /uploads/complete): combined with retain_media=True
+    on an audio-only file, stores it under PERMANENT_AUDIO_DIR instead of
+    UPLOAD_DIR, so it's kept indefinitely instead of being swept after
+    RECORDING_RETENTION_DAYS. Video files are unaffected — same 3-day sweep as
+    always, regardless of caller.
     """
     filename = file.filename or "upload.wav"
     suffix = Path(filename).suffix.lower()
@@ -51,11 +69,14 @@ async def create_session_and_dispatch(
             f"Unsupported file type: {suffix}. Allowed: {', '.join(sorted(ALLOWED_SUFFIXES))}",
         )
 
+    is_permanent_audio = from_api and retain_media and suffix not in VIDEO_SUFFIXES
+    target_dir = PERMANENT_AUDIO_DIR if is_permanent_audio else UPLOAD_DIR
+
     session_id = str(_uuid_module.uuid4())
     file_name = f"{session_id}{suffix}"
-    file_path = UPLOAD_DIR / file_name
+    file_path = target_dir / file_name
 
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    target_dir.mkdir(parents=True, exist_ok=True)
 
     file_size = 0
     with open(file_path, "wb") as f:
@@ -81,6 +102,22 @@ async def create_session_and_dispatch(
 
     transcription_config = config_dict.get("transcription", {})
     analysis_config = config_dict.get("analysis", {})
+
+    # API-only: a transcript-only request (run_behavioural=false) defaults to
+    # the Parakeet backend instead of the normal AssemblyAI-first auto cascade
+    # (see services/voiceAgent/transcriber.py) — faster/cheaper when full
+    # behavioural analysis isn't needed. Never applied from the dashboard, and
+    # never overrides an explicit model_preference the caller already set. If
+    # Parakeet isn't configured (PARAKEET_URL unset), the transcriber's own
+    # fallback logs a warning and uses the normal auto cascade instead.
+    if (
+        from_api
+        and not analysis_config.get("run_behavioural", True)
+        and not transcription_config.get("model_preference")
+    ):
+        transcription_config = {**transcription_config, "model_preference": "parakeet"}
+        config_dict["transcription"] = transcription_config
+
     if not meeting_type or meeting_type == "sales_call":
         meeting_type = config_dict.get("meeting_type", meeting_type)
     num_speakers = config_dict.get("num_speakers") or None
@@ -120,6 +157,7 @@ async def create_session_and_dispatch(
         user_email=current_user.get("email", ""),
         retain_media=retain_media,
         callback_url=callback_url,
+        include_media_in_webhook=include_media_in_webhook,
     )
 
     return {
