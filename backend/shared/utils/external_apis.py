@@ -688,7 +688,7 @@ class DiarizeClient:
 
 class AssemblyAIClient:
     """
-    Transcription + speaker diarization via AssemblyAI Universal-3-Pro.
+    Transcription + speaker diarization via AssemblyAI Universal-3.5 Pro.
 
     AssemblyAI provides both transcription and diarization in a single
     async API call, replacing both Whisper and Deepgram/pyannote.
@@ -769,7 +769,7 @@ class AssemblyAIClient:
         payload = {
             "audio_url": audio_url,
             "speaker_labels": True,
-            "speech_models": ["universal-3-pro"],
+            "speech_models": ["universal-3-5-pro"],
         }
 
         with httpx.Client(timeout=self.timeout) as client:
@@ -824,7 +824,7 @@ class AssemblyAIClient:
             {
                 "duration_seconds": float,
                 "backend": "assemblyai",
-                "model": "universal-3-pro",
+                "model": "universal-3-5-pro",
                 "segments": [
                     {
                         "speaker": "Speaker_0",
@@ -890,7 +890,7 @@ class AssemblyAIClient:
         return {
             "duration_seconds": duration,
             "backend": "assemblyai",
-            "model": "universal-3-pro",
+            "model": "universal-3-5-pro",
             "segments": segments,
             "num_speakers": len(speakers),
             "speakers": speakers,

@@ -1,6 +1,6 @@
 """
 NEXUS Shared — AssemblyAI Client
-Single API call for transcription + diarization (Universal-3 Pro).
+Single API call for transcription + diarization (Universal-3.5 Pro).
 
 AssemblyAI transcribes first, then diarizes — both in one request.
 Returns transcript with speaker labels and word-level timestamps.
@@ -72,7 +72,7 @@ class AssemblyAIClient:
                 "segments": [{speaker, start_ms, end_ms, text, words}],
                 "speakers": [str],
                 "backend": "assemblyai",
-                "model": "universal-3-pro",
+                "model": "universal-3-5-pro",
                 "processing_time": float,
             }
         """
@@ -86,7 +86,7 @@ class AssemblyAIClient:
         logger.info(f"AssemblyAI: uploading {audio_file.name}...")
         upload_url = self._upload(audio_path)
 
-        # Step 2: Build transcript request for Universal-3 Pro.
+        # Step 2: Build transcript request for Universal-3.5 Pro.
         # Features we use from AssemblyAI:
         #   - speaker_labels: diarization (who said what)
         #   - speaker_identification: enhanced speaker labelling via speech_understanding
@@ -96,10 +96,10 @@ class AssemblyAIClient:
         #   - translation via speech_understanding (when translate_to is set)
         # Everything else (sentiment, IAB, PII, content_safety, profanity) is handled
         # better by NEXUS own agents and is NOT sent to AssemblyAI.
-        # universal-3-pro does not support the format_text parameter — omit it.
+        # universal-3-5-pro does not support the format_text parameter — omit it.
         request_body: dict = {
             "audio_url": upload_url,
-            "speech_models": ["universal-3-pro"],
+            "speech_models": ["universal-3-5-pro"],
             "speaker_labels": speaker_labels,
             "punctuate": auto_punctuation,
             "disfluencies": keep_filler_words,
@@ -265,7 +265,7 @@ class AssemblyAIClient:
             "segments": segments,
             "speakers": speakers,
             "backend": "assemblyai",
-            "model": "universal-3-pro",
+            "model": "universal-3-5-pro",
             "processing_time": elapsed,
         }
 

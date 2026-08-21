@@ -150,7 +150,7 @@ class Transcriber:
         # Explicit model_preference overrides always need the target backend ready.
         #
         # AUTO cascade order:
-        #   1. AssemblyAI  (Universal-3 Pro)
+        #   1. AssemblyAI  (Universal-3.5 Pro)
         #   2. Parakeet + NeMo GPU diarize
         #   3. Deepgram    (Nova-3)
         #   4. Whisper + NeMo combined (/transcribe-diarize)
@@ -229,7 +229,7 @@ class Transcriber:
             if client is not None:
                 self._assemblyai_client = client
                 self._use_assemblyai = True
-                logger.info("Using AssemblyAI backend (Universal-3 Pro, transcription + diarization)")
+                logger.info("Using AssemblyAI backend (Universal-3.5 Pro, transcription + diarization)")
             else:
                 logger.warning("AssemblyAI API key set but client creation failed.")
         except Exception as e:
@@ -451,7 +451,7 @@ class Transcriber:
 
             if result is None:
                 # Auto cascade (default):
-                #   1. AssemblyAI (Universal-3 Pro — transcription + diarization, one call)
+                #   1. AssemblyAI (Universal-3.5 Pro — transcription + diarization, one call)
                 #   2. Parakeet + NeMo (/transcribe + GPU /diarize — fast, GPU)
                 #   3. Deepgram (Nova-3 — transcription + diarization, one call)
                 #   4. Whisper+NeMo combined (/transcribe-diarize — GPU, best accuracy)
@@ -806,7 +806,7 @@ class Transcriber:
 
     def _transcribe_assemblyai(self, audio_path: str) -> dict:
         """
-        Transcribe via AssemblyAI Universal-3 Pro — transcribes first,
+        Transcribe via AssemblyAI Universal-3.5 Pro — transcribes first,
         then diarizes, all in one API call.
 
         Fallback: Whisper transcribe + Deepgram diarize
@@ -865,7 +865,7 @@ class Transcriber:
         return {
             "duration_seconds": result["duration_seconds"],
             "backend": "assemblyai",
-            "model": "universal-3-pro",
+            "model": "universal-3-5-pro",
             "segments": segments,
             "diarization_backend": "assemblyai",
             "diarization_confidence": 0.85,
